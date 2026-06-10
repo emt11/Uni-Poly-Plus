@@ -1,0 +1,52 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs and run outputs
+logs/
+results/
+plots/
+runs/
+wandb/
+tensorboard/
+
+# Trained models and checkpoints
+saved_models/
+checkpoints/
+pretrain_models/
+pretrained_models/
+data/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.h5
+
+# Generated dataset caches
+data/processed/
+pretrain_models/data/**/processed/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
