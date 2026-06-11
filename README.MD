@@ -239,4 +239,4 @@ results/attention_heatmap.png
 如有问题或反馈，请联系：
 
 **QI HUANG**  
-Email: huangqi@mail.sim.ac.cn
+Email: zzz1159600zz@gmail.com

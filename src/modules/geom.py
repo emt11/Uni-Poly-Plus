@@ -12,6 +12,8 @@ from torch import nn, Tensor
 
 
 GEOM_EPS = 1e-8
+PAINN_UPDATE_SCALE = 0.1
+PAINN_MAX_VECTOR_NORM = 50.0
 
 
 def _unpack_geometry_input(data_or_z, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None):
@@ -71,15 +73,15 @@ class SchNetEncoder(SchNet):
             std=std,
             atomref=atomref,
         )
-        
+
         # Remove regression output layers
         # self.lin1 = Linear(hidden_channels, hidden_channels // 2)
         # self.act = ShiftedSoftplus()
         # self.lin2 = Linear(hidden_channels // 2, 1)
-        
+
         if load_from_pretrain is not None:
             self.load_pretrained_weights(load_from_pretrain)
-            
+
     def load_pretrained_weights(self, pretrain_path: str):
         """
         Load weights from pretrained model path.
@@ -89,7 +91,7 @@ class SchNetEncoder(SchNet):
         """
         if not os.path.exists(pretrain_path):
             raise FileNotFoundError(f"Pretrained model file not found: {pretrain_path}")
-        
+
         # Load pretrained weights
         state_dict = torch.load(pretrain_path, map_location='cpu')
         self.load_state_dict(state_dict, strict=False)
@@ -98,12 +100,12 @@ class SchNetEncoder(SchNet):
     def forward(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None) -> Tensor:
         """
         Forward pass, returns graph-level high-dimensional representations.
-        
+
         Args:
             z (torch.Tensor): Atomic numbers for each atom, shape [num_atoms].
             pos (torch.Tensor): Coordinates for each atom, shape [num_atoms, 3].
             batch (torch.Tensor, optional): Batch indices, shape [num_atoms]. Defaults to None.
-        
+
         Returns:
             torch.Tensor: Graph-level embeddings, shape [num_graphs, hidden_channels].
         """
@@ -175,7 +177,7 @@ class CosineCutoff(nn.Module):
 
 
 class PaiNNInteraction(nn.Module):
-    def __init__(self, hidden_channels: int, num_rbf: int):
+    def __init__(self, hidden_channels: int, num_rbf: int, update_scale: float = PAINN_UPDATE_SCALE):
         super().__init__()
         self.filter_net = nn.Sequential(
             nn.Linear(num_rbf, hidden_channels),
@@ -187,6 +189,7 @@ class PaiNNInteraction(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_channels, hidden_channels * 3)
         )
+        self.update_scale = update_scale
 
     def forward(
         self,
@@ -209,13 +212,13 @@ class PaiNNInteraction(nn.Module):
             + msg_sv.unsqueeze(1) * edge_unit.unsqueeze(-1)
         )
 
-        s = s + scatter(ds, row, dim=0, dim_size=s.size(0), reduce='mean')
-        v = v + scatter(dv, row, dim=0, dim_size=v.size(0), reduce='mean')
+        s = s + self.update_scale * scatter(ds, row, dim=0, dim_size=s.size(0), reduce='mean')
+        v = v + self.update_scale * scatter(dv, row, dim=0, dim_size=v.size(0), reduce='mean')
         return s, v
 
 
 class PaiNNMixing(nn.Module):
-    def __init__(self, hidden_channels: int, eps: float = 1e-8):
+    def __init__(self, hidden_channels: int, eps: float = 1e-8, update_scale: float = PAINN_UPDATE_SCALE):
         super().__init__()
         self.eps = eps
         self.vector_u = nn.Linear(hidden_channels, hidden_channels, bias=False)
@@ -225,6 +228,7 @@ class PaiNNMixing(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_channels, hidden_channels * 3)
         )
+        self.update_scale = update_scale
 
     def forward(self, s: Tensor, v: Tensor):
         u = self.vector_u(v)
@@ -234,8 +238,8 @@ class PaiNNMixing(nn.Module):
         ds, dv, dsv = self.scalar_mlp(torch.cat([s, v_norm], dim=-1)).chunk(3, dim=-1)
         uv_dot = torch.sum(u * v_proj, dim=1)
 
-        s = s + ds + dsv * uv_dot
-        v = v + dv.unsqueeze(1) * u
+        s = s + self.update_scale * (ds + dsv * uv_dot)
+        v = v + self.update_scale * dv.unsqueeze(1) * u
         return s, v
 
 
@@ -276,6 +280,9 @@ class PaiNNEncoder(nn.Module):
         self.mixing = nn.ModuleList([
             PaiNNMixing(hidden_channels) for _ in range(num_layers)
         ])
+        self.scalar_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_channels) for _ in range(num_layers)
+        ])
 
         if readout == 'mean':
             self.readout = global_mean_pool
@@ -308,6 +315,9 @@ class PaiNNEncoder(nn.Module):
         )
 
     def _edge_features(self, pos: Tensor, batch: Tensor):
+        if not torch.isfinite(pos).all():
+            raise ValueError("PaiNNEncoder received non-finite coordinates.")
+
         edge_index = radius_graph(
             pos,
             r=self.cutoff,
@@ -329,8 +339,15 @@ class PaiNNEncoder(nn.Module):
             return edge_index, pos.new_empty((0, self.num_rbf)), pos.new_empty((0, 3))
 
         edge_unit = edge_vec / edge_dist.unsqueeze(-1)
-        edge_rbf = self.rbf(edge_dist) * self.cutoff_fn(edge_dist).unsqueeze(-1)
+        edge_rbf = self.rbf(edge_dist).clamp_(0.0, 1.0) * self.cutoff_fn(edge_dist).unsqueeze(-1)
         return edge_index, edge_rbf, edge_unit
+
+    def _stabilize_features(self, s: Tensor, v: Tensor, norm: nn.LayerNorm):
+        s = norm(s)
+        vector_norm = torch.linalg.vector_norm(v, dim=1, keepdim=True)
+        vector_scale = torch.clamp(PAINN_MAX_VECTOR_NORM / (vector_norm + self.eps), max=1.0)
+        v = v * vector_scale
+        return s, v
 
     def forward(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None) -> Tensor:
         z, pos, batch = _unpack_geometry_input(z, pos, batch)
@@ -340,12 +357,14 @@ class PaiNNEncoder(nn.Module):
 
         edge_index, edge_rbf, edge_unit = self._edge_features(pos, batch)
         if edge_index.numel() > 0:
-            for interaction, mixing in zip(self.interactions, self.mixing):
+            for interaction, mixing, norm in zip(self.interactions, self.mixing, self.scalar_norms):
                 s, v = interaction(s, v, edge_index, edge_rbf, edge_unit)
                 s, v = mixing(s, v)
+                s, v = self._stabilize_features(s, v, norm)
         else:
-            for mixing in self.mixing:
+            for mixing, norm in zip(self.mixing, self.scalar_norms):
                 s, v = mixing(s, v)
+                s, v = self._stabilize_features(s, v, norm)
 
         graph_embedding = self.readout(s, batch)
         return graph_embedding
