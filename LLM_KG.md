@@ -1,6 +1,6 @@
 # LLM 文献抽取与 Polymer KG 构建方案
 
-本文档定义 Uni-Poly-Plus 的 LLM 文献抽取、文档级事实聚合、Polymer KG 构建和先验特征生成流程。本文固定使用 JSON schema v2.0，不再设计其他 schema。
+本文档定义 Uni-Poly-Plus 的 LLM 文献抽取、文档级事实聚合、Polymer KG 构建和 KG embedding 生成流程。本文固定使用 JSON schema v2.0，不再设计其他 schema。
 
 ## 1. 项目目标与数据现状
 
@@ -17,8 +17,8 @@
 1. 抽取带证据的 LiteratureSample 事实。
 2. 连接 RepeatUnit、PolymerClass 和 LiteratureSample。
 3. 构建可追溯 Polymer KG。
-4. 将多篇文献聚合成 RepeatUnit/PolymerClass 级 literature-derived prior。
-5. 生成 enriched_records.csv、KG embedding 和 numeric descriptor matrix。
+4. 将多篇文献事实通过 dataset_links 接入同一 Polymer KG。
+5. 使用全部结构、类别、数值、事件、来源和证据信息训练 KG embedding。
 
 ~~~text
 DatasetRecord → RepeatUnit → PolymerClass → LiteratureSample
@@ -36,9 +36,11 @@ DatasetRecord → RepeatUnit → PolymerClass → LiteratureSample
 
 LiteratureSample 是文章中的具体 sample、film、blend、composite 或材料体系；DatasetRecord 是 smi_all.csv 的一行。文献中的 Mn、组成和条件必须先挂在 LiteratureSample 下，不能声明为当前 record 的真实值。
 
-### 2.2 文献事实只作为 prior
+### 2.2 文献事实作为 KG 邻域知识
 
-同一 repeat unit 可对应不同组成、序列、架构、分子量和制备条件。正确做法是聚合 Mn_prior_mean/std/count、各枚举分布、来源文章数和证据数，而不是直接写入 record.Mn。
+同一 repeat unit 可对应不同组成、序列、架构、分子量和制备条件。正确做法是将这些事实保留在各自的 LiteratureSample、Measurement 和 Event 节点中，再通过 dataset_links 与 RepeatUnit/PolymerClass 相连，而不是直接写入 record.Mn。
+
+文献知识通过图中的多来源邻居和关系结构影响 RepeatUnit/PolymerClass embedding，不再单独生成 prior 表格或统计特征文件。
 
 ### 2.3 科学语义约束
 
@@ -50,7 +52,7 @@ LiteratureSample 是文章中的具体 sample、film、blend、composite 或材�
 
 ### 2.4 Label leakage
 
-val 不得输入 LLM、进入检索 query、参与 PolymerClass 判断、dataset linking 或 prior 生成。若未来抽取到与 prop 相同的属性值，也必须从模型输入中屏蔽。
+val 不得输入 LLM、进入检索 query、参与 PolymerClass 判断、dataset linking 或 KG 构建。若未来抽取到与 prop 相同的属性值，也必须从图输入中屏蔽。
 
 ## 3. 为什么采用文档级抽取
 
@@ -59,14 +61,13 @@ val 不得输入 LLM、进入检索 query、参与 PolymerClass 判断、dataset
 ~~~text
 文档解析 → 语义切块 → 候选召回 → chunk 局部抽取
 → 文档内实体对齐 → LiteratureSample 聚合
-→ 校验/标准化 → dataset_links → prior aggregation → KG/特征
+→ 校验/标准化 → dataset_links → KG 构建 → KG embedding
 ~~~
 
 ## 4. 固定 JSON Schema v2.0
 
 ~~~json
 {
-  "schema_version": "2.0",
   "article": {
     "article_id": "art_001",
     "title": null,
@@ -97,7 +98,6 @@ val 不得输入 LLM、进入检索 query、参与 PolymerClass 判断、dataset
         {
           "assertion_id": "comp_001",
           "composition_type": null,
-          "composition_scope": null,
           "ratio_basis": null,
           "components": [
             {"name": null, "role": null, "value": null}
@@ -124,11 +124,10 @@ val 不得输入 LLM、进入检索 query、参与 PolymerClass 判断、dataset
           "measurement_id": "mw_001",
           "Mn": {"value": null, "unit": null},
           "Mw": {"value": null, "unit": null},
-          "dispersity": {"value": null, "derived": false},
+          "dispersity": {"value": null},
           "degree_of_polymerization": {
             "value": null,
-            "dp_type": null,
-            "derived": false
+            "dp_type": null
           },
           "evidence_refs": []
         }
@@ -173,27 +172,23 @@ val 不得输入 LLM、进入检索 query、参与 PolymerClass 判断、dataset
 
 ## 5. 顶层字段
 
-### 5.1 schema_version
-
-当前固定为 2.0，用于校验、兼容和数据迁移。它不是模型或 prompt 版本。
-
-### 5.2 article
+### 5.1 article
 
 表示来源文章，不表示样品。article_id 是内部 ID；title、doi、year、journal 用于追踪、去重、引用和 Article 节点属性。KG 关系为 LiteratureSample --reported_in--> Article。
 
-### 5.3 evidence_records
+### 5.2 evidence_records
 
 保存事实的原文证据。evidence_id 供其他对象引用；chunk_id、section、page、paragraph_id 定位原文；sentence 保存原文句子而非 LLM 改写。它是防止幻觉、人工审核、跨段落合并和 provenance 的核心。
 
-### 5.4 literature_samples
+### 5.3 literature_samples
 
 表示文章中的具体聚合物样品或材料体系。一篇文章可有多个样品，一个 PolymerClass 可对应多个 LiteratureSample。所有组成、结构、分子量和事件事实均挂在此层。
 
-### 5.5 dataset_links
+### 5.4 dataset_links
 
-表示 LiteratureSample 与数据集 RepeatUnit 的候选弱链接，不代表二者是同一实验样品。它用于聚合文献 prior。
+表示 LiteratureSample 与数据集 RepeatUnit 的候选弱链接，不代表二者是同一实验样品。它用于将文献知识接入以 RepeatUnit 为入口的 KG，并通过关系类型和置信度控制消息传播。
 
-### 5.6 warnings
+### 5.5 warnings
 
 记录 ambiguous_relation、missing_unit、multiple_materials、sample_alignment_unclear、evidence_missing、unsupported_inference、conflicting_values、unknown_enum_value、possible_label_leakage 等问题。
 
@@ -215,7 +210,6 @@ val 不得输入 LLM、进入检索 query、参与 PolymerClass 判断、dataset
 |---|---|
 | assertion_id | 组成断言 ID |
 | composition_type | 材料组成类型 |
-| composition_scope | 断言适用层级/来源 |
 | ratio_basis | 比例基准 |
 | components | 成分列表 |
 | evidence_refs | 支持证据 |
@@ -227,14 +221,13 @@ composition_type:
 homopolymer, condensation_multi_monomer, copolymer, terpolymer,
 blend, composite, mixture, unknown
 
-composition_scope:
-sample_level, polymer_class_level, inferred_from_structure, database_prior
-
 ratio_basis:
 mol_fraction, weight_fraction, feed_ratio, actual_ratio, stoichiometric_ratio
 ~~~
 
 components.name 是 styrene、MMA、adipic acid、silica 等；role 为 monomer、comonomer、polymer_component、filler、additive、solvent 或 unknown；value 可为 0.7、70 mol% 或 1:1。Feed ratio、实际组成和固定化学计量比不能混用。
+
+composition_assertions 嵌套在 LiteratureSample 下，因此默认表示该文献样品的组成事实，不再使用额外字段重复标记层级。事实来源通过 evidence_refs、Evidence 和 Article 关系表达；PolymerClass 级知识通过 KG 关系连接，不写入该 assertion 的层级属性。
 
 ## 8. sequence_distribution_assertions
 
@@ -256,13 +249,13 @@ architecture_type 可为 linear、branched、star、graft、comb、brush、netwo
 
 - measurement_id：记录 ID。
 - Mn.value/unit、Mw.value/unit：数值和原始单位。
-- dispersity.value：PDI/Đ；derived 表示是否由 Mw/Mn 计算。
-- degree_of_polymerization.value：DP；dp_type 为 number_average、weight_average 或 unknown；derived 表示是否派生。
+- dispersity.value：文献明确报告的 PDI/Đ。
+- degree_of_polymerization.value：文献明确报告的 DP；dp_type 为 number_average、weight_average 或 unknown。
 - evidence_refs：支持证据。
 
-LLM 只提取原始值、单位和证据；程序负责统一 Mn/Mw 到 g/mol。原文直接报告 PDI 时 derived=false；程序计算时为 true。同一样品多个值应保留多条 measurement。
+LLM 只提取原始值、单位和证据；程序负责统一 Mn/Mw 到 g/mol。dispersity.value 和 degree_of_polymerization.value 只保存文献明确报告的值，未报告时保持 null。后处理程序可以根据 Mw/Mn 或分子量与重复单元摩尔质量计算派生结果，用于一致性校验或在 KG 中建立派生关系，但不把计算值写回这两个字段。同一样品多个值应保留多条 measurement。
 
-这些连续值主要进入 numeric descriptor matrix；KG 保存测量对象、样品关系和证据，不能只靠 KG embedding 表示数值尺度。
+这些连续值全部进入 KG。原始数值作为 MolecularWeightMeasurement 节点的属性或数值节点保存；构图时可由确定性程序增加标准化数值和区间类别，用于 KG embedding 学习数值尺度。JSON schema 本身不新增字段。
 
 ## 11. polymerization_events
 
@@ -301,7 +294,7 @@ canonical_smiles, polymer_name, alias, repeat_unit,
 monomer_names, functional_groups, database_id
 ~~~
 
-精确结构链接可高权重聚合；class/alias 为中低权重；family/similarity 为低权重；uncertain 默认不进入 prior。禁止直接把文献值写成 record 真值。
+精确结构链接可使用高关系权重；class/alias 为中低权重；family/similarity 为低权重；uncertain 默认不用于向 RepeatUnit 传播知识。禁止直接把文献值写成 record 真值。
 
 ## 13. LLM 抽取原则
 
@@ -344,7 +337,7 @@ monomer_names, functional_groups, database_id
 
 ### 15.2 枚举和科学规则
 
-校验 composition type/scope、ratio basis、component role、sequence、architecture、dp_type、relation type 和 matched_on。未映射值标记 warning。
+校验 composition type、ratio basis、component role、sequence、architecture、dp_type、relation type 和 matched_on。未映射值标记 warning。
 
 Mn/Mw 必须为正数并在统计时统一 g/mol；PDI 通常不小于 1并检查 Mw/Mn；DP 为正数；比例非负；温度、时间、压力和 pH 做单位与范围校验。
 
@@ -377,24 +370,90 @@ LiteratureSample --linked_to_repeat_unit--> RepeatUnit
 
 事实证据链必须为 Fact → Evidence → SourceChunk → Article。
 
-## 17. Prior Aggregation 与 enriched_records.csv
+## 17. 全部数据进入 Polymer KG
 
-按 dataset_links 分组 LiteratureSample，至少生成：
+本方案不再生成 enriched_records.csv 或独立的 numeric descriptor matrix。v2.0 JSON 中的所有有效数据统一转换为 KG 节点、关系或属性：
 
-- strict prior：仅 exact/canonical structure links。
-- broad prior：允许 PolymerClass link，但保留权重和 mask。
+| JSON 信息 | KG 表示 |
+|---|---|
+| PolymerClass、composition type、sequence、architecture、method | 枚举实体节点及关系 |
+| component name | ChemicalEntity/Component 节点 |
+| component ratio | CompositionAssertion 的数值属性或 RatioValue 节点 |
+| Mn、Mw、PDI、DP | MolecularWeightMeasurement 的数值属性或 Value 节点 |
+| temperature、time、pressure、pH | PolymerizationEvent 的数值属性或 ConditionValue 节点 |
+| solvent、atmosphere | 条件实体节点及关系 |
+| Article、Evidence | provenance 节点及 supported_by/reported_in 关系 |
+| relation_type、confidence | dataset link 的关系类型和边属性 |
+| warnings | 审核属性；默认不作为普通事实关系传播 |
 
-连续值聚合 count、mean、std、median、min/max、source article count；枚举值聚合 mode、counts、proportions、entropy。
+同一个 RepeatUnit 关联的不同 LiteratureSample 不需要先压缩成均值或众数。它们作为不同邻居保留，KG 模型通过多跳关系和聚合机制学习其分布与共现模式。
 
-enriched_records.csv 可包含 record_id、smiles、prop、val、repeat_unit_id、polymer_class_id，各枚举的 mode/distribution/count，Mn/Mw/PDI/DP_prior_mean/std/count，方法和条件 prior，source_article_count、evidence_count、link_confidence_mean 和 prior_available_mask。val 仅作为最终监督标签，不参与 prior 构建。
+为了比较弱链接的影响，可以构建两种图视图，但最终产物仍是 KG embedding：
 
-## 18. Numeric Descriptor、KG Embedding 与 Metadata
+- strict graph：只保留 exact_repeat_unit_match 和 canonical_smiles_match。
+- broad graph：加入 polymer_class_match、alias_match 等弱链接，并使用关系类型或 confidence 控制权重。
 
-- Numeric descriptor：component ratio、Mn/Mw/PDI/DP、温度/时间/压力/pH 的统计值及 support count；每项配 missing mask。
-- KG embedding：PolymerClass、composition type、component identity、sequence、architecture、method category 和节点关系。
-- Metadata/mask：DOI、evidence、relation type、confidence、warnings、source count 和 missing mask。
+### 17.1 连续数值的 KG 表示
 
-连续数值不能只进入 KG embedding：KG 表达关系和来源，numeric branch 表达数值尺度和分布。
+全部数据进入 KG 不等于把每个浮点数当作彼此无关的字符串实体。连续值建议同时使用：
+
+1. 原始数值属性：保留精确 value 和 unit。
+2. 标准化数值属性：由后处理程序统一单位，仅用于构图和训练，不修改 JSON schema。
+3. 区间节点：按训练集或领域规则离散为 Mn_bin、temperature_bin 等类别节点。
+4. 关系限定：区分 has_Mn、has_Mw、has_PDI、has_temperature。
+
+例如：
+
+~~~text
+MolecularWeightMeasurement_mw1 --has_Mn_value--> 52000
+MolecularWeightMeasurement_mw1 --has_Mn_bin--> Mn_50k_100k
+MolecularWeightMeasurement_mw1 --supported_by--> Evidence_ev14
+LiteratureSample_s1 --has_molecular_weight--> MolecularWeightMeasurement_mw1
+~~~
+
+区间边界必须由确定性程序生成，并在训练、验证和测试间使用同一规则，不能让 LLM 决定。
+
+## 18. KG Embedding 设计
+
+最终只生成 KG embedding。Embedding 覆盖：
+
+~~~text
+RepeatUnit
+PolymerClass
+LiteratureSample
+CompositionAssertion / Component
+SequenceDistribution
+ChainArchitecture
+MolecularWeightMeasurement / numeric bins
+PolymerizationEvent / condition entities / numeric bins
+Article / Evidence
+~~~
+
+### 18.1 关系与数值初始化
+
+- 枚举实体和普通关系使用可训练 embedding 或预训练 KG embedding。
+- 原始连续值作为对应 Measurement/Event 节点的初始数值特征。
+- 数值区间作为普通 KG 实体参与关系学习。
+- relation_type 建成不同边类型。
+- confidence 作为边权重或消息传递门控值。
+- Evidence 和 Article 可参与 provenance-aware embedding；若图过大，可只参与 KG 训练，不输出其最终向量。
+
+### 18.2 RepeatUnit 的最终表示
+
+最终模型使用 RepeatUnit 节点或其 PolymerClass 节点的 KG embedding。图编码器通过多跳消息传递，将 LiteratureSample 的 Assertion、Measurement、Event 和 Evidence 信息汇总到 RepeatUnit。
+
+不存在文献链接的 RepeatUnit 使用 unknown/no-literature embedding，并保留 coverage mask，不能用零向量暗示数值为零。
+
+### 18.3 输出
+
+下游只需要：
+
+~~~text
+kg_entity_mapping.csv
+kg_embedding.npy
+~~~
+
+kg_entity_mapping.csv 只负责将 repeat_unit_id、PolymerClass ID 和 embedding 行号对应起来，不重复承载文献事实。
 
 ## 19. 实施路线
 
@@ -406,7 +465,7 @@ enriched_records.csv 可包含 record_id、smiles、prop、val、repeat_unit_id�
 数据整理 → RepeatUnit 规范化 → PolymerClass/alias
 → 文献检索 → 文档解析/chunk 召回 → LLM 抽取
 → LiteratureSample 聚合 → 校验/标准化 → dataset linking
-→ KG → prior aggregation → 模型输入文件
+→ KG triples/attributes → KG embedding
 ~~~
 
 评估 JSON valid rate、evidence precision、sample identity accuracy、事实准确率、跨 chunk 对齐准确率、dataset link precision、hallucination rate 和 cost per accepted fact。
@@ -419,13 +478,13 @@ enriched_records.csv 可包含 record_id、smiles、prop、val、repeat_unit_id�
 | 跨样品错配 | sample/table/entity 对齐，不确定则拆分 |
 | 缩聚物误分类 | condensation_multi_monomer，禁止推断序列 |
 | ratio 混淆 | ratio_basis 区分 feed/actual/stoichiometric |
-| 文献值成为 record 真值 | LiteratureSample 层 + prior aggregation |
-| 连续尺度丢失 | numeric descriptor matrix |
-| 弱链接噪声 | relation 分层、confidence、strict/broad prior |
+| 文献值成为 record 真值 | LiteratureSample 节点隔离，通过 KG 关系间接传播 |
+| 连续尺度丢失 | 原始数值属性 + 标准化属性 + 数值区间节点 |
+| 弱链接噪声 | relation 分层、confidence、strict/broad graph |
 | 文献量偏差 | Article 级去重、source count、最小支持度 |
 | label leakage | val 全流程隔离、同目标属性屏蔽 |
 
-验收要求：每条事实可追溯；多样品不默认合并；未提及字段不补全；PA66/PET 不误标为 random/block/graft；样品级数值只以 prior 连接数据集；dataset link 有 relation、依据和 confidence；val 不进入检索、prompt、链接和 prior；KG triples、numeric descriptors 和 metadata 能由同一 v2.0 JSON 一致生成。
+验收要求：每条事实可追溯；多样品不默认合并；未提及字段不补全；PA66/PET 不误标为 random/block/graft；样品级事实通过 LiteratureSample 和 dataset link 接入 KG；dataset link 有 relation、依据和 confidence；val 不进入检索、prompt 或链接；全部有效 JSON 数据能一致转换为 KG；最终能够为 RepeatUnit 生成 KG embedding。
 
 ## 21. 总结
 
@@ -437,12 +496,6 @@ RepeatUnit → PolymerClass → LiteratureSample
                          → Evidence/Article
 ~~~
 
-最终分工：
-
-~~~text
-枚举与关系 → KG embedding
-连续统计值 → numeric descriptor matrix
-证据、来源、链接强度、warnings → metadata/mask
-~~~
+最终不再拆分 enriched table、numeric branch 和 KG branch。枚举、关系、连续值、实验条件、来源及证据统一进入 Polymer KG；通过节点属性、数值区间节点、边类型和边权重共同训练 KG embedding。
 
 该分层既保留 Polymer KG 的可追溯性，也避免把文献具体样品事实误当成当前 DatasetRecord 的真实值。

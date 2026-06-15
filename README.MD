@@ -238,5 +238,5 @@ results/attention_heatmap.png
 
 如有问题或反馈，请联系：
 
-**QI HUANG**  
-Email: zzz1159600zz@gmail.com
+**EMT Spica**  
+Email: emt11spica@gmail.com
