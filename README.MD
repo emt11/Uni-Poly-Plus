@@ -1,6 +1,6 @@
 # Uni-Poly
 
-Uni-Poly 是一个面向聚合物性质预测的多模态表征学习框架。项目将 SMILES、二维分子图、三维几何结构、分子指纹以及领域知识等信息统一到同一个聚合物表示中，用于提升不同聚合物性质任务上的预测效果。
+Uni-Poly 是一个面向聚合物性质预测的多模态表征学习框架。当前版本将 SMILES、二维分子图、三维几何结构和分子指纹统一到同一个聚合物表示中。
 
 ## 项目简介
 
@@ -10,9 +10,13 @@ Uni-Poly 是一个面向聚合物性质预测的多模态表征学习框架。�
 - **二维分子图**：使用图结构描述原子与化学键关系。
 - **三维几何结构**：支持 `painn` 和 `schnet` 几何编码后端。
 - **分子指纹**：引入传统化学指纹特征。
-- **知识图谱/领域知识**：通过 `knowledge_graph/` 下的映射和嵌入文件增强聚合物语义信息。
+当前可用模态固定为：
 
-当前仓库包含预训练、下游训练、注意力权重可视化、caption 生成示例以及部分已处理数据和模型权重。
+```text
+smiles, graph, fp, geom
+```
+
+旧文本模态和旧知识图谱模态已从训练代码中移除。新的 Polymer KG embedding 将在后续版本中按独立方案重新接入。
 
 ## 目录结构
 
@@ -24,11 +28,10 @@ Uni-Poly/
 ├── data/
 │   ├── raw/                          # 原始 CSV 数据，文件名形如 smi_tg.csv
 │   ├── SchNet/                       # SchNet 相关中间数据
-│   └── smiles_text_dict.json         # SMILES 到文本描述的映射
+│   └── smiles_text_dict.json         # 保留的历史文本映射，当前训练不加载
 ├── src/
 │   ├── dataset/                      # 数据集、图数据、几何数据与 DataLoader
-│   ├── modules/                      # 多模态编码器、图/几何/知识模块
-│   ├── kg/                           # 知识图谱加载与映射工具
+│   ├── modules/                      # 多模态编码器、图与几何模块
 │   └── utils.py                      # 训练、评估、损失与通用工具函数
 ├── scripts/
 │   ├── pretrain.py                   # 多模态对比预训练入口
@@ -44,8 +47,8 @@ Uni-Poly/
 │   └── results.csv                   # 训练评估结果
 ├── plots/
 │   └── pretrain/                     # 预训练 loss 数据与曲线
-├── knowledge_graph/                  # 知识图谱、本体、映射和嵌入文件
-└── caption_generation/               # 聚合物文本描述生成 notebook 与示例输入
+├── knowledge_graph/                  # 保留的历史知识图谱数据，不参与当前训练
+└── caption_generation/               # 保留的历史 notebook，不参与当前训练
 ```
 
 ## 环境要求
@@ -92,7 +95,6 @@ smi_<task>.csv
 
 ```text
 pretrained_models/encoders/PubChem10M_SMILES_BPE_450k
-pretrained_models/encoders/multitask-text-and-chemistry-t5-base-augm
 pretrained_models/saved_pretrained_model.pth
 ```
 
@@ -104,26 +106,7 @@ pretrained_models/encoders/schnet_qm9_cv.pth
 data/Schnet/
 ```
 
-### 3. 知识图谱数据
-
-启用 `kg` 模态时，程序会使用 `knowledge_graph/` 下的映射、功能团、元素、本体和嵌入文件。当前示例脚本默认启用 `kg`：
-
-```bash
---modalities smiles graph fp geom kg
-```
-
 ## 使用方法
-
-### 生成聚合物文本描述
-
-caption 生成示例位于 `caption_generation/`：
-
-```text
-caption_generation/Poly-caption.ipynb
-caption_generation/json_input.json
-```
-
-在 Jupyter Notebook 中打开并运行 `Poly-caption.ipynb`，输入 JSON 格式可参考 `json_input.json`。
 
 ### 多模态预训练
 
@@ -138,7 +121,7 @@ bash scripts/run_pretrain.sh
 ```bash
 python scripts/pretrain.py \
   --dataset_name smi_all \
-  --modalities smiles graph fp geom kg \
+  --modalities smiles graph fp geom \
   --geometry_encoder schnet
 ```
 
@@ -172,7 +155,7 @@ bash scripts/run_train.sh
 
 ```bash
 python scripts/train.py \
-  --modalities smiles graph fp geom kg \
+  --modalities smiles graph fp geom \
   --geometry_encoder schnet \
   --tasks tg eat eea egb egc ei eps nc xc \
   --pretrained_model_path ./pretrained_models/saved_pretrained_model.pth
@@ -189,7 +172,7 @@ logs/train.log
 常用参数包括：
 
 - `--tasks`：需要训练的任务列表
-- `--modalities`：使用的模态列表，例如 `smiles graph fp geom kg`
+- `--modalities`：使用的模态列表，可选 `smiles graph fp geom`
 - `--geometry_encoder`：几何编码器，可选 `painn` 或 `schnet`
 - `--freeze_encoder`：是否冻结编码器
 - `--pretrained_model_path`：预训练 Uni-Poly 权重路径
@@ -227,7 +210,9 @@ results/attention_heatmap.png
 
 - `scripts/run_pretrain.sh` 和 `scripts/run_train.sh` 中默认设置了 `CUDA_VISIBLE_DEVICES=1`。如果机器上 GPU 编号不同，请按需修改。
 - 示例脚本使用 `nohup ... &` 在后台运行任务，日志会写入 `logs/` 目录。
-- 如果禁用知识图谱模态，请从 `--modalities` 中移除 `kg`。
+- `text` 和旧 `kg` 不再是合法模态；传入时 CLI 会直接报错。
+- 旧 checkpoint 仍使用 `strict=False` 尝试加载，其中旧文本或旧 KG encoder 参数会被视为不匹配参数并忽略。
+- 新的 Polymer KG embedding 会在后续版本重新接入，当前版本不会加载 `knowledge_graph/` 中的旧 embedding。
 - 如果使用 CPU 运行，训练速度会明显下降。
 
 ## 许可证

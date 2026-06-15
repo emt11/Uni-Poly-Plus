@@ -3,11 +3,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
-from transformers import AutoModelForSeq2SeqLM, RobertaModel
+from transformers import RobertaModel
 
 from .geom import PaiNNEncoder, SchNetEncoder
 from .graph import GNN_graphpred
-from .kg import KGEncoder
+
+
+SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom')
 
 
 class UniEncoderAttention(nn.Module):
@@ -15,7 +17,6 @@ class UniEncoderAttention(nn.Module):
         self,
         joint_embedding_dim: int,
         smiles_model_name: Optional[str],
-        text_model_name: Optional[str],
         gnn_model_name: Optional[str],
         geom_model_name: Optional[str],
         modality_list: List[str],
@@ -27,6 +28,14 @@ class UniEncoderAttention(nn.Module):
         geometry_encoder: str = 'painn',
     ):
         super().__init__()
+        unsupported = [modality for modality in modality_list if modality not in SUPPORTED_MODALITIES]
+        if unsupported:
+            raise ValueError(
+                f"Unsupported modality: {unsupported[0]}. Current supported modalities are: "
+                f"{', '.join(SUPPORTED_MODALITIES)}."
+            )
+        if not modality_list:
+            raise ValueError("At least one modality must be enabled.")
         self.modality_list = modality_list
         self.joint_embedding_dim = joint_embedding_dim
         self.output_attention_weights = output_attention_weights
@@ -38,7 +47,6 @@ class UniEncoderAttention(nn.Module):
                 joint_embedding_dim=joint_embedding_dim,
                 freeze_encoder=freeze_encoder,
                 smiles_model_name=smiles_model_name,
-                text_model_name=text_model_name,
                 gnn_model_name=gnn_model_name,
                 geom_model_name=geom_model_name,
                 geometry_encoder=geometry_encoder,
@@ -81,7 +89,6 @@ class EncoderModule(nn.Module):
         joint_embedding_dim: int,
         freeze_encoder: bool,
         smiles_model_name: Optional[str] = None,
-        text_model_name: Optional[str] = None,
         gnn_model_name: Optional[str] = None,
         geom_model_name: Optional[str] = None,
         geometry_encoder: str = 'painn',
@@ -93,14 +100,13 @@ class EncoderModule(nn.Module):
             modality=modality,
             joint_embedding_dim=joint_embedding_dim,
             smiles_model_name=smiles_model_name,
-            text_model_name=text_model_name,
             gnn_model_name=gnn_model_name,
             geom_model_name=geom_model_name,
             geometry_encoder=geometry_encoder,
         )
         self.encoder = encoder
-        self.norm = None if modality == 'kg' else (nn.LayerNorm(input_dim) if encoder else None)
-        self.projection = None if modality == 'kg' else self._create_projection(input_dim, joint_embedding_dim)
+        self.norm = nn.LayerNorm(input_dim) if encoder else None
+        self.projection = self._create_projection(input_dim, joint_embedding_dim)
 
         if encoder and freeze_encoder:
             for param in self.encoder.parameters():
@@ -111,7 +117,6 @@ class EncoderModule(nn.Module):
         modality: str,
         joint_embedding_dim: int,
         smiles_model_name: Optional[str],
-        text_model_name: Optional[str],
         gnn_model_name: Optional[str],
         geom_model_name: Optional[str],
         geometry_encoder: str,
@@ -120,10 +125,6 @@ class EncoderModule(nn.Module):
             encoder = RobertaModel.from_pretrained(smiles_model_name)
             input_dim = encoder.config.hidden_size
             print(f"Loaded smiles pretrained weights from {smiles_model_name}")
-        elif modality == 'text':
-            encoder = AutoModelForSeq2SeqLM.from_pretrained(text_model_name).encoder
-            input_dim = encoder.config.hidden_size
-            print(f"Loaded text pretrained weights from {text_model_name}")
         elif modality == 'geom':
             encoder = self._initialize_geometry_encoder(geometry_encoder, geom_model_name)
             input_dim = encoder.hidden_channels
@@ -147,11 +148,11 @@ class EncoderModule(nn.Module):
         elif modality == 'fp':
             encoder = None
             input_dim = 1024
-        elif modality == 'kg':
-            encoder = KGEncoder(joint_embedding_dim=joint_embedding_dim)
-            input_dim = joint_embedding_dim
         else:
-            raise ValueError(f"Unsupported modality: {modality}")
+            raise ValueError(
+                f"Unsupported modality: {modality}. Current supported modalities are: "
+                f"{', '.join(SUPPORTED_MODALITIES)}."
+            )
 
         return encoder, input_dim
 
@@ -215,17 +216,15 @@ class EncoderModule(nn.Module):
             nn.ReLU(),
         )
 
-    def _encode_text_like(self, data, input_ids_attr: str, attention_mask_attr: str):
-        input_ids = getattr(data, input_ids_attr).to(self.encoder.device)
-        attention_mask = getattr(data, attention_mask_attr).to(self.encoder.device)
+    def _encode_smiles(self, data):
+        input_ids = data.input_ids_smiles.to(self.encoder.device)
+        attention_mask = data.attention_mask_smiles.to(self.encoder.device)
         features = self.encoder(input_ids, attention_mask=attention_mask).last_hidden_state
         return self.projection(self.norm(features[:, 0, :]))
 
     def forward(self, data):
         if self.modality == 'smiles':
-            return self._encode_text_like(data, 'input_ids_smiles', 'attention_mask_smiles')
-        if self.modality == 'text':
-            return self._encode_text_like(data, 'input_ids_text', 'attention_mask_text')
+            return self._encode_smiles(data)
         if self.modality == 'graph':
             features, _ = self.encoder(data.x, data.edge_index, data.edge_attr, data.batch)
             return self.projection(self.norm(features))
@@ -234,10 +233,10 @@ class EncoderModule(nn.Module):
             return self.projection(self.norm(features))
         if self.modality == 'fp':
             return self.projection(data.fp)
-        if self.modality == 'kg':
-            return self.encoder(data.kg_entity_ids, data.kg_mask)
-
-        raise ValueError(f"Unsupported modality: {self.modality}")
+        raise ValueError(
+            f"Unsupported modality: {self.modality}. Current supported modalities are: "
+            f"{', '.join(SUPPORTED_MODALITIES)}."
+        )
 
 
 class AttentionPooling(nn.Module):

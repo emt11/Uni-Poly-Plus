@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import warnings
 import torch
@@ -9,17 +10,30 @@ import matplotlib.pyplot as plt
 import json
 from tqdm import tqdm
 
-from src.dataset import UniDataset
-from src.modules import UniEncoderAttention
-from src.utils import get_data_loader, compute_contrastive_loss
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom')
+
+
+def parse_modality(value):
+    if value not in SUPPORTED_MODALITIES:
+        raise argparse.ArgumentTypeError(
+            f"Unsupported modality: {value}. Current supported modalities are: "
+            f"{', '.join(SUPPORTED_MODALITIES)}."
+        )
+    return value
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Pretrain UniEncoderAttention Model")
     parser.add_argument(
         '--modalities',
         nargs='+',
+        type=parse_modality,
         default=['smiles', 'graph', 'fp', 'geom'],
-        help="List of modalities to use. Example: --modalities smiles text"
+        help="Modalities to use. Supported: smiles, graph, fp, geom."
     )
     parser.add_argument(
         '--geometry_encoder',
@@ -33,12 +47,6 @@ def parse_arguments():
         type=str,
         default="./pretrained_models/encoders/PubChem10M_SMILES_BPE_450k",
         help="Pretrained model name or path for SMILES"
-    )
-    parser.add_argument(
-        '--text_model_name',
-        type=str,
-        default="./pretrained_models/encoders/multitask-text-and-chemistry-t5-base-augm",
-        help="Pretrained model name or path for Text"
     )
     parser.add_argument(
         '--gnn_model_name',
@@ -111,6 +119,10 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+
+    from src.dataset import UniDataset
+    from src.modules import UniEncoderAttention
+    from src.utils import compute_contrastive_loss, get_data_loader
     
     # Get all available GPUs
     if torch.cuda.is_available():
@@ -129,9 +141,7 @@ def main():
         root=args.root,
         dataset=args.dataset_name,
         smiles_model_name=args.smiles_model_name,
-        text_model_name=args.text_model_name,
-        geometry_encoder=args.geometry_encoder,
-        use_kg='kg' in args.modalities
+        geometry_encoder=args.geometry_encoder
     )
     indices = np.arange(len(dataset))
     dataloader = get_data_loader(dataset, indices=indices, batch_size=args.batch_size, shuffle=False)
@@ -140,7 +150,6 @@ def main():
     model = UniEncoderAttention(
         joint_embedding_dim=256,
         smiles_model_name=args.smiles_model_name,
-        text_model_name=args.text_model_name,
         gnn_model_name=args.gnn_model_name,
         geom_model_name=args.geom_model_name,
         modality_list=args.modalities,

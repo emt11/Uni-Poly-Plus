@@ -1,5 +1,4 @@
 import os
-import json
 import torch
 import pandas as pd
 from rdkit import Chem
@@ -20,9 +19,7 @@ class UniDataset(Dataset):
         root,
         dataset,
         smiles_model_name,
-        text_model_name,
         geometry_encoder='painn',
-        use_kg=False,
         transform=None,
         pre_transform=None
     ):
@@ -30,15 +27,8 @@ class UniDataset(Dataset):
         self.root = root
         self.transform = transform
         self.pre_transform = pre_transform
-        self.use_kg = use_kg
-        self.text_dict = json.load(open('./data/smiles_text_dict.json', 'r'))
         self.data_list = []
         self.smiles_tokenizer = AutoTokenizer.from_pretrained(smiles_model_name)
-        self.text_tokenizer = AutoTokenizer.from_pretrained(text_model_name)
-        self.kg_store = None
-        if self.use_kg:
-            from src.kg import load_kg_embedding_store
-            self.kg_store = load_kg_embedding_store(root='.')
         
         geometry_cache_dirs = {
             'schnet': 'Schnet',
@@ -56,15 +46,13 @@ class UniDataset(Dataset):
         if os.path.exists(self.processed_file):
             # If processed dataset exists, load it
             self.data_list = torch.load(self.processed_file, weights_only=False)
-            if self.use_kg:
-                self._ensure_kg_fields()
             print(f"loaded {self.processed_file} with {len(self.data_list)} samples")  # Loaded the processed dataset from ...
             
         else:
             # If processed dataset doesn't exist, process and save it
             # Get maximum token length
             csv_path = f"{self.root}/raw/{self.dataset}.csv"
-            self.max_length_smiles, self.max_length_text = self.get_max_token_length(csv_path, self.smiles_tokenizer, self.text_tokenizer,self.text_dict)
+            self.max_length_smiles = self.get_max_smiles_token_length(csv_path)
             
             self.process()
             torch.save(self.data_list, self.processed_file)
@@ -77,41 +65,18 @@ class UniDataset(Dataset):
         return self.data_list[idx]
 
 
-    def get_max_token_length(self, csv_path, smiles_tokenizer, text_tokenizer,text_dict):
+    def get_max_smiles_token_length(self, csv_path):
         df = pd.read_csv(csv_path)
         max_smiles_length = 0
-        max_text_length = 0
         
         for _, row in tqdm(df.iterrows(), total=len(df), desc="Checking token lengths"):
             smiles = row[0]
             
-            # Tokenize SMILES
             smiles_tokens = self.smiles_tokenizer.encode(smiles)
             max_smiles_length = max(max_smiles_length, len(smiles_tokens))
-            
-            # Tokenize text input
-            # input_text = self.text_dict[smiles] if smiles in self.text_dict else ''
-            # text_tokens = self.text_tokenizer.encode(input_text)
-            # max_text_length = max(max_text_length, len(text_tokens))
         
         print(f"Max SMILES token length: {max_smiles_length}")
-        print(f"Max text token length: {max_text_length}")
-        
-        return max_smiles_length, max_text_length
-
-    def _attach_kg_fields(self, data, smiles):
-        from src.kg import smiles_to_kg_entity_ids
-
-        kg_entity_ids = smiles_to_kg_entity_ids(smiles, self.kg_store, root='.')
-        data.kg_entity_ids = torch.tensor(kg_entity_ids, dtype=torch.long)
-        data.kg_mask = torch.ones(len(kg_entity_ids), dtype=torch.bool)
-        return data
-
-    def _ensure_kg_fields(self):
-        for data in self.data_list:
-            if hasattr(data, 'kg_entity_ids') and hasattr(data, 'kg_mask'):
-                continue
-            self._attach_kg_fields(data, data.smiles)
+        return max_smiles_length
 
 
     def process(self):
@@ -146,19 +111,7 @@ class UniDataset(Dataset):
             data.input_ids_smiles = tokenizer_output.input_ids
             data.attention_mask_smiles = tokenizer_output.attention_mask
 
-            data.text = self.text_dict[smiles] if smiles in self.text_dict else ''
-            tokenizer_output = self.text_tokenizer(
-                data.text,
-                return_tensors='pt',
-                max_length=self.max_length_text+5,
-                padding='max_length',
-                truncation=True
-            )
-            data.input_ids_text = tokenizer_output.input_ids
-            data.attention_mask_text = tokenizer_output.attention_mask
             data.fp = torch.tensor(mfpgen.GetFingerprint(fp_mol), dtype=torch.float).unsqueeze(0)
-            if self.use_kg:
-                self._attach_kg_fields(data, smiles)
             try:
                 mol = Chem.MolFromSmiles(smiles)
                 geom_data = mol2coords(mol)

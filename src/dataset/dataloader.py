@@ -9,13 +9,9 @@ def custom_collate(data_list):
     edge_index_list = []
     edge_attr_list = []
     smiles_list = []
-    text_list = []
     input_ids_smiles_list = []
     attention_mask_smiles_list = []
-    input_ids_text_list = []
-    attention_mask_text_list = []
     fp_list = []
-    kg_entity_ids_list = []
     batch2d_list = []
     x3d_list = []
     pos3d_list = []
@@ -29,11 +25,6 @@ def custom_collate(data_list):
         smiles_list.append(data.smiles)
         input_ids_smiles_list.append(data.input_ids_smiles)
         attention_mask_smiles_list.append(data.attention_mask_smiles)
-
-        # text
-        text_list.append(data.text)
-        input_ids_text_list.append(data.input_ids_text)
-        attention_mask_text_list.append(data.attention_mask_text)
 
         # 2D graph data
         num_nodes2d = data.x.size(0)
@@ -55,9 +46,6 @@ def custom_collate(data_list):
         # fingerprint
         fp_list.append(data.fp)
 
-        if hasattr(data, 'kg_entity_ids'):
-            kg_entity_ids_list.append(data.kg_entity_ids)
-
         # Labels
         y_list.append(data.y.reshape(-1))
 
@@ -71,14 +59,7 @@ def custom_collate(data_list):
     batch.smiles = smiles_list
     batch.input_ids_smiles = torch.cat(input_ids_smiles_list, dim=0)
     batch.attention_mask_smiles = torch.cat(attention_mask_smiles_list, dim=0)
-    batch.text = text_list
-    batch.input_ids_text = torch.cat(input_ids_text_list, dim=0)
-    batch.attention_mask_text = torch.cat(attention_mask_text_list, dim=0)
     batch.fp = torch.cat(fp_list, dim=0)
-    if kg_entity_ids_list:
-        from src.kg import pad_kg_entity_ids
-
-        batch.kg_entity_ids, batch.kg_mask = pad_kg_entity_ids(kg_entity_ids_list)
     batch.x3d = torch.cat(x3d_list, dim=0)
     batch.pos3d = torch.cat(pos3d_list, dim=0)
     batch.batch3d = torch.cat(batch3d_list, dim=0)

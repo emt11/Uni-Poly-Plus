@@ -9,23 +9,41 @@ import pandas as pd
 import seaborn as sns
 
 
+SUPPORTED_MODALITIES = ("smiles", "graph", "fp", "geom")
+
+
+def validate_modalities(modalities):
+    if modalities is None:
+        return
+    unsupported = [modality for modality in modalities if modality not in SUPPORTED_MODALITIES]
+    if unsupported:
+        raise ValueError(
+            f"Unsupported modality: {unsupported[0]}. Current supported modalities are: "
+            f"{', '.join(SUPPORTED_MODALITIES)}."
+        )
+
+
 def parse_modalities(value):
     if isinstance(value, (list, tuple)):
-        return list(value)
+        modalities = [str(item) for item in value]
+        validate_modalities(modalities)
+        return modalities
     if pd.isna(value):
         return None
 
-    text = str(value).strip()
-    if not text:
+    raw_value = str(value).strip()
+    if not raw_value:
         return None
 
     for parser in (ast.literal_eval, json.loads):
         try:
-            parsed = parser(text)
+            parsed = parser(raw_value)
         except (ValueError, SyntaxError, json.JSONDecodeError):
             continue
         if isinstance(parsed, (list, tuple)):
-            return [str(item) for item in parsed]
+            modalities = [str(item) for item in parsed]
+            validate_modalities(modalities)
+            return modalities
 
     return None
 
@@ -38,20 +56,25 @@ def parse_attention(value, modalities=None):
             raise ValueError("Missing attention value.")
         parsed_value = None
 
-    text = str(value).strip()
-    if not text:
+    raw_value = str(value).strip()
+    if not raw_value:
         raise ValueError("Empty attention value.")
 
     if parsed_value is not None:
         if isinstance(parsed_value, dict):
-            return {str(key): float(value) for key, value in parsed_value.items()}
+            result = {str(key): float(value) for key, value in parsed_value.items()}
+            validate_modalities(list(result))
+            return result
         weights = np.asarray(parsed_value, dtype=float)
         if weights.ndim == 2:
             weights = weights.mean(axis=0)
         if weights.ndim != 1:
             raise ValueError(f"Unsupported attention array shape: {weights.shape}")
         if modalities is None:
-            modalities = [f"modality_{idx}" for idx in range(len(weights))]
+            if len(weights) > len(SUPPORTED_MODALITIES):
+                raise ValueError("Attention contains more entries than supported modalities.")
+            modalities = list(SUPPORTED_MODALITIES[:len(weights)])
+        validate_modalities(modalities)
         if len(modalities) != len(weights):
             raise ValueError(
                 f"Modalities length ({len(modalities)}) does not match "
@@ -61,12 +84,14 @@ def parse_attention(value, modalities=None):
 
     for parser in (json.loads, ast.literal_eval):
         try:
-            parsed = parser(text)
+            parsed = parser(raw_value)
         except (ValueError, SyntaxError, json.JSONDecodeError):
             continue
 
         if isinstance(parsed, dict):
-            return {str(key): float(value) for key, value in parsed.items()}
+            result = {str(key): float(value) for key, value in parsed.items()}
+            validate_modalities(list(result))
+            return result
 
         if isinstance(parsed, (list, tuple)):
             weights = np.asarray(parsed, dtype=float)
@@ -75,7 +100,10 @@ def parse_attention(value, modalities=None):
             if weights.ndim != 1:
                 raise ValueError(f"Unsupported attention array shape: {weights.shape}")
             if modalities is None:
-                modalities = [f"modality_{idx}" for idx in range(len(weights))]
+                if len(weights) > len(SUPPORTED_MODALITIES):
+                    raise ValueError("Attention contains more entries than supported modalities.")
+                modalities = list(SUPPORTED_MODALITIES[:len(weights)])
+            validate_modalities(modalities)
             if len(modalities) != len(weights):
                 raise ValueError(
                     f"Modalities length ({len(modalities)}) does not match "
@@ -83,17 +111,18 @@ def parse_attention(value, modalities=None):
                 )
             return {modality: float(weight) for modality, weight in zip(modalities, weights)}
 
-    if ":" in text:
+    if ":" in raw_value:
         parsed = {}
-        for item in text.split(";"):
+        for item in raw_value.split(";"):
             item = item.strip()
             if not item:
                 continue
             name, raw_weight = item.split(":", 1)
             parsed[name.strip()] = float(raw_weight.strip())
+        validate_modalities(list(parsed))
         return parsed
 
-    raise ValueError(f"Could not parse attention value: {text}")
+    raise ValueError(f"Could not parse attention value: {raw_value}")
 
 
 def build_attention_matrix(results_df):
@@ -108,6 +137,7 @@ def build_attention_matrix(results_df):
 
     for _, row in results_df.iterrows():
         modalities = parse_modalities(row.get("model_modality_list"))
+        validate_modalities(modalities)
         attention = parse_attention(row[attention_column], modalities=modalities)
         rows.append((row["task"], attention))
         for modality in attention:

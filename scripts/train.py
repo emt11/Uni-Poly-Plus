@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import warnings
 import torch
@@ -7,9 +8,20 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split, KFold
 
-from src.dataset import UniDataset
-from src.modules import UniEncoderAttention
-from src.utils import scale_targets, train_and_evaluate, get_data_loader
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom')
+
+
+def parse_modality(value):
+    if value not in SUPPORTED_MODALITIES:
+        raise argparse.ArgumentTypeError(
+            f"Unsupported modality: {value}. Current supported modalities are: "
+            f"{', '.join(SUPPORTED_MODALITIES)}."
+        )
+    return value
 
 
 def collect_attention_pooling_weights(model, data_loader, device):
@@ -66,8 +78,9 @@ def parse_arguments():
     parser.add_argument(
         '--modalities',
         nargs='+',
+        type=parse_modality,
         default=['smiles', 'graph', 'fp', 'geom'],
-        help="List of model modalities. Example: --modalities smiles text"
+        help="Model modalities. Supported: smiles, graph, fp, geom."
     )
     parser.add_argument(
         '--geometry_encoder',
@@ -128,6 +141,10 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+
+    from src.dataset import UniDataset
+    from src.modules import UniEncoderAttention
+    from src.utils import get_data_loader, scale_targets, train_and_evaluate
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Ignore warnings
@@ -135,7 +152,6 @@ def main():
     
     pre_trained_model_dict = {
         'smiles_model_name': "./pretrained_models/encoders/PubChem10M_SMILES_BPE_450k",
-        'text_model_name': "./pretrained_models/encoders/multitask-text-and-chemistry-t5-base-augm",
         # 'gnn_model_name': "./pretrained_models/encoders/Mole-BERT.pth",
         'gnn_model_name': "",
         # 'geom_model_name': "./pretrained_models/encoders/schnet_qm9_cv.pth"
@@ -145,7 +161,6 @@ def main():
     result_output_dir = args.results_dir
     model_output_dir = args.models_dir
     model_modality_list = args.modalities
-    use_kg = 'kg' in model_modality_list
     
     task_list = args.tasks
     dataset_name_list = ['smi_' + task for task in task_list]
@@ -154,9 +169,7 @@ def main():
             root='./data',
             dataset=dataset_name,
             smiles_model_name=pre_trained_model_dict['smiles_model_name'],
-            text_model_name=pre_trained_model_dict['text_model_name'],
-            geometry_encoder=args.geometry_encoder,
-            use_kg=use_kg
+            geometry_encoder=args.geometry_encoder
         )
         for dataset_name in dataset_name_list
     ]
@@ -202,7 +215,6 @@ def main():
             model = UniEncoderAttention(
                 joint_embedding_dim=256,
                 smiles_model_name=pre_trained_model_dict['smiles_model_name'],
-                text_model_name=pre_trained_model_dict['text_model_name'],
                 gnn_model_name=pre_trained_model_dict['gnn_model_name'],
                 geom_model_name=pre_trained_model_dict['geom_model_name'],
                 modality_list=model_modality_list,

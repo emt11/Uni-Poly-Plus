@@ -8,7 +8,6 @@ Uni-Poly 是用于聚合物性质预测的多模态深度学习项目，核心�
 
 - 多模态数据读取与特征构建：`src/dataset/`
 - 模型结构与模态融合：`src/modules/`
-- 知识图谱相关加载与映射：`src/kg/`
 - 多模态对比预训练：`scripts/pretrain.py`
 - 下游性质预测训练：`scripts/train.py`
 - 注意力权重可视化：`scripts/plot_attention_heatmap.py`
@@ -18,14 +17,12 @@ Uni-Poly 是用于聚合物性质预测的多模态深度学习项目，核心�
 ## 关键目录
 
 - `src/dataset/`：数据集、图数据、几何数据、DataLoader。改动这里通常会影响预训练和下游训练。
-- `src/modules/`：Uni-Poly 模型、图编码、几何编码、知识模块。改动这里需要重点检查 checkpoint 加载和模态维度。
-- `src/kg/`：知识图谱映射、加载和工具函数。启用 `kg` 模态时依赖这里。
+- `src/modules/`：Uni-Poly 模型、图编码和几何编码。改动这里需要重点检查 checkpoint 加载和模态维度。
 - `scripts/`：命令行入口。新增参数时同步更新 README 和本文件。
 - `data/raw/`：原始性质数据，文件名约定为 `smi_<task>.csv`。
 - `pretrained_models/`、`saved_models/`：模型权重目录。默认不要重写、删除或提交大规模权重变更。
 - `logs/`、`plots/`、`results/`：运行产物。除非任务明确要求，不要把历史结果当作源码重构对象。
-- `caption_generation/`：caption 生成 notebook 与示例输入。
-- `knowledge_graph/`：知识图谱、本体、映射和嵌入文件。
+- `caption_generation/` 与 `knowledge_graph/`：保留的历史资产，不参与当前训练运行时。新的 Polymer KG 会在后续版本重新接入。
 
 ## 环境与依赖
 
@@ -52,7 +49,7 @@ bash scripts/run_pretrain.sh
 ```bash
 python scripts/pretrain.py \
   --dataset_name smi_all \
-  --modalities smiles graph fp geom kg \
+  --modalities smiles graph fp geom \
   --geometry_encoder schnet
 ```
 
@@ -66,7 +63,7 @@ bash scripts/run_train.sh
 
 ```bash
 python scripts/train.py \
-  --modalities smiles graph fp geom kg \
+  --modalities smiles graph fp geom \
   --geometry_encoder schnet \
   --tasks tg eat eea egb egc ei eps nc xc \
   --pretrained_model_path ./pretrained_models/saved_pretrained_model.pth
@@ -87,9 +84,9 @@ python scripts/plot_attention_heatmap.py \
 - 优先保持现有模块结构，不引入新的训练框架或配置系统，除非用户明确要求。
 - 入口脚本参数使用 `argparse`，新增训练参数时保持 CLI 向后兼容。
 - 数据集命名遵循 `smi_<task>`，对应原始 CSV 位于 `data/raw/smi_<task>.csv`。
-- 模态名保持当前约定：`smiles`、`graph`、`fp`、`geom`、`kg`。
+- 当前支持的模态只有：`smiles`、`graph`、`fp`、`geom`。传入 `text` 或旧 `kg` 必须在 CLI 和模型入口报错。
 - 几何编码器当前使用 `painn` 或 `schnet`，新增后端时需要同步检查数据处理和模型初始化。
-- checkpoint 加载当前允许 `strict=False`。修改模型 state dict key 时，要说明对已有权重的影响。
+- checkpoint 加载当前允许 `strict=False`。旧 checkpoint 中的文本或旧 KG encoder 参数会被忽略；修改模型 state dict key 时要说明兼容性。
 - 保持 README 与脚本默认行为一致。当前根目录说明文件名是 `README.MD`，如需平台渲染更稳定，可改名为 `README.md`，但应确认不会影响用户已有引用。
 - 不要提交或重写 `__pycache__/`、大型 `.pth`、`.pt`、`.bin`、`.safetensors` 文件，除非任务目标就是更新模型或数据资产。
 
@@ -111,7 +108,7 @@ python scripts/plot_attention_heatmap.py \
 - `src/modules/uni_encoder.py`：多模态融合和 attention 权重通常集中在这里，维度错误会影响所有任务。
 - `src/dataset/dataset.py`：数据字段变化会传播到预训练、训练、可视化和 checkpoint 兼容性。
 - `src/dataset/geom_data.py`、`src/modules/geom.py`：与 `painn`/`schnet` 后端和三维数据格式强相关。
-- `src/kg/` 与 `knowledge_graph/`：启用 `kg` 模态时依赖路径、实体映射和嵌入维度。
+- 未来重新接入 Polymer KG 时，不得复用已移除的旧 KG 运行时假设；需要重新定义 embedding 文件和 RepeatUnit 映射接口。
 - `scripts/train.py`：负责 5 折交叉验证、结果 CSV、模型保存和 attention 汇总，改动后要检查输出列是否仍被可视化脚本支持。
 
 ## 输出与产物
