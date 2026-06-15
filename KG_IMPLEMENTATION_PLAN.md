@@ -170,6 +170,176 @@ scripts/kg/
 
 `src/kg_pipeline/` 是离线数据与图构建代码，不应直接依赖训练模块。`scripts/kg/` 只做参数解析和流程编排。Uni-Poly 接入在选定方案后再最小修改 `src/dataset/`、`src/modules/` 和训练入口。
 
+### 3.1 跨 Chunk 候选召回的默认实现
+
+本项目不采用“一个 chunk 填满一个 JSON”的召回目标。完整的 `LiteratureSample` 信息通常分布在样品定义、实验部分、表征段落、结果讨论、表格和补充材料中。召回目标是为每个 LiteratureSample 收集分别支持身份、组成、序列、链架构、分子量和聚合/制备条件的一组 evidence chunks。
+
+最终召回单元是按样品组织的 evidence bundle，而不是单一段落：
+
+```text
+LiteratureSample
+  ├── identity chunks
+  ├── composition chunks
+  ├── sequence-distribution chunks
+  ├── chain-architecture chunks
+  ├── molecular-weight chunks
+  └── polymerization/preparation chunks
+```
+
+#### 3.1.1 文档切分
+
+- 优先沿 Article、Section、Paragraph 和 Table 的原始结构切分。
+- 普通文本 chunk 为 300-600 tokens，v1 默认 450 tokens。
+- overlap 为 50-100 tokens，v1 默认 75 tokens。
+- 不跨 section 强行拼接，保留 section title、paragraph order、page 和 source hash。
+- 表格单独生成 `TableChunk`，保留 caption、column headers、row label、footnote 和正文引用句。
+- Supporting Information 使用独立 source 标记，但归属同一 Article。
+
+每个 `SourceChunk` 至少保存：
+
+```text
+chunk_id, article_id, source_type, section, page,
+paragraph_ids, order_start, order_end, text, text_hash
+```
+
+#### 3.1.2 三级召回流程
+
+```text
+Level 1: Article retrieval
+Level 2: field-specific retrieval
+Level 3: sample-conditioned retrieval
+```
+
+**Level 1：文章级召回**
+
+使用 PolymerClass、规范名称、aliases、缩写、单体名称和 repeat-unit-derived 检索词寻找候选 Article。文章级检索只确定候选语料，不直接生成 dataset link。query 中禁止出现 `val` 或从标签推导出的属性值。
+
+**Level 2：字段分路召回**
+
+为六类事实分别建立 query pack 和独立排行榜：
+
+| retrieval task | 目标字段 | 典型检索词 | 章节先验 |
+|---|---|---|---|
+| identity | sample_label、polymer_name、alias、class | denoted、designated、sample、film、prepared、obtained | Abstract、Materials、Experimental |
+| composition | composition_type、components、ratio | composition、copolymer、blend、loading、feed ratio、mol%、wt% | Materials、Experimental、Table |
+| sequence | distribution_type | random、statistical、alternating、block、multiblock、gradient、sequence | NMR、Characterization、Results |
+| architecture | architecture_type | linear、branched、star、comb、brush、network、cyclic | Synthesis、Characterization、Discussion |
+| molecular_weight | Mn、Mw、PDI、DP | molecular weight、number-average、GPC、SEC、dispersity | Characterization、GPC/SEC、Table |
+| polymerization | method 和 conditions | polymerized、initiator、reaction、heated、annealed、casting、extrusion | Experimental、Synthesis、SI |
+
+每类召回同时执行：
+
+1. exact keyword/dictionary match；
+2. BM25 lexical retrieval；
+3. dense embedding retrieval；
+4. section prior 加权；
+5. 表格和正文交叉引用扩展。
+
+sequence 和 architecture 使用高精度词表。出现多个 monomer、component 或 ratio 不能作为 random/block/graft 的判定依据，只能作为 composition 候选。
+
+**Level 3：Sample 驱动二次召回**
+
+第一轮局部抽取产生 article-level sample registry：
+
+```text
+sample_id
+sample_labels
+polymer_names
+aliases
+identity_evidence_refs
+```
+
+然后对每个已识别样品分别执行二次检索：
+
+```text
+P1 + composition terms
+P1 + sequence terms
+P1 + architecture terms
+P1 + Mn/Mw/GPC/SEC
+P1 + polymerization/preparation terms
+```
+
+`the resulting polymer`、`the obtained sample`、`this film` 等指代表达可以进入候选扩展，但代词本身不能作为最终归属证据。跨 chunk 合并优先级仍为：相同 sample label > 相同 table row > 明确回指 > 无竞争对象的同名材料 > 仅 PolymerClass 相同。
+
+#### 3.1.3 多路召回合并与排序
+
+v1 不训练专用 reranker，先使用可解释的加权分数：
+
+```text
+base_score =
+    0.30 * normalized_bm25
+  + 0.30 * dense_similarity
+  + 0.20 * exact_entity_match
+  + 0.10 * section_prior
+  + 0.10 * field_keyword_coverage
+```
+
+sample-conditioned retrieval 额外加入 `sample_label_match`，加入后重新归一化各项权重。所有原始子分数和最终分数写入候选记录，便于 Pilot 调参和复现。
+
+只有 Pilot gold set 表明基础混合召回的 Recall@K 不足时，才增加 cross-encoder 或 embedding reranker。reranker 必须按事实类型评分，不能使用“是否与完整 JSON 相关”的单一标签。
+
+#### 3.1.4 邻域和引用扩展
+
+每个命中的 anchor chunk 自动形成 context bundle：
+
+```text
+previous chunk
+anchor chunk
+next chunk
+section title
+referenced table/caption
+```
+
+v1 默认相邻窗口为 `+/-1` chunk。扩展内容只为 LLM 提供上下文，最终 `evidence_refs` 必须指向真正支持事实的句子或表格行，不能把整个 bundle 当作证据。
+
+正文包含 `shown in Table 2`、`see Supporting Information` 等引用时，将对应 TableChunk 或 SI chunk 加入 bundle；无法解析引用时生成 warning。
+
+#### 3.1.5 表格专项召回
+
+表格不得展平成缺少行列归属的纯文本。推荐转换为：
+
+```text
+Table 2: Molecular characteristics
+row.sample=P1
+row.feed_ratio=70:30 mol%
+row.Mn=42000 g/mol
+row.Mw=71000 g/mol
+row.PDI=1.69
+```
+
+送入 LLM 的表格 bundle 包含 caption、header、目标 sample row、footnote 和正文引用句。一个表格中多个 sample row 必须生成不同的 row-level evidence 定位。
+
+#### 3.1.6 局部抽取、聚合与补召回
+
+- 每次 LLM 调用只处理一种 fact type 和少量相关 bundles。
+- LLM 返回局部事实、sample candidates、evidence 和 warnings，不直接生成完整 article JSON。
+- 后处理程序将局部结果对齐到 sample registry，再生成完整 schema v2.0。
+- 聚合后维护 identity、composition、sequence、architecture、molecular_weight、polymerization 的 sample coverage 状态。
+- 只有发现新 alias/sample label、明确跨引用或 sample attribution 不完整时执行一次补召回。
+- 最大召回迭代数为 2，防止因为未报告字段无限搜索。
+
+未召回某类事实表示该文献中 `not_found`，最终对应数组保持 `[]`，不能要求 LLM 用常识补齐。
+
+#### 3.1.7 v1 默认参数
+
+```yaml
+chunk:
+  target_tokens: 450
+  overlap_tokens: 75
+  preserve_section: true
+
+retrieval:
+  bm25_top_k: 10
+  dense_top_k: 10
+  merged_top_k_per_fact_type: 8
+  sample_conditioned_top_k_per_fact_type: 5
+  neighbor_window: 1
+  max_iterations: 2
+  reranker: disabled
+```
+
+参数通过 50 RepeatUnit Pilot 的人工 gold set，按事实类型评估 `Recall@5`、`Recall@10`、MRR、候选数量和 cost per accepted fact 后再调整。
+
 ---
 
 ## 4. JSON schema v2.0 到 KG 的映射
@@ -779,11 +949,11 @@ has_literature_link
 
 ### Stage 2：文献检索与 chunk 召回
 
-**目标**：按 PolymerClass/alias 合并检索，解析全文并召回可能包含 schema 事实的 chunks。  
-**输入**：class/alias candidates、文献 API/本地 PDF/HTML。  
-**输出**：`literature_index.jsonl`、`source_chunks.jsonl`、`candidate_chunks.jsonl`。  
-**关键风险**：版权/访问限制、重复文章、PDF 顺序错误、表格丢失、召回率不足。  
-**验证**：DOI 去重；chunk 顺序和定位可还原；gold facts 的 chunk recall@k；表格/补充材料覆盖率。  
+**目标**：按 PolymerClass/alias 合并检索文章，执行六类 field-specific hybrid retrieval、邻域/表格扩展和 Sample 驱动二次召回。
+**输入**：class/alias candidates、文献 API/本地 PDF/HTML、字段 query packs；二次召回还接收 sample registry。
+**输出**：`literature_index.jsonl`、`source_chunks.jsonl`、按 fact type 标注的 `candidate_chunks.jsonl`、context bundles 和 retrieval coverage。
+**关键风险**：版权/访问限制、重复文章、PDF 顺序错误、表格丢失、同名样品错配、字段召回不足或 Top-K 过大。
+**验证**：DOI 去重；chunk 顺序和定位可还原；分别计算六类事实的 Recall@5、Recall@10 和 MRR；验证表格/SI 引用扩展；确认二次召回只使用文献内 sample identity。
 **Pilot**：必须。
 
 ### Stage 3：LLM schema v2.0 局部抽取
@@ -884,6 +1054,8 @@ Pilot manifest 必须记录选样理由，不能使用 `val` 选样。
 - Mn/Mw/PDI/DP；
 - polymerization/preparation method 和 conditions；
 - evidence sentence；
+- 每条事实对应的 gold SourceChunk/TableChunk，用于评估字段分路召回；
+- 每个 LiteratureSample 的 identity aliases 和应触发的 sample-conditioned query；
 - dataset link relation type、matched_on 和 accept/reject。
 
 ### 11.4 Pilot 验收标准
@@ -900,6 +1072,9 @@ Pilot manifest 必须记录选样理由，不能使用 `val` 选样。
 8. mapping 与 `.npy` 行号一一对应，所有 50 个 RepeatUnit 有明确 fallback 或 embedding。
 9. Uni-Poly 能读取 mapping/embedding 并完成单 batch forward；不要求本阶段启动长训练。
 10. 日志、prompt、query、KG 中不存在 `val`。
+11. 六类事实分别报告 Recall@5、Recall@10 和 MRR，不使用单一总体召回率掩盖 sequence/architecture 等稀疏字段。
+12. 邻域扩展和表格引用能够恢复 gold evidence，且 evidence_refs 精确落到支持句或表格行。
+13. 最多两轮召回；第二轮必须由第一轮识别出的 sample label/name/alias 驱动。
 
 建议同时报告：evidence precision、fact precision/recall、sample alignment accuracy、link precision/coverage、hallucination rate、cost per accepted fact、RepeatUnit literature coverage。
 
@@ -910,19 +1085,31 @@ Pilot manifest 必须记录选样理由，不能使用 `val` 选样。
 以下决策必须由项目负责人确认后再进入实现：
 
 1. **Pilot 文献来源**：开放全文、本地 PDF、出版商 API 的使用范围。
+    使用混合来源HTML/XML 优先，本地 PDF fallback
 2. **LLM 提供商与模型**：API、结构化输出能力、费用和数据合规要求。
+    QWEN 和 DEEPSEEK 两个模型都要实现
 3. **文档解析工具链**：GROBID、HTML/XML/JATS parser、PDF fallback。
-4. **候选召回策略**：关键词/BM25 baseline，是否增加 embedding reranker。
+    请你自行判断
+4. **候选召回策略**：
+    v1 固定使用字段分路的 keyword + BM25 + dense retrieval + section prior + 邻域/表格扩展 + sample-conditioned 二次召回；是否在 Pilot 后增加 fact-specific cross-encoder reranker仍需决定。
 5. **KG embedding baseline**：TransE、DistMult、ComplEx 或 RotatE。
+    先使用 TransE
 6. **关系 GNN 实验**：是否在 Pilot 后实现 R-GCN/HGT。
+    不实现
 7. **默认图视图**：strict 或 broad；broad 的 confidence threshold。
+    strict
 8. **连续数值方案**：属性、属性+bins 或 value encoder。
+    Mn/Mw/DP 建议对数分箱
 9. **provenance 节点参与范围**：全部参与 embedding，或仅用于审计/辅助训练。
+    证据完整保留，但默认不让 SourceChunk 参与 embedding。
 10. **Uni-Poly 接入位置**：第五模态、late fusion、结构增强或 cross-attention。
+    第五模态
 11. **embedding 训练策略**：冻结、只训练 projection、或允许下游微调。
+     冻结 embedding，只训练 projection
 12. **无文献链接回退**：class、structure-only、learned unknown 或组合。
+     多级回退RepeatUnit embedding → PolymerClass → learned unknown
 13. **embedding dimension 与版本策略**：例如 128/256，并与模型 joint dimension 对齐。
-
+    原始 128 → projection 到 256
 ---
 
 ## 13. 实现 TODO
@@ -957,10 +1144,10 @@ Pilot manifest 必须记录选样理由，不能使用 `val` 选样。
 
 * [ ] 实现 candidate chunk recall
 
-  * goal: 为 schema 字段召回高相关 chunks，控制 LLM 成本。
+  * goal: 实现六类 field-specific hybrid retrieval、可解释分数融合、邻域/表格扩展、sample registry 和 sample-conditioned 二次召回。
   * files likely to add/modify: `src/kg_pipeline/chunk_recall.py`, `scripts/kg/recall_chunks.py`
-  * output: `candidate_chunks.jsonl`
-  * validation: gold fact recall@k、按事实类型统计召回率。
+  * output: 带 fact type、各路分数、anchor/context IDs、iteration 和 sample candidate 的 `candidate_chunks.jsonl`
+  * validation: 六类事实分别计算 Recall@5、Recall@10、MRR；检查 table/SI 引用扩展、最大两轮停止条件和 query 无 `val`。
 
 * [ ] 固定 JSON schema v2.0 与 LLM extraction contract
 
@@ -1034,4 +1221,3 @@ Pilot manifest 必须记录选样理由，不能使用 `val` 选样。
 8. `kg_entity_mapping.csv` 与 `kg_embedding.npy` 完整对应。
 9. 未链接文献的 RepeatUnit 有明确、可解释的 fallback。
 10. Uni-Poly 在不启用 KG 时维持现有四模态行为；启用 KG 时只读取新版本化 Polymer KG embedding。
-
