@@ -457,9 +457,57 @@ kg_entity_mapping.csv 只负责将 repeat_unit_id、PolymerClass ID 和 embeddin
 
 ## 19. 实施路线
 
-1. Pilot：50 个 unique RepeatUnit，建立人工 gold set。
-2. Batch：Top 200 高频 RepeatUnit，固定 schema、枚举、evidence 和 linking 规则。
-3. Full run：按 PolymerClass 合并检索，覆盖全部 unique SMILES，支持断点续跑。
+### 19.1 Pilot：验证正确性
+
+选择 50 个具有代表性的 unique RepeatUnit，而不是简单选择出现频率最高的结构。样本应覆盖：
+
+~~~text
+主要 PolymerClass
+均聚物、固定缩聚多单体体系和明确共聚物
+简单与复杂 repeat-unit 表示
+文献丰富与文献稀缺类别
+容易发生样品对齐或枚举混淆的困难案例
+~~~
+
+人工阅读对应文献并建立 gold set，标注样品身份、组成、序列、架构、分子量、聚合条件、evidence 和 dataset link。Pilot 的目标是验证抽取、跨 chunk 聚合、实体链接和 KG 映射是否正确。
+
+### 19.2 Batch：验证工程稳定性
+
+选择约 200 个 unique RepeatUnit，重点覆盖主要 PolymerClass、不同结构复杂度及 Pilot 发现的困难案例。频率可以作为覆盖数据行数的参考，但不能作为唯一选择依据。
+
+Batch 阶段用于验证批量文档解析、LLM 成本、失败重试、样品聚合、KG 规模和 embedding 训练稳定性。完成后冻结：
+
+~~~text
+JSON schema v2.0
+受控枚举
+Prompt 模板
+evidence 校验规则
+dataset linking 规则和阈值
+数值单位标准化与区间规则
+JSON 到 KG triples/attributes 的映射
+~~~
+
+### 19.3 Full run：扩展覆盖率
+
+将全部 unique RepeatUnit 先映射到 PolymerClass，再按 PolymerClass 合并检索和去重文献，避免对多个相关 RepeatUnit 重复下载、解析和抽取同一文章。
+
+处理状态至少按 RepeatUnit、Article 和 Chunk 保存：
+
+~~~text
+repeat_unit_normalized
+polymer_class_mapped
+literature_retrieved
+article_parsed
+chunks_recalled
+llm_extracted
+sample_aggregated
+validated
+dataset_linked
+kg_generated
+embedding_generated
+~~~
+
+失败后从对应阶段继续，不重新运行已经完成的文献和对象。
 
 ~~~text
 数据整理 → RepeatUnit 规范化 → PolymerClass/alias
