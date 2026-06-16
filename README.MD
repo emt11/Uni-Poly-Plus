@@ -16,7 +16,7 @@ Uni-Poly 是一个面向聚合物性质预测的多模态表征学习框架。�
 smiles, graph, fp, geom
 ```
 
-旧文本模态和旧知识图谱模态已从训练代码中移除。新的 Polymer KG embedding 将在后续版本中按独立方案重新接入。
+旧 TEXT 和旧 KG 运行时已移除。新的 Polymer KG embedding 通过 `kg_work/features` 中的映射和向量文件作为可选第五模态接入。
 
 ## 目录结构
 
@@ -172,7 +172,7 @@ logs/train.log
 常用参数包括：
 
 - `--tasks`：需要训练的任务列表
-- `--modalities`：使用的模态列表，可选 `smiles graph fp geom`
+- `--modalities`：使用的模态列表，可选 `smiles graph fp geom kg`
 - `--geometry_encoder`：几何编码器，可选 `painn` 或 `schnet`
 - `--freeze_encoder`：是否冻结编码器
 - `--pretrained_model_path`：预训练 Uni-Poly 权重路径
@@ -198,6 +198,27 @@ python scripts/plot_attention_heatmap.py \
 results/attention_heatmap.png
 ```
 
+## Polymer KG MVP
+
+离线 pipeline 遵循 `LLM_KG.md` 的 JSON schema v2.0。最小本地流程：
+
+```bash
+python scripts/kg/prepare_records.py --input data/raw/smi_all.csv --output_dir kg_work
+python scripts/kg/map_polymer_classes.py --repeat_units kg_work/repeat_units.csv --output_dir kg_work --mode rule_stub
+python scripts/kg/parse_documents.py --input_dir kg_work/documents --output kg_work/chunks/source_chunks.jsonl
+python scripts/kg/recall_chunks.py --source_chunks kg_work/chunks/source_chunks.jsonl --output kg_work/chunks/candidate_chunks.jsonl
+python scripts/kg/build_kg.py --records kg_work/records.csv --repeat_units kg_work/repeat_units.csv --validated_dir kg_work/extractions/validated --dataset_links kg_work/links/dataset_links.jsonl --source_chunks kg_work/chunks/source_chunks.jsonl --output_dir kg_work/kg --graph strict
+python scripts/kg/train_kg_embedding.py --triples kg_work/kg/triples.tsv --nodes kg_work/kg/nodes.csv --edges kg_work/kg/edges.csv --repeat_units kg_work/repeat_units.csv --output_dir kg_work/features --embedding_dim 128 --model transe --graph strict
+```
+
+Qwen 使用 `DASHSCOPE_API_KEY`，DeepSeek 使用 `DEEPSEEK_API_KEY`。临时 LLM PolymerClass mapping 仅用于流程测试，不是正式 registry。启用第五模态：
+
+```bash
+python scripts/train.py --modalities smiles graph fp geom kg \
+  --kg_mapping_path kg_work/features/kg_entity_mapping.csv \
+  --kg_embedding_path kg_work/features/kg_embedding.npy
+```
+
 ## 结果文件说明
 
 - `results/results.csv`：下游任务的评估指标、模态组合和注意力权重等结果。
@@ -210,9 +231,10 @@ results/attention_heatmap.png
 
 - `scripts/run_pretrain.sh` 和 `scripts/run_train.sh` 中默认设置了 `CUDA_VISIBLE_DEVICES=1`。如果机器上 GPU 编号不同，请按需修改。
 - 示例脚本使用 `nohup ... &` 在后台运行任务，日志会写入 `logs/` 目录。
-- `text` 和旧 `kg` 不再是合法模态；传入时 CLI 会直接报错。
+- `text` 仍不是合法模态；`kg` 仅表示新的 Polymer KG embedding，不复用旧 KG 实现。
+- 未显式启用 `kg` 时不会读取 KG 文件，默认四模态行为不变。
 - 旧 checkpoint 仍使用 `strict=False` 尝试加载，其中旧文本或旧 KG encoder 参数会被视为不匹配参数并忽略。
-- 新的 Polymer KG embedding 会在后续版本重新接入，当前版本不会加载 `knowledge_graph/` 中的旧 embedding。
+- 新 KG 默认读取 `kg_work/features/kg_entity_mapping.csv` 和 `kg_work/features/kg_embedding.npy`，不会读取 `knowledge_graph/` 中的旧 embedding。
 - 如果使用 CPU 运行，训练速度会明显下降。
 
 ## 许可证

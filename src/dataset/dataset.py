@@ -20,6 +20,9 @@ class UniDataset(Dataset):
         dataset,
         smiles_model_name,
         geometry_encoder='painn',
+        enable_kg=False,
+        kg_mapping_path=None,
+        kg_embedding_path=None,
         transform=None,
         pre_transform=None
     ):
@@ -57,6 +60,9 @@ class UniDataset(Dataset):
             self.process()
             torch.save(self.data_list, self.processed_file)
             print(f"processed and saved {self.processed_file} with {len(self.data_list)} samples")  # Processed and saved the dataset to ...
+
+        if enable_kg:
+            self._attach_kg_indices(kg_mapping_path, kg_embedding_path)
 
     def __len__(self):
         return len(self.data_list)
@@ -126,3 +132,43 @@ class UniDataset(Dataset):
 
         # Explanation: Printing the total number of processed samples
         print("Dataset processed. Total samples:", len(self.data_list))
+
+    def _attach_kg_indices(self, mapping_path, embedding_path):
+        if not mapping_path or not embedding_path:
+            raise ValueError("KG modality requires kg_mapping_path and kg_embedding_path")
+        if not os.path.exists(mapping_path) or not os.path.exists(embedding_path):
+            raise FileNotFoundError(
+                f"KG files not found: mapping={mapping_path}, embedding={embedding_path}"
+            )
+        mapping = pd.read_csv(mapping_path)
+        embeddings = np.load(embedding_path, mmap_mode="r")
+        required = {"embedding_index", "canonical_smiles", "has_literature_link"}
+        if not required.issubset(mapping.columns):
+            raise ValueError(f"KG mapping missing columns: {sorted(required.difference(mapping.columns))}")
+        if embeddings.ndim != 2 or len(mapping) != embeddings.shape[0]:
+            raise ValueError(
+                f"KG mapping rows ({len(mapping)}) must match embedding rows ({embeddings.shape})"
+            )
+        indices = sorted(mapping["embedding_index"].astype(int).tolist())
+        if indices != list(range(len(mapping))):
+            raise ValueError("KG embedding_index must be contiguous and 0-based")
+        lookup = {}
+        for row in mapping.to_dict("records"):
+            canonical = str(row.get("canonical_smiles") or "")
+            if canonical:
+                lookup[canonical] = (
+                    int(row["embedding_index"]),
+                    str(row["has_literature_link"]).lower() == "true",
+                )
+        for data in self.data_list:
+            canonical = data.smiles
+            try:
+                mol = Chem.MolFromSmiles(data.smiles)
+                if mol is not None:
+                    canonical = Chem.MolToSmiles(mol, canonical=True)
+            except Exception:
+                pass
+            index, has_literature = lookup.get(canonical, (-1, False))
+            data.kg_embedding_index = torch.tensor([index], dtype=torch.long)
+            data.kg_mask = torch.tensor([index >= 0], dtype=torch.bool)
+            data.has_literature_link = torch.tensor([has_literature], dtype=torch.bool)

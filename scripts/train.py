@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom')
+SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom', 'kg')
 
 
 def parse_modality(value):
@@ -80,7 +80,7 @@ def parse_arguments():
         nargs='+',
         type=parse_modality,
         default=['smiles', 'graph', 'fp', 'geom'],
-        help="Model modalities. Supported: smiles, graph, fp, geom."
+        help="Model modalities. Supported: smiles, graph, fp, geom, kg."
     )
     parser.add_argument(
         '--geometry_encoder',
@@ -136,6 +136,11 @@ def parse_arguments():
         default=1.0,
         help="Maximum gradient norm for gradient clipping."
     )
+    parser.add_argument("--kg_embedding_path", default="kg_work/features/kg_embedding.npy")
+    parser.add_argument("--kg_mapping_path", default="kg_work/features/kg_entity_mapping.csv")
+    parser.add_argument("--kg_embedding_dim", type=int, default=128)
+    parser.add_argument("--kg_projection_dim", type=int, default=256)
+    parser.add_argument("--kg_freeze_embedding", choices=["true"], default="true")
     return parser.parse_args()
 
 
@@ -169,7 +174,10 @@ def main():
             root='./data',
             dataset=dataset_name,
             smiles_model_name=pre_trained_model_dict['smiles_model_name'],
-            geometry_encoder=args.geometry_encoder
+            geometry_encoder=args.geometry_encoder,
+            enable_kg="kg" in args.modalities,
+            kg_mapping_path=args.kg_mapping_path,
+            kg_embedding_path=args.kg_embedding_path
         )
         for dataset_name in dataset_name_list
     ]
@@ -213,13 +221,16 @@ def main():
             )
 
             model = UniEncoderAttention(
-                joint_embedding_dim=256,
+                joint_embedding_dim=args.kg_projection_dim,
                 smiles_model_name=pre_trained_model_dict['smiles_model_name'],
                 gnn_model_name=pre_trained_model_dict['gnn_model_name'],
                 geom_model_name=pre_trained_model_dict['geom_model_name'],
                 modality_list=model_modality_list,
                 freeze_encoder=freeze_encoder,
-                geometry_encoder=args.geometry_encoder
+                geometry_encoder=args.geometry_encoder,
+                kg_embedding_path=args.kg_embedding_path if "kg" in args.modalities else None,
+                kg_embedding_dim=args.kg_embedding_dim,
+                kg_freeze_embedding=args.kg_freeze_embedding == "true"
             )
 
             if pretrained_model_path:

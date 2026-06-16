@@ -1,0 +1,2 @@
+alias_id,alias_text,normalized_alias,target_node_id,target_type,source_article_id,evidence_id,mapping_method,confidence,status
+alias_b4d0d7e683dd53cb,unknown condensation polymer,unknown condensation polymer,kg_polymerclass_pc_condensation_polymer_unknown,PolymerClass,,,heuristic_stub,1.0,accepted

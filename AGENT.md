@@ -84,7 +84,8 @@ python scripts/plot_attention_heatmap.py \
 - 优先保持现有模块结构，不引入新的训练框架或配置系统，除非用户明确要求。
 - 入口脚本参数使用 `argparse`，新增训练参数时保持 CLI 向后兼容。
 - 数据集命名遵循 `smi_<task>`，对应原始 CSV 位于 `data/raw/smi_<task>.csv`。
-- 当前支持的模态只有：`smiles`、`graph`、`fp`、`geom`。传入 `text` 或旧 `kg` 必须在 CLI 和模型入口报错。
+- 当前支持 `smiles`、`graph`、`fp`、`geom` 和可选的新 `kg` 第五模态。`text` 仍必须报错；新 `kg` 不复用旧 KG 运行时。
+- 只有显式启用 `kg` 时才读取 `kg_work/features/kg_entity_mapping.csv` 和 `kg_embedding.npy`；默认四模态不依赖 KG 文件。
 - 几何编码器当前使用 `painn` 或 `schnet`，新增后端时需要同步检查数据处理和模型初始化。
 - checkpoint 加载当前允许 `strict=False`。旧 checkpoint 中的文本或旧 KG encoder 参数会被忽略；修改模型 state dict key 时要说明兼容性。
 - 保持 README 与脚本默认行为一致。当前根目录说明文件名是 `README.MD`，如需平台渲染更稳定，可改名为 `README.md`，但应确认不会影响用户已有引用。
@@ -108,7 +109,7 @@ python scripts/plot_attention_heatmap.py \
 - `src/modules/uni_encoder.py`：多模态融合和 attention 权重通常集中在这里，维度错误会影响所有任务。
 - `src/dataset/dataset.py`：数据字段变化会传播到预训练、训练、可视化和 checkpoint 兼容性。
 - `src/dataset/geom_data.py`、`src/modules/geom.py`：与 `painn`/`schnet` 后端和三维数据格式强相关。
-- 未来重新接入 Polymer KG 时，不得复用已移除的旧 KG 运行时假设；需要重新定义 embedding 文件和 RepeatUnit 映射接口。
+- Polymer KG 使用新的 RepeatUnit mapping、冻结 128 维 embedding 和可训练 256 维 projection，不得复用已移除的旧 KG 运行时假设。
 - `scripts/train.py`：负责 5 折交叉验证、结果 CSV、模型保存和 attention 汇总，改动后要检查输出列是否仍被可视化脚本支持。
 
 ## 输出与产物
