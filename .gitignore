@@ -22,6 +22,8 @@ Thumbs.db
 .ipynb_checkpoints/
 
 # Logs and run outputs
+kg_work/
+kg_work_*/
 logs/
 results/
 plots/

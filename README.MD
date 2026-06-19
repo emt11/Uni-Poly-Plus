@@ -1,61 +1,31 @@
-# Uni-Poly
+# Uni-Poly-Plus
 
-Uni-Poly 是一个面向聚合物性质预测的多模态表征学习框架。当前版本将 SMILES、二维分子图、三维几何结构和分子指纹统一到同一个聚合物表示中。
+Uni-Poly-Plus 是面向聚合物性质预测的多模态学习项目。当前主模型支持结构、图、指纹、几何信息，并可选接入新的 Polymer KG embedding 作为第五模态。
 
-## 项目简介
+## 支持模态
 
-传统聚合物性质预测方法通常依赖单一表征，难以同时覆盖聚合物的序列、拓扑、空间结构和领域语义信息。Uni-Poly 通过多模态编码器和注意力融合机制，将以下信息组合起来：
-
-- **SMILES 序列**：使用预训练 SMILES 编码器提取序列表示。
-- **二维分子图**：使用图结构描述原子与化学键关系。
-- **三维几何结构**：支持 `painn` 和 `schnet` 几何编码后端。
-- **分子指纹**：引入传统化学指纹特征。
-当前可用模态固定为：
+当前训练入口支持：
 
 ```text
-smiles, graph, fp, geom
+smiles graph fp geom kg
 ```
 
-旧 TEXT 和旧 KG 运行时已移除。新的 Polymer KG embedding 通过 `kg_work/features` 中的映射和向量文件作为可选第五模态接入。
+说明：
 
-## 目录结构
+- `smiles`：SMILES 序列编码。
+- `graph`：二维分子图编码。
+- `fp`：分子指纹特征。
+- `geom`：三维几何编码，支持 `painn` / `schnet`。
+- `kg`：新的 Polymer KG embedding，可选启用。
+
+新 `kg` 模态读取：
 
 ```text
-Uni-Poly/
-├── README.MD                         # 项目说明
-├── requirements.txt                  # Python 依赖
-├── LICENSE                           # Apache 2.0 许可证
-├── data/
-│   ├── raw/                          # 原始 CSV 数据，文件名形如 smi_tg.csv
-│   ├── SchNet/                       # SchNet 相关中间数据
-│   └── smiles_text_dict.json         # 保留的历史文本映射，当前训练不加载
-├── src/
-│   ├── dataset/                      # 数据集、图数据、几何数据与 DataLoader
-│   ├── modules/                      # 多模态编码器、图与几何模块
-│   └── utils.py                      # 训练、评估、损失与通用工具函数
-├── scripts/
-│   ├── pretrain.py                   # 多模态对比预训练入口
-│   ├── train.py                      # 下游性质预测训练入口
-│   ├── run_pretrain.sh               # 预训练示例脚本
-│   ├── run_train.sh                  # 下游训练示例脚本
-│   └── plot_attention_heatmap.py     # 注意力权重热力图绘制脚本
-├── pretrained_models/
-│   ├── encoders/                     # 预训练编码器权重或 Hugging Face 模型目录
-│   └── saved_pretrained_model.pth    # Uni-Poly 预训练权重
-├── saved_models/                     # 各下游任务保存的最优模型
-├── results/
-│   └── results.csv                   # 训练评估结果
-├── plots/
-│   └── pretrain/                     # 预训练 loss 数据与曲线
-├── knowledge_graph/                  # 保留的历史知识图谱数据，不参与当前训练
-└── caption_generation/               # 保留的历史 notebook，不参与当前训练
+kg_work/features/kg_entity_mapping.csv
+kg_work/features/kg_embedding.npy
 ```
 
-## 环境要求
-
-- Python 3.8 或更高版本
-- 推荐使用支持 CUDA 的 GPU
-- PyTorch、PyTorch Geometric、RDKit、Transformers 等依赖
+## 快速开始
 
 安装依赖：
 
@@ -63,187 +33,102 @@ Uni-Poly/
 pip install -r requirements.txt
 ```
 
-如果安装 `torch-geometric`、`torch-scatter`、`torch-sparse` 或 `rdkit` 时遇到版本问题，请根据本机 CUDA、PyTorch 和 Python 版本安装匹配的 wheel 或 conda 包。
+预训练四模态：
 
-## 数据准备
-
-### 1. 性质预测数据
-
-下游任务数据放在 `data/raw/` 目录中，文件名约定为：
-
-```text
-smi_<task>.csv
+```bash
+python scripts/pretrain.py   --dataset_name smi_all   --modalities smiles graph fp geom   --geometry_encoder schnet
 ```
 
-例如：
+下游训练四模态：
 
-- `smi_tg.csv`：玻璃化转变温度任务
-- `smi_eat.csv`
-- `smi_eea.csv`
-- `smi_egb.csv`
-- `smi_egc.csv`
-- `smi_ei.csv`
-- `smi_eps.csv`
-- `smi_nc.csv`
-- `smi_xc.csv`
+```bash
+python scripts/train.py   --modalities smiles graph fp geom   --geometry_encoder schnet   --tasks tg eat eea egb egc ei eps nc xc   --pretrained_model_path ./pretrained_models/saved_pretrained_model.pth
+```
 
-训练脚本会根据任务名自动读取 `data/raw/smi_<task>.csv`。CSV 至少需要包含 SMILES 和对应性质标签，具体格式可参考仓库中已有的 `data/raw/smi_tg.csv`。
+生成 KG embedding 后启用五模态训练：
 
-### 2. 预训练编码器与模型权重
+```bash
+python scripts/train.py   --modalities smiles graph fp geom kg   --kg_mapping_path kg_work/features/kg_entity_mapping.csv   --kg_embedding_path kg_work/features/kg_embedding.npy   --kg_embedding_dim 128   --kg_projection_dim 256   --kg_freeze_embedding true
+```
 
-默认配置会读取以下路径中的模型或权重：
+## 文档导航
+
+- [RUN.MD](RUN.MD)：唯一运行手册。包含 KG pipeline、online/local/both 文献模式、KG embedding、pretrain/train with kg。
+- [LLM_KG.MD](LLM_KG.MD)：KG 语义与开发设计文档。包含 schema、label leakage、证据链、节点/边设计和 TODO。
+- [AGENT.MD](AGENT.MD)：开发和代码代理约束。包含修改代码时必须遵守的边界和验证要求。
+
+## 数据入口
+
+下游任务数据位于：
 
 ```text
-pretrained_models/encoders/PubChem10M_SMILES_BPE_450k
+data/raw/smi_<task>.csv
+```
+
+KG pipeline 默认使用：
+
+```text
+data/raw/smi_all.csv
+```
+
+`data/raw/smi_all.csv` 至少包含：
+
+```text
+smiles,val,prop
+```
+
+KG pipeline 不允许将 `val` 输入 LLM、检索 query、KG triples 或 embedding。
+
+## 常见输出
+
+训练与评估：
+
+```text
 pretrained_models/saved_pretrained_model.pth
-```
-
-如果使用 SchNet 几何编码器，还需要确保相关 SchNet 权重和数据位于项目中对应目录，例如：
-
-```text
-pretrained_models/encoders/schnet_qm9_gap.pth
-pretrained_models/encoders/schnet_qm9_cv.pth
-data/Schnet/
-```
-
-## 使用方法
-
-### 多模态预训练
-
-使用默认示例脚本：
-
-```bash
-bash scripts/run_pretrain.sh
-```
-
-该脚本默认执行：
-
-```bash
-python scripts/pretrain.py \
-  --dataset_name smi_all \
-  --modalities smiles graph fp geom \
-  --geometry_encoder schnet
-```
-
-预训练输出包括：
-
-- 模型权重：`pretrained_models/saved_pretrained_model.pth`
-- loss 数据：`plots/pretrain/loss_data.json`
-- loss 曲线：`plots/pretrain/loss_curve.png`
-- 日志文件：`logs/pretrain.log`
-
-可用参数包括：
-
-- `--dataset_name`：预训练数据集名称，默认 `smi_all`
-- `--modalities`：使用的模态列表
-- `--geometry_encoder`：几何编码器，可选 `painn` 或 `schnet`
-- `--batch_size`：批大小，默认 `32`
-- `--epochs`：预训练轮数，默认 `20`
-- `--lr`：学习率，默认 `1e-4`
-- `--temperature`：对比学习温度系数，默认 `0.07`
-- `--save_path`：预训练权重保存路径
-
-### 下游性质预测训练
-
-使用默认示例脚本：
-
-```bash
-bash scripts/run_train.sh
-```
-
-该脚本默认执行 9 个任务的训练：
-
-```bash
-python scripts/train.py \
-  --modalities smiles graph fp geom \
-  --geometry_encoder schnet \
-  --tasks tg eat eea egb egc ei eps nc xc \
-  --pretrained_model_path ./pretrained_models/saved_pretrained_model.pth
-```
-
-训练脚本使用 5 折交叉验证，并将结果保存到：
-
-```text
-results/results.csv
 saved_models/<task>/UniEncoderAttention_best.pth
-logs/train.log
+results/results.csv
+plots/pretrain/loss_curve.png
+logs/
 ```
 
-常用参数包括：
-
-- `--tasks`：需要训练的任务列表
-- `--modalities`：使用的模态列表，可选 `smiles graph fp geom kg`
-- `--geometry_encoder`：几何编码器，可选 `painn` 或 `schnet`
-- `--freeze_encoder`：是否冻结编码器
-- `--pretrained_model_path`：预训练 Uni-Poly 权重路径
-- `--epochs`：训练轮数，默认 `100`
-- `--patience`：早停耐心值，默认 `10`
-- `--batch_size`：批大小，默认 `32`
-- `--results_dir`：结果 CSV 保存路径
-- `--models_dir`：模型保存目录
-
-### 绘制注意力权重热力图
-
-训练完成后，如果 `results/results.csv` 中包含 attention 相关列，可以运行：
-
-```bash
-python scripts/plot_attention_heatmap.py \
-  --results_csv ./results/results.csv \
-  --output ./results/attention_heatmap.png
-```
-
-输出文件：
+KG pipeline：
 
 ```text
-results/attention_heatmap.png
+kg_work/records.csv
+kg_work/repeat_units.csv
+kg_work/polymer_class_candidates.jsonl
+kg_work/retrieval/
+kg_work/chunks/
+kg_work/extractions/
+kg_work/links/dataset_links.jsonl
+kg_work/kg/
+kg_work/features/kg_entity_mapping.csv
+kg_work/features/kg_embedding.npy
+kg_work/pilot_report.json
 ```
 
-## Polymer KG MVP
 
-离线 pipeline 遵循 `LLM_KG.md` 的 JSON schema v2.0。最小本地流程：
+## 源码模块
 
-```bash
-python scripts/kg/prepare_records.py --input data/raw/smi_all.csv --output_dir kg_work
-python scripts/kg/map_polymer_classes.py --repeat_units kg_work/repeat_units.csv --output_dir kg_work --mode rule_stub
-python scripts/kg/parse_documents.py --input_dir kg_work/documents --output kg_work/chunks/source_chunks.jsonl
-python scripts/kg/recall_chunks.py --source_chunks kg_work/chunks/source_chunks.jsonl --output kg_work/chunks/candidate_chunks.jsonl
-python scripts/kg/build_kg.py --records kg_work/records.csv --repeat_units kg_work/repeat_units.csv --validated_dir kg_work/extractions/validated --dataset_links kg_work/links/dataset_links.jsonl --source_chunks kg_work/chunks/source_chunks.jsonl --output_dir kg_work/kg --graph strict
-python scripts/kg/train_kg_embedding.py --triples kg_work/kg/triples.tsv --nodes kg_work/kg/nodes.csv --edges kg_work/kg/edges.csv --repeat_units kg_work/repeat_units.csv --output_dir kg_work/features --embedding_dim 128 --model transe --graph strict
+KG pipeline 的核心实现集中在：
+
+```text
+src/kg_pipeline/io_utils.py
+src/kg_pipeline/dataset.py
+src/kg_pipeline/literature.py
+src/kg_pipeline/llm_extract.py
+src/kg_pipeline/article_validation.py
+src/kg_pipeline/kg_build.py
+src/kg_pipeline/kg_embedding.py
 ```
 
-Qwen 使用 `DASHSCOPE_API_KEY`，DeepSeek 使用 `DEEPSEEK_API_KEY`。临时 LLM PolymerClass mapping 仅用于流程测试，不是正式 registry。启用第五模态：
+`scripts/kg/*.py` 保持为轻量 CLI wrapper。旧的细粒度模块文件已删除，新增代码应写入上述核心模块。
 
-```bash
-python scripts/train.py --modalities smiles graph fp geom kg \
-  --kg_mapping_path kg_work/features/kg_entity_mapping.csv \
-  --kg_embedding_path kg_work/features/kg_embedding.npy
+## 模型目录
+
+当前不重命名模型目录，因为训练脚本和默认参数已经引用这些路径：
+
+```text
+pretrained_models/   外部或已训练权重，例如 encoder 和 saved_pretrained_model.pth
+pretrain_models/     预训练过程输出、缓存或中间产物
 ```
-
-## 结果文件说明
-
-- `results/results.csv`：下游任务的评估指标、模态组合和注意力权重等结果。
-- `saved_models/`：每个任务对应的最优模型权重。
-- `plots/pretrain/loss_curve.png`：预训练对比损失曲线。
-- `logs/pretrain.log`：预训练日志。
-- `logs/train.log`：下游训练日志。
-
-## 注意事项
-
-- `scripts/run_pretrain.sh` 和 `scripts/run_train.sh` 中默认设置了 `CUDA_VISIBLE_DEVICES=1`。如果机器上 GPU 编号不同，请按需修改。
-- 示例脚本使用 `nohup ... &` 在后台运行任务，日志会写入 `logs/` 目录。
-- `text` 仍不是合法模态；`kg` 仅表示新的 Polymer KG embedding，不复用旧 KG 实现。
-- 未显式启用 `kg` 时不会读取 KG 文件，默认四模态行为不变。
-- 旧 checkpoint 仍使用 `strict=False` 尝试加载，其中旧文本或旧 KG encoder 参数会被视为不匹配参数并忽略。
-- 新 KG 默认读取 `kg_work/features/kg_entity_mapping.csv` 和 `kg_work/features/kg_embedding.npy`，不会读取 `knowledge_graph/` 中的旧 embedding。
-- 如果使用 CPU 运行，训练速度会明显下降。
-
-## 许可证
-
-本项目使用 Apache License 2.0。详情请查看 [LICENSE](LICENSE)。
-
-## 联系方式
-
-如有问题或反馈，请联系：
-
-**EMT Spica**  
-Email: emt11spica@gmail.com

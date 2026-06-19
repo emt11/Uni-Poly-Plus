@@ -1,14 +1,51 @@
+"""Dataset record and repeat-unit preparation for Polymer KG."""
+
+from .io_utils import stable_hash, stable_id
+
+
+def canonicalize_repeat_unit(smiles):
+    raw = str(smiles or "").strip()
+    result = {
+        "raw_smiles": raw,
+        "canonical_smiles": raw,
+        "valid_rdkit_parse": False,
+        "formula": "",
+    }
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import rdMolDescriptors
+
+        mol = Chem.MolFromSmiles(raw)
+        if mol is None:
+            return result
+        result.update(
+            canonical_smiles=Chem.MolToSmiles(mol, canonical=True),
+            valid_rdkit_parse=True,
+            formula=rdMolDescriptors.CalcMolFormula(mol),
+        )
+    except (ImportError, RuntimeError, ValueError):
+        pass
+    return result
+
+
+def repeat_unit_identity(smiles):
+    normalized = canonicalize_repeat_unit(smiles)
+    identity_text = normalized["canonical_smiles"] or normalized["raw_smiles"]
+    normalized["structure_hash"] = stable_hash(identity_text, length=24)
+    normalized["repeat_unit_id"] = stable_id("ru", identity_text, length=20)
+    return normalized
+
+
 from collections import defaultdict
 
-from .common import read_csv, stable_id, write_csv
-from .repeat_units import repeat_unit_identity
+from .io_utils import read_csv, stable_id, write_csv
 
 
 RECORD_FIELDS = ["record_id", "row_index", "smiles", "prop", "repeat_unit_id"]
 REPEAT_UNIT_FIELDS = [
     "repeat_unit_id", "raw_smiles", "canonical_smiles", "structure_hash",
-    "valid_rdkit_parse", "formula", "molecular_weight_M0", "num_records",
-    "props", "repeat_unit_representation_type", "polymer_origin_hint",
+    "valid_rdkit_parse", "formula", "num_records",
+    "props",
 ]
 
 
@@ -54,4 +91,3 @@ def prepare_records(input_path, output_dir, max_repeat_units=None):
     write_csv(f"{output_dir}/records.csv", RECORD_FIELDS, records)
     write_csv(f"{output_dir}/repeat_units.csv", REPEAT_UNIT_FIELDS, repeat_units)
     return {"records": len(records), "repeat_units": len(repeat_units)}
-

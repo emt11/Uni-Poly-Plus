@@ -1,12 +1,14 @@
 import argparse
 import _common  # noqa: F401
-from src.kg_pipeline.chunk_recall import recall_chunks
+from src.kg_pipeline.literature import recall_chunks
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Recall field-specific candidate chunks")
+    parser = argparse.ArgumentParser(description="Recall field- and sample-conditioned candidate chunks")
     parser.add_argument("--source_chunks", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--polymer_class_candidates", help="LLM mapping JSONL used for sample-conditioned recall")
+    parser.add_argument("--retrieval_dir", help="Retrieval output directory with retrieved_articles/download_manifest metadata")
     parser.add_argument("--bm25_top_k", type=int, default=10)
     parser.add_argument("--dense_top_k", type=int, default=10)
     parser.add_argument("--merged_top_k_per_fact_type", type=int, default=8)
@@ -14,9 +16,19 @@ def main():
     parser.add_argument("--neighbor_window", type=int, default=1)
     parser.add_argument("--max_iterations", type=int, default=2)
     args = parser.parse_args()
-    print({"candidates": recall_chunks(args.source_chunks, args.output, args.bm25_top_k, args.dense_top_k, args.merged_top_k_per_fact_type, args.neighbor_window, args.max_iterations)})
+    print({"candidates": recall_chunks(
+        args.source_chunks,
+        args.output,
+        args.bm25_top_k,
+        args.dense_top_k,
+        args.merged_top_k_per_fact_type,
+        args.neighbor_window,
+        args.max_iterations,
+        mapping_path=args.polymer_class_candidates,
+        sample_conditioned_top_k=args.sample_conditioned_top_k_per_fact_type,
+        retrieval_dir=args.retrieval_dir,
+    )})
 
 
 if __name__ == "__main__":
     main()
-

@@ -1,6 +1,6 @@
 import argparse
 import _common  # noqa: F401
-from src.kg_pipeline.embedding import train_transe
+from src.kg_pipeline.kg_embedding import train_transe
 
 
 def main():

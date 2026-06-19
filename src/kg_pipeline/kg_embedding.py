@@ -1,10 +1,12 @@
+"""TransE baseline and repeat-unit KG embedding export."""
+
 import json
 import os
 import random
 
 import numpy as np
 
-from .common import read_csv, stable_id, write_csv, write_json
+from .io_utils import read_csv, stable_id, write_csv, write_json
 
 
 def _read_triples(path):
@@ -29,12 +31,21 @@ def train_transe(triples_path, nodes_path, edges_path, repeat_units_path, output
     np.random.seed(seed)
     triples = _read_triples(triples_path)
     nodes = read_csv(nodes_path)
+    build_manifest_path = os.path.join(os.path.dirname(nodes_path), "build_manifest.json")
+    build_manifest = {}
+    if os.path.exists(build_manifest_path):
+        with open(build_manifest_path, "r", encoding="utf-8") as handle:
+            build_manifest = json.load(handle)
     node_types = {row["node_id"]: row["node_type"] for row in nodes}
     node_sources = {row["node_id"]: row["source_id"] for row in nodes}
     allowed_scopes = {"strict"} if graph_variant == "strict" else {"strict", "broad"}
     repeat_to_class = {
         edge["head_id"]: edge["tail_id"] for edge in edge_rows
         if edge.get("relation_type") == "maps_to" and edge.get("graph_scope") in allowed_scopes
+    }
+    repeat_to_family = {
+        edge["head_id"]: edge["tail_id"] for edge in edge_rows
+        if edge.get("relation_type") == "belongs_to_family" and edge.get("graph_scope") in allowed_scopes
     }
     eligible = sorted({entity for triple in triples for entity in (triple[0], triple[2]) if node_types.get(entity) != "SourceChunk"})
     test_only = not triples or not literature_repeat_units
@@ -77,16 +88,23 @@ def train_transe(triples_path, nodes_path, edges_path, repeat_units_path, output
     mapping_rows = []
     output_vectors = []
     unknown_vector = np.random.default_rng(seed + 1).normal(0, 0.05, embedding_dim).astype(np.float32)
+    fallback_count = 0
     for unit in repeat_units:
         kg_node_id = f"kg_repeatunit_{unit['repeat_unit_id']}"
         has_entity = kg_node_id in entity_to_index
         class_node_id = repeat_to_class.get(kg_node_id)
+        family_node_id = repeat_to_family.get(kg_node_id)
         if has_entity:
             vector = entity_embeddings[entity_to_index[kg_node_id]]
         elif class_node_id in entity_to_index:
             vector = entity_embeddings[entity_to_index[class_node_id]]
+            fallback_count += 1
+        elif family_node_id in entity_to_index:
+            vector = entity_embeddings[entity_to_index[family_node_id]]
+            fallback_count += 1
         else:
             vector = unknown_vector.copy()
+            fallback_count += 1
         embedding_index = len(output_vectors)
         output_vectors.append(vector)
         has_link = kg_node_id in literature_repeat_units
@@ -102,6 +120,27 @@ def train_transe(triples_path, nodes_path, edges_path, repeat_units_path, output
     np.save(os.path.join(output_dir, "kg_embedding.npy"), matrix)
     fields = ["embedding_index", "kg_node_id", "entity_type", "repeat_unit_id", "canonical_smiles", "polymer_class_id", "graph_variant", "has_literature_link", "embedding_version"]
     write_csv(os.path.join(output_dir, "kg_entity_mapping.csv"), fields, mapping_rows)
-    manifest = {"model": "TransE", "embedding_dim": embedding_dim, "epochs": epochs, "seed": seed, "graph_variant": graph_variant, "num_triples": len(triples), "num_training_entities": len(eligible), "num_mapped_entities": len(mapping_rows), "shape": list(matrix.shape), "source_chunks_excluded": True, "test_only": test_only, "fallback": "learned_unknown_seeded"}
+    manifest = {
+        "model": "TransE",
+        "embedding_dim": embedding_dim,
+        "epochs": epochs,
+        "seed": seed,
+        "graph_variant": graph_variant,
+        "triple_count": len(triples),
+        "entity_count": len(eligible),
+        "mapped_repeat_unit_count": len(mapping_rows),
+        "output_shape": list(matrix.shape),
+        "dtype": "float32",
+        "fallback_count": fallback_count,
+        "source_chunks_excluded": True,
+        "has_literature_links": bool(literature_repeat_units),
+        "test_only": test_only,
+        "warnings": ["no_validated_literature_links_embedding_is_test_only"] if test_only else [],
+        "fallback": "repeat_unit_then_polymer_class_then_family_then_seeded_unknown",
+        "mapping_mode": build_manifest.get("mapping_mode", ""),
+        "mapping_source_type": build_manifest.get("mapping_source_type", ""),
+        "mapping_provider": build_manifest.get("mapping_provider", ""),
+        "mapping_model": build_manifest.get("mapping_model", ""),
+    }
     write_json(os.path.join(output_dir, "embedding_manifest.json"), manifest)
     return manifest

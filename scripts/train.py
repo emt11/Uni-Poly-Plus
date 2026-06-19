@@ -15,6 +15,17 @@ if PROJECT_ROOT not in sys.path:
 SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom', 'kg')
 
 
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"true", "1", "yes", "y"}:
+        return True
+    if lowered in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def parse_modality(value):
     if value not in SUPPORTED_MODALITIES:
         raise argparse.ArgumentTypeError(
@@ -140,7 +151,7 @@ def parse_arguments():
     parser.add_argument("--kg_mapping_path", default="kg_work/features/kg_entity_mapping.csv")
     parser.add_argument("--kg_embedding_dim", type=int, default=128)
     parser.add_argument("--kg_projection_dim", type=int, default=256)
-    parser.add_argument("--kg_freeze_embedding", choices=["true"], default="true")
+    parser.add_argument("--kg_freeze_embedding", type=parse_bool, default=True, help="Freeze KG embedding table when true; fine-tune when false")
     return parser.parse_args()
 
 
@@ -230,7 +241,7 @@ def main():
                 geometry_encoder=args.geometry_encoder,
                 kg_embedding_path=args.kg_embedding_path if "kg" in args.modalities else None,
                 kg_embedding_dim=args.kg_embedding_dim,
-                kg_freeze_embedding=args.kg_freeze_embedding == "true"
+                kg_freeze_embedding=args.kg_freeze_embedding
             )
 
             if pretrained_model_path:

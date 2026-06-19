@@ -1,6 +1,6 @@
 import argparse
 import _common  # noqa: F401
-from src.kg_pipeline.document_parser import parse_documents
+from src.kg_pipeline.literature import parse_documents
 
 
 def main():

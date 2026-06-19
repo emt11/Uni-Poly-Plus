@@ -1,7 +1,7 @@
 import argparse
 import os
 import _common  # noqa: F401
-from src.kg_pipeline.validation import aggregate_and_validate
+from src.kg_pipeline.article_validation import aggregate_and_validate
 
 
 def main():

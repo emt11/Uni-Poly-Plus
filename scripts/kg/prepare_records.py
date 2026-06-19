@@ -1,6 +1,6 @@
 import argparse
 import _common  # noqa: F401
-from src.kg_pipeline.records import prepare_records
+from src.kg_pipeline.dataset import prepare_records
 
 
 def main():
