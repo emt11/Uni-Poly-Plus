@@ -321,3 +321,5 @@ class GNN_graphpred(torch.nn.Module):
 
         node_representation = self.gnn(x, edge_index, edge_attr)
         return self.pool(node_representation, batch), node_representation
+
+

@@ -4,7 +4,6 @@ from torch_geometric.data import Batch
 
 def custom_collate(data_list):
     # Initialize lists to hold batched data
-
     x_list = []
     edge_index_list = []
     edge_attr_list = []
@@ -17,9 +16,6 @@ def custom_collate(data_list):
     pos3d_list = []
     batch3d_list = []
     y_list = []
-    kg_embedding_index_list = []
-    kg_mask_list = []
-    has_literature_link_list = []
 
     num_nodes2d_cum = 0
 
@@ -29,7 +25,7 @@ def custom_collate(data_list):
         input_ids_smiles_list.append(data.input_ids_smiles)
         attention_mask_smiles_list.append(data.attention_mask_smiles)
 
-        # 2D graph data
+        # 2D graph data — one graph per sample
         num_nodes2d = data.x.size(0)
         x_list.append(data.x)
         edge_index_list.append(data.edge_index + num_nodes2d_cum)
@@ -51,10 +47,6 @@ def custom_collate(data_list):
 
         # Labels
         y_list.append(data.y.reshape(-1))
-        if hasattr(data, "kg_embedding_index"):
-            kg_embedding_index_list.append(data.kg_embedding_index.reshape(-1))
-            kg_mask_list.append(data.kg_mask.reshape(-1))
-            has_literature_link_list.append(data.has_literature_link.reshape(-1))
 
     # Create batched data
     batch = Batch()
@@ -72,9 +64,5 @@ def custom_collate(data_list):
     batch.batch3d = torch.cat(batch3d_list, dim=0)
 
     batch.y = torch.stack(y_list, dim=0)
-    if kg_embedding_index_list:
-        batch.kg_embedding_index = torch.cat(kg_embedding_index_list, dim=0)
-        batch.kg_mask = torch.cat(kg_mask_list, dim=0)
-        batch.has_literature_link = torch.cat(has_literature_link_list, dim=0)
-    
+
     return batch

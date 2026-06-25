@@ -15,7 +15,7 @@ def mol2_2Dcoords(mol):
     return coordinates
 
 
-def mol2_3Dcoords(mol, cnt):
+def mol2_3Dcoords(mol, cnt, optimizer="auto"):
     coordinate_list = []
     coordinates_2d = mol2_2Dcoords(Chem.Mol(mol)).astype(np.float32)
 
@@ -28,10 +28,16 @@ def mol2_3Dcoords(mol, cnt):
             res = AllChem.EmbedMolecule(mol_tmp, params)
             if res == 0:
                 try:
-                    if AllChem.MMFFHasAllMoleculeParams(mol_tmp):
-                        AllChem.MMFFOptimizeMolecule(mol_tmp, maxIters=200)
-                    else:
+                    optimizer_mode = str(optimizer).lower()
+                    if optimizer_mode == "uff":
                         AllChem.UFFOptimizeMolecule(mol_tmp, maxIters=200)
+                    elif optimizer_mode == "auto":
+                        if AllChem.MMFFHasAllMoleculeParams(mol_tmp):
+                            AllChem.MMFFOptimizeMolecule(mol_tmp, maxIters=200)
+                        else:
+                            AllChem.UFFOptimizeMolecule(mol_tmp, maxIters=200)
+                    else:
+                        raise ValueError("optimizer must be 'auto' or 'uff'")
                 except Exception:
                     pass
                 coordinates = mol_tmp.GetConformer().GetPositions().astype(np.float32)
@@ -43,15 +49,21 @@ def mol2_3Dcoords(mol, cnt):
     return coordinate_list
 
 
-def mol2coords(mol):
-    mol = process_star_atoms(mol)
+def mol2coords(mol, process_stars=True, optimizer="auto"):
+    if process_stars:
+        mol = process_star_atoms(mol)
+    else:
+        mol = Chem.Mol(mol)
+        Chem.SanitizeMol(mol)
+        mol = Chem.AddHs(mol)
+
     cnt = CONFORMER_3D_COUNT
     if len(mol.GetAtoms()) > 400:
         coordinates = mol2_2Dcoords(mol).astype(np.float32)
         coordinate_list = [coordinates] * (cnt + 1)
         print("Atom count > 400, using 2D coordinates")
     else:
-        coordinate_list = mol2_3Dcoords(mol, cnt)
+        coordinate_list = mol2_3Dcoords(mol, cnt, optimizer=optimizer)
         coordinate_list.append(mol2_2Dcoords(Chem.Mol(mol)).astype(np.float32))
 
     atomic_numbers = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
@@ -63,6 +75,7 @@ def mol2coords(mol):
         pos=torch.tensor(positions, dtype=torch.float),
         pos_confs=torch.tensor(positions_all, dtype=torch.float),
     )
+    data.geom_optimizer = str(optimizer).lower()
     return data
 
 
@@ -73,8 +86,14 @@ def process_star_atoms(mol):
         for atom in rw_mol.GetAtoms()
         if atom.GetAtomicNum() == 0
     ]
+
+    if len(star_idx) == 0:
+        sanitized = rw_mol.GetMol()
+        Chem.SanitizeMol(sanitized)
+        return Chem.AddHs(sanitized)
+
     if len(star_idx) != 2:
-        raise ValueError(f"Star Substitution expects exactly two '*' atoms, got {len(star_idx)}")
+        return replace_star_atoms_with_hydrogen(rw_mol, star_idx)
 
     neighbor_idx = []
     for idx in star_idx:
@@ -85,9 +104,7 @@ def process_star_atoms(mol):
             if neighbor.GetAtomicNum() != 0
         ]
         if len(neighbors) != 1:
-            raise ValueError(
-                f"Star atom {idx} must have exactly one non-star neighbor, got {len(neighbors)}"
-            )
+            return replace_star_atoms_with_hydrogen(rw_mol, star_idx)
         neighbor_idx.append(neighbors[0])
 
     replacement_atomic_nums = [
@@ -103,6 +120,20 @@ def process_star_atoms(mol):
         atom.SetNumExplicitHs(0)
         atom.SetNoImplicit(False)
 
+    substituted_mol = rw_mol.GetMol()
+    Chem.SanitizeMol(substituted_mol)
+    return Chem.AddHs(substituted_mol)
+
+
+def replace_star_atoms_with_hydrogen(rw_mol, star_idx):
+    """Fallback geometry preparation for non-linear or malformed repeat units."""
+    for idx in star_idx:
+        atom = rw_mol.GetAtomWithIdx(idx)
+        atom.SetAtomicNum(1)
+        atom.SetFormalCharge(0)
+        atom.SetIsotope(0)
+        atom.SetNumExplicitHs(0)
+        atom.SetNoImplicit(False)
     substituted_mol = rw_mol.GetMol()
     Chem.SanitizeMol(substituted_mol)
     return Chem.AddHs(substituted_mol)

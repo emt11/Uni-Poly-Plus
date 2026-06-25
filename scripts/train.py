@@ -12,18 +12,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom', 'kg')
-
-
-def parse_bool(value):
-    if isinstance(value, bool):
-        return value
-    lowered = str(value).strip().lower()
-    if lowered in {"true", "1", "yes", "y"}:
-        return True
-    if lowered in {"false", "0", "no", "n"}:
-        return False
-    raise argparse.ArgumentTypeError("expected true or false")
+SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom')
 
 
 def parse_modality(value):
@@ -91,7 +80,7 @@ def parse_arguments():
         nargs='+',
         type=parse_modality,
         default=['smiles', 'graph', 'fp', 'geom'],
-        help="Model modalities. Supported: smiles, graph, fp, geom, kg."
+        help="Model modalities. Supported: smiles, graph, fp, geom."
     )
     parser.add_argument(
         '--geometry_encoder',
@@ -99,6 +88,19 @@ def parse_arguments():
         choices=['painn', 'schnet'],
         default='painn',
         help="Geometry encoder backend."
+    )
+    parser.add_argument(
+        '--graph_input',
+        type=str,
+        choices=['repeat_unit', 'dimer'],
+        default='repeat_unit',
+        help="Graph input type. 'repeat_unit' keeps the original graph; 'dimer' uses a legal two-repeat-unit graph when possible and falls back to repeat_unit."
+    )
+    parser.add_argument(
+        '--geom_model_name',
+        type=str,
+        default='',
+        help="Pretrained geometry encoder path for SchNet or PaiNN. Leave empty for random initialization."
     )
     parser.add_argument(
         '--freeze_encoder',
@@ -147,11 +149,40 @@ def parse_arguments():
         default=1.0,
         help="Maximum gradient norm for gradient clipping."
     )
-    parser.add_argument("--kg_embedding_path", default="kg_work/features/kg_embedding.npy")
-    parser.add_argument("--kg_mapping_path", default="kg_work/features/kg_entity_mapping.csv")
-    parser.add_argument("--kg_embedding_dim", type=int, default=128)
-    parser.add_argument("--kg_projection_dim", type=int, default=256)
-    parser.add_argument("--kg_freeze_embedding", type=parse_bool, default=True, help="Freeze KG embedding table when true; fine-tune when false")
+    parser.add_argument(
+        '--joint_embedding_dim',
+        type=int,
+        default=256,
+        help="Shared projection dimension for modality fusion."
+    )
+    parser.add_argument(
+        '--feature_source_dataset',
+        type=str,
+        default='smi_all',
+        help="Dataset used to build the SMILES-level feature cache (default: smi_all)."
+    )
+    parser.add_argument(
+        '--disable_feature_cache',
+        action='store_true',
+        help="Disable SMILES-level feature cache and use legacy per-dataset caching."
+    )
+    parser.add_argument(
+        '--rebuild_feature_cache',
+        action='store_true',
+        help="Force rebuild the feature cache even if it already exists."
+    )
+    parser.add_argument(
+        '--max_smiles_length',
+        type=int,
+        default=None,
+        help="Override SMILES token max length. Computed from feature_source_dataset when not set."
+    )
+    parser.add_argument(
+        '--max_smiles_length_cap',
+        type=int,
+        default=256,
+        help="Cap for auto-computed max SMILES token length (default: 256)."
+    )
     return parser.parse_args()
 
 
@@ -162,22 +193,20 @@ def main():
     from src.modules import UniEncoderAttention
     from src.utils import get_data_loader, scale_targets, train_and_evaluate
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     # Ignore warnings
     warnings.filterwarnings("ignore")
-    
+
     pre_trained_model_dict = {
         'smiles_model_name': "./pretrained_models/encoders/PubChem10M_SMILES_BPE_450k",
-        # 'gnn_model_name': "./pretrained_models/encoders/Mole-BERT.pth",
         'gnn_model_name': "",
-        # 'geom_model_name': "./pretrained_models/encoders/schnet_qm9_cv.pth"
-        'geom_model_name': ""
+        'geom_model_name': args.geom_model_name
     }
-    
+
     result_output_dir = args.results_dir
     model_output_dir = args.models_dir
     model_modality_list = args.modalities
-    
+
     task_list = args.tasks
     dataset_name_list = ['smi_' + task for task in task_list]
     dataset_list = [
@@ -186,20 +215,23 @@ def main():
             dataset=dataset_name,
             smiles_model_name=pre_trained_model_dict['smiles_model_name'],
             geometry_encoder=args.geometry_encoder,
-            enable_kg="kg" in args.modalities,
-            kg_mapping_path=args.kg_mapping_path,
-            kg_embedding_path=args.kg_embedding_path
+            graph_input=args.graph_input,
+            use_feature_cache=not args.disable_feature_cache,
+            feature_source_dataset=args.feature_source_dataset,
+            rebuild_feature_cache=args.rebuild_feature_cache,
+            max_smiles_length=args.max_smiles_length,
+            max_smiles_length_cap=args.max_smiles_length_cap,
         )
         for dataset_name in dataset_name_list
     ]
-    
+
     freeze_encoder = args.freeze_encoder
     pretrained_model_path = args.pretrained_model_path
     epochs = args.epochs
     patience = args.patience
-    
+
     result_file_initialized = False
-    
+
     for task in task_list:
         print(f"\nStarting task: {task}")
         dataset = dataset_list[task_list.index(task)]
@@ -232,16 +264,13 @@ def main():
             )
 
             model = UniEncoderAttention(
-                joint_embedding_dim=args.kg_projection_dim,
+                joint_embedding_dim=args.joint_embedding_dim,
                 smiles_model_name=pre_trained_model_dict['smiles_model_name'],
                 gnn_model_name=pre_trained_model_dict['gnn_model_name'],
                 geom_model_name=pre_trained_model_dict['geom_model_name'],
                 modality_list=model_modality_list,
                 freeze_encoder=freeze_encoder,
                 geometry_encoder=args.geometry_encoder,
-                kg_embedding_path=args.kg_embedding_path if "kg" in args.modalities else None,
-                kg_embedding_dim=args.kg_embedding_dim,
-                kg_freeze_embedding=args.kg_freeze_embedding
             )
 
             if pretrained_model_path:
@@ -300,6 +329,7 @@ def main():
             'task': task,
             'model_name': args.model_name,
             'model_modality_list': model_modality_list,
+            'graph_input': args.graph_input,
             'avg_test_r2': f"{avg_test_r2:.3f}",
             'std_test_r2': f"{std_test_r2:.3f}",
             'avg_test_mae': f"{avg_test_mae:.3f}",
@@ -321,7 +351,7 @@ def main():
         )
         result_file_initialized = True
         print(f"Results have been appended to '{result_output_dir}'.")
-        
+
 
 if __name__ == "__main__":
     main()

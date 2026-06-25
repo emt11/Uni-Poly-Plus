@@ -247,3 +247,5 @@ def compute_contrastive_loss(embeddings, temperature=0.07):
 
     total_loss = total_loss / count
     return total_loss
+
+

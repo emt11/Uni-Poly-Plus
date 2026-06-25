@@ -14,18 +14,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom', 'kg')
-
-
-def parse_bool(value):
-    if isinstance(value, bool):
-        return value
-    lowered = str(value).strip().lower()
-    if lowered in {"true", "1", "yes", "y"}:
-        return True
-    if lowered in {"false", "0", "no", "n"}:
-        return False
-    raise argparse.ArgumentTypeError("expected true or false")
+SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom')
 
 
 def parse_modality(value):
@@ -44,7 +33,7 @@ def parse_arguments():
         nargs='+',
         type=parse_modality,
         default=['smiles', 'graph', 'fp', 'geom'],
-        help="Modalities to use. Supported: smiles, graph, fp, geom, kg."
+        help="Modalities to use. Supported: smiles, graph, fp, geom."
     )
     parser.add_argument(
         '--geometry_encoder',
@@ -52,6 +41,13 @@ def parse_arguments():
         choices=['painn', 'schnet'],
         default='painn',
         help="Geometry encoder backend."
+    )
+    parser.add_argument(
+        '--graph_input',
+        type=str,
+        choices=['repeat_unit', 'dimer'],
+        default='repeat_unit',
+        help="Graph input type. 'repeat_unit' keeps the original graph; 'dimer' uses a legal two-repeat-unit graph when possible and falls back to repeat_unit."
     )
     parser.add_argument(
         '--smiles_model_name',
@@ -62,7 +58,6 @@ def parse_arguments():
     parser.add_argument(
         '--gnn_model_name',
         type=str,
-        # default="./pretrained_models/encoders/Mole-BERT.pth",
         default="",
         help="Pretrained GNN model path"
     )
@@ -70,7 +65,6 @@ def parse_arguments():
         '--geom_model_name',
         type=str,
         default="",
-        # default="./pretrained_models/encoders/schnet_qm9_gap.pth",
         help="Pretrained Geometry model path"
     )
     parser.add_argument(
@@ -81,7 +75,7 @@ def parse_arguments():
     parser.add_argument(
         '--dataset_name',
         type=str,
-        default='smi_all', 
+        default='smi_all',
         help="Name of the dataset for pretraining (unlabeled or labeled, but labels unused here)"
     )
     parser.add_argument(
@@ -126,11 +120,40 @@ def parse_arguments():
         default='./pretrained_models/saved_pretrained_model.pth',
         help="Path to save the pretrained model."
     )
-    parser.add_argument("--kg_embedding_path", default="kg_work/features/kg_embedding.npy")
-    parser.add_argument("--kg_mapping_path", default="kg_work/features/kg_entity_mapping.csv")
-    parser.add_argument("--kg_embedding_dim", type=int, default=128)
-    parser.add_argument("--kg_projection_dim", type=int, default=256)
-    parser.add_argument("--kg_freeze_embedding", type=parse_bool, default=True, help="Freeze KG embedding table when true; fine-tune when false")
+    parser.add_argument(
+        '--joint_embedding_dim',
+        type=int,
+        default=256,
+        help="Shared projection dimension for modality fusion."
+    )
+    parser.add_argument(
+        '--feature_source_dataset',
+        type=str,
+        default=None,
+        help="Dataset used to build the SMILES-level feature cache. Defaults to --dataset_name."
+    )
+    parser.add_argument(
+        '--disable_feature_cache',
+        action='store_true',
+        help="Disable SMILES-level feature cache and use legacy per-dataset caching."
+    )
+    parser.add_argument(
+        '--rebuild_feature_cache',
+        action='store_true',
+        help="Force rebuild the feature cache even if it already exists."
+    )
+    parser.add_argument(
+        '--max_smiles_length',
+        type=int,
+        default=None,
+        help="Override SMILES token max length. Computed from feature_source_dataset when not set."
+    )
+    parser.add_argument(
+        '--max_smiles_length_cap',
+        type=int,
+        default=256,
+        help="Cap for auto-computed max SMILES token length (default: 256)."
+    )
     return parser.parse_args()
 
 def main():
@@ -139,7 +162,7 @@ def main():
     from src.dataset import UniDataset
     from src.modules import UniEncoderAttention
     from src.utils import compute_contrastive_loss, get_data_loader
-    
+
     # Get all available GPUs
     if torch.cuda.is_available():
         n_gpus = torch.cuda.device_count()
@@ -158,28 +181,27 @@ def main():
         dataset=args.dataset_name,
         smiles_model_name=args.smiles_model_name,
         geometry_encoder=args.geometry_encoder,
-        enable_kg="kg" in args.modalities,
-        kg_mapping_path=args.kg_mapping_path,
-        kg_embedding_path=args.kg_embedding_path
+        graph_input=args.graph_input,
+        use_feature_cache=not args.disable_feature_cache,
+        feature_source_dataset=args.feature_source_dataset,
+        rebuild_feature_cache=args.rebuild_feature_cache,
+        max_smiles_length=args.max_smiles_length,
+        max_smiles_length_cap=args.max_smiles_length_cap,
     )
     indices = np.arange(len(dataset))
     dataloader = get_data_loader(dataset, indices=indices, batch_size=args.batch_size, shuffle=False)
 
     # Initialize model
     model = UniEncoderAttention(
-        joint_embedding_dim=args.kg_projection_dim,
+        joint_embedding_dim=args.joint_embedding_dim,
         smiles_model_name=args.smiles_model_name,
         gnn_model_name=args.gnn_model_name,
         geom_model_name=args.geom_model_name,
         modality_list=args.modalities,
         freeze_encoder=args.freeze_encoder,
         geometry_encoder=args.geometry_encoder,
-        kg_embedding_path=args.kg_embedding_path if "kg" in args.modalities else None,
-        kg_embedding_dim=args.kg_embedding_dim,
-        kg_freeze_embedding=args.kg_freeze_embedding
     )
-    
-    # Use all available GPUs for data parallel training
+
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs for data parallel training")
         model = nn.DataParallel(model)
@@ -189,10 +211,10 @@ def main():
 
     # Create directory for saving loss curves and data
     os.makedirs('./plots/pretrain', exist_ok=True)
-    
+
     # Record loss for each epoch
     losses = []
-    
+
     model.train()
     for epoch in range(args.epochs):
         epoch_loss = 0.0

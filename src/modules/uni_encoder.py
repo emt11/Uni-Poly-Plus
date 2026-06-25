@@ -3,14 +3,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
-import numpy as np
 from transformers import RobertaModel
 
 from .geom import PaiNNEncoder, SchNetEncoder
 from .graph import GNN_graphpred
 
 
-SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom', 'kg')
+SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom')
 
 
 class UniEncoderAttention(nn.Module):
@@ -27,9 +26,6 @@ class UniEncoderAttention(nn.Module):
         ff_dim: Optional[int] = None,
         dropout: float = 0.1,
         geometry_encoder: str = 'painn',
-        kg_embedding_path: Optional[str] = None,
-        kg_embedding_dim: int = 128,
-        kg_freeze_embedding: bool = True,
     ):
         super().__init__()
         unsupported = [modality for modality in modality_list if modality not in SUPPORTED_MODALITIES]
@@ -54,9 +50,6 @@ class UniEncoderAttention(nn.Module):
                 gnn_model_name=gnn_model_name,
                 geom_model_name=geom_model_name,
                 geometry_encoder=geometry_encoder,
-                kg_embedding_path=kg_embedding_path,
-                kg_embedding_dim=kg_embedding_dim,
-                kg_freeze_embedding=kg_freeze_embedding,
             )
             for modality in modality_list
         })
@@ -78,7 +71,10 @@ class UniEncoderAttention(nn.Module):
         )
 
     def forward(self, data):
-        embeddings = [self.encoders[modality](data) for modality in self.modality_list]
+        embeddings = []
+        for modality in self.modality_list:
+            module = self.encoders[modality]
+            embeddings.append(module(data))
         embeddings = torch.stack(embeddings, dim=1)
 
         fused_output, modality_attention = self.fusion_module(embeddings)
@@ -99,9 +95,6 @@ class EncoderModule(nn.Module):
         gnn_model_name: Optional[str] = None,
         geom_model_name: Optional[str] = None,
         geometry_encoder: str = 'painn',
-        kg_embedding_path: Optional[str] = None,
-        kg_embedding_dim: int = 128,
-        kg_freeze_embedding: bool = True,
     ):
         super().__init__()
         self.modality = modality
@@ -113,9 +106,6 @@ class EncoderModule(nn.Module):
             gnn_model_name=gnn_model_name,
             geom_model_name=geom_model_name,
             geometry_encoder=geometry_encoder,
-            kg_embedding_path=kg_embedding_path,
-            kg_embedding_dim=kg_embedding_dim,
-            kg_freeze_embedding=kg_freeze_embedding,
         )
         self.encoder = encoder
         self.norm = nn.LayerNorm(input_dim) if encoder else None
@@ -133,9 +123,6 @@ class EncoderModule(nn.Module):
         gnn_model_name: Optional[str],
         geom_model_name: Optional[str],
         geometry_encoder: str,
-        kg_embedding_path: Optional[str],
-        kg_embedding_dim: int,
-        kg_freeze_embedding: bool,
     ):
         if modality == 'smiles':
             encoder = RobertaModel.from_pretrained(smiles_model_name)
@@ -164,20 +151,6 @@ class EncoderModule(nn.Module):
         elif modality == 'fp':
             encoder = None
             input_dim = 1024
-        elif modality == 'kg':
-            if not kg_embedding_path:
-                raise ValueError("KG modality requires kg_embedding_path")
-            matrix = np.load(kg_embedding_path)
-            if matrix.ndim != 2 or matrix.shape[1] != kg_embedding_dim:
-                raise ValueError(
-                    f"Expected KG embedding shape [N, {kg_embedding_dim}], got {matrix.shape}"
-                )
-            encoder = nn.Embedding.from_pretrained(
-                torch.tensor(matrix, dtype=torch.float32), freeze=kg_freeze_embedding
-            )
-            input_dim = kg_embedding_dim
-            self.unknown_embedding = nn.Parameter(torch.empty(input_dim))
-            nn.init.normal_(self.unknown_embedding, std=0.05)
         else:
             raise ValueError(
                 f"Unsupported modality: {modality}. Current supported modalities are: "
@@ -263,13 +236,6 @@ class EncoderModule(nn.Module):
             return self.projection(self.norm(features))
         if self.modality == 'fp':
             return self.projection(data.fp)
-        if self.modality == 'kg':
-            indices = data.kg_embedding_index.to(self.encoder.weight.device)
-            mask = data.kg_mask.to(self.encoder.weight.device).bool()
-            features = self.encoder(indices.clamp(min=0))
-            fallback = self.unknown_embedding.unsqueeze(0).expand_as(features)
-            features = torch.where(mask.unsqueeze(-1), features, fallback)
-            return self.projection(self.norm(features))
         raise ValueError(
             f"Unsupported modality: {self.modality}. Current supported modalities are: "
             f"{', '.join(SUPPORTED_MODALITIES)}."

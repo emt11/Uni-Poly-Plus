@@ -42,6 +42,7 @@ data/
 *.pth
 *.onnx
 *.h5
+.claude
 
 # Generated dataset caches
 data/processed/
