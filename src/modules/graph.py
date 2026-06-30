@@ -7,8 +7,7 @@ import torch.nn.functional as F
 from torch_scatter import scatter_add
 from torch_geometric.nn.inits import glorot, zeros
 
-NUM_ATOM_FEATURES = 62
-NUM_BOND_FEATURES = 12
+from src.dataset.graph_data import NUM_ATOM_FEATURES, NUM_BOND_FEATURES
 
 class GINConv(MessagePassing):
     """

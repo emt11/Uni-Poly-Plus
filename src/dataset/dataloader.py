@@ -2,7 +2,7 @@ import torch
 from torch_geometric.data import Batch
 
 
-def custom_collate(data_list):
+def custom_collate(data_list, random_conformer=False):
     # Initialize lists to hold batched data
     x_list = []
     edge_index_list = []
@@ -34,9 +34,14 @@ def custom_collate(data_list):
         batch2d_list.append(torch.full((num_nodes2d,), batch_idx, dtype=torch.long))
         num_nodes2d_cum += num_nodes2d
 
-        # 3D graph data
+        # 3D graph data. Training loaders can sample one conformer per epoch;
+        # evaluation keeps the deterministic first conformer stored in data.pos.
         z3d = data.z
-        pos3d = data.pos
+        if random_conformer and hasattr(data, 'pos_confs') and data.pos_confs.dim() == 3:
+            conf_idx = torch.randint(data.pos_confs.size(0), (1,)).item()
+            pos3d = data.pos_confs[conf_idx]
+        else:
+            pos3d = data.pos
         num_nodes3d = pos3d.size(0)
         x3d_list.append(z3d)
         pos3d_list.append(pos3d)

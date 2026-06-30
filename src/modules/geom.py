@@ -12,8 +12,8 @@ from torch import nn, Tensor
 
 
 GEOM_EPS = 1e-8
-PAINN_UPDATE_SCALE = 0.1
-PAINN_MAX_VECTOR_NORM = 50.0
+PAINN_UPDATE_SCALE = 0.05
+PAINN_MAX_VECTOR_NORM = 20.0
 
 
 def _unpack_geometry_input(data_or_z, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None):
@@ -97,6 +97,15 @@ class SchNetEncoder(SchNet):
         self.load_state_dict(state_dict, strict=False)
 
 
+    def encode_nodes(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None):
+        z, pos, batch = _unpack_geometry_input(z, pos, batch)
+        h = self.embedding(z)
+        edge_index, edge_weight = self.interaction_graph(pos, batch)
+        edge_attr = self.distance_expansion(edge_weight)
+        for interaction in self.interactions:
+            h = h + interaction(h, edge_index, edge_weight, edge_attr)
+        return h, batch
+
     def forward(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None) -> Tensor:
         """
         Forward pass, returns graph-level high-dimensional representations.
@@ -110,14 +119,7 @@ class SchNetEncoder(SchNet):
             torch.Tensor: Graph-level embeddings, shape [num_graphs, hidden_channels].
         """
         z, pos, batch = _unpack_geometry_input(z, pos, batch)
-
-        h = self.embedding(z)
-        edge_index, edge_weight = self.interaction_graph(pos, batch)
-        edge_attr = self.distance_expansion(edge_weight)
-
-        for interaction in self.interactions:
-            h = h + interaction(h, edge_index, edge_weight, edge_attr)
-
+        h, batch = self.encode_nodes(z, pos, batch)
 
         # h = self.lin1(h)
         # h = self.act(h)
@@ -349,7 +351,7 @@ class PaiNNEncoder(nn.Module):
         v = v * vector_scale
         return s, v
 
-    def forward(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None) -> Tensor:
+    def encode_nodes(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None):
         z, pos, batch = _unpack_geometry_input(z, pos, batch)
 
         s = self.embedding(z)
@@ -365,7 +367,12 @@ class PaiNNEncoder(nn.Module):
             for mixing, norm in zip(self.mixing, self.scalar_norms):
                 s, v = mixing(s, v)
                 s, v = self._stabilize_features(s, v, norm)
+        return s, batch
 
+    def forward(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None) -> Tensor:
+        s, batch = self.encode_nodes(z, pos, batch)
+        if not torch.isfinite(s).all():
+            raise ValueError("PaiNNEncoder produced non-finite node features.")
         graph_embedding = self.readout(s, batch)
         return graph_embedding
 

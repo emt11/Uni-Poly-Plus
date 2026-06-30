@@ -33,8 +33,8 @@ class UniDataset(Dataset):
         self.pre_transform = pre_transform
         self.data_list = []
         self.graph_input = str(graph_input).lower()
-        if self.graph_input not in {'repeat_unit', 'dimer'}:
-            raise ValueError("graph_input must be 'repeat_unit' or 'dimer'")
+        if self.graph_input not in {'repeat_unit', 'star_linking'}:
+            raise ValueError("graph_input must be 'repeat_unit' or 'star_linking'")
         self.smiles_tokenizer = AutoTokenizer.from_pretrained(smiles_model_name)
 
         geometry_cache_dirs = {
@@ -48,9 +48,9 @@ class UniDataset(Dataset):
         processed_dir = os.path.join(self.root, 'processed', geometry_cache_dirs[self.geometry_encoder])
         os.makedirs(processed_dir, exist_ok=True)
 
-        graph_tag = 'gin'
-        if self.graph_input == 'dimer':
-            graph_tag = 'gin-dimer-uffgeom'
+        graph_tag = 'gin-backbone'
+        if self.graph_input == 'star_linking':
+            graph_tag = 'gin-starlink-backbone'
 
         self.use_feature_cache = bool(use_feature_cache)
 
@@ -119,18 +119,18 @@ class UniDataset(Dataset):
 
             data.fp = torch.tensor(mfpgen.GetFingerprint(fp_mol), dtype=torch.float).unsqueeze(0)
             try:
-                geom_optimizer = "uff" if structure["structure_input"] == "dimer" else "auto"
-                geom_data = mol2coords(
-                    structure["structure_mol"],
-                    process_stars=(structure["structure_input"] == "repeat_unit"),
-                    optimizer=geom_optimizer,
-                )
+                geom_optimizer = "auto"
+                geom_data = mol2coords(mol, process_stars=True, optimizer=geom_optimizer)
                 data.pos = geom_data.pos
                 data.z = geom_data.z
                 data.pos_confs = geom_data.pos_confs
-                data.geom_smiles = structure["structure_smiles"]
-                data.geom_input = structure["structure_input"]
+                data.geom_smiles = smiles
+                data.geom_input = getattr(geom_data, "geom_input", "star_substitution")
                 data.geom_optimizer = geom_optimizer
+                data.geom_optimizer_used = getattr(geom_data, "geom_optimizer_used", geom_optimizer)
+                data.geom_build_ok = bool(getattr(geom_data, "geom_build_ok", True))
+                data.geom_failed_reason = getattr(geom_data, "geom_failed_reason", "")
+                data.geom_num_confs = int(getattr(geom_data, "geom_num_confs", data.pos_confs.size(0)))
             except Exception as e:
                 print(e)
                 print(f"Failed to generate 3D coordinates for {smiles}")
@@ -245,7 +245,8 @@ class UniDataset(Dataset):
                 "feature_source_dataset": self.feature_source_dataset,
                 "geometry_encoder": self.geometry_encoder,
                 "graph_input": self.graph_input,
-                "geometry_structure": "dimer_uff" if self.graph_input == "dimer" else "repeat_unit_auto",
+                "geometry_structure": "star_substitution_multi_conformer",
+                "graph_features": "backbone_attachment_starlink_edge",
                 "max_smiles_length": self.max_smiles_length,
                 "tokenizer": str(type(self.smiles_tokenizer).__name__),
             },
@@ -286,19 +287,20 @@ class UniDataset(Dataset):
         # Morgan fingerprint
         data.fp = torch.tensor(mfpgen.GetFingerprint(fp_mol), dtype=torch.float).unsqueeze(0)
 
-        # 3D geometry. Dimer mode follows the paper's UFF-optimized dimer structure.
-        geom_optimizer = "uff" if structure["structure_input"] == "dimer" else "auto"
-        geom_data = mol2coords(
-            structure["structure_mol"],
-            process_stars=(structure["structure_input"] == "repeat_unit"),
-            optimizer=geom_optimizer,
-        )
+        # 3D geometry stays on the original repeat-unit structure. Star-linking is
+        # a topology-only graph construction and is not used for SchNet/PaiNN.
+        geom_optimizer = "auto"
+        geom_data = mol2coords(mol, process_stars=True, optimizer=geom_optimizer)
         data.pos = geom_data.pos
         data.z = geom_data.z
         data.pos_confs = geom_data.pos_confs
-        data.geom_smiles = structure["structure_smiles"]
-        data.geom_input = structure["structure_input"]
+        data.geom_smiles = smiles
+        data.geom_input = getattr(geom_data, "geom_input", "star_substitution")
         data.geom_optimizer = geom_optimizer
+        data.geom_optimizer_used = getattr(geom_data, "geom_optimizer_used", geom_optimizer)
+        data.geom_build_ok = bool(getattr(geom_data, "geom_build_ok", True))
+        data.geom_failed_reason = getattr(geom_data, "geom_failed_reason", "")
+        data.geom_num_confs = int(getattr(geom_data, "geom_num_confs", data.pos_confs.size(0)))
 
         return data
 

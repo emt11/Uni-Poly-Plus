@@ -65,15 +65,17 @@ def scale_targets(dataset, task, train_indices=None, raw_targets=None):
 
     return target_scaler
 
-def get_data_loader(dataset, indices=None, batch_size=32, shuffle=False, drop_last=False):
+def get_data_loader(dataset, indices=None, batch_size=32, shuffle=False, drop_last=False, random_conformer=None):
     if indices is None:
         indices = range(len(dataset))
     subset_dataset = [dataset[i] for i in indices]
+    if random_conformer is None:
+        random_conformer = bool(shuffle)
 
     loader = DataLoader(
         subset_dataset,
         batch_size=batch_size,
-        collate_fn=custom_collate,
+        collate_fn=lambda samples: custom_collate(samples, random_conformer=random_conformer),
         shuffle=shuffle,
         drop_last=drop_last
     )

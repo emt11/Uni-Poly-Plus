@@ -26,6 +26,10 @@ class UniEncoderAttention(nn.Module):
         ff_dim: Optional[int] = None,
         dropout: float = 0.1,
         geometry_encoder: str = 'painn',
+        graph_num_layers: int = 6,
+        graph_emb_dim: int = 256,
+        graph_dropout: float = 0.1,
+        graph_pooling: str = 'attention',
     ):
         super().__init__()
         unsupported = [modality for modality in modality_list if modality not in SUPPORTED_MODALITIES]
@@ -50,6 +54,10 @@ class UniEncoderAttention(nn.Module):
                 gnn_model_name=gnn_model_name,
                 geom_model_name=geom_model_name,
                 geometry_encoder=geometry_encoder,
+                graph_num_layers=graph_num_layers,
+                graph_emb_dim=graph_emb_dim,
+                graph_dropout=graph_dropout,
+                graph_pooling=graph_pooling,
             )
             for modality in modality_list
         })
@@ -95,6 +103,10 @@ class EncoderModule(nn.Module):
         gnn_model_name: Optional[str] = None,
         geom_model_name: Optional[str] = None,
         geometry_encoder: str = 'painn',
+        graph_num_layers: int = 6,
+        graph_emb_dim: int = 256,
+        graph_dropout: float = 0.1,
+        graph_pooling: str = 'attention',
     ):
         super().__init__()
         self.modality = modality
@@ -106,6 +118,10 @@ class EncoderModule(nn.Module):
             gnn_model_name=gnn_model_name,
             geom_model_name=geom_model_name,
             geometry_encoder=geometry_encoder,
+            graph_num_layers=graph_num_layers,
+            graph_emb_dim=graph_emb_dim,
+            graph_dropout=graph_dropout,
+            graph_pooling=graph_pooling,
         )
         self.encoder = encoder
         self.norm = nn.LayerNorm(input_dim) if encoder else None
@@ -123,6 +139,10 @@ class EncoderModule(nn.Module):
         gnn_model_name: Optional[str],
         geom_model_name: Optional[str],
         geometry_encoder: str,
+        graph_num_layers: int,
+        graph_emb_dim: int,
+        graph_dropout: float,
+        graph_pooling: str,
     ):
         if modality == 'smiles':
             encoder = RobertaModel.from_pretrained(smiles_model_name)
@@ -133,13 +153,13 @@ class EncoderModule(nn.Module):
             input_dim = encoder.hidden_channels
         elif modality == 'graph':
             encoder = GNN_graphpred(
-                num_layer=5,
-                emb_dim=300,
+                num_layer=graph_num_layers,
+                emb_dim=graph_emb_dim,
                 num_tasks=1,
                 JK='last',
-                drop_ratio=0,
+                drop_ratio=graph_dropout,
                 gnn_type='gin',
-                graph_pooling='mean',
+                graph_pooling=graph_pooling,
             )
             gnn_model_path = self._get_pretrained_path(gnn_model_name, "GNN")
             if gnn_model_path:

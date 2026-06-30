@@ -39,17 +39,22 @@ allowable_features = {
     ]
 }
 
+GRAPH_EXTRA_ATOM_FEATURES = 3  # is_backbone, is_attachment_neighbor, is_side_chain
+GRAPH_EXTRA_BOND_FEATURES = 1  # is_star_linking_edge
+
 NUM_ATOM_FEATURES = (
     len(allowable_features['possible_atom_symbols']) +
     4 +
     len(allowable_features['possible_hybridization_list']) +
     len(allowable_features['possible_chirality_list']) +
-    2
+    2 +
+    GRAPH_EXTRA_ATOM_FEATURES
 )
 NUM_BOND_FEATURES = (
     len(allowable_features['possible_bonds']) +
     len(allowable_features['possible_bond_stereo_list']) +
-    2
+    2 +
+    GRAPH_EXTRA_BOND_FEATURES
 )
 
 
@@ -63,10 +68,41 @@ def one_of_k_encoding_unk(x, allowable_set):
     return list(map(lambda s: x == s, allowable_set))
 
 
-def mol_to_graph_data_obj_simple(mol):
+def _graph_backbone_annotations(mol, original_neighbors=None, star_link_edge=None):
+    n_atoms = mol.GetNumAtoms()
+    backbone = set()
+    attachment_neighbors = set(int(i) for i in (original_neighbors or []))
+    side_chain = set(range(n_atoms))
+
+    if original_neighbors is not None and len(original_neighbors) == 2:
+        try:
+            path = Chem.rdmolops.GetShortestPath(mol, int(original_neighbors[0]), int(original_neighbors[1]))
+            backbone.update(int(i) for i in path)
+        except Exception:
+            backbone.update(int(i) for i in original_neighbors if int(i) < n_atoms)
+
+    side_chain = side_chain - backbone
+    star_link_edge_set = set()
+    if star_link_edge is not None:
+        i, j = int(star_link_edge[0]), int(star_link_edge[1])
+        star_link_edge_set.add((i, j))
+        star_link_edge_set.add((j, i))
+
+    return backbone, attachment_neighbors, side_chain, star_link_edge_set
+
+
+def mol_to_graph_data_obj_simple(mol, backbone_info=None):
+    backbone_info = backbone_info or {}
+    backbone, attachment_neighbors, side_chain, star_link_edge_set = _graph_backbone_annotations(
+        mol,
+        original_neighbors=backbone_info.get("neighbors"),
+        star_link_edge=backbone_info.get("star_link_edge"),
+    )
+
     # atoms
     atom_features_list = []
     for atom in mol.GetAtoms():
+        atom_idx = atom.GetIdx()
         atom_symbol = '*' if atom.GetAtomicNum() == 0 else atom.GetSymbol()
         atom_feature = (
             one_of_k_encoding_unk(atom_symbol, allowable_features['possible_atom_symbols']) +
@@ -80,7 +116,10 @@ def mol_to_graph_data_obj_simple(mol):
             one_of_k_encoding_unk(atom.GetChiralTag(), allowable_features['possible_chirality_list']) +
             [
                 int(atom.GetIsAromatic()),
-                int(atom.IsInRing())
+                int(atom.IsInRing()),
+                int(atom_idx in backbone),
+                int(atom_idx in attachment_neighbors),
+                int(atom_idx in side_chain),
             ]
         )
         atom_features_list.append(atom_feature)
@@ -98,7 +137,8 @@ def mol_to_graph_data_obj_simple(mol):
                 one_of_k_encoding_unk(bond.GetStereo(), allowable_features['possible_bond_stereo_list']) +
                 [
                     int(bond.GetIsConjugated()),
-                    int(bond.IsInRing())
+                    int(bond.IsInRing()),
+                    int((i, j) in star_link_edge_set),
                 ]
             )
             edges_list.append((i, j))
@@ -106,18 +146,14 @@ def mol_to_graph_data_obj_simple(mol):
             edges_list.append((j, i))
             edge_features_list.append(edge_feature)
 
-        # data.edge_index: Graph connectivity in COO format with shape [2, num_edges]
         edge_index = torch.tensor(np.array(edges_list).T, dtype=torch.long)
-
-        # data.edge_attr: Edge feature matrix with shape [num_edges, num_edge_features]
-        edge_attr = torch.tensor(np.array(edge_features_list),
-                                 dtype=torch.float)
-    else:   # mol has no bonds
+        edge_attr = torch.tensor(np.array(edge_features_list), dtype=torch.float)
+    else:
         edge_index = torch.empty((2, 0), dtype=torch.long)
         edge_attr = torch.empty((0, NUM_BOND_FEATURES), dtype=torch.float)
 
     data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-
+    data.has_backbone_features = True
     return data
 
 
@@ -150,75 +186,65 @@ def _sanitize_to_smiles(mol):
     return Chem.MolToSmiles(mol, canonical=True)
 
 
-def generate_nmer_smiles(smiles, n, replace_terminal_dummy_atoms=True):
-    """Generate a linear n-mer from a two-attachment repeat-unit SMILES."""
-    n = int(n)
-    if n <= 1:
-        return smiles
 
-    monomer = Chem.MolFromSmiles(smiles)
-    if monomer is None:
+def build_star_linking_mol(smiles):
+    """Build the induced star-linking graph molecule from a two-attachment P-SMILES.
+
+    The two dummy atoms are removed and their neighboring boundary atoms are
+    connected with the original attachment bond type. This is a graph
+    construction strategy for topology input, not a physical 3D conformer.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
         raise ValueError("invalid smiles")
-    dummy_atoms, neighbors, bond_types = _get_dummy_atoms_and_neighbors(monomer)
+
+    dummy_atoms, neighbors, bond_types = _get_dummy_atoms_and_neighbors(mol)
     if len(dummy_atoms) != 2:
-        raise ValueError("n-mer generation requires exactly two dummy atoms")
+        raise ValueError("star_linking requires exactly two dummy atoms")
+    if len(set(neighbors)) != 2:
+        raise ValueError("star_linking requires two distinct boundary atoms")
     if bond_types[0] != bond_types[1]:
         raise ValueError("attachment bond types are not consistent")
+    editable = Chem.EditableMol(mol)
+    if mol.GetBondBetweenAtoms(int(neighbors[0]), int(neighbors[1])) is None:
+        editable.AddBond(int(neighbors[0]), int(neighbors[1]), order=bond_types[0])
+    for atom_idx in sorted(dummy_atoms, reverse=True):
+        editable.RemoveAtom(int(atom_idx))
 
-    num_atoms = monomer.GetNumAtoms()
-    oligomer = monomer
-    for _ in range(n - 1):
-        oligomer = Chem.CombineMols(oligomer, monomer)
-
-    repeat = np.zeros((n, 2), dtype=np.int64)
-    connect = np.zeros((n, 2), dtype=np.int64)
-    for i in range(n):
-        repeat[i] = np.array(dummy_atoms, dtype=np.int64) + i * num_atoms
-        connect[i] = np.array(neighbors, dtype=np.int64) + i * num_atoms
-
-    editable = Chem.EditableMol(oligomer)
-    remove_atoms = []
-    for i in range(n - 1):
-        editable.AddBond(int(connect[i, 1]), int(connect[i + 1, 0]), order=bond_types[0])
-        remove_atoms.extend([int(repeat[i, 1]), int(repeat[i + 1, 0])])
-
-    if replace_terminal_dummy_atoms:
-        editable.ReplaceAtom(int(repeat[0, 0]), Chem.Atom(1))
-        editable.ReplaceAtom(int(repeat[n - 1, 1]), Chem.Atom(1))
-
-    for atom_idx in sorted(remove_atoms, reverse=True):
-        editable.RemoveAtom(atom_idx)
-
-    mol = editable.GetMol()
-    try:
-        mol = Chem.RemoveHs(mol)
-    except Exception:
-        pass
-    return _sanitize_to_smiles(mol)
-
-
-
+    linked_mol = editable.GetMol()
+    Chem.SanitizeMol(linked_mol)
+    return linked_mol
 
 
 def build_structure_for_input(smiles, graph_input="repeat_unit"):
-    """Build the molecular structure shared by graph and geometry inputs.
+    """Resolve the molecular graph used by the GIN backend.
 
-    ``repeat_unit`` returns the original repeat-unit molecule. ``dimer`` attempts
-    to build a legal two-repeat-unit local segment; when this is not possible,
-    it falls back to the repeat-unit molecule and records why.
+    ``repeat_unit`` keeps the original repeat-unit graph. ``star_linking``
+    removes two attachment dummy atoms and connects their boundary atoms. The
+    star-linked graph is only used for the graph modality; geometry generation
+    stays on the original repeat-unit molecule in the dataset layer.
     """
     graph_input = str(graph_input).lower()
-    if graph_input not in {"repeat_unit", "dimer"}:
-        raise ValueError("graph_input must be 'repeat_unit' or 'dimer'")
+    if graph_input not in {"repeat_unit", "star_linking"}:
+        raise ValueError("graph_input must be 'repeat_unit' or 'star_linking'")
 
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError("invalid smiles")
 
     attachment_count = sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 0)
+    backbone_info = {}
+    try:
+        dummy_atoms, boundary_neighbors, _ = _get_dummy_atoms_and_neighbors(mol)
+        if len(boundary_neighbors) == 2:
+            backbone_info["neighbors"] = [int(boundary_neighbors[0]), int(boundary_neighbors[1])]
+    except Exception:
+        backbone_info = {}
+
     base = {
         "requested_input": graph_input,
         "attachment_count": int(attachment_count),
+        "backbone_info": backbone_info,
     }
 
     if graph_input == "repeat_unit":
@@ -227,32 +253,23 @@ def build_structure_for_input(smiles, graph_input="repeat_unit"):
             "structure_smiles": smiles,
             "structure_mol": mol,
             "structure_input": "repeat_unit",
-            "dimer_build_ok": False,
-            "dimer_failed_reason": "",
-        }
-
-    if attachment_count != 2:
-        return {
-            **base,
-            "structure_smiles": smiles,
-            "structure_mol": mol,
-            "structure_input": "repeat_unit",
-            "dimer_build_ok": False,
-            "dimer_failed_reason": "attachment_count_not_2",
+            "graph_build_ok": True,
+            "graph_failed_reason": "",
         }
 
     try:
-        dimer_smiles = generate_nmer_smiles(smiles, 2, replace_terminal_dummy_atoms=True)
-        dimer_mol = Chem.MolFromSmiles(dimer_smiles)
-        if dimer_mol is None:
-            raise ValueError("invalid_dimer_smiles")
+        linked_mol = build_star_linking_mol(smiles)
+        linked_info = dict(backbone_info)
+        if "neighbors" in linked_info:
+            linked_info["star_link_edge"] = linked_info["neighbors"]
         return {
             **base,
-            "structure_smiles": dimer_smiles,
-            "structure_mol": dimer_mol,
-            "structure_input": "dimer",
-            "dimer_build_ok": True,
-            "dimer_failed_reason": "",
+            "backbone_info": linked_info,
+            "structure_smiles": Chem.MolToSmiles(linked_mol, canonical=True),
+            "structure_mol": linked_mol,
+            "structure_input": "star_linking",
+            "graph_build_ok": True,
+            "graph_failed_reason": "",
         }
     except Exception as exc:
         return {
@@ -260,8 +277,8 @@ def build_structure_for_input(smiles, graph_input="repeat_unit"):
             "structure_smiles": smiles,
             "structure_mol": mol,
             "structure_input": "repeat_unit",
-            "dimer_build_ok": False,
-            "dimer_failed_reason": str(exc)[:200],
+            "graph_build_ok": False,
+            "graph_failed_reason": str(exc)[:200],
         }
 
 
@@ -272,19 +289,17 @@ def annotate_structure_fields(data, structure, prefix="graph"):
     data.requested_graph_input = structure["requested_input"]
     data.structure_smiles = structure["structure_smiles"]
     data.structure_input = structure["structure_input"]
-    data.dimer_build_ok = bool(structure["dimer_build_ok"])
-    data.dimer_failed_reason = structure["dimer_failed_reason"]
+    data.graph_build_ok = bool(structure["graph_build_ok"])
+    data.graph_failed_reason = structure["graph_failed_reason"]
     data.attachment_count = int(structure["attachment_count"])
+    data.has_backbone_features = True
     return data
 
 
 def build_graph_for_input(smiles, graph_input="repeat_unit"):
-    """Build the graph used by the default GIN backend.
-
-    Graph construction now uses the same resolved structure that geometry can
-    reuse, so ``graph_input=dimer`` can feed both graph and GEOM with the same
-    dimer molecule.
-    """
+    """Build the graph used by the default GIN backend."""
     structure = build_structure_for_input(smiles, graph_input)
-    data = mol_to_graph_data_obj_simple(structure["structure_mol"])
+    data = mol_to_graph_data_obj_simple(
+        structure["structure_mol"], backbone_info=structure.get("backbone_info")
+    )
     return annotate_structure_fields(data, structure, prefix="graph")

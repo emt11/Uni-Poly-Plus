@@ -1,11 +1,18 @@
 import os
 import sys
 import argparse
+import ast
+import json
 import warnings
 import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
 from sklearn.model_selection import train_test_split, KFold
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +68,140 @@ def format_attention_weights(modalities, attention_weights):
     )
 
 
+def parse_modalities_for_plot(value):
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    if pd.isna(value):
+        return None
+
+    raw_value = str(value).strip()
+    if not raw_value:
+        return None
+
+    for parser in (ast.literal_eval, json.loads):
+        try:
+            parsed = parser(raw_value)
+        except (ValueError, SyntaxError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, (list, tuple)):
+            return [str(item) for item in parsed]
+
+    return None
+
+
+def parse_attention_for_plot(value, modalities=None):
+    if pd.isna(value):
+        raise ValueError("Missing attention value.")
+
+    raw_value = str(value).strip()
+    if not raw_value:
+        raise ValueError("Empty attention value.")
+
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(raw_value)
+        except (ValueError, SyntaxError, json.JSONDecodeError):
+            continue
+
+        if isinstance(parsed, dict):
+            return {str(key): float(weight) for key, weight in parsed.items()}
+        if isinstance(parsed, (list, tuple)):
+            weights = np.asarray(parsed, dtype=float)
+            if weights.ndim == 2:
+                weights = weights.mean(axis=0)
+            if weights.ndim != 1:
+                raise ValueError(f"Unsupported attention array shape: {weights.shape}")
+            if modalities is None:
+                modalities = list(SUPPORTED_MODALITIES[:len(weights)])
+            if len(modalities) != len(weights):
+                raise ValueError(
+                    f"Modalities length ({len(modalities)}) does not match attention length "
+                    f"({len(weights)})."
+                )
+            return {modality: float(weight) for modality, weight in zip(modalities, weights)}
+
+    if ":" in raw_value:
+        parsed = {}
+        for item in raw_value.split(";"):
+            item = item.strip()
+            if not item:
+                continue
+            name, raw_weight = item.split(":", 1)
+            parsed[name.strip()] = float(raw_weight.strip())
+        return parsed
+
+    raise ValueError(f"Could not parse attention value: {raw_value}")
+
+
+def build_attention_matrix(results_df):
+    attention_column = "attention" if "attention" in results_df.columns else "attention_weights"
+    if attention_column not in results_df.columns:
+        raise ValueError("Results CSV must contain an 'attention' or 'attention_weights' column.")
+    if "task" not in results_df.columns:
+        raise ValueError("Results CSV must contain a 'task' column.")
+
+    rows = []
+    modality_order = []
+    for _, row in results_df.iterrows():
+        modalities = parse_modalities_for_plot(row.get("model_modality_list"))
+        attention = parse_attention_for_plot(row[attention_column], modalities=modalities)
+        rows.append((row["task"], attention))
+        for modality in attention:
+            if modality not in modality_order:
+                modality_order.append(modality)
+
+    matrix = pd.DataFrame(
+        [
+            [attention.get(modality, np.nan) for modality in modality_order]
+            for _, attention in rows
+        ],
+        index=[task for task, _ in rows],
+        columns=modality_order,
+    )
+    matrix.index.name = "task"
+    return matrix
+
+
+def default_attention_heatmap_path(results_csv_path):
+    results_path = Path(results_csv_path)
+    return results_path.with_name(f"{results_path.stem}_attention_heatmap.png")
+
+
+def plot_attention_heatmap_from_results(results_csv_path, output_path=None):
+    results_csv_path = Path(results_csv_path)
+    if output_path is None:
+        output_path = default_attention_heatmap_path(results_csv_path)
+    else:
+        output_path = Path(output_path)
+
+    results_df = pd.read_csv(results_csv_path)
+    matrix = build_attention_matrix(results_df)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    height = max(4.0, 0.45 * len(matrix.index) + 1.5)
+    width = max(5.0, 0.9 * len(matrix.columns) + 2.0)
+    plt.figure(figsize=(width, height))
+    sns.set_theme(style="white", font_scale=0.95)
+    ax = sns.heatmap(
+        matrix,
+        cmap="YlOrRd",
+        vmin=0.0,
+        vmax=1.0,
+        linewidths=0.5,
+        linecolor="white",
+        annot=True,
+        fmt=".2f",
+        cbar_kws={"label": "5-fold mean attention"},
+    )
+    ax.set_xlabel("modalities")
+    ax.set_ylabel("task")
+    ax.set_title("Attention Pooling Weights")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    return output_path
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Train UniEncoderAttention Model")
     parser.add_argument(
@@ -92,9 +233,9 @@ def parse_arguments():
     parser.add_argument(
         '--graph_input',
         type=str,
-        choices=['repeat_unit', 'dimer'],
-        default='repeat_unit',
-        help="Graph input type. 'repeat_unit' keeps the original graph; 'dimer' uses a legal two-repeat-unit graph when possible and falls back to repeat_unit."
+        choices=['repeat_unit', 'star_linking'],
+        default='star_linking',
+        help="Graph input type. 'repeat_unit' keeps the original graph; 'star_linking' removes two attachment atoms and connects their boundary atoms for graph-only topology input."
     )
     parser.add_argument(
         '--geom_model_name',
@@ -150,6 +291,31 @@ def parse_arguments():
         help="Maximum gradient norm for gradient clipping."
     )
     parser.add_argument(
+        '--graph_num_layers',
+        type=int,
+        default=6,
+        help="Number of GIN/GINE graph layers."
+    )
+    parser.add_argument(
+        '--graph_emb_dim',
+        type=int,
+        default=256,
+        help="Hidden dimension for GIN/GINE graph encoder."
+    )
+    parser.add_argument(
+        '--graph_dropout',
+        type=float,
+        default=0.1,
+        help="Dropout ratio for GIN/GINE graph encoder."
+    )
+    parser.add_argument(
+        '--graph_pooling',
+        type=str,
+        choices=['sum', 'mean', 'max', 'attention', 'set2set', 'set2set1', 'set2set2'],
+        default='attention',
+        help="Graph-level pooling for GIN/GINE encoder."
+    )
+    parser.add_argument(
         '--joint_embedding_dim',
         type=int,
         default=256,
@@ -182,6 +348,17 @@ def parse_arguments():
         type=int,
         default=256,
         help="Cap for auto-computed max SMILES token length (default: 256)."
+    )
+    parser.add_argument(
+        '--attention_heatmap_path',
+        type=str,
+        default=None,
+        help="Optional output path for attention heatmap. Defaults to <results_dir stem>_attention_heatmap.png."
+    )
+    parser.add_argument(
+        '--disable_attention_heatmap',
+        action='store_true',
+        help="Disable automatic attention heatmap generation after writing training results."
     )
     return parser.parse_args()
 
@@ -271,6 +448,10 @@ def main():
                 modality_list=model_modality_list,
                 freeze_encoder=freeze_encoder,
                 geometry_encoder=args.geometry_encoder,
+                graph_num_layers=args.graph_num_layers,
+                graph_emb_dim=args.graph_emb_dim,
+                graph_dropout=args.graph_dropout,
+                graph_pooling=args.graph_pooling,
             )
 
             if pretrained_model_path:
@@ -351,6 +532,17 @@ def main():
         )
         result_file_initialized = True
         print(f"Results have been appended to '{result_output_dir}'.")
+
+
+    if not args.disable_attention_heatmap and result_file_initialized:
+        try:
+            heatmap_path = plot_attention_heatmap_from_results(
+                result_output_dir,
+                output_path=args.attention_heatmap_path,
+            )
+            print(f"Attention heatmap saved to '{heatmap_path}'.")
+        except Exception as exc:
+            print(f"Warning: failed to generate attention heatmap: {exc}")
 
 
 if __name__ == "__main__":

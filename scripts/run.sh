@@ -4,14 +4,17 @@ set -euo pipefail
 export PYTHONPATH=$(pwd)
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 
-LOG_FILE="./logs/pretrain_starlink_schnet_multistage_all.log"
+LOG_FILE="./logs/run_starlink_schnet_multistage.log"
 GRAPH_GEOM_PRETRAIN_PATH="./pretrained_models/saved_pretrained_model_starlink_schnet_graph_geom_all.pth"
 ALIGN_PRETRAIN_PATH="./pretrained_models/saved_pretrained_model_starlink_schnet_alignment_all.pth"
+RESULT_PATH="./results/results_starlink_schnet_multistage_all.csv"
+MODEL_DIR="./saved_models_starlink_schnet_multistage"
 
 GRAPH_GEOM_EPOCHS=${GRAPH_GEOM_EPOCHS:-20}
 ALIGN_EPOCHS=${ALIGN_EPOCHS:-10}
+TRAIN_EPOCHS=${TRAIN_EPOCHS:-100}
 
-mkdir -p logs pretrained_models
+mkdir -p logs pretrained_models results "$MODEL_DIR"
 : > "$LOG_FILE"
 
 run_stage() {
@@ -39,7 +42,7 @@ COMMON_PRETRAIN_ARGS=(
     --graph_mask_ratio 0.15
 )
 
-run_stage "Stage 1/2 Graph + Geom 单模态预训练" \
+run_stage "Stage 1/3 Graph + Geom 单模态预训练：star-linking/backbone + schnet denoising" \
     python scripts/pretrain.py \
         "${COMMON_PRETRAIN_ARGS[@]}" \
         --pretrain_stage graph_geom \
@@ -50,7 +53,7 @@ run_stage "Stage 1/2 Graph + Geom 单模态预训练" \
         --rebuild_feature_cache \
         --save_path "$GRAPH_GEOM_PRETRAIN_PATH"
 
-run_stage "Stage 2/2 多模态对齐预训练" \
+run_stage "Stage 2/3 多模态对齐预训练：加载 Graph/Geom 权重后进行 contrastive alignment" \
     python scripts/pretrain.py \
         "${COMMON_PRETRAIN_ARGS[@]}" \
         --pretrain_stage alignment \
@@ -61,5 +64,23 @@ run_stage "Stage 2/2 多模态对齐预训练" \
         --graph_starlink_consistency_weight 0.1 \
         --save_path "$ALIGN_PRETRAIN_PATH"
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 多阶段预训练完成。最终权重：$ALIGN_PRETRAIN_PATH" | tee -a "$LOG_FILE"
-echo "日志：$LOG_FILE"
+run_stage "Stage 3/3 下游 5-fold 监督训练：加载 alignment 权重" \
+    python scripts/train.py \
+        --modalities smiles graph fp geom \
+        --geometry_encoder schnet \
+        --geom_model_name "" \
+        --graph_input star_linking \
+        --tasks eat eea egb egc ei eps nc tg xc \
+        --pretrained_model_path "$ALIGN_PRETRAIN_PATH" \
+        --graph_num_layers 6 \
+        --graph_emb_dim 256 \
+        --graph_dropout 0.1 \
+        --graph_pooling attention \
+        --joint_embedding_dim 256 \
+        --epochs "$TRAIN_EPOCHS" \
+        --patience 10 \
+        --results_dir "$RESULT_PATH" \
+        --models_dir "$MODEL_DIR"
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Star-linking + Backbone / SchNet 多阶段流程完成。结果：$RESULT_PATH" | tee -a "$LOG_FILE"
+echo "总日志：$LOG_FILE"
