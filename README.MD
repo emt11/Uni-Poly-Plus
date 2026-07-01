@@ -46,8 +46,10 @@ data/raw/smi_<task>.csv
 当前下游任务集合：
 
 ```text
-eat eea egb egc ei eps nc tg xc
+eat eea egb egc ei eps nc xc
 ```
+
+当前 `data/raw/smi_all.csv` 是 no-`tg` 版本，由上述 8 个单任务 CSV 合并生成，不包含 `prop=tg`。`data/raw/smi_tg.csv` 保留在仓库中，但不进入当前主线预训练、缓存构建和下游任务列表。若需要恢复 9-task 实验，需要重新生成包含 `tg` 的 `smi_all.csv`，并同步修改脚本中的 `--tasks` 和输出路径。
 
 ## 3. 支持模态
 
@@ -100,12 +102,12 @@ Stage 3: 下游 5-fold supervised training
 默认输出：
 
 ```text
-logs/run_starlink_schnet_multistage.log
+logs/run_starlink_schnet_multistage_8tasks.log
 pretrained_models/saved_pretrained_model_starlink_schnet_graph_geom_all.pth
 pretrained_models/saved_pretrained_model_starlink_schnet_alignment_all.pth
-results/results_starlink_schnet_multistage_all.csv
-results/results_starlink_schnet_multistage_all_attention_heatmap.png
-saved_models_starlink_schnet_multistage/
+results/results_starlink_schnet_multistage_8tasks.csv
+results/results_starlink_schnet_multistage_8tasks_attention_heatmap.png
+saved_models_starlink_schnet_multistage_8tasks/
 ```
 
 可以通过环境变量临时调整 epoch：
@@ -240,7 +242,7 @@ logs/
 pretrained_models/
 results/
 results/*_attention_heatmap.png
-saved_models_starlink_schnet_multistage/
+saved_models_starlink_schnet_multistage_8tasks/
 plots/pretrain/
 data/processed/Schnet/
 ```
@@ -248,7 +250,7 @@ data/processed/Schnet/
 常用查看命令：
 
 ```bash
-tail -f logs/run_starlink_schnet_multistage.log
+tail -f logs/run_starlink_schnet_multistage_8tasks.log
 ```
 
 ## 9. 源码目录
@@ -268,6 +270,7 @@ scripts/           预训练、下游训练、绘图和运行脚本
 - [MCMPP_CrossAttention.MD](MCMPP_CrossAttention.MD)：MCMPP 多模态 cross-attention 论文分析。
 - [MFBERT_FGNN.MD](MFBERT_FGNN.MD)：MFBERT + FGNN 论文分析。
 - [EDCL.MD](EDCL.MD)：Energy-Guided Denoising Contrastive Learning 论文分析。
+- [Galformer.MD](Galformer.MD)：Geometry-Aware Line Graph Transformer 论文分析。
 
 ## 11. 维护约束
 

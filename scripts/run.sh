@@ -4,11 +4,11 @@ set -euo pipefail
 export PYTHONPATH=$(pwd)
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 
-LOG_FILE="./logs/run_starlink_schnet_multistage.log"
+LOG_FILE="./logs/run_starlink_schnet_multistage_8tasks.log"
 GRAPH_GEOM_PRETRAIN_PATH="./pretrained_models/saved_pretrained_model_starlink_schnet_graph_geom_all.pth"
 ALIGN_PRETRAIN_PATH="./pretrained_models/saved_pretrained_model_starlink_schnet_alignment_all.pth"
-RESULT_PATH="./results/results_starlink_schnet_multistage_all.csv"
-MODEL_DIR="./saved_models_starlink_schnet_multistage"
+RESULT_PATH="./results/results_starlink_schnet_multistage_8tasks.csv"
+MODEL_DIR="./saved_models_starlink_schnet_multistage_8tasks"
 
 GRAPH_GEOM_EPOCHS=${GRAPH_GEOM_EPOCHS:-20}
 ALIGN_EPOCHS=${ALIGN_EPOCHS:-10}
@@ -70,7 +70,7 @@ run_stage "Stage 3/3 下游 5-fold 监督训练：加载 alignment 权重" \
         --geometry_encoder schnet \
         --geom_model_name "" \
         --graph_input star_linking \
-        --tasks eat eea egb egc ei eps nc tg xc \
+        --tasks eat eea egb egc ei eps nc xc \
         --pretrained_model_path "$ALIGN_PRETRAIN_PATH" \
         --graph_num_layers 6 \
         --graph_emb_dim 256 \

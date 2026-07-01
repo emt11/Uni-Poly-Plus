@@ -207,8 +207,8 @@ def parse_arguments():
     parser.add_argument(
         '--tasks',
         nargs='+',
-        default=['tg', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc', 'eat'],
-        help="List of tasks to train on. Example: --tasks tg er de"
+        default=['eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc'],
+        help="List of tasks to train on. Default excludes tg: eat eea egb egc ei eps nc xc"
     )
     parser.add_argument(
         '--model_name',

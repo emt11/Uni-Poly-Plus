@@ -51,8 +51,10 @@ data/raw/smi_<task>.csv
 当前下游任务集合：
 
 ```text
-eat eea egb egc ei eps nc tg xc
+eat eea egb egc ei eps nc xc
 ```
+
+当前 `data/raw/smi_all.csv` 是 no-`tg` 主线数据，由 8 个单任务 CSV 合并生成，不包含 `prop=tg`。`data/raw/smi_tg.csv` 保留但不参与当前预训练、缓存构建或下游训练。恢复 9-task 时必须重新生成包含 `tg` 的 `smi_all.csv`，并同步修改脚本 `--tasks`、结果文件名和模型目录。
 
 数据约束：
 
@@ -385,9 +387,9 @@ python scripts/train.py
 输出：
 
 ```text
-results/results_starlink_schnet_multistage_all.csv
-results/results_starlink_schnet_multistage_all_attention_heatmap.png
-saved_models_starlink_schnet_multistage/<task>/UniEncoderAttention_best.pth
+results/results_starlink_schnet_multistage_8tasks.csv
+results/results_starlink_schnet_multistage_8tasks_attention_heatmap.png
+saved_models_starlink_schnet_multistage_8tasks/<task>/UniEncoderAttention_best.pth
 ```
 
 ### 9.1 Attention 可视化
@@ -492,12 +494,12 @@ python scripts/train.py \
   --modalities smiles graph fp geom \
   --geometry_encoder schnet \
   --graph_input star_linking \
-  --tasks eat eea egb egc ei eps nc tg xc \
+  --tasks eat eea egb egc ei eps nc xc \
   --pretrained_model_path ./pretrained_models/saved_pretrained_model_starlink_schnet_alignment_all.pth \
   --epochs 100 \
   --patience 10 \
-  --results_dir ./results/results_starlink_schnet_multistage_all.csv \
-  --models_dir ./saved_models_starlink_schnet_multistage
+  --results_dir ./results/results_starlink_schnet_multistage_8tasks.csv \
+  --models_dir ./saved_models_starlink_schnet_multistage_8tasks
 ```
 
 ## 11. 输出文件
@@ -512,15 +514,15 @@ pretrained_models/saved_pretrained_model_starlink_schnet_alignment_all.pth
 训练结果：
 
 ```text
-results/results_starlink_schnet_multistage_all.csv
-results/results_starlink_schnet_multistage_all_attention_heatmap.png
-saved_models_starlink_schnet_multistage/
+results/results_starlink_schnet_multistage_8tasks.csv
+results/results_starlink_schnet_multistage_8tasks_attention_heatmap.png
+saved_models_starlink_schnet_multistage_8tasks/
 ```
 
 日志：
 
 ```text
-logs/run_starlink_schnet_multistage.log
+logs/run_starlink_schnet_multistage_8tasks.log
 logs/pretrain_starlink_schnet_multistage_all.log
 ```
 
