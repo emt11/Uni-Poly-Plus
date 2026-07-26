@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree, softmax
-from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool, GlobalAttention, Set2Set
+from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool, GlobalAttention, Set2Set, GraphNorm
 import torch.nn.functional as F
 from torch_scatter import scatter_add
 from torch_geometric.nn.inits import glorot, zeros
@@ -89,11 +89,13 @@ class GNN(torch.nn.Module):
     Output:
         Node representations.
     """
-    def __init__(self, num_layer, emb_dim, JK="last", drop_ratio=0, gnn_type="gin"):
+    def __init__(self, num_layer, emb_dim, JK="last", drop_ratio=0, gnn_type="gin", norm_type="batch", residual=False):
         super(GNN, self).__init__()
         self.num_layer = num_layer
         self.drop_ratio = drop_ratio
         self.JK = JK
+        self.norm_type = str(norm_type)
+        self.residual = bool(residual)
 
         if self.num_layer < 2:
             raise ValueError("Number of GNN layers must be greater than 1.")
@@ -107,17 +109,28 @@ class GNN(torch.nn.Module):
         for layer in range(num_layer):
             self.gnns.append(GINConv(emb_dim, emb_dim, aggr="add"))
 
-        # List of batch norms
         self.batch_norms = torch.nn.ModuleList()
         for layer in range(num_layer):
-            self.batch_norms.append(torch.nn.BatchNorm1d(emb_dim))
+            if self.norm_type == "batch":
+                self.batch_norms.append(torch.nn.BatchNorm1d(emb_dim))
+            elif self.norm_type == "graph":
+                self.batch_norms.append(GraphNorm(emb_dim))
+            elif self.norm_type == "layer":
+                self.batch_norms.append(torch.nn.LayerNorm(emb_dim))
+            else:
+                raise ValueError("norm_type must be 'batch', 'graph', or 'layer'")
+        self.jk_projection = torch.nn.Linear((num_layer + 1) * emb_dim, emb_dim) if JK == "concat" else None
 
     def forward(self, *argv):
-        if len(argv) == 3:
+        if len(argv) == 4:
+            x, edge_index, edge_attr, batch = argv[0], argv[1], argv[2], argv[3]
+        elif len(argv) == 3:
             x, edge_index, edge_attr = argv[0], argv[1], argv[2]
+            batch = None
         elif len(argv) == 1:
             data = argv[0]
             x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
+            batch = getattr(data, "batch", None)
         else:
             raise ValueError("Unmatched number of arguments.")
 
@@ -131,17 +144,22 @@ class GNN(torch.nn.Module):
         h_list = [x]
         for layer in range(self.num_layer):
             h = self.gnns[layer](h_list[layer], edge_index, edge_attr)
-            h = self.batch_norms[layer](h)
+            if self.norm_type == "graph":
+                h = self.batch_norms[layer](h, batch)
+            else:
+                h = self.batch_norms[layer](h)
             if layer == self.num_layer - 1:
                 # Remove ReLU for the last layer
                 h = F.dropout(h, self.drop_ratio, training=self.training)
             else:
                 h = F.dropout(F.relu(h), self.drop_ratio, training=self.training)
+            if self.residual and h.shape == h_list[layer].shape:
+                h = h + h_list[layer]
             h_list.append(h)
 
         # Different implementations of Jumping Knowledge (JK)
         if self.JK == "concat":
-            node_representation = torch.cat(h_list, dim=1)
+            node_representation = self.jk_projection(torch.cat(h_list, dim=1))
         elif self.JK == "last":
             node_representation = h_list[-1]
         elif self.JK == "max":
@@ -264,7 +282,7 @@ class GNN_graphpred(torch.nn.Module):
         https://arxiv.org/abs/1810.00826
         JK-net: https://arxiv.org/abs/1806.03536
     """
-    def __init__(self, num_layer, emb_dim, num_tasks, JK="last", drop_ratio=0, graph_pooling="mean", gnn_type="gin"):
+    def __init__(self, num_layer, emb_dim, num_tasks, JK="last", drop_ratio=0, graph_pooling="mean", gnn_type="gin", norm_type="batch", residual=False):
         super(GNN_graphpred, self).__init__()
         self.num_layer = num_layer
         self.drop_ratio = drop_ratio
@@ -275,7 +293,7 @@ class GNN_graphpred(torch.nn.Module):
         if self.num_layer < 2:
             raise ValueError("Number of GNN layers must be greater than 1.")
 
-        self.gnn = GNN(num_layer, emb_dim, JK, drop_ratio, gnn_type=gnn_type)
+        self.gnn = GNN(num_layer, emb_dim, JK, drop_ratio, gnn_type=gnn_type, norm_type=norm_type, residual=residual)
 
         # Different kinds of graph pooling
         if graph_pooling == "sum":
@@ -285,26 +303,17 @@ class GNN_graphpred(torch.nn.Module):
         elif graph_pooling == "max":
             self.pool = global_max_pool
         elif graph_pooling == "attention":
-            if self.JK == "concat":
-                self.pool = GlobalAttention(gate_nn=torch.nn.Linear((self.num_layer + 1) * emb_dim, 1))
-            else:
-                self.pool = GlobalAttention(gate_nn=torch.nn.Linear(emb_dim, 1))
+            self.pool = GlobalAttention(gate_nn=torch.nn.Linear(emb_dim, 1))
         elif graph_pooling.startswith("set2set"):
             set2set_iter = int(graph_pooling[len("set2set"):]) if graph_pooling[len("set2set"):].isdigit() else 1
-            if self.JK == "concat":
-                self.pool = Set2Set((self.num_layer + 1) * emb_dim, set2set_iter)
-            else:
-                self.pool = Set2Set(emb_dim, set2set_iter)
+            self.pool = Set2Set(emb_dim, set2set_iter)
         else:
             raise ValueError("Invalid graph pooling type.")
 
         # For graph-level binary classification
         self.mult = 2 if graph_pooling.startswith("set2set") else 1
         
-        if self.JK == "concat":
-            self.graph_pred_linear = torch.nn.Linear(self.mult * (self.num_layer + 1) * self.emb_dim, self.num_tasks)
-        else:
-            self.graph_pred_linear = torch.nn.Linear(self.mult * self.emb_dim, self.num_tasks)
+        self.graph_pred_linear = torch.nn.Linear(self.mult * self.emb_dim, self.num_tasks)
 
     def from_pretrained(self, model_file):
         self.gnn.load_state_dict(torch.load(model_file), strict=False)
@@ -318,7 +327,6 @@ class GNN_graphpred(torch.nn.Module):
         else:
             raise ValueError("Unmatched number of arguments.")
 
-        node_representation = self.gnn(x, edge_index, edge_attr)
+        node_representation = self.gnn(x, edge_index, edge_attr, batch)
         return self.pool(node_representation, batch), node_representation
-
 

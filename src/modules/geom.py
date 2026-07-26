@@ -1,7 +1,6 @@
 import torch
 import os
 import math
-from torch_geometric.nn.models import SchNet
 from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool, radius_graph
 try:
     from torch_geometric.utils import scatter
@@ -37,124 +36,6 @@ def _unpack_geometry_input(data_or_z, pos: Optional[Tensor] = None, batch: Optio
 
     batch = torch.zeros_like(z) if batch is None else batch
     return z.long(), pos.float(), batch.long()
-
-
-class SchNetEncoder(SchNet):
-    """
-    Encoder version of SchNet that outputs high-dimensional graph representations instead of scalar values.
-    """
-    def __init__(
-        self,
-        hidden_channels: int = 128,
-        num_filters: int = 128,
-        num_interactions: int = 6,
-        num_gaussians: int = 50,
-        cutoff: float = 10.0,
-        interaction_graph: Optional[Callable] = None,
-        max_num_neighbors: int = 32,
-        readout: str = 'mean',
-        dipole: bool = False,
-        mean: Optional[float] = None,
-        std: Optional[float] = None,
-        atomref: Optional[Tensor] = None,
-        load_from_pretrain: Optional[str] = '../pretrained_models/encoders/schnet_qm9_model.pt',
-    ):
-        super().__init__(
-            hidden_channels=hidden_channels,
-            num_filters=num_filters,
-            num_interactions=num_interactions,
-            num_gaussians=num_gaussians,
-            cutoff=cutoff,
-            interaction_graph=interaction_graph,
-            max_num_neighbors=max_num_neighbors,
-            readout=readout,
-            dipole=dipole,
-            mean=mean,
-            std=std,
-            atomref=atomref,
-        )
-
-        # Remove regression output layers
-        # self.lin1 = Linear(hidden_channels, hidden_channels // 2)
-        # self.act = ShiftedSoftplus()
-        # self.lin2 = Linear(hidden_channels // 2, 1)
-
-        if load_from_pretrain is not None:
-            self.load_pretrained_weights(load_from_pretrain)
-
-    def load_pretrained_weights(self, pretrain_path: str):
-        """
-        Load weights from pretrained model path.
-
-        Args:
-            pretrain_path (str): File path to pretrained model.
-        """
-        if not os.path.exists(pretrain_path):
-            raise FileNotFoundError(f"Pretrained model file not found: {pretrain_path}")
-
-        # Load pretrained weights
-        state_dict = torch.load(pretrain_path, map_location='cpu')
-        self.load_state_dict(state_dict, strict=False)
-
-
-    def encode_nodes(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None):
-        z, pos, batch = _unpack_geometry_input(z, pos, batch)
-        h = self.embedding(z)
-        edge_index, edge_weight = self.interaction_graph(pos, batch)
-        edge_attr = self.distance_expansion(edge_weight)
-        for interaction in self.interactions:
-            h = h + interaction(h, edge_index, edge_weight, edge_attr)
-        return h, batch
-
-    def forward(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None) -> Tensor:
-        """
-        Forward pass, returns graph-level high-dimensional representations.
-
-        Args:
-            z (torch.Tensor): Atomic numbers for each atom, shape [num_atoms].
-            pos (torch.Tensor): Coordinates for each atom, shape [num_atoms, 3].
-            batch (torch.Tensor, optional): Batch indices, shape [num_atoms]. Defaults to None.
-
-        Returns:
-            torch.Tensor: Graph-level embeddings, shape [num_graphs, hidden_channels].
-        """
-        z, pos, batch = _unpack_geometry_input(z, pos, batch)
-        h, batch = self.encode_nodes(z, pos, batch)
-
-        # h = self.lin1(h)
-        # h = self.act(h)
-        # h = self.lin2(h)
-
-        if self.dipole:
-            # Calculate center of mass
-            mass = self.atomic_mass[z].view(-1, 1)
-            M = self.sum_aggr(mass, batch, dim=0)
-            c = self.sum_aggr(mass * pos, batch, dim=0) / M
-            h = h * (pos - c.index_select(0, batch))
-
-        if not self.dipole and self.mean is not None and self.std is not None:
-            h = h * self.std + self.mean
-
-        if not self.dipole and self.atomref is not None:
-            h = h + self.atomref(z)
-
-        # Use readout to generate graph-level embeddings
-        graph_embedding = self.readout(h, batch, dim=0)
-        # if self.dipole:
-        #     out = torch.norm(out, dim=-1, keepdim=True)
-
-        # if self.scale is not None:
-        #     out = self.scale * out
-
-        return graph_embedding
-
-    def __repr__(self) -> str:
-        return (f'{self.__class__.__name__}('
-                f'hidden_channels={self.hidden_channels}, '
-                f'num_filters={self.num_filters}, '
-                f'num_interactions={self.num_interactions}, '
-                f'num_gaussians={self.num_gaussians}, '
-                f'cutoff={self.cutoff})')
 
 
 class GaussianRBF(nn.Module):
@@ -249,7 +130,7 @@ class PaiNNEncoder(nn.Module):
     """
     PaiNN geometry encoder with scalar and vector features.
 
-    The public output matches SchNetEncoder: graph-level embeddings with shape
+    The public output is graph-level embeddings with shape
     [num_graphs, hidden_channels].
     """
     def __init__(
@@ -316,9 +197,12 @@ class PaiNNEncoder(nn.Module):
             f"skipped {skipped} incompatible weights."
         )
 
-    def _edge_features(self, pos: Tensor, batch: Tensor):
+    def _edge_features(self, pos: Tensor, batch: Tensor, cell: Optional[Tensor] = None, pbc: Optional[Tensor] = None):
         if not torch.isfinite(pos).all():
             raise ValueError("PaiNNEncoder received non-finite coordinates.")
+
+        if cell is not None and pbc is not None:
+            return self._periodic_edge_features(pos, batch, cell, pbc)
 
         edge_index = radius_graph(
             pos,
@@ -332,6 +216,99 @@ class PaiNNEncoder(nn.Module):
 
         row, col = edge_index
         edge_vec = pos[row] - pos[col]
+        return self._finalize_edge_features(edge_index, edge_vec, pos)
+
+    def _periodic_edge_features(self, pos: Tensor, batch: Tensor, cell: Tensor, pbc: Tensor):
+        if cell.dim() == 2:
+            cell = cell.unsqueeze(0)
+        if pbc.dim() == 1:
+            pbc = pbc.unsqueeze(0)
+
+        edge_chunks = []
+        edge_vec_chunks = []
+        unique_batches = torch.unique(batch, sorted=True)
+        for graph_id in unique_batches.tolist():
+            graph_mask = batch == graph_id
+            node_idx = torch.nonzero(graph_mask, as_tuple=False).view(-1)
+            if node_idx.numel() == 0:
+                continue
+
+            graph_pos = pos[node_idx]
+            graph_cell = cell[int(graph_id)]
+            graph_pbc = pbc[int(graph_id)]
+            active_axes = torch.nonzero(graph_pbc.bool(), as_tuple=False).flatten()
+            if active_axes.numel() != 1:
+                edge_index = radius_graph(
+                    graph_pos,
+                    r=self.cutoff,
+                    batch=graph_pos.new_zeros(graph_pos.size(0), dtype=torch.long),
+                    loop=False,
+                    max_num_neighbors=self.max_num_neighbors,
+                )
+                if edge_index.numel() > 0:
+                    row, col = edge_index
+                    edge_chunks.append(torch.stack([node_idx[row], node_idx[col]], dim=0))
+                    edge_vec_chunks.append(graph_pos[row] - graph_pos[col])
+                continue
+
+            graph_edges, graph_vecs = self._periodic_graph_edges(
+                node_idx, graph_pos, graph_cell[int(active_axes[0].item())]
+            )
+            if graph_edges.numel() > 0:
+                edge_chunks.append(graph_edges)
+                edge_vec_chunks.append(graph_vecs)
+
+        if not edge_chunks:
+            return pos.new_empty((2, 0), dtype=torch.long), pos.new_empty((0, self.num_rbf)), pos.new_empty((0, 3))
+
+        edge_index = torch.cat(edge_chunks, dim=1)
+        edge_vec = torch.cat(edge_vec_chunks, dim=0)
+        return self._finalize_edge_features(edge_index, edge_vec, pos)
+
+    def _periodic_graph_edges(self, node_idx: Tensor, graph_pos: Tensor, vector_t: Tensor):
+        rows = []
+        cols = []
+        vecs = []
+        n_nodes = graph_pos.size(0)
+        shifts = (-1.0, 0.0, 1.0)
+        for local_row in range(n_nodes):
+            candidate_cols = []
+            candidate_vecs = []
+            candidate_dists = []
+            target_pos = graph_pos[local_row]
+            for shift in shifts:
+                shifted_pos = graph_pos + vector_t.view(1, 3) * shift
+                edge_vec = target_pos.view(1, 3) - shifted_pos
+                edge_dist = torch.linalg.vector_norm(edge_vec, dim=-1)
+                valid = edge_dist < self.cutoff
+                if shift == 0.0:
+                    valid[local_row] = False
+                valid = valid & (edge_dist > self.eps)
+                if valid.any():
+                    local_cols = torch.nonzero(valid, as_tuple=False).view(-1)
+                    candidate_cols.append(local_cols)
+                    candidate_vecs.append(edge_vec[local_cols])
+                    candidate_dists.append(edge_dist[local_cols])
+            if not candidate_cols:
+                continue
+            local_cols = torch.cat(candidate_cols, dim=0)
+            local_vecs = torch.cat(candidate_vecs, dim=0)
+            local_dists = torch.cat(candidate_dists, dim=0)
+            if local_cols.numel() > self.max_num_neighbors:
+                keep = torch.argsort(local_dists)[:self.max_num_neighbors]
+                local_cols = local_cols[keep]
+                local_vecs = local_vecs[keep]
+            rows.append(node_idx[local_row].repeat(local_cols.numel()))
+            cols.append(node_idx[local_cols])
+            vecs.append(local_vecs)
+
+        if not rows:
+            return graph_pos.new_empty((2, 0), dtype=torch.long), graph_pos.new_empty((0, 3))
+        return torch.stack([torch.cat(rows), torch.cat(cols)], dim=0), torch.cat(vecs, dim=0)
+
+    def _finalize_edge_features(self, edge_index: Tensor, edge_vec: Tensor, pos: Tensor):
+        if edge_index.numel() == 0:
+            return edge_index, pos.new_empty((0, self.num_rbf)), pos.new_empty((0, 3))
         edge_dist = torch.norm(edge_vec, dim=-1)
         valid_edge_mask = edge_dist > self.eps
         edge_index = edge_index[:, valid_edge_mask]
@@ -352,12 +329,15 @@ class PaiNNEncoder(nn.Module):
         return s, v
 
     def encode_nodes(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None):
+        data = z if pos is None and not torch.is_tensor(z) else None
         z, pos, batch = _unpack_geometry_input(z, pos, batch)
+        cell = getattr(data, 'cell', None) if data is not None else None
+        pbc = getattr(data, 'pbc', None) if data is not None else None
 
         s = self.embedding(z)
         v = torch.zeros(s.size(0), 3, self.hidden_channels, device=s.device, dtype=s.dtype)
 
-        edge_index, edge_rbf, edge_unit = self._edge_features(pos, batch)
+        edge_index, edge_rbf, edge_unit = self._edge_features(pos, batch, cell=cell, pbc=pbc)
         if edge_index.numel() > 0:
             for interaction, mixing, norm in zip(self.interactions, self.mixing, self.scalar_norms):
                 s, v = interaction(s, v, edge_index, edge_rbf, edge_unit)
@@ -370,9 +350,15 @@ class PaiNNEncoder(nn.Module):
         return s, batch
 
     def forward(self, z: Tensor, pos: Optional[Tensor] = None, batch: Optional[Tensor] = None) -> Tensor:
+        data = z if pos is None and not torch.is_tensor(z) else None
         s, batch = self.encode_nodes(z, pos, batch)
         if not torch.isfinite(s).all():
             raise ValueError("PaiNNEncoder produced non-finite node features.")
+        pool_mask = getattr(data, 'geom_pool_mask', None) if data is not None else None
+        if pool_mask is not None:
+            pool_mask = pool_mask.bool()
+            s = s[pool_mask]
+            batch = batch[pool_mask]
         graph_embedding = self.readout(s, batch)
         return graph_embedding
 

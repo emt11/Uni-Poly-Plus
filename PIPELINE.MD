@@ -1,553 +1,325 @@
-# PIPELINE.MD
+# Uni-Poly-Plus 当前流程
 
-本文档是当前 Uni-Poly-Plus 项目的整体流程维护文档。任何涉及数据流、缓存、Graph/Geom 构造、预训练、训练脚本、输出路径或模型模态的改动，都必须同步更新本文档。
+本文档只描述当前可运行实现。实验入口和参数真源为 `scripts/run.sh`；旧 SCAGE、
+screw、descriptor 和调参历史保留在源码、Git 历史或 `Z-Paper/`，不再混入主流程。
 
-## 1. 总体目标
+## 1. 任务与路线
 
-当前项目用于聚合物性质预测，主线是四模态学习：
-
-```text
-SMILES + Graph + FP + Geom -> UniEncoderAttention -> property prediction
-```
-
-当前推荐路线：
-
-```text
-data/raw/smi_all.csv
--> SMILES-level feature cache
--> Graph / FP / Geom feature cache
--> Graph + Geom 单模态预训练
--> 多模态 alignment 预训练
--> data/raw/smi_<task>.csv 下游 5-fold supervised training
--> results / saved_models
-```
-
-推荐完整入口：
-
-```bash
-bash scripts/run.sh
-```
-
-推荐只跑预训练入口：
-
-```bash
-bash scripts/run_pretrain.sh
-```
-
-## 2. 输入数据
-
-预训练数据：
-
-```text
-data/raw/smi_all.csv
-```
-
-下游任务数据：
-
-```text
-data/raw/smi_<task>.csv
-```
-
-当前下游任务集合：
+下游任务：
 
 ```text
 eat eea egb egc ei eps nc xc
 ```
 
-当前 `data/raw/smi_all.csv` 是 no-`tg` 主线数据，由 8 个单任务 CSV 合并生成，不包含 `prop=tg`。`data/raw/smi_tg.csv` 保留但不参与当前预训练、缓存构建或下游训练。恢复 9-task 时必须重新生成包含 `tg` 的 `smi_all.csv`，并同步修改脚本 `--tasks`、结果文件名和模型目录。
+当前支持：
 
-数据约束：
+| `BASELINE` | 模态 | Graph 分支 |
+|---|---|---|
+| `flat4` | SMILES + FP + Graph + Geom | GIN + PaiNN 历史基线 |
+| `scage_parallel` | SMILES + Graph + FP | sparse MIPS-PyG + PBC 距离，当前主线 |
 
-- `smi_all.csv` 用于预训练和全局缓存构建。
-- `smi_<task>.csv` 用于单任务 supervised training。
-- 下游训练使用 5-fold cross validation。
-- 当前训练逻辑中 `KFold(n_splits=5, shuffle=True, random_state=1)`，即随机打乱后划分 fold。
+`BASELINE=mips` 与 `BASELINE=scage_mips_ablation` 均已移除。底层
+`src/modules/mips_graph.py`、MIPS descriptor、构图、cache 和历史 checkpoint
+仍保留用于源码审计与历史结果复核，但不再构成可运行路线。
 
-## 3. Feature Cache
-
-当前项目使用 SMILES 级别 feature cache，避免预训练和每个下游任务重复处理同一个 SMILES。
-
-缓存默认目录：
+## 2. `scage_parallel` 数据流
 
 ```text
-data/processed/Schnet/
+P-SMILES
+├─ ChemBERTa SMILES encoder ──────────────────────────────┐
+├─ ECFP / MixFP encoder ──────────────────────────────────┤
+└─ PolyGen-inspired PBC optimizer                         │
+   └─ primitive m-RU cell                                 │
+      └─ alias-free repeated supercell                    │
+         └─ sparse 5-hop LGA + PBC distance               │
+            └─ MIPSPeriodicGraphEncoder ──────────────────┤
+                                                         │
+SMILES / Graph / FP -> availability-aware parallel attention
+                    -> regression head
 ```
 
-缓存包含：
+该路线不实例化 PaiNN，不使用 MIPS 的 137 维输入、MD200 或 AtomPair3D512，也不
+实例化旧 `SCAGEGraphEncoder`。旧 SCAGE 类保留为源码参考。
 
-- SMILES token。
-- Graph data。
-- Fingerprint。
-- Geom data。
-- 相关 metadata。
+固定入口配置：
 
-如果修改以下内容，必须重建缓存：
+```text
+graph_encoder_type = scage
+graph_input = star_linking
+geom_input = polygen_periodic
+fusion_type = parallel_attention
+Stage 1 modalities = graph
+Stage 2/3 modalities = smiles graph fp
+```
 
-- `graph_input`
-- Graph 节点特征或边特征维度
-- star-linking 逻辑
-- backbone / attachment 特征
-- Geom 构象生成逻辑
-- conformer 数量
-- SMILES token 长度
-- cache tag
+`scripts/pretrain.py` 和 `scripts/train.py` 会拒绝与新架构不一致的 SCAGE 参数。
 
-重建参数：
+## 3. PBC primitive cell
+
+输入 P-SMILES 必须有两个各自只连接一个邻居的 `*`。现有
+PolyGen-inspired optimizer 依次尝试：
+
+```text
+m_geom = 1, 2, 3, 4, 6
+R = I
+T = (0, 0, L_base)
+```
+
+它联合优化分数坐标和 `L_base`，约束单胞内与跨边界键长、键角、二面角及非键
+碰撞。`pbc_geometry_version=14` 保持不变。只有通过严格质量门的候选才设置
+`polygen_periodic_valid=True`。
+
+这一步的角度和二面角只属于构象优化约束，不输入 Graph encoder，也不作为当前
+Stage 1 学习目标。
+
+PBC 失败时，新 Graph 路线只保留二维周期拓扑。共享 dataloader 所需的坐标字段会
+写成零占位，`periodic_geometry_valid=False`，不得读取 finite-trimer 或普通 3D
+fallback 作为距离。
+
+## 4. MIPS periodic supercell
+
+局部图配置固定为：
+
+```text
+max_hops = 5
+d_thres = max_hops + 1 = 6
+required boundary distance > 2*d_thres - 1 = 11
+repeat factors = 1, 2, 4, 8, 16
+max_repeat_rounds = 5
+max_model_atoms = 384
+```
+
+PBC 成功时，从 optimizer 输出的 `m_geom`-RU primitive cell 开始倍增；失败时从
+一个 RU 的二维 motif 开始倍增。选择首个满足 boundary 条件的 factor `k`。
+
+有效 PBC 坐标不重新执行 ETKDG、MMFF/UFF、Adam 或 LBFGS，而是精确复制：
+
+```text
+r(i,q) = r_i + q(0,0,L_base)
+L_model = k * L_base
+model_cell_ru = k * m_geom
+```
+
+最终原子顺序为 RU0、RU1、……。节点化学字段来自一个重复单元模板并逐 RU 复制，
+避免周期切口产生 seam-specific 节点输入。`scage_backbone_role` 只区分
+backbone/non-backbone，不编码 attachment seam。
+
+末端周期边不作为普通 RDKit 环写入 molecule；它只在周期邻接表中携带 `+1/-1`
+image shift。
+
+若 5 轮或 384 atoms 内仍不满足条件：
+
+```text
+graph_available = False
+```
+
+该样本仍可使用 SMILES 和 FP，Graph 只保留 self-edge 占位且输出严格为零。
+
+## 5. Sparse LGA cache
+
+对每个 query atom，从 `(atom_id, image_shift)` 状态执行最多 5-hop BFS。attention
+edge 方向固定为 `source/key -> target/query`，并包含 self-edge。
+
+cache 核心字段：
+
+```text
+lga_edge_index             [2,E]
+lga_spd                    [E], 0..5
+lga_path_index             [E,6], padding=-1
+lga_path_mask              [E,6]
+lga_image_shift            [E], 仅离线距离与诊断
+lga_pbc_distance_confs     [C,E]
+lga_geometry_valid         [E]
+graph_available            [1]
+periodic_geometry_valid    [1]
+geometry_period_ru
+mips_repeat_factor
+model_cell_ru
+mips_boundary_distance
+mips_condition_valid
+mips_alias_free
+```
+
+构图硬检查 boundary condition、每个 query 的 image alias、路径长度及索引映射。
+collate 对 edge/path 的有效节点索引加 batch offset，`-1` padding 保持不变，并从
+同一个随机 conformer 同时选择坐标和 edge distance。该路线不再构建 dense
+`scage_spd/scage_path` batch。
+
+版本：
+
+```text
+feature schema = scage-mips-pbc-lga-v1
+periodic_lga_schema_version = 1
+pbc_geometry_version = 14
+```
+
+旧 SCAGE cache 不迁移，必须完整重建。
+
+## 6. Sparse Graph encoder
+
+实现：`src/modules/mips_periodic_graph.py`
+
+节点输入：
+
+```text
+9 categorical SCAGE fields
+mass
+van_der_waals_radius
+Gasteiger partial_charge
+binary backbone role
+```
+
+categorical index 0 可学习。没有 padding category、RU index、copy index、
+image-shift embedding、boundary/seam embedding、Graph Token 或 descriptor。
+
+固定结构：
+
+```text
+6 layers
+hidden dim 512
+8 heads
+FFN dim 2048
+dropout / attention dropout / activation dropout = 0.10
+pre-norm residual attention
+pre-norm residual GELU FFN
+readout = atom global mean
+```
+
+每条 sparse edge 的 attention logit：
+
+```text
+q_i·k_j / sqrt(head_dim)
++ SPD head embedding
++ path-node head bias
++ geometry_valid * 64-RBF(PBC Euclidean distance) projection
+```
+
+SPD 和 distance projection 零初始化。path-node bias 从初始节点表示计算一次并在
+6 层复用。softmax 按 target/query 的全部入边归一化。
+
+`lga_image_shift` 只离线计算：
+
+```text
+distance = ||r_source + nT - r_target||
+```
+
+geometry-invalid 时 distance bias 精确为零，但拓扑 forward 正常。graph-unavailable
+时 node/graph 表示归零。masked atom 使用独立 mask token替换化学字段，backbone
+role 保留。
+
+## 7. Stage 1
+
+`scage_parallel` 使用 graph-only `scage_m4p`，当前只有三个任务：
+
+| 任务 | 先验 |
+|---|---:|
+| masked atom | 1.0 |
+| LGA SPD（0..5） | 0.5 |
+| PBC LGA edge distance | 0.75 |
+
+保持动态 loss 标准化。距离使用 scalar SmoothL1Loss；抽为回归 target 的 edge 在
+该次 geometry-pretext forward 中会屏蔽自身 distance bias，防止读取答案。
+
+以下旧任务在新主线中停用：
+
+```text
+ECFP reconstruction
+PerioGT periodic contrast
+same-cell / nearest-image dual distance
+image-shift classification
+angle prediction
+torsion prediction
+screw prediction
+```
+
+geometry-invalid 不产生 distance target；graph-unavailable 不产生任何 Graph target。
+
+## 8. Stage 2
+
+Stage 2 使用 `smiles graph fp` parallel attention，关闭动态任务权重，也不继续
+Stage 1 辅助任务。目标保留：
+
+```text
+two-view fused InfoNCE
+Graph-SMILES InfoNCE
+Graph-FP InfoNCE
+LOMO consistency
+batch pooling-prior KL
+fusion-conditioned masked atom
+```
+
+intrinsic availability 为：
+
+```text
+SMILES=True
+FP=True
+Graph=data.graph_available
+```
+
+随机 modality dropout 与 intrinsic mask 取交集。Graph 对比和融合 masked-atom
+只统计可用 Graph。DDP 先 gather 有效数，再 padding gather 表示；全局少于两个
+有效样本时对应 InfoNCE 为无 target 的零损失。
+
+Stage 1 checkpoint 只严格迁移 `encoders.graph.encoder.*` 到 Stage 2，不迁移
+Stage 1 fusion/head。
+
+## 9. Stage 3
+
+Stage 3 使用项目各路线共用的 5-fold 协议：
+
+- KFold `n_splits=5, shuffle=True, random_state=1`；
+- 每一折的 held-out fold 同时作为 validation 和 test；
+- 剩余四折全部作为训练集，不再默认切分 inner validation；
+- 不提供 inner-validation 切分开关，三条路线使用完全相同的划分；
+- 默认 `TARGET_TRANSFORM=recommended`：eps/nc 为 log+standard，其余 standard；
+- 默认 Huber/SmoothL1，`HUBER_BETA=0.5`；
+- 前 5 epochs 训练 fusion/head，随后分阶段解冻 Graph/SMILES；
+- FP 按当前 `FP_UNFREEZE_EPOCH` 设置；
+- 支持 unimodal auxiliary、fusion-prior KL、SWA 等显式消融入口。
+
+forward 会把 intrinsic availability 与训练态 modality dropout 合并。Graph 不可用
+时，主融合、单模态辅助和 pooling prior 都不会把零 Graph 当成真实模态。
+
+## 10. Checkpoint
+
+新 SCAGE schema：
+
+```text
+schema = scage-mips-pbc-pyg-v1
+Stage 1 meta.stage = scage_m4p
+Stage 2 meta.stage = alignment
+```
+
+Stage 2 只接受新 Stage 1；Stage 3 只接受新 alignment。旧
+`scage-polygen-periodic-v4`、`mips-model-v2` 和
+`mips-parallel-ablation-v1` 均不能加载到 `scage_parallel`。
+
+## 11. 运行
+
+首次运行必须重建 cache：
 
 ```bash
---rebuild_feature_cache
-```
-
-SMILES token 长度：
-
-- 默认由 `smi_all.csv` 统计得到。
-- 当前有 `--max_smiles_length_cap` 上限，默认 `256`。
-- 如果出现：
-
-```text
-[token] truncated x / n SMILES at max_length=256
-```
-
-表示有 `x` 条 SMILES 超过最大 token 长度并被截断。少量截断通常可以接受；大量截断时需要提高 `--max_smiles_length_cap`。
-
-## 4. Graph 流程
-
-Graph 输入当前只支持：
-
-```text
-repeat_unit
-star_linking
-```
-
-正式推荐：
-
-```bash
---graph_input star_linking
-```
-
-### 4.1 repeat_unit
-
-保留原始 repeat-unit graph。
-
-用途：
-
-- baseline。
-- star-linking 失败 fallback。
-
-### 4.2 star_linking
-
-star-linking 只用于 Graph 模态。
-
-处理逻辑：
-
-1. 解析原始 P-SMILES。
-2. 要求恰好存在两个 `*` attachment atoms。
-3. 每个 `*` 必须只有一个邻居。
-4. 两个 `*` 与邻居之间的 bond type 必须一致。
-5. 删除两个 `*`。
-6. 在两个 attachment neighbor atoms 之间添加同类型 bond。
-7. RDKit sanitize 成功后得到 star-linked graph。
-8. 失败时 fallback 到 `repeat_unit` graph。
-
-语义：
-
-```text
-Graph star-linking 是拓扑周期近似，使 GNN 消息可以跨 repeat-unit 边界传播。
-它不等价于真实 3D 闭环构象。
-```
-
-### 4.3 Backbone / Attachment Features
-
-Graph 当前加入 backbone 相关特征：
-
-- `is_backbone_atom`
-- `is_attachment_neighbor`
-- `is_side_chain_atom`
-- `is_star_linking_edge`
-
-当前 backbone 定义：
-
-```text
-两个 attachment neighbor atoms 之间的最短路径 = backbone
-```
-
-这些特征用于 Graph encoder，不直接进入 Geom 坐标构造。
-
-## 5. FP 流程
-
-FP 模态使用 Morgan fingerprint。
-
-注意：
-
-- RDKit 版本较新时可能提示 MorganGenerator deprecation warning。
-- 这是 RDKit API 提示，不代表训练失败。
-- 如需彻底消除 warning，应统一迁移到 MorganGenerator。
-
-## 6. Geom 流程
-
-Geom 当前支持：
-
-```bash
---geometry_encoder painn
---geometry_encoder schnet
-```
-
-当前 `scripts/run.sh` 推荐主线：
-
-```bash
---geometry_encoder schnet
-```
-
-但同一次完整流程必须保持预训练和下游训练的 `geometry_encoder` 一致。不要用 SchNet 预训练 checkpoint 去初始化 PaiNN 下游训练，除非明确是在做不兼容权重加载实验。
-
-### 6.1 Geom 输入原则
-
-Geom 不默认使用 star-linked closed graph。
-
-原因：
-
-```text
-star-linking 是拓扑处理。
-SchNet / PaiNN 使用 3D 坐标、欧氏距离和方向。
-把 repeat unit 强行闭成环状 3D 构象，通常不等价于真实无限聚合物链。
-```
-
-### 6.2 当前 Geom 构象策略
-
-当前 Geom 推荐使用：
-
-- star-substitution capped repeat unit。
-- 多构象生成。
-- MMFF 优先。
-- UFF fallback。
-- 3D 失败时 fallback 到 2D。
-- 训练时可随机选择 conformer。
-
-star-substitution 逻辑：
-
-```text
-左侧 * 用右侧边界邻居元素替换
-右侧 * 用左侧边界邻居元素替换
-```
-
-这样做的目标是给 open repeat unit 一个较合理的端基近似，而不是制造 star-linked 闭环 3D。
-
-### 6.3 PaiNN 稳定性
-
-PaiNN 对坐标、距离和异常构象敏感。修改 Geom 时必须检查：
-
-- 是否出现 `nan`。
-- 距离是否存在 0 或异常小值。
-- batch index 是否正确。
-- fallback 后 `pos3d` 是否仍可用。
-- 多构象 shape 是否一致。
-
-## 7. 模型结构
-
-当前主模型：
-
-```text
-UniEncoderAttention
-```
-
-输入模态：
-
-```text
-smiles graph fp geom
-```
-
-Graph encoder：
-
-```text
-GINE / GIN-style PyG encoder
-```
-
-当前推荐 Graph 参数：
-
-```bash
---graph_num_layers 6
---graph_emb_dim 256
---graph_dropout 0.1
---graph_pooling attention
-```
-
-Geom encoder：
-
-```text
-PaiNN 或 SchNet
-```
-
-当前融合方式：
-
-```text
-各模态 encoder 输出 embedding
--> projection 到 joint_embedding_dim
--> stack
--> attention fusion
--> prediction head
-```
-
-## 8. 预训练流程
-
-`scripts/pretrain.py` 支持三种阶段：
-
-```bash
---pretrain_stage graph_geom
---pretrain_stage alignment
---pretrain_stage joint
-```
-
-### 8.1 Stage 1：Graph + Geom 单模态预训练
-
-目标：
-
-```text
-先让 Graph / Geom encoder 学到结构表征，不做跨模态强对齐。
-```
-
-典型 loss：
-
-- Graph masked atom reconstruction。
-- Graph repeat-unit vs star-linking consistency。
-- Geom coordinate denoising。
-- Geom pairwise distance reconstruction。
-
-典型参数：
-
-```bash
---pretrain_stage graph_geom
---geom_denoise_weight 1.0
---graph_pretrain_weight 1.0
---graph_starlink_consistency_weight 0.5
-```
-
-输出：
-
-```text
-pretrained_models/saved_pretrained_model_starlink_schnet_graph_geom_all.pth
-```
-
-### 8.2 Stage 2：多模态 Alignment 预训练
-
-目标：
-
-```text
-加载 Stage 1 权重，再进行 SMILES / Graph / FP / Geom 的 contrastive alignment。
-```
-
-典型参数：
-
-```bash
---pretrain_stage alignment
---pretrained_model_path pretrained_models/saved_pretrained_model_starlink_schnet_graph_geom_all.pth
---geom_denoise_weight 0.1
---graph_pretrain_weight 0.1
---graph_starlink_consistency_weight 0.1
-```
-
-输出：
-
-```text
-pretrained_models/saved_pretrained_model_starlink_schnet_alignment_all.pth
-```
-
-### 8.3 joint 阶段
-
-`joint` 是兼容旧逻辑的 baseline：
-
-```text
-contrastive + graph auxiliary + geom auxiliary 直接相加。
-```
-
-不推荐作为最终主线。
-
-## 9. 下游训练流程
-
-下游训练入口：
-
-```bash
-python scripts/train.py
-```
-
-推荐加载 alignment checkpoint：
-
-```bash
---pretrained_model_path ./pretrained_models/saved_pretrained_model_starlink_schnet_alignment_all.pth
-```
-
-当前训练方式：
-
-```text
-每个 task 独立训练
-每个 task 做 5-fold cross validation
-每个 fold 使用 4/5 训练，1/5 测试
-当前代码中 test loader 同时作为 early-stopping validation loader
-```
-
-输出：
-
-```text
-results/results_starlink_schnet_multistage_8tasks.csv
-results/results_starlink_schnet_multistage_8tasks_attention_heatmap.png
-saved_models_starlink_schnet_multistage_8tasks/<task>/UniEncoderAttention_best.pth
-```
-
-### 9.1 Attention 可视化
-
-`train.py` 会在所有 task 训练完成、results CSV 全部写入后生成一次 attention heatmap。默认输出路径由 `--results_dir` 推导：
-
-```text
-results/<results_csv_stem>_attention_heatmap.png
-```
-
-可选参数：
-
-```bash
---attention_heatmap_path ./results/custom_attention_heatmap.png
---disable_attention_heatmap
-```
-
-热力图使用每个 task 的 5-fold mean attention，展示 SMILES / Graph / FP / Geom 在 fusion attention 中的相对权重。
-
-注意：
-
-```text
-如果需要严格 train / val / test 三划分，需要改 scripts/train.py。
-当前 5-fold 逻辑更接近 cross-validation benchmark。
-```
-
-## 10. 运行脚本
-
-### 10.1 完整流程
-
-```bash
+BASELINE=scage_parallel \
+PRETRAIN_DATASET=PI1M_50k \
+REBUILD_FEATURE_CACHE=1 \
 bash scripts/run.sh
 ```
 
-阶段：
-
-```text
-Stage 1/3 Graph + Geom 单模态预训练
-Stage 2/3 多模态 alignment 预训练
-Stage 3/3 下游 5-fold supervised training
-```
-
-可用环境变量控制 epoch：
+最小流程：
 
 ```bash
-GRAPH_GEOM_EPOCHS=5 ALIGN_EPOCHS=3 TRAIN_EPOCHS=20 bash scripts/run.sh
+BASELINE=scage_parallel PRETRAIN_DATASET=PI1M_50k \
+REBUILD_FEATURE_CACHE=1 GRAPH_GEOM_EPOCHS=1 ALIGN_EPOCHS=1 \
+TRAIN_EPOCHS=1 TASKS=eat FOLD_IDS=0 EXPERIMENT_TAG=mips_pbc_smoke \
+bash scripts/run.sh
 ```
 
-### 10.2 只跑预训练
+500 条预检：
 
 ```bash
-bash scripts/run_pretrain.sh
+/root/anaconda3/envs/Uni-Poly/bin/python scripts/preflight_mips24h.py \
+  --sample-size 500
 ```
 
-阶段：
-
-```text
-Stage 1/2 Graph + Geom 单模态预训练
-Stage 2/2 多模态 alignment 预训练
-```
-
-### 10.3 单独命令示例
-
-Graph + Geom 单模态预训练：
-
-```bash
-python scripts/pretrain.py \
-  --dataset_name smi_all \
-  --modalities smiles graph fp geom \
-  --geometry_encoder schnet \
-  --graph_input star_linking \
-  --pretrain_stage graph_geom \
-  --epochs 20 \
-  --geom_denoise_weight 1.0 \
-  --graph_pretrain_weight 1.0 \
-  --graph_starlink_consistency_weight 0.5 \
-  --rebuild_feature_cache \
-  --save_path ./pretrained_models/saved_pretrained_model_starlink_schnet_graph_geom_all.pth
-```
-
-Alignment 预训练：
-
-```bash
-python scripts/pretrain.py \
-  --dataset_name smi_all \
-  --modalities smiles graph fp geom \
-  --geometry_encoder schnet \
-  --graph_input star_linking \
-  --pretrain_stage alignment \
-  --pretrained_model_path ./pretrained_models/saved_pretrained_model_starlink_schnet_graph_geom_all.pth \
-  --epochs 10 \
-  --geom_denoise_weight 0.1 \
-  --graph_pretrain_weight 0.1 \
-  --graph_starlink_consistency_weight 0.1 \
-  --save_path ./pretrained_models/saved_pretrained_model_starlink_schnet_alignment_all.pth
-```
-
-下游训练：
-
-```bash
-python scripts/train.py \
-  --modalities smiles graph fp geom \
-  --geometry_encoder schnet \
-  --graph_input star_linking \
-  --tasks eat eea egb egc ei eps nc xc \
-  --pretrained_model_path ./pretrained_models/saved_pretrained_model_starlink_schnet_alignment_all.pth \
-  --epochs 100 \
-  --patience 10 \
-  --results_dir ./results/results_starlink_schnet_multistage_8tasks.csv \
-  --models_dir ./saved_models_starlink_schnet_multistage_8tasks
-```
-
-## 11. 输出文件
-
-预训练权重：
-
-```text
-pretrained_models/saved_pretrained_model_starlink_schnet_graph_geom_all.pth
-pretrained_models/saved_pretrained_model_starlink_schnet_alignment_all.pth
-```
-
-训练结果：
-
-```text
-results/results_starlink_schnet_multistage_8tasks.csv
-results/results_starlink_schnet_multistage_8tasks_attention_heatmap.png
-saved_models_starlink_schnet_multistage_8tasks/
-```
-
-日志：
-
-```text
-logs/run_starlink_schnet_multistage_8tasks.log
-logs/pretrain_starlink_schnet_multistage_all.log
-```
-
-预训练曲线：
-
-```text
-plots/pretrain/loss_data.json
-plots/pretrain/loss_curve.png
-```
-
-这些均属于运行产物，通常不应提交到 git。
-
-## 12. 必须同步 PIPELINE.MD 的改动
-
-以下改动必须同步本文档：
-
-- 新增或删除模态。
-- 修改 `scripts/run.sh` / `scripts/run_pretrain.sh` / `scripts/run_train.sh`。
-- 修改 `scripts/pretrain.py` 的阶段、loss 或 checkpoint 逻辑。
-- 修改 `scripts/train.py` 的 fold、validation、checkpoint 或输出逻辑。
-- 修改 Graph 构造、Graph 特征、star-linking、backbone 逻辑。
-- 修改 Geom 构象、star-substitution、多构象或 fallback 逻辑。
-- 修改 feature cache 目录、命名、内容或 rebuild 条件。
-- 修改默认数据文件或任务列表。
-- 修改结果输出路径或模型保存路径。
-
-如果代码和本文档不一致，应优先判断代码是否是误改；确认后同步修正文档或代码，不能让两者长期冲突。
-
+预检报告 repeat factor、model RU、atom/edge count、geometry-valid、
+graph-unavailable、alias failure 和单样本耗时分布。

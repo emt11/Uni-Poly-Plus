@@ -1,261 +1,212 @@
-# AGENT.MD
+# Uni-Poly-Plus 代码代理约束
 
-本文档是当前 Uni-Poly-Plus 项目的代码代理约束。所有后续代码修改、实验脚本修改和文档更新都应遵守这里的规则。
+## 1. 基本规则
 
-## 1. 沟通规则
+- 默认使用中文。
+- `scripts/run.sh` 是正式实验入口和参数真源。
+- 用户要求实现时应修改代码并做与风险相称的验证；未运行大规模训练必须明确说明。
+- worktree 可能包含用户实验修改，不得回滚、覆盖或删除无关内容。
+- 不恢复已删除的 `README.MD`，不删除 cache、checkpoint、日志或历史结果。
 
-- 默认使用中文回复。
-- 回答要直接说明结论、原因和可执行命令。
-- 不要只给计划；如果用户要求实现，应直接修改代码并运行可行验证。
-- 如果无法运行完整训练，必须明确说明未运行原因。
-
-## 2. 当前项目主线
-
-当前项目是聚合物性质预测的多模态模型，正式主线为：
+## 2. 当前路线
 
 ```text
-SMILES + Graph + FP + Geom
+flat4:
+  SMILES + FP + GIN Graph + PaiNN Geom
+
+scage_parallel:
+  SMILES + sparse MIPS-PyG PBC Graph + FP
+  当前默认研究路线
 ```
 
-当前重点实现：
+`BASELINE=mips` 与 `BASELINE=scage_mips_ablation` 均已移除，传入时应明确报错。
+底层 MIPS encoder、137 维输入、descriptor、构图、cache 和历史 checkpoint 仅作为
+源码与实验历史保留，不得重新暴露成训练路线。
 
-- `smiles`：SMILES tokenizer / encoder。
-- `graph`：二维拓扑图，当前推荐 `star_linking`。
-- `fp`：Morgan fingerprint。
-- `geom`：3D 几何模态，当前推荐 `PaiNN`，也支持 `SchNet`。
+## 3. `scage_parallel` 不变量
 
-当前推荐运行路线：
+固定配置：
 
 ```text
-Stage 1: Graph + Geom 单模态预训练
-Stage 2: 多模态 alignment 预训练
-Stage 3: 下游 5-fold supervised training
+graph_encoder_type=scage
+graph_input=star_linking
+geom_input=polygen_periodic
+fusion_type=parallel_attention
+Stage 1 modalities=graph
+Stage 2/3 modalities=smiles graph fp
 ```
 
-入口脚本：
+虽然 CLI 名称仍为 `scage`，实际 Graph encoder 必须实例化
+`MIPSPeriodicGraphEncoder`。旧 `SCAGEGraphEncoder` 保留源码，但主线不得实例化。
 
-```bash
-bash scripts/run.sh
-```
-
-只跑预训练：
-
-```bash
-bash scripts/run_pretrain.sh
-```
-
-## 3. Graph 模块约束
-
-Graph 输入目前只应支持：
+模型固定：
 
 ```text
-repeat_unit
-star_linking
+6 layers / 512 dim / 8 heads / FFN 2048
+dropout=0.10
+max_hops=5
+64 Gaussian RBF, 0–12 Å
+atom mean readout
 ```
 
-`star_linking` 语义：
-
-1. 删除两个 `*` attachment atoms。
-2. 连接两个 attachment neighbor atoms。
-3. 只用于 `graph` 模态。
-4. 如果 `*` 数量不是 2、连接键不一致或 RDKit sanitize 失败，应 fallback 到 `repeat_unit` graph。
-
-Graph 当前还包含 backbone / attachment 特征：
-
-- `is_backbone_atom`
-- `is_attachment_neighbor`
-- `is_side_chain_atom`
-- `is_star_linking_edge`
-
-修改 Graph 特征维度时必须同步：
-
-- `src/dataset/graph_data.py`
-- `src/modules/graph.py`
-- feature cache tag
-- 需要提醒用户使用 `--rebuild_feature_cache`
-
-## 4. Geom 模块约束
-
-Geom 不默认使用 star-linked closed graph。
-
-原因：
+禁止重新加入：
 
 ```text
-star-linking 是拓扑处理，不等价于真实 3D 闭环构象。
-SchNet / PaiNN 使用距离和方向信息，错误闭环会污染几何表征。
+Graph Token
+RU/copy index embedding
+boundary/seam embedding
+image-shift embedding
+MIPS 137-d input或descriptor
+dense attention
+Euclidean cutoff建边
+dual branch或branch fusion
+angle/torsion作为encoder输入
 ```
 
-Geom 当前推荐：
+## 4. 周期构图
 
-- 使用 star-substitution capped repeat unit。
-- 多构象生成。
-- MMFF 优先，UFF fallback。
-- 3D 失败时 fallback 到 2D。
-- 训练时可随机选择 conformer。
-
-修改 Geom 时要关注：
-
-- `src/dataset/geom_data.py`
-- `src/dataset/dataloader.py`
-- `src/modules/geom.py`
-- PaiNN 是否出现 `nan`
-- 坐标、距离、batch index 是否一致
-
-## 5. 多阶段预训练约束
-
-`scripts/pretrain.py` 当前支持：
-
-```bash
---pretrain_stage graph_geom
---pretrain_stage alignment
---pretrain_stage joint
-```
-
-语义：
-
-- `graph_geom`：只训练 Graph / Geom 辅助任务，不做 contrastive alignment。
-- `alignment`：加载上一阶段权重，做多模态 contrastive alignment，并保留小权重辅助 loss。
-- `joint`：兼容旧逻辑，直接把所有启用 loss 加起来。
-
-推荐不要把 `joint` 作为最终主线，只作为 baseline。
-
-修改 loss 时必须明确：
-
-- 该 loss 属于 Graph、Geom、Alignment 还是 downstream supervised。
-- 是否会和其他 loss 共享 encoder。
-- loss 数值尺度是否可能主导训练。
-- 是否需要在 `run.sh` 中单独暴露权重。
-
-## 6. 数据和缓存约束
-
-原始数据：
+保留 `src/dataset/geom_data.py` 中 PolyGen-inspired translation-only optimizer：
 
 ```text
-data/raw/smi_all.csv
-data/raw/smi_<task>.csv
+m_geom=1/2/3/4/6
+R=I
+T=(0,0,L_base)
+pbc_geometry_version=14
 ```
 
-处理后缓存默认位于：
+只接受严格质量门通过的 PBC geometry。失败样本只使用二维周期拓扑，不能把
+finite-trimer、普通 3D 或拓扑 hop 当作 Å 距离。
+
+MIPS supercell 固定：
 
 ```text
-data/processed/Schnet/
+max_hops=5
+d_thres=6
+boundary distance >11
+repeat factor=1/2/4/8/16
+max_repeat_rounds=5
+max_model_atoms=384
 ```
 
-SMILES 级别 feature cache 是当前重要优化，不要随意删除。
+PBC 成功时只按 `r(i,q)=r_i+qT` 复制 primitive 坐标，并令
+`L_model=kL_base`；禁止重新优化构象。周期末端边只保存在带 `+1/-1` shift 的邻接
+表中。
 
-如果改动以下内容，必须重建缓存：
+每个 query 必须在 `(atom_id,image_shift)` 空间执行最多 5-hop BFS，并硬检查
+boundary condition、alias-free、6-node path 上限及坐标映射。失败必须设置
+`graph_available=False`，而不是使用不合格短 cell。
 
-- Graph 输入类型。
-- Graph 节点/边特征维度。
-- Geom 构象生成逻辑。
-- SMILES token 最大长度。
-- feature cache tag。
+## 5. Cache 与 collate
 
-需要提醒用户加：
-
-```bash
---rebuild_feature_cache
-```
-
-## 7. 训练和验证要求
-
-任何涉及整体流程的改动，都必须同步更新 `PIPELINE.MD`，包括：
-
-- 数据输入 / 输出路径。
-- feature cache。
-- Graph 构造。
-- Geom 构象。
-- 预训练阶段和 loss。
-- 下游训练流程。
-- `scripts/run.sh` / `scripts/run_pretrain.sh` / `scripts/run_train.sh`。
-
-修改 Python 代码后至少运行：
-
-```bash
-python -m py_compile scripts/pretrain.py scripts/train.py src/dataset/*.py src/modules/*.py src/utils.py
-```
-
-修改 CLI 后检查：
-
-```bash
-python scripts/pretrain.py --help
-python scripts/train.py --help
-```
-
-修改 shell 脚本后检查：
-
-```bash
-bash -n scripts/run.sh
-bash -n scripts/run_pretrain.sh
-bash -n scripts/run_train.sh
-```
-
-如环境缺少 RDKit / PyG / CUDA，不能伪造测试结果，应明确说明。
-
-## 8. 文件修改边界
-
-优先修改已有文件，不要新增复杂目录或框架。
-
-常见职责：
-
-- `src/dataset/graph_data.py`：Graph 构造、star-linking、节点/边特征。
-- `src/dataset/geom_data.py`：3D 构象、star-substitution、fallback。
-- `src/dataset/dataset.py`：数据集、缓存、cache tag。
-- `src/dataset/dataloader.py`：batch collate、多构象选择。
-- `src/modules/graph.py`：GINE / Graph encoder。
-- `src/modules/geom.py`：SchNet / PaiNN。
-- `src/modules/uni_encoder.py`：多模态 encoder 和融合。
-- `scripts/pretrain.py`：预训练阶段和 loss。
-- `scripts/train.py`：下游训练和 5-fold。
-- `scripts/run.sh`：完整串行运行入口。
-
-不要恢复旧 KG pipeline、旧 TEXT 模态、旧 dimer/n-mer 逻辑，除非用户明确要求。
-
-## 9. Git 和产物约束
-
-不要提交运行产物：
+新主线 schema：
 
 ```text
-logs/
-plots/
-results/
-saved_models*/
-pretrained_models/*.pth
-data/processed/
-kg_work/
+scage_data_schema=scage-mips-pbc-lga-v1
+periodic_lga_schema_version=1
+pbc_geometry_version=14
 ```
 
-不要提交 API key、token、私有路径中的 secret。
+修改 LGA 字段、atom input、PBC mapping 或构图条件时必须：
 
-如果工作区已有用户改动：
+1. 升级描述性 feature schema；
+2. 更新 dataset load validation；
+3. 更新 partial-cache matching；
+4. 提醒完整 `--rebuild_feature_cache`；
+5. 不迁移旧 SCAGE cache。
 
-- 不要 `git reset --hard`。
-- 不要随意 revert 用户改动。
-- 只改和当前任务直接相关的文件。
+collate 必须：
 
-## 10. 文档约束
+- 给 `lga_edge_index` 和 `lga_path_index>=0` 加 node offset；
+- 保留 path padding `-1`；
+- 同一 conformer 同时选择坐标和 edge distance；
+- 不为新 SCAGE 路线生成 dense `scage_spd/path` batch。
 
-当前正式文档：
+## 6. Attention 与几何
 
-- `README.MD`：项目入口和运行说明。
-- `PIPELINE.MD`：整体数据流、模型流、预训练和训练流程的唯一详细维护文档。
-- `TODO.MD`：后续开发计划和研究方案。
-- `PerioGT.MD`：PerioGT 代码/论文分析。
-- `IDEAS.MD`：临时研究想法。
-- `AGENT.MD`：当前代码代理约束。
+唯一 logit：
 
-`PIPELINE.MD` 是当前项目流程的唯一详细版本。以下改动必须同步更新 `PIPELINE.MD`：
+```text
+q·k/sqrt(d_head) + SPD bias + path-node bias
++ geometry_valid * RBF(PBC Euclidean distance)
+```
 
-- 新增或删除模态。
-- 修改 Graph / Geom / FP / SMILES 处理逻辑。
-- 修改缓存路径、缓存内容或 cache tag。
-- 修改预训练阶段、loss、checkpoint 加载或保存路径。
-- 修改下游训练 fold、validation、任务列表、结果输出路径。
-- 修改任何 `scripts/run*.sh` 运行脚本。
+- softmax 按 target/query 的全部入边归一化；
+- SPD 和 distance projection 零初始化；
+- path bias 从初始 node embedding 计算一次，六层复用；
+- `image_shift` 只用于离线距离，不进入模型；
+- geometry-invalid 的 distance bias 必须精确为零；
+- graph-unavailable 的 node/graph 输出必须为零。
 
-如果修改运行命令，应优先同步 `README.MD`。
+masked atom 只替换化学字段，保留 backbone role。
 
-如果修改未来开发计划，应同步 `TODO.MD`。
+## 7. 训练阶段
 
-不要让 `README.MD`、`PIPELINE.MD`、`TODO.MD`、`AGENT.MD` 出现互相冲突的运行命令或流程描述。
+SCAGE Stage 1 只允许：
 
+```text
+masked atom: 1.0
+LGA SPD: 0.5
+PBC edge distance: 0.75
+```
+
+保留动态 loss 归一化。distance target edge 在对应 pretext forward 中必须屏蔽自身
+distance bias。不得恢复 ECFP、PerioGT、same/nearest dual distance、shift class、
+angle、torsion 或 screw loss，除非用户明确开启新的消融路线。
+
+Stage 2：
+
+- 使用 `smiles graph fp` parallel attention；
+- 不使用动态权重，不继续 Stage 1 loss；
+- intrinsic mask 为 SMILES=True、FP=True、Graph=`graph_available`；
+- Graph-SMILES、Graph-FP 和 fusion masked atom 只统计有效 Graph；
+- DDP 对变长有效样本执行 count gather + padding gather。
+
+Stage 3：
+
+- 使用各路线共用的 5-fold：每折 held-out partition 同时作为 validation 和 test；
+- 不保留 `VALIDATION_FRACTION` 或 inner-validation 分支，三条路线必须共用完全相同的划分；
+- 标签统计只能来自训练折；
+- 保持现有标签变换、loss、学习率和分阶段解冻策略；
+- 单任务与 8-task 运行必须由稳定 task/fold seed 保持一致。
+
+## 8. Checkpoint
+
+`scage_parallel`：
+
+```text
+schema=scage-mips-pbc-pyg-v1
+Stage 1 stage=scage_m4p
+Stage 2 stage=alignment
+```
+
+Stage 1 到 Stage 2 只严格迁移 `encoders.graph.encoder.*`。Stage 3 只接受新
+alignment checkpoint。旧 SCAGE、独立 MIPS 或错阶段 checkpoint 必须明确拒绝，
+不得部分加载旧 Graph 参数。
+
+历史 `mips-model-v2` 与 `mips-parallel-ablation-v1` checkpoint 保留但当前没有
+运行入口，也不得加载到 `scage_parallel`。
+
+## 9. 验证要求
+
+相关修改至少运行：
+
+```text
+python -m py_compile
+bash -n scripts/run.sh scripts/run_pretrain.sh scripts/run_train.sh
+scripts/pretrain.py --help
+scripts/train.py --help
+```
+
+构图/encoder 修改还应验证：
+
+- boundary `>11`、1/2/4/8/16 扩展和 384 atoms 上限；
+- self-edge、方向、SPD、path padding、alias-free；
+- PBC edge distance 等于显式坐标计算；
+- 每个 query/head attention 和为 1；
+- geometry-invalid topology forward；
+- graph mean readout；
+- Stage 1 三项 loss forward/backward；
+- Stage 2/3 mixed availability；
+- 新旧 checkpoint 拒绝规则。
+
+500 条正式预检使用 `scripts/preflight_mips24h.py --sample-size 500`。
