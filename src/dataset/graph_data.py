@@ -7,6 +7,7 @@ import math
 from dataclasses import dataclass
 from collections import deque
 from torch_geometric.data import Data
+from .mips_trimer_contract import FEATURE_SCHEMA, LEGACY_FEATURE_SCHEMA
 
 allowable_features = {
     'possible_atom_symbols' : [
@@ -83,13 +84,27 @@ SCAGE_SPD_MAX_DISTANCE = 20
 MIPS_ATOM_FEATURE_DIM = 137
 MIPS_ATOM_CLASSES = 101
 MIPS_MAX_PATH_NODES = 3
-PERIODIC_LGA_SCHEMA_VERSION = 1
+MIPS_EXPERIMENT_FEATURE_SCHEMA = FEATURE_SCHEMA
+# Canonical periodic MTS topology is LGA schema 2.  The explicit finite-copy
+# helper below is retained only as a private/test reference and is labelled
+# with the legacy v1 value so production validation cannot accept it.
+MIPS_LOCAL_LGA_SCHEMA_VERSION = 2
+LEGACY_MIPS_LOCAL_LGA_SCHEMA_VERSION = 1
+CANONICAL_PERIODIC_LGA_SCHEMA_VERSION = MIPS_LOCAL_LGA_SCHEMA_VERSION
+MIPS_MULTIMER_BUILDER_VERSION = 2
 
 
 @dataclass(frozen=True)
-class MIPSPeriodicConfig:
-    max_hops: int = 5
-    max_repeat_rounds: int = 5
+class MIPSLocalConfig:
+    """Configuration for the non-PBC localized MIPS graph.
+
+    ``max_hops`` is the largest graph distance visible to attention.  The MIPS
+    paper uses two hops, while topology-plus uses five.  No coordinate, cell or
+    image information is part of this contract.
+    """
+
+    max_hops: int = 2
+    max_repeat_units: int = 16
     max_model_atoms: int = 384
 
     @property
@@ -169,8 +184,8 @@ def _one_hot_with_unknown(value, choices):
     return [float(value == item) for item in values] + [float(value not in values)]
 
 
-def _attach_mips_atom_features(data, mol, backbone):
-    """Attach MIPS atom features and the paper's separate backbone indicator."""
+def _mips_atom_feature_rows(mol):
+    """Return the public-MIPS 137-d atom rows for one RDKit molecule."""
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
     hybridizations = [
         Chem.rdchem.HybridizationType.SP,
@@ -196,11 +211,44 @@ def _attach_mips_atom_features(data, mol, backbone):
         if len(row) != MIPS_ATOM_FEATURE_DIM:
             raise RuntimeError(f"MIPS atom feature width is {len(row)}, expected 137")
         rows.append(row)
-    data.mips_x = torch.tensor(rows, dtype=torch.float)
+    return torch.tensor(rows, dtype=torch.float)
+
+
+def _attach_mips_atom_features(data, mol, backbone):
+    """Attach MIPS atom features and the paper's separate backbone indicator."""
+    data.mips_x = _mips_atom_feature_rows(mol)
     data.mips_backbone_mask = torch.zeros(mol.GetNumAtoms(), dtype=torch.long)
     if backbone:
         data.mips_backbone_mask[torch.tensor(sorted(backbone), dtype=torch.long)] = 1
-    data.mips_input_schema_version = 2
+    data.mips_input_schema_version = 3
+    return data
+
+
+def attach_polymerized_mips_atom_features(data, smiles):
+    """Use an open topology-only Trimer to define polymerized atom features.
+
+    O8 contains a virtual closing edge, so atom degree/H/hybridization must
+    describe an interior polymer atom rather than the finite repeated graph's
+    artificial termini.  The central unit of an open Trimer has both real
+    inter-RU bonds.  Its rows are indexed by canonical RU atom ID and then
+    broadcast to every O8 repeat copy.
+    """
+    trimer, metadata = build_periodic_multimer_mol(
+        smiles, num_repeat_units=3, close_periodic=False
+    )
+    unit_atoms = metadata.get("unit_atoms") or []
+    if len(unit_atoms) != 3:
+        raise ValueError("polymerized MIPS features require a three-unit chain")
+    central = torch.tensor(unit_atoms[1], dtype=torch.long)
+    canonical = data.canonical_ru_atom_index.long()
+    if canonical.numel() != int(data.num_nodes):
+        raise ValueError("canonical MIPS mapping is incomplete")
+    if canonical.numel() and int(canonical.max()) + 1 != central.numel():
+        raise ValueError("Trimer/O8 canonical atom counts differ")
+    rows = _mips_atom_feature_rows(trimer)[central]
+    data.mips_x = rows[canonical].clone()
+    data.mips_input_schema_version = 4
+    data.mips_atom_feature_source = "topology_only_trimer_central_ru"
     return data
 
 
@@ -377,7 +425,7 @@ def _attach_scage_topology_features(data, mol, star_link_edge_set, virtual_edges
     return data
 
 
-def mol_to_graph_data_obj_simple(mol, backbone_info=None):
+def build_mips_data_object(mol, backbone_info=None):
     backbone_info = backbone_info or {}
     backbone, attachment_neighbors, side_chain, star_link_edge_set = _graph_backbone_annotations(
         mol,
@@ -510,15 +558,19 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
     dummy_atoms, neighbors, bond_types = _get_dummy_atoms_and_neighbors(source)
     if len(dummy_atoms) != 2:
         raise ValueError("periodic multimer requires exactly two dummy atoms")
-    if len(set(neighbors)) != 2:
-        raise ValueError("periodic multimer requires two distinct boundary atoms")
-    if bond_types[0] != bond_types[1]:
-        raise ValueError("attachment bond types are not consistent")
-    connection_bond_type = (
-        Chem.rdchem.BondType.SINGLE
-        if bond_types[0] == Chem.rdchem.BondType.AROMATIC
-        else bond_types[0]
-    )
+    attachment_bond_mismatch = bond_types[0] != bond_types[1]
+    if attachment_bond_mismatch:
+        # Public MIPS creates repeat/Star connections as single bonds.  Use
+        # that direction-invariant convention only when the two P-SMILES
+        # attachment bonds disagree; otherwise preserve the encoded bond.
+        connection_bond_type = Chem.rdchem.BondType.SINGLE
+        connection_bond_policy = "mismatch_single"
+    elif bond_types[0] == Chem.rdchem.BondType.AROMATIC:
+        connection_bond_type = Chem.rdchem.BondType.SINGLE
+        connection_bond_policy = "aromatic_single"
+    else:
+        connection_bond_type = bond_types[0]
+        connection_bond_policy = "matching_attachment_type"
 
     dummy_set = set(int(idx) for idx in dummy_atoms)
     copy_source = Chem.Mol(source)
@@ -547,9 +599,12 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
     base_mol.UpdatePropertyCache(strict=False)
     left_base = int(old_to_base[int(neighbors[0])])
     right_base = int(old_to_base[int(neighbors[1])])
-    if left_base == right_base:
-        raise ValueError("periodic multimer requires two distinct mapped boundaries")
-    backbone_base = list(Chem.GetShortestPath(base_mol, left_base, right_base))
+    shared_boundary = left_base == right_base
+    backbone_base = (
+        [left_base]
+        if shared_boundary
+        else list(Chem.GetShortestPath(base_mol, left_base, right_base))
+    )
     base_atoms = int(base_mol.GetNumAtoms())
 
     combined = Chem.RWMol()
@@ -610,6 +665,12 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
         "inter_unit_edges": inter_unit_edges,
         "periodic_edge": periodic_edge,
         "attachment_bond_type": connection_bond_type,
+        "attachment_bond_type_left": str(bond_types[0]),
+        "attachment_bond_type_right": str(bond_types[1]),
+        "attachment_bond_mismatch": bool(attachment_bond_mismatch),
+        "connection_bond_policy": connection_bond_policy,
+        "shared_boundary": bool(shared_boundary),
+        "multimer_builder_version": MIPS_MULTIMER_BUILDER_VERSION,
     }
 
 
@@ -636,265 +697,11 @@ def build_polygen_periodic_structure(smiles, num_repeat_units):
         "structure_mol": mol,
         "structure_input": "polygen_periodic",
         "graph_build_ok": True,
-        "graph_failed_reason": "",
+        "topology_failure_code": "",
         "periodic_metadata": metadata,
     }
 
 
-def _periodic_scage_atom_template(smiles):
-    """Create one cut-invariant RU template for the periodic node inputs."""
-    motif, metadata = build_periodic_multimer_mol(
-        smiles, num_repeat_units=1, close_periodic=True
-    )
-    template = Data()
-    _attach_scage_atom_features(template, motif)
-    periodic_edge = metadata.get("periodic_edge")
-    if periodic_edge is not None:
-        _apply_virtual_edge_atom_features(template, [(
-            int(periodic_edge[0]),
-            int(periodic_edge[1]),
-            metadata["attachment_bond_type"],
-        )])
-    return {
-        name: getattr(template, name).clone()
-        for name in SCAGE_CATEGORICAL_FEATURES + SCAGE_CONTINUOUS_FEATURES
-    }
-
-
-def build_mips_periodic_structure(
-    smiles,
-    geometry_num_ru=1,
-    geometry_valid=False,
-    config=None,
-):
-    """Build the alias-free MIPS supercell used by ``scage_parallel``.
-
-    A strict PBC primitive starts from its optimized ``geometry_num_ru`` cell.
-    Topology-only samples start from one RU.  The open motif is doubled until
-    its two outer boundaries satisfy the MIPS locality condition, then the
-    final boundary edge is represented as a virtual periodic edge.
-    """
-    config = config or MIPSPeriodicConfig()
-    geometry_num_ru = max(1, int(geometry_num_ru))
-    base_num_ru = geometry_num_ru if bool(geometry_valid) else 1
-    last_reason = ""
-    for repeat_round in range(int(config.max_repeat_rounds)):
-        repeat_factor = 1 << repeat_round
-        model_num_ru = base_num_ru * repeat_factor
-        try:
-            open_mol, open_meta = build_periodic_multimer_mol(
-                smiles, model_num_ru, close_periodic=False
-            )
-            atom_count = int(open_mol.GetNumAtoms())
-            boundary_distance = len(open_meta["ordered_backbone_path"]) - 1
-            if atom_count > int(config.max_model_atoms):
-                last_reason = f"model_atoms={atom_count}>{config.max_model_atoms}"
-                break
-            if boundary_distance <= int(config.required_boundary_distance):
-                last_reason = (
-                    f"boundary_distance={boundary_distance}<="
-                    f"{config.required_boundary_distance}"
-                )
-                continue
-            periodic_mol, metadata = build_periodic_multimer_mol(
-                smiles, model_num_ru, close_periodic=True
-            )
-            periodic_edge = metadata["periodic_edge"]
-            backbone_info = {
-                "neighbors": [metadata["left_boundary"], metadata["right_boundary"]],
-                "star_link_edge": list(periodic_edge),
-                "ordered_backbone_path": metadata["ordered_backbone_path"],
-                "virtual_edges": [(
-                    int(periodic_edge[0]),
-                    int(periodic_edge[1]),
-                    metadata["attachment_bond_type"],
-                )],
-            }
-            return {
-                "requested_input": "star_linking",
-                "attachment_count": 2,
-                "backbone_info": backbone_info,
-                "structure_smiles": Chem.MolToSmiles(periodic_mol, canonical=False),
-                "structure_mol": periodic_mol,
-                "structure_input": "mips_periodic_supercell",
-                "graph_build_ok": True,
-                "graph_failed_reason": "",
-                "graph_available": True,
-                "periodic_metadata": metadata,
-                "geometry_period_ru": geometry_num_ru if geometry_valid else 0,
-                "mips_repeat_factor": repeat_factor,
-                "model_cell_ru": model_num_ru,
-                "mips_boundary_distance": boundary_distance,
-                "mips_distance_threshold": config.distance_threshold,
-                "mips_condition_valid": True,
-                "periodic_atom_template": _periodic_scage_atom_template(smiles),
-            }
-        except Exception as exc:
-            last_reason = str(exc)[:200]
-
-    # Keep the other modalities usable.  The placeholder graph is never
-    # exposed to fusion and receives self-only LGA edges below.
-    placeholder_mol, metadata = build_periodic_multimer_mol(
-        smiles, 1, close_periodic=False
-    )
-    pair = [metadata["left_boundary"], metadata["right_boundary"]]
-    backbone_info = {
-        "neighbors": pair,
-        "star_link_edge": [],
-        "ordered_backbone_path": metadata["ordered_backbone_path"],
-        "virtual_edges": [],
-    }
-    return {
-        "requested_input": "star_linking",
-        "attachment_count": 2,
-        "backbone_info": backbone_info,
-        "structure_smiles": Chem.MolToSmiles(placeholder_mol, canonical=False),
-        "structure_mol": placeholder_mol,
-        "structure_input": "mips_periodic_unavailable",
-        "graph_build_ok": False,
-        "graph_failed_reason": f"mips_periodic_condition_failed:{last_reason}"[:240],
-        "graph_available": False,
-        "periodic_metadata": metadata,
-        "geometry_period_ru": geometry_num_ru if geometry_valid else 0,
-        "mips_repeat_factor": 0,
-        "model_cell_ru": 1,
-        "mips_boundary_distance": len(metadata["ordered_backbone_path"]) - 1,
-        "mips_distance_threshold": config.distance_threshold,
-        "mips_condition_valid": False,
-        "periodic_atom_template": _periodic_scage_atom_template(smiles),
-    }
-
-
-def _mips_periodic_adjacency(mol, periodic_edge):
-    adjacency = [[] for _ in range(mol.GetNumAtoms())]
-    for bond in mol.GetBonds():
-        begin, end = int(bond.GetBeginAtomIdx()), int(bond.GetEndAtomIdx())
-        adjacency[begin].append((end, 0))
-        adjacency[end].append((begin, 0))
-    if periodic_edge is not None:
-        tail, head = (int(value) for value in periodic_edge)
-        adjacency[tail].append((head, 1))
-        adjacency[head].append((tail, -1))
-    for neighbors in adjacency:
-        neighbors.sort(key=lambda value: (value[0], value[1]))
-    return adjacency
-
-
-def _periodic_local_states(query, adjacency, max_hops):
-    start = (int(query), 0)
-    distance = {start: 0}
-    predecessor = {start: None}
-    queue = deque([start])
-    while queue:
-        atom, image = queue.popleft()
-        current_distance = distance[(atom, image)]
-        if current_distance >= int(max_hops):
-            continue
-        for neighbor, edge_shift in adjacency[atom]:
-            state = (int(neighbor), int(image + edge_shift))
-            if state in distance:
-                continue
-            distance[state] = current_distance + 1
-            predecessor[state] = (atom, image)
-            queue.append(state)
-    return distance, predecessor
-
-
-def attach_periodic_lga_topology(data, structure, config=None):
-    """Attach sparse source->query LGA records and validate alias freedom."""
-    config = config or MIPSPeriodicConfig()
-    template = structure.get("periodic_atom_template") or {}
-    unit_atoms = (structure.get("periodic_metadata") or {}).get("unit_atoms", [])
-    if template and unit_atoms:
-        for name in SCAGE_CATEGORICAL_FEATURES + SCAGE_CONTINUOUS_FEATURES:
-            values = getattr(data, name).clone()
-            motif_values = template[name].to(dtype=values.dtype)
-            for atom_indices in unit_atoms:
-                if len(atom_indices) != motif_values.size(0):
-                    raise RuntimeError("periodic atom-template mapping is inconsistent")
-                values[torch.tensor(atom_indices, dtype=torch.long)] = motif_values
-            setattr(data, name, values)
-    # The legacy SCAGE role 2 marked the arbitrary periodic cut endpoints.
-    # This route keeps only the cut-invariant backbone/non-backbone role.
-    data.scage_backbone_role = (data.scage_backbone_role > 0).long()
-    graph_available = bool(structure.get("graph_available", False))
-    num_atoms = int(data.x.size(0))
-    metadata = structure.get("periodic_metadata") or {}
-    periodic_edge = metadata.get("periodic_edge") if graph_available else None
-    adjacency = _mips_periodic_adjacency(structure["structure_mol"], periodic_edge)
-    sources, targets, distances, shifts, paths = [], [], [], [], []
-    alias_free = True
-
-    for query in range(num_atoms):
-        if graph_available:
-            state_distances, predecessor = _periodic_local_states(
-                query, adjacency, config.max_hops
-            )
-            atom_images = {}
-            for atom, image in state_distances:
-                previous = atom_images.get(atom)
-                if previous is not None and previous != image:
-                    alias_free = False
-                    break
-                atom_images[atom] = image
-            if not alias_free:
-                break
-            ordered_states = sorted(
-                state_distances,
-                key=lambda state: (state_distances[state], state[0], state[1]),
-            )
-        else:
-            state_distances = {(query, 0): 0}
-            predecessor = {(query, 0): None}
-            ordered_states = [(query, 0)]
-
-        for state in ordered_states:
-            atom, image = state
-            path_states = []
-            current = state
-            while current is not None:
-                path_states.append(current)
-                current = predecessor[current]
-            path_states.reverse()
-            path_atoms = [int(item[0]) for item in path_states]
-            if len(path_atoms) > int(config.max_hops) + 1:
-                raise RuntimeError("periodic LGA path exceeds configured maximum")
-            sources.append(int(atom))
-            targets.append(int(query))
-            distances.append(int(state_distances[state]))
-            shifts.append(int(image))
-            paths.append(path_atoms)
-
-    if graph_available and not alias_free:
-        # A condition-valid cell must be injective in every local query. Treat
-        # failure as unavailable instead of introducing image multi-edges.
-        graph_available = False
-        sources = list(range(num_atoms))
-        targets = list(range(num_atoms))
-        distances = [0] * num_atoms
-        shifts = [0] * num_atoms
-        paths = [[idx] for idx in range(num_atoms)]
-
-    edge_count = len(sources)
-    max_path_nodes = int(config.max_hops) + 1
-    path_index = torch.full((edge_count, max_path_nodes), -1, dtype=torch.long)
-    path_mask = torch.zeros((edge_count, max_path_nodes), dtype=torch.bool)
-    for edge_idx, path in enumerate(paths):
-        path_index[edge_idx, :len(path)] = torch.tensor(path, dtype=torch.long)
-        path_mask[edge_idx, :len(path)] = True
-
-    data.lga_edge_index = torch.tensor([sources, targets], dtype=torch.long)
-    data.lga_spd = torch.tensor(distances, dtype=torch.long)
-    data.lga_path_index = path_index
-    data.lga_path_mask = path_mask
-    data.lga_image_shift = torch.tensor(shifts, dtype=torch.long)
-    data.lga_geometry_valid = torch.zeros(edge_count, dtype=torch.bool)
-    data.lga_pbc_distance_confs = torch.zeros((1, edge_count), dtype=torch.float)
-    data.graph_available = bool(graph_available)
-    data.periodic_topology_valid = bool(graph_available)
-    data.mips_alias_free = bool(alias_free and graph_available)
-    data.periodic_lga_schema_version = PERIODIC_LGA_SCHEMA_VERSION
-    return data
 
 
 def _sanitize_to_smiles(mol):
@@ -972,7 +779,7 @@ def generate_multimer_smiles(num_repeat_units, smiles, replace_dummy_atoms=False
     return Chem.MolToSmiles(multimer, canonical=True)
 
 
-def periodicity_augment_smiles(
+def repeat_cut_augment_smiles(
     smiles, max_mrus=3, return_n=False, rng=None, return_metadata=False
 ):
     """PerioGT-style periodicity augmentation for P-SMILES.
@@ -990,9 +797,9 @@ def periodicity_augment_smiles(
 
     dummy_atoms, neighbors, bond_types = _get_dummy_atoms_and_neighbors(mol)
     if len(dummy_atoms) != 2:
-        raise ValueError("periodicity_augment_smiles requires exactly two dummy atoms")
+        raise ValueError("repeat_cut_augment_smiles requires exactly two dummy atoms")
     if len(set(neighbors)) != 2:
-        raise ValueError("periodicity_augment_smiles requires two distinct attachment neighbors")
+        raise ValueError("repeat_cut_augment_smiles requires two distinct attachment neighbors")
     if bond_types[0] != bond_types[1]:
         raise ValueError("attachment bond types are not consistent")
 
@@ -1092,7 +899,7 @@ def build_star_linking_mol(smiles, return_mapping=False):
 
 
 def build_structure_for_input(smiles, graph_input="repeat_unit"):
-    """Resolve the molecular graph used by the GIN backend.
+    """Resolve the MTS repeat-unit or Star-Linking topology graph.
 
     ``repeat_unit`` keeps the original repeat-unit graph. ``star_linking``
     removes two attachment dummy atoms and connects their boundary atoms. The
@@ -1129,7 +936,7 @@ def build_structure_for_input(smiles, graph_input="repeat_unit"):
             "structure_mol": mol,
             "structure_input": "repeat_unit",
             "graph_build_ok": True,
-            "graph_failed_reason": "",
+            "topology_failure_code": "",
         }
 
     try:
@@ -1146,7 +953,7 @@ def build_structure_for_input(smiles, graph_input="repeat_unit"):
             "structure_mol": linked_mol,
             "structure_input": "star_linking",
             "graph_build_ok": True,
-            "graph_failed_reason": "",
+            "topology_failure_code": "",
         }
     except Exception as exc:
         return {
@@ -1155,7 +962,7 @@ def build_structure_for_input(smiles, graph_input="repeat_unit"):
             "structure_mol": mol,
             "structure_input": "repeat_unit",
             "graph_build_ok": False,
-            "graph_failed_reason": str(exc)[:200],
+            "topology_failure_code": str(exc)[:200],
         }
 
 
@@ -1177,10 +984,8 @@ def build_mips_paper_structure(smiles, distance_threshold=3, max_repeat_units=16
     if original is None:
         raise ValueError("invalid smiles")
     dummy_atoms, neighbors, bond_types = _get_dummy_atoms_and_neighbors(original)
-    if len(dummy_atoms) != 2 or len(set(neighbors)) != 2:
-        raise ValueError("MIPS requires exactly two distinct attachment boundaries")
-    if bond_types[0] != bond_types[1]:
-        raise ValueError("attachment bond types are not consistent")
+    if len(dummy_atoms) != 2:
+        raise ValueError("MIPS requires exactly two attachment sites")
 
     last_error = None
     for repeat_units in range(1, int(max_repeat_units) + 1):
@@ -1207,7 +1012,7 @@ def build_mips_paper_structure(smiles, distance_threshold=3, max_repeat_units=16
                 "structure_mol": linked_mol,
                 "structure_input": "mips_star_linking",
                 "graph_build_ok": True,
-                "graph_failed_reason": "",
+                "topology_failure_code": "",
                 "mips_repeat_units": repeat_units,
                 "mips_boundary_distance": boundary_distance,
                 "mips_distance_threshold": distance_threshold,
@@ -1221,6 +1026,345 @@ def build_mips_paper_structure(smiles, distance_threshold=3, max_repeat_units=16
     )
 
 
+def build_mips_local_structure(smiles_or_mol, config=None):
+    """Build the finite, non-PBC repeated graph used by the second route.
+
+    The terminal connection is a virtual topological edge.  It is deliberately
+    not represented as an RDKit ring and carries no cell, translation or image
+    shift.  Repetition stops at the smallest integer RU count satisfying the
+    MIPS boundary condition.
+    """
+
+    config = config or MIPSLocalConfig()
+    last_reason = ""
+    candidates = {}
+
+    def evaluate(repeat_units):
+        nonlocal last_reason
+        if repeat_units in candidates:
+            return candidates[repeat_units]
+        try:
+            open_mol, open_meta = build_periodic_multimer_mol(
+                smiles_or_mol, repeat_units, close_periodic=False
+            )
+            atom_count = int(open_mol.GetNumAtoms())
+            if atom_count > int(config.max_model_atoms):
+                last_reason = (
+                    f"model_atoms={atom_count}>{int(config.max_model_atoms)}"
+                )
+                result = None
+                candidates[repeat_units] = result
+                return result
+            left_boundary = int(open_meta["left_boundary"])
+            right_boundary = int(open_meta["right_boundary"])
+            boundary_path = (
+                [left_boundary]
+                if left_boundary == right_boundary
+                else list(Chem.GetShortestPath(
+                    open_mol, left_boundary, right_boundary
+                ))
+            )
+            boundary_distance = len(boundary_path) - 1
+            open_meta["ordered_backbone_path"] = boundary_path
+            if boundary_distance <= int(config.required_boundary_distance):
+                last_reason = (
+                    f"boundary_distance={boundary_distance}<="
+                    f"{int(config.required_boundary_distance)}"
+                )
+                result = False
+            else:
+                result = (open_mol, open_meta, boundary_distance)
+            candidates[repeat_units] = result
+            return result
+        except Exception as exc:
+            last_reason = str(exc)[:200]
+            candidates[repeat_units] = False
+            return False
+
+    upper = None
+    repeat_units = 1
+    previous = 0
+    while repeat_units <= int(config.max_repeat_units):
+        result = evaluate(repeat_units)
+        if result is None:
+            break
+        if result:
+            upper = repeat_units
+            break
+        previous = repeat_units
+        repeat_units *= 2
+    if upper is not None:
+        # The boundary distance is monotone with RU count. Search only inside
+        # the final doubling bracket to recover the smallest legal integer.
+        selected = None
+        for repeat_units in range(previous + 1, upper + 1):
+            result = evaluate(repeat_units)
+            if result:
+                selected = (repeat_units, *result)
+                break
+        if selected is None:
+            raise RuntimeError("MIPS doubling bracket lost its valid endpoint")
+        repeat_units, open_mol, open_meta, boundary_distance = selected
+        tail = int(open_meta["right_boundary"])
+        head = int(open_meta["left_boundary"])
+        if tail == head:
+            raise RuntimeError(
+                "MIPS boundary condition produced a Star self-loop"
+            )
+        bond_type = open_meta["attachment_bond_type"]
+        backbone_info = {
+            "neighbors": [head, tail],
+            "star_link_edge": [tail, head],
+            "ordered_backbone_path": list(open_meta["ordered_backbone_path"]),
+            "virtual_edges": [(tail, head, bond_type)],
+        }
+        return {
+            "requested_input": "star_linking",
+            "attachment_count": 2,
+            "backbone_info": backbone_info,
+            "structure_smiles": Chem.MolToSmiles(open_mol, canonical=False),
+            "structure_mol": open_mol,
+            "structure_input": "mips_local_star_linking",
+            "graph_build_ok": True,
+            "topology_failure_code": "",
+            "graph_available": True,
+            "repeat_metadata": open_meta,
+            "mips_repeat_units": int(repeat_units),
+            "mips_boundary_distance": int(boundary_distance),
+            "mips_distance_threshold": int(config.distance_threshold),
+            "mips_condition_valid": True,
+        }
+
+    # Preserve the other modalities with a single-RU placeholder.  It receives
+    # self-only attention and is masked by graph_available at fusion time.
+    try:
+        placeholder, metadata = build_periodic_multimer_mol(
+            smiles_or_mol, 1, close_periodic=False
+        )
+    except Exception:
+        original = (
+            Chem.Mol(smiles_or_mol)
+            if isinstance(smiles_or_mol, Chem.Mol)
+            else Chem.MolFromSmiles(str(smiles_or_mol))
+        )
+        dummy_atoms, neighbors, bond_types = _get_dummy_atoms_and_neighbors(
+            original
+        )
+        if len(dummy_atoms) != 2 or len(neighbors) != 2:
+            raise
+        keep = [
+            atom_idx for atom_idx in range(original.GetNumAtoms())
+            if atom_idx not in set(dummy_atoms)
+        ]
+        old_to_new = {
+            atom_idx: new_idx for new_idx, atom_idx in enumerate(keep)
+        }
+        editable = Chem.RWMol(original)
+        for atom_idx in sorted(dummy_atoms, reverse=True):
+            editable.RemoveAtom(int(atom_idx))
+        placeholder = editable.GetMol()
+        Chem.SanitizeMol(placeholder)
+        left_boundary = old_to_new[int(neighbors[0])]
+        right_boundary = old_to_new[int(neighbors[1])]
+        metadata = {
+            "left_boundary": left_boundary,
+            "right_boundary": right_boundary,
+            "unit_left_boundaries": [left_boundary],
+            "unit_right_boundaries": [right_boundary],
+            "unit_atoms": [list(range(placeholder.GetNumAtoms()))],
+            "base_atom_count": int(placeholder.GetNumAtoms()),
+            "ordered_backbone_path": [left_boundary],
+            "attachment_bond_type": bond_types[0],
+        }
+    pair = [int(metadata["left_boundary"]), int(metadata["right_boundary"])]
+    return {
+        "requested_input": "star_linking",
+        "attachment_count": 2,
+        "backbone_info": {
+            "neighbors": pair,
+            "star_link_edge": pair,
+            "ordered_backbone_path": list(metadata["ordered_backbone_path"]),
+            "virtual_edges": [],
+        },
+        "structure_smiles": Chem.MolToSmiles(placeholder, canonical=False),
+        "structure_mol": placeholder,
+        "structure_input": "mips_local_unavailable",
+        "graph_build_ok": False,
+        "topology_failure_code": f"mips_condition_failed:{last_reason}"[:240],
+        "graph_available": False,
+        "repeat_metadata": metadata,
+        "mips_repeat_units": 1,
+        "mips_boundary_distance": len(metadata["ordered_backbone_path"]) - 1,
+        "mips_distance_threshold": int(config.distance_threshold),
+        "mips_condition_valid": False,
+    }
+
+
+def _mips_local_adjacency(mol, virtual_edges):
+    adjacency = [[] for _ in range(mol.GetNumAtoms())]
+    for bond in mol.GetBonds():
+        begin, end = int(bond.GetBeginAtomIdx()), int(bond.GetEndAtomIdx())
+        codes = _bond_path_codes(bond, False)
+        adjacency[begin].append((end, codes))
+        adjacency[end].append((begin, codes))
+    for begin, end, bond_type in virtual_edges:
+        bond_code = allowable_features["possible_bonds"].index(bond_type) + 1
+        codes = (bond_code, 1, 1, 1, 2)
+        adjacency[int(begin)].append((int(end), codes))
+        adjacency[int(end)].append((int(begin), codes))
+    for neighbors in adjacency:
+        neighbors.sort(key=lambda item: item[0])
+    return adjacency
+
+
+def _bounded_distances(start, adjacency, max_hops):
+    distances = {int(start): 0}
+    queue = deque([int(start)])
+    while queue:
+        node = queue.popleft()
+        if distances[node] >= int(max_hops):
+            continue
+        for neighbor, _ in adjacency[node]:
+            if neighbor not in distances:
+                distances[neighbor] = distances[node] + 1
+                queue.append(neighbor)
+    return distances
+
+
+def attach_mips_local_lga(data, structure, config=None):
+    """Attach fixed-O8 sparse edges and one deterministic shortest path."""
+
+    config = config or MIPSLocalConfig()
+    graph_available = bool(structure.get("graph_available", False))
+    mol = structure["structure_mol"]
+    virtual_edges = (structure.get("backbone_info") or {}).get("virtual_edges", [])
+    adjacency = _mips_local_adjacency(mol, virtual_edges)
+    num_atoms = int(mol.GetNumAtoms())
+
+    # Explicit canonical/orbit mapping prevents repeated copies leaking masked
+    # atom targets and prevents short RUs receiving a larger loss weight.
+    metadata = structure.get("repeat_metadata") or {}
+    unit_atoms = metadata.get("unit_atoms") or [list(range(num_atoms))]
+    canonical = torch.full((num_atoms,), -1, dtype=torch.long)
+    ru_copy = torch.zeros(num_atoms, dtype=torch.long)
+    for copy_idx, atom_indices in enumerate(unit_atoms):
+        for canonical_idx, atom_idx in enumerate(atom_indices):
+            canonical[int(atom_idx)] = int(canonical_idx)
+            ru_copy[int(atom_idx)] = int(copy_idx)
+    if bool((canonical < 0).any()):
+        raise RuntimeError("MIPS canonical RU mapping is incomplete")
+
+    sources, targets, spd_values = [], [], []
+    representative_paths = []
+    bond_histograms = []
+    canonical_pairs = []
+
+    for target in range(num_atoms):
+        if graph_available:
+            target_distances = _bounded_distances(
+                target, adjacency, config.max_hops
+            )
+            source_nodes = sorted(
+                target_distances,
+                key=lambda node: (target_distances[node], node),
+            )
+        else:
+            target_distances = {target: 0}
+            source_nodes = [target]
+
+        for source in source_nodes:
+            distance = int(target_distances[source])
+            sources.append(int(source))
+            targets.append(int(target))
+            spd_values.append(distance)
+            canonical_pairs.append(
+                int(canonical[source]) * max(1, int(canonical.max()) + 1)
+                + int(canonical[target])
+            )
+
+            source_distances = _bounded_distances(
+                source, adjacency, config.max_hops
+            )
+            path_by_position = []
+            for position in range(distance + 1):
+                members = sorted(
+                    node for node, source_distance in source_distances.items()
+                    if source_distance == position
+                    and node in target_distances
+                    and source_distance + target_distances[node] == distance
+                )
+                path_by_position.append(members)
+            representative_path = [
+                members[0] for members in path_by_position if members
+            ]
+            representative_paths.append(representative_path)
+
+            histogram = torch.zeros(
+                int(config.max_hops), 6, dtype=torch.float
+            )
+            for position in range(distance):
+                left = representative_path[position]
+                right = representative_path[position + 1]
+                codes = next(
+                    edge_codes
+                    for neighbor, edge_codes in adjacency[left]
+                    if neighbor == right
+                )
+                # Six categories: four bond types, other, and virtual star.
+                category = (
+                    5 if int(codes[4]) == 2
+                    else min(4, int(codes[0]) - 1)
+                )
+                histogram[position, category] = 1.0
+            bond_histograms.append(histogram)
+
+    edge_count = len(sources)
+    path_width = int(config.max_hops) + 1
+    path_index = torch.full((edge_count, path_width), -1, dtype=torch.long)
+    path_mask = torch.zeros((edge_count, path_width), dtype=torch.bool)
+    for edge_idx, path in enumerate(representative_paths):
+        path_index[edge_idx, :len(path)] = torch.tensor(path, dtype=torch.long)
+        path_mask[edge_idx, :len(path)] = True
+
+    data.lga_edge_index = torch.tensor([sources, targets], dtype=torch.long)
+    data.lga_spd = torch.tensor(spd_values, dtype=torch.long)
+    data.lga_path_index = path_index
+    data.lga_path_mask = path_mask
+    data.lga_path_bond_hist = (
+        torch.stack(bond_histograms, dim=0)
+        if bond_histograms else torch.zeros((0, int(config.max_hops), 6))
+    )
+    star_edge = (
+        (structure.get("backbone_info") or {}).get("star_link_edge") or []
+    )
+    if len(star_edge) == 2:
+        left, right = (int(star_edge[0]), int(star_edge[1]))
+        data.lga_star_edge_mask = torch.tensor(
+            [
+                (source == left and target == right)
+                or (source == right and target == left)
+                for source, target in zip(sources, targets)
+            ],
+            dtype=torch.bool,
+        )
+    else:
+        data.lga_star_edge_mask = torch.zeros(edge_count, dtype=torch.bool)
+    data.canonical_ru_atom_index = canonical
+    data.ru_copy_index = ru_copy
+    data.canonical_pair_index = torch.tensor(canonical_pairs, dtype=torch.long)
+    data.graph_available = bool(graph_available)
+    data.mips_condition_valid = bool(
+        structure.get("mips_condition_valid", graph_available)
+    )
+    data.mips_alias_free = bool(graph_available)
+    data.mips_local_lga_schema_version = LEGACY_MIPS_LOCAL_LGA_SCHEMA_VERSION
+    # This helper is the retired explicit finite-copy reference.  Label it
+    # with the legacy identity so production cache validation cannot mistake
+    # it for canonical periodic topology.
+    data.feature_schema = LEGACY_FEATURE_SCHEMA
+    return data
+
+
 def annotate_structure_fields(data, structure, prefix="graph"):
     """Attach auditable structure metadata to a PyG Data object."""
     setattr(data, f"{prefix}_smiles", structure["structure_smiles"])
@@ -1229,7 +1373,7 @@ def annotate_structure_fields(data, structure, prefix="graph"):
     data.structure_smiles = structure["structure_smiles"]
     data.structure_input = structure["structure_input"]
     data.graph_build_ok = bool(structure["graph_build_ok"])
-    data.graph_failed_reason = structure["graph_failed_reason"]
+    data.topology_failure_code = structure["topology_failure_code"]
     data.attachment_count = int(structure["attachment_count"])
     data.has_backbone_features = True
     backbone_info = structure.get("backbone_info") or {}
@@ -1245,35 +1389,99 @@ def annotate_structure_fields(data, structure, prefix="graph"):
         data.graph_build_ok
         and data.structure_input in {
             "star_linking", "mips_star_linking", "polygen_periodic",
-            "mips_periodic_supercell",
+            "mips_periodic_supercell", "mips_local_star_linking",
         }
         and len(pair) == 2
         and len(star_edge) == 2
         and len(path) >= 2
     )
-    periodic_metadata = structure.get("periodic_metadata") or {}
-    ru_index = periodic_metadata.get("atom_ru_index")
+    repeat_metadata = (
+        structure.get("repeat_metadata")
+        or structure.get("periodic_metadata")
+        or {}
+    )
+    ru_index = repeat_metadata.get("atom_ru_index")
     if ru_index is None:
         ru_index = [0] * int(data.x.size(0))
     data.scage_ru_index = torch.tensor(ru_index, dtype=torch.long)
-    data.periodic_ru_count = int(periodic_metadata.get("num_repeat_units", 1))
     data.mips_repeat_units = int(structure.get("mips_repeat_units", 1))
     data.mips_boundary_distance = int(structure.get("mips_boundary_distance", -1))
     data.mips_distance_threshold = int(structure.get("mips_distance_threshold", 3))
+    data.attachment_bond_type_left = str(
+        repeat_metadata.get("attachment_bond_type_left", "")
+    )
+    data.attachment_bond_type_right = str(
+        repeat_metadata.get("attachment_bond_type_right", "")
+    )
+    data.attachment_bond_mismatch = bool(
+        repeat_metadata.get("attachment_bond_mismatch", False)
+    )
+    data.connection_bond_policy = str(
+        repeat_metadata.get("connection_bond_policy", "")
+    )
+    data.shared_attachment_boundary = bool(
+        repeat_metadata.get("shared_boundary", False)
+    )
+    data.multimer_builder_version = int(
+        repeat_metadata.get("multimer_builder_version", 0)
+    )
     data.graph_available = bool(structure.get("graph_available", data.graph_build_ok))
-    data.geometry_period_ru = int(structure.get("geometry_period_ru", 0))
-    data.mips_repeat_factor = int(structure.get("mips_repeat_factor", 1))
-    data.model_cell_ru = int(structure.get("model_cell_ru", data.periodic_ru_count))
+    if data.structure_input.startswith("mips_local_"):
+        data.mips_repeat_factor = data.mips_repeat_units
+    else:
+        data.periodic_ru_count = int(
+            repeat_metadata.get("num_repeat_units", 1)
+        )
+        data.geometry_period_ru = int(structure.get("geometry_period_ru", 0))
+        data.mips_repeat_factor = int(structure.get("mips_repeat_factor", 1))
+        data.model_cell_ru = int(
+            structure.get("model_cell_ru", data.periodic_ru_count)
+        )
     data.mips_condition_valid = bool(
         structure.get("mips_condition_valid", data.graph_available)
     )
     return data
 
 
-def build_graph_for_input(smiles, graph_input="repeat_unit"):
-    """Build the graph used by the default GIN backend."""
+def build_mips_graph_for_input(smiles, graph_input="star_linking"):
+    """Build the sparse O8 MTS graph for a P-SMILES string."""
     structure = build_structure_for_input(smiles, graph_input)
-    data = mol_to_graph_data_obj_simple(
+    data = build_mips_data_object(
         structure["structure_mol"], backbone_info=structure.get("backbone_info")
     )
     return annotate_structure_fields(data, structure, prefix="graph")
+
+
+def build_canonical_periodic_topology(smiles_or_mol, max_hops=2):
+    """Native single-canonical-RU MTS topology builder.
+
+    The implementation lives in :mod:`canonical_periodic` to keep the legacy
+    explicit reference construction isolated.  This lazy wrapper avoids a
+    graph_data/canonical_periodic import cycle and gives callers one natural
+    builder entry point.
+    """
+
+    from .canonical_periodic import build_canonical_periodic_topology as _build
+    return _build(smiles_or_mol, max_hops=max_hops)
+
+
+def migrate_explicit_topology_to_canonical(old_topology, ru_base=None, **kwargs):
+    """Copy verified canonical feature rows and rebuild lifted relations."""
+
+    from .canonical_periodic import migrate_explicit_topology_to_canonical as _migrate
+    return _migrate(old_topology, ru_base, **kwargs)
+
+
+def build_corrected_explicit_k_ru_reference(canonical_topology, repeat_factor):
+    """Build the corrected translation-symmetric explicit test reference."""
+
+    from .canonical_periodic import (
+        build_corrected_explicit_k_ru_reference as _build_reference,
+    )
+    return _build_reference(canonical_topology, repeat_factor)
+
+
+def build_lifted_periodic_relations(smiles_or_mol, max_hops=2):
+    """Compatibility wrapper for the canonical lifted-relation builder."""
+
+    return build_canonical_periodic_topology(smiles_or_mol, max_hops=max_hops)

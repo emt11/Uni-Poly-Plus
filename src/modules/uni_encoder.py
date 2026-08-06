@@ -4,15 +4,105 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
 from transformers import RobertaModel
+from transformers.utils import logging as transformers_logging
+from src.dataset.mips_trimer_contract import ROUTE_INTERNAL, ROUTE_NAME
 
-from .geom import PaiNNEncoder
-from .graph import GNN_graphpred
-from .scage_graph import SCAGEGraphEncoder
-from .mips_periodic_graph import MIPSPeriodicGraphEncoder
+from .mips_local_graph import MIPSLocalGraphEncoder
 
 
-SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp', 'geom')
-SUPPORTED_FUSION_TYPES = ('self_attention_pooling', 'parallel_attention')
+SUPPORTED_MODALITIES = ('smiles', 'graph', 'fp')
+SUPPORTED_FUSION_TYPES = ('none', 'zero_gated_residual')
+
+
+def _model_load_log_mode():
+    mode = os.environ.get("UNIPOLY_MODEL_LOAD_LOG", "concise").strip().lower()
+    if mode not in {"quiet", "concise", "verbose"}:
+        raise ValueError(
+            "UNIPOLY_MODEL_LOAD_LOG must be quiet, concise, or verbose"
+        )
+    return mode
+
+
+def _model_load_log(message):
+    if _model_load_log_mode() != "quiet":
+        print(message, flush=True)
+
+
+def _load_roberta_encoder(model_name):
+    """Load the encoder without repeating expected MLM-head diagnostics."""
+
+    if _model_load_log_mode() == "verbose":
+        return RobertaModel.from_pretrained(model_name)
+    previous_verbosity = transformers_logging.get_verbosity()
+    progress_was_enabled = transformers_logging.is_progress_bar_enabled()
+    try:
+        transformers_logging.set_verbosity_error()
+        transformers_logging.disable_progress_bar()
+        return RobertaModel.from_pretrained(model_name)
+    finally:
+        transformers_logging.set_verbosity(previous_verbosity)
+        if progress_was_enabled:
+            transformers_logging.enable_progress_bar()
+
+
+class SharedPrivateProjection(nn.Module):
+    """Split a modality into aligned shared and modality-private halves."""
+
+    def __init__(self, dim):
+        super().__init__()
+        if int(dim) % 2:
+            raise ValueError("shared/private projection requires an even dimension")
+        self.half_dim = int(dim) // 2
+        self.shared = nn.Sequential(
+            nn.LayerNorm(int(dim)),
+            nn.Linear(int(dim), self.half_dim),
+            nn.GELU(),
+        )
+        self.private = nn.Sequential(
+            nn.LayerNorm(int(dim)),
+            nn.Linear(int(dim), self.half_dim),
+            nn.GELU(),
+        )
+        self.output_norm = nn.LayerNorm(int(dim))
+
+    def forward(self, embedding):
+        shared = self.shared(embedding)
+        private = self.private(embedding)
+        combined = self.output_norm(torch.cat([shared, private], dim=-1))
+        return combined, shared, private
+
+
+class LoRALinear(nn.Module):
+    """Minimal frozen-base LoRA adapter used by MTS SMILES experiments."""
+
+    def __init__(self, base, rank=8, alpha=16.0, dropout=0.05):
+        super().__init__()
+        if not isinstance(base, nn.Linear):
+            raise TypeError("LoRALinear requires nn.Linear")
+        self.base = base
+        for parameter in self.base.parameters():
+            parameter.requires_grad = False
+        self.lora_a = nn.Parameter(torch.empty(int(rank), base.in_features))
+        self.lora_b = nn.Parameter(torch.zeros(base.out_features, int(rank)))
+        nn.init.kaiming_uniform_(self.lora_a, a=5 ** 0.5)
+        self.scale = float(alpha) / float(rank)
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, values):
+        update = F.linear(F.linear(self.dropout(values), self.lora_a), self.lora_b)
+        return self.base(values) + self.scale * update
+
+
+def inject_roberta_lora(encoder, last_layers=4):
+    """Inject rank-8 LoRA into Q/K/V/output projections of final layers."""
+    layers = list(encoder.encoder.layer)
+    for layer in layers[-int(last_layers):]:
+        attention = layer.attention
+        for parent, name in (
+            (attention.self, "query"), (attention.self, "key"),
+            (attention.self, "value"), (attention.output, "dense"),
+        ):
+            setattr(parent, name, LoRALinear(getattr(parent, name)))
 
 
 class UniEncoderAttention(nn.Module):
@@ -21,22 +111,16 @@ class UniEncoderAttention(nn.Module):
         joint_embedding_dim: int,
         smiles_model_name: Optional[str],
         gnn_model_name: Optional[str],
-        geom_model_name: Optional[str],
         modality_list: List[str],
         output_attention_weights: bool = True,
         freeze_encoder: bool = False,
         num_heads: int = 8,
         ff_dim: Optional[int] = None,
         dropout: float = 0.1,
-        geometry_encoder: str = 'painn',
         graph_num_layers: int = 6,
         graph_emb_dim: int = 256,
         graph_dropout: float = 0.1,
-        graph_pooling: str = 'attention',
-        graph_jk: str = 'sum',
-        graph_norm: str = 'graph',
-        graph_residual: bool = True,
-        graph_encoder_type: str = 'gin',
+        graph_encoder_type: str = ROUTE_INTERNAL,
         scage_dist_bar=None,
         scage_num_heads: int = 16,
         scage_ffn_hidden_dim: int = 256,
@@ -58,9 +142,37 @@ class UniEncoderAttention(nn.Module):
         scage_periodic_image_cap: int = 1,
         scage_periodic_image_temperature: float = 0.5,
         scage_force_topology_only: bool = False,
-        fusion_type: str = 'self_attention_pooling',
+        mips_core: str = "topology_plus",
+        mips_max_hops: Optional[int] = None,
+        mips_use_descriptors: bool = False,
+        spatial_mode: str = "trimer_scage",
+        graph_geometry_mode: str = "trimer_scage_mcl",
+        mcl_distance_percentiles=(0.20, 0.50),
+        trimer_num_candidates: int = 4,
+        trimer_max_heavy_atoms: int = 384,
+        mips_variant: str = None,
+        mips_fusion_mode: str = "none",
+        projection_mode: str = "shared_private",
+        modality_control: str = "real",
+        controlled_modality: Optional[str] = None,
+        mips_atom_feature_mode: str = None,
+        mips_attention_scale: str = None,
+        mips_norm_mode: str = None,
+        mips_activation: str = None,
+        mips_spd_bias_mode: str = None,
+        mips_path_bias_mode: str = None,
+        mips_multi_scale_hop_gate: Optional[bool] = None,
+        mips_semantics: str = None,
+        mips_descriptor_fusion_mode: str = "graph_md_residual",
+        mips_descriptor_components: str = "md200",
+        mips_descriptor_disturbance: float = 0.0,
+        mips_backbone_mode: str = None,
+        mips_input_norm: bool = None,
+        mips_mask_mode: str = None,
+        mips_mask_policy: str = None,
+        mips_masked_loss_reduction: str = None,
+        fusion_type: str = 'none',
         fp_mode: str = 'ecfp',
-        parallel_attention_layers: int = 1,
         fusion_dropout: Optional[float] = None,
         head_dropout: float = 0.25,
         fp_bit_dropout: float = 0.0,
@@ -88,15 +200,30 @@ class UniEncoderAttention(nn.Module):
                 f"{', '.join(SUPPORTED_FUSION_TYPES)}."
             )
         self.fusion_type = fusion_type
+        self.mips_fusion_mode = str(mips_fusion_mode)
+        self.projection_mode = str(projection_mode)
+        self.modality_control = str(modality_control)
+        self.controlled_modality = controlled_modality
+        if self.mips_fusion_mode != "none":
+            raise ValueError(
+                "MIPS-Trimer-SCAGE uses a single graph path; parallel fusion "
+                "is not an active model component."
+            )
+        if self.projection_mode not in {"plain", "shared_private"}:
+            raise ValueError("projection_mode must be plain or shared_private")
+        if self.modality_control not in {
+            "real", "batch_shuffled", "constant_zero"
+        }:
+            raise ValueError("unsupported modality control")
         self.graph_encoder_type = str(graph_encoder_type).lower()
+        if self.graph_encoder_type == "mts":
+            self.graph_encoder_type = ROUTE_INTERNAL
         self.modality_dropout = dict(modality_dropout or {})
-        if self.fusion_type == 'parallel_attention':
-            valid_modalities = set(modality_list) in ({'graph'}, {'smiles', 'graph', 'fp'})
-            if self.graph_encoder_type != 'scage' or not valid_modalities:
-                raise ValueError(
-                    "fusion_type='parallel_attention' requires graph_encoder_type='scage' "
-                    "and either Stage 1 modalities=graph or Stage 2/3 modalities=smiles graph fp."
-                )
+        if self.mips_fusion_mode != "none":
+            raise ValueError(
+                "The retired parallel/self-attention fusion path is not available; "
+                "use mips_fusion_mode='none' with none or zero_gated_residual."
+            )
 
         self.encoders = nn.ModuleDict({
             modality: EncoderModule(
@@ -105,15 +232,9 @@ class UniEncoderAttention(nn.Module):
                 freeze_encoder=freeze_encoder,
                 smiles_model_name=smiles_model_name,
                 gnn_model_name=gnn_model_name,
-                geom_model_name=geom_model_name,
-                geometry_encoder=geometry_encoder,
                 graph_num_layers=graph_num_layers,
                 graph_emb_dim=graph_emb_dim,
                 graph_dropout=graph_dropout,
-                graph_pooling=graph_pooling,
-                graph_jk=graph_jk,
-                graph_norm=graph_norm,
-                graph_residual=graph_residual,
                 graph_encoder_type=graph_encoder_type,
                 scage_dist_bar=scage_dist_bar,
                 scage_num_heads=scage_num_heads,
@@ -136,38 +257,81 @@ class UniEncoderAttention(nn.Module):
                 scage_periodic_image_cap=scage_periodic_image_cap,
                 scage_periodic_image_temperature=scage_periodic_image_temperature,
                 scage_force_topology_only=scage_force_topology_only,
+                mips_core=mips_core,
+                mips_max_hops=mips_max_hops,
+                mips_use_descriptors=mips_use_descriptors,
+                spatial_mode=spatial_mode,
+                graph_geometry_mode=graph_geometry_mode,
+                mcl_distance_percentiles=mcl_distance_percentiles,
+                trimer_num_candidates=trimer_num_candidates,
+                trimer_max_heavy_atoms=trimer_max_heavy_atoms,
+                mips_variant=mips_variant,
+                mips_atom_feature_mode=mips_atom_feature_mode,
+                mips_attention_scale=mips_attention_scale,
+                mips_norm_mode=mips_norm_mode,
+                mips_activation=mips_activation,
+                mips_spd_bias_mode=mips_spd_bias_mode,
+                mips_path_bias_mode=mips_path_bias_mode,
+                mips_multi_scale_hop_gate=mips_multi_scale_hop_gate,
+                mips_semantics=mips_semantics,
+                mips_descriptor_fusion_mode=mips_descriptor_fusion_mode,
+                mips_descriptor_components=mips_descriptor_components,
+                mips_descriptor_disturbance=mips_descriptor_disturbance,
+                mips_backbone_mode=mips_backbone_mode,
+                mips_input_norm=mips_input_norm,
+                mips_mask_mode=mips_mask_mode,
+                mips_mask_policy=mips_mask_policy,
+                mips_masked_loss_reduction=mips_masked_loss_reduction,
                 fp_mode=fp_mode,
                 fp_bit_dropout=fp_bit_dropout,
+                low_capacity_adapter=(
+                    self.fusion_type == 'zero_gated_residual'
+                    and modality in {'smiles', 'fp'}
+                ),
             )
             for modality in modality_list
         })
+        if self.fusion_type == 'zero_gated_residual' and 'smiles' in self.encoders:
+            inject_roberta_lora(self.encoders['smiles'].encoder, last_layers=4)
 
         ff_dim = ff_dim or (joint_embedding_dim * 2)
-        self.fusion_module = FusionModule(
-            joint_embedding_dim=joint_embedding_dim,
-            num_heads=num_heads,
-            ff_dim=ff_dim,
-            dropout=dropout,
-        )
-        fusion_dropout = dropout if fusion_dropout is None else float(fusion_dropout)
-        self.parallel_attention_fusion = ParallelAttentionFusion(
-            joint_embedding_dim=joint_embedding_dim,
-            num_heads=num_heads,
-            ff_dim=ff_dim,
-            modality_names=modality_list,
-            num_layers=parallel_attention_layers,
-            dropout=fusion_dropout,
-        )
+        if self.fusion_type == "none":
+            if list(modality_list) != ["graph"]:
+                raise ValueError(
+                    "fusion_type='none' is reserved for the graph-only "
+                    f"{ROUTE_NAME} route"
+                )
+            self.fusion_module = None
+        elif self.fusion_type == "zero_gated_residual":
+            if 'graph' not in modality_list:
+                raise ValueError("zero_gated_residual requires a graph anchor")
+            self.fusion_module = None
+        self.residual_modality_gates = nn.ParameterDict({
+            name: nn.Parameter(torch.zeros(()))
+            for name in modality_list if name != 'graph'
+        }) if self.fusion_type == 'zero_gated_residual' else nn.ParameterDict()
+
+        self.shared_private_projections = nn.ModuleDict()
+        if self.projection_mode == "shared_private":
+            self.shared_private_projections.update({
+                name: SharedPrivateProjection(joint_embedding_dim)
+                for name in modality_list
+            })
 
         projection_dim = int(alignment_projection_dim)
-        self.alignment_projections = nn.ModuleDict({
-            name: nn.Sequential(
-                nn.Linear(joint_embedding_dim, joint_embedding_dim),
-                nn.GELU(),
-                nn.Linear(joint_embedding_dim, projection_dim),
-            )
-            for name in tuple(modality_list) + ('fusion',)
-        })
+        self.alignment_projections = nn.ModuleDict()
+        if self.fusion_type not in {"none", "zero_gated_residual"}:
+            for name in tuple(modality_list) + ('fusion',):
+                input_dim = (
+                    joint_embedding_dim
+                    if name == "fusion" or self.projection_mode == "plain"
+                    else joint_embedding_dim // 2
+                )
+                self.alignment_projections[name] = nn.Sequential(
+                    nn.Linear(input_dim, joint_embedding_dim),
+                    nn.GELU(),
+                    nn.Linear(joint_embedding_dim, projection_dim),
+                )
 
         self.mlp = nn.Sequential(
             nn.Linear(joint_embedding_dim, 128),
@@ -205,15 +369,49 @@ class UniEncoderAttention(nn.Module):
         })
 
     def encode_modalities(self, data):
-        return torch.stack([self.encoders[name](data) for name in self.modality_list], dim=1)
+        encoded = []
+        shared_parts = []
+        private_parts = []
+        for name in self.modality_list:
+            value = self.encoders[name](data)
+            control_applies = (
+                self.modality_control != "real"
+                and (
+                    name == self.controlled_modality
+                    if self.controlled_modality is not None
+                    else name != "graph"
+                )
+            )
+            if control_applies:
+                if self.modality_control == "constant_zero":
+                    value = torch.zeros_like(value)
+                elif value.size(0) > 1:
+                    value = value.roll(shifts=1, dims=0)
+            if self.projection_mode == "shared_private":
+                value, shared, private = self.shared_private_projections[name](value)
+            else:
+                shared = value
+                private = torch.zeros_like(value)
+            encoded.append(value)
+            shared_parts.append(shared)
+            private_parts.append(private)
+        self.shared_modality_embeddings = torch.stack(shared_parts, dim=1)
+        self.private_modality_embeddings = torch.stack(private_parts, dim=1)
+        return torch.stack(encoded, dim=1)
+
+    def split_shared_private(self, name, embedding):
+        if self.projection_mode == "plain":
+            return embedding, embedding, torch.zeros_like(embedding)
+        if name not in self.shared_private_projections:
+            raise KeyError(f"No shared/private projection exists for {name!r}")
+        return self.shared_private_projections[name](embedding)
 
     def intrinsic_availability_mask(self, data, device=None):
         """Return modalities that physically exist for each sample.
 
         SMILES and fingerprints are always available in the current dataset.
-        The periodic graph builder may explicitly reject an over-long or
-        aliasing repeat unit; those graph placeholders must never participate
-        in fusion or alignment.
+        The finite non-PBC graph builder may reject an over-long repeat unit;
+        those graph placeholders must never participate in fusion or alignment.
         """
         device = device or next(self.parameters()).device
         batch_size = len(data.smiles)
@@ -230,6 +428,18 @@ class UniEncoderAttention(nn.Module):
                         f"{available.numel()} vs {batch_size}"
                     )
                 mask[:, self.modality_list.index('graph')] = available
+        for name, field in (
+            ('smiles', 'smiles_available'), ('fp', 'fp_available')
+        ):
+            if name in self.modality_list and hasattr(data, field):
+                available = torch.as_tensor(
+                    getattr(data, field), device=device
+                ).view(-1).bool()
+                if available.numel() != batch_size:
+                    raise ValueError(
+                        f"{field} must contain one value per graph"
+                    )
+                mask[:, self.modality_list.index(name)] = available
         return mask
 
     def sample_availability_mask(
@@ -248,7 +458,10 @@ class UniEncoderAttention(nn.Module):
         if not probabilities or len(self.modality_list) < min_available:
             return mask
         for idx, name in enumerate(self.modality_list):
-            probability = float(probabilities.get(name, 0.0))
+            probability = (
+                0.0 if self.fusion_type == 'zero_gated_residual' and name == 'graph'
+                else float(probabilities.get(name, 0.0))
+            )
             if probability > 0:
                 mask[:, idx] &= torch.rand(batch_size, device=device) >= probability
         for row in range(batch_size):
@@ -265,11 +478,35 @@ class UniEncoderAttention(nn.Module):
         return mask
 
     def fuse_embeddings(self, embeddings, availability_mask=None):
-        if self.fusion_type == 'parallel_attention':
-            return self.parallel_attention_fusion(embeddings, availability_mask=availability_mask)
-        if availability_mask is not None and not bool(availability_mask.all()):
-            raise ValueError("Availability masks are supported only by parallel_attention fusion")
-        return self.fusion_module(embeddings)
+        if self.fusion_type == 'none':
+            if embeddings.ndim != 3 or embeddings.size(1) != 1:
+                raise ValueError("fusion_type='none' requires one graph modality")
+            weights = embeddings.new_ones((embeddings.size(0), 1))
+            return embeddings[:, 0], weights
+        if self.fusion_type == 'zero_gated_residual':
+            graph_index = self.modality_list.index('graph')
+            fused = embeddings[:, graph_index]
+            weights = embeddings.new_zeros(
+                (embeddings.size(0), len(self.modality_list))
+            )
+            weights[:, graph_index] = 1.0
+            for index, name in enumerate(self.modality_list):
+                if name == 'graph':
+                    continue
+                gate = torch.tanh(self.residual_modality_gates[name])
+                available = (
+                    availability_mask[:, index].to(embeddings.dtype)
+                    if availability_mask is not None
+                    else embeddings.new_ones(embeddings.size(0))
+                )
+                coefficient = gate * available
+                fused = fused + coefficient.unsqueeze(-1) * embeddings[:, index]
+                weights[:, index] = coefficient
+            return fused, weights
+        raise RuntimeError(
+            "Unsupported fusion path; MTS only supports none and "
+            "zero_gated_residual."
+        )
 
     def project_alignment(self, name, embedding):
         if name not in self.alignment_projections:
@@ -299,7 +536,7 @@ class UniEncoderAttention(nn.Module):
 
     def forward(self, data, availability_mask=None):
         embeddings = self.encode_modalities(data)
-        if self.fusion_type == 'parallel_attention':
+        if self.fusion_type == 'zero_gated_residual':
             intrinsic_mask = self.intrinsic_availability_mask(
                 data, device=embeddings.device
             )
@@ -307,6 +544,9 @@ class UniEncoderAttention(nn.Module):
                 availability_mask = self.sample_availability_mask(
                     embeddings.size(0), device=embeddings.device,
                     intrinsic_mask=intrinsic_mask,
+                    min_available=(
+                        1 if self.fusion_type == 'zero_gated_residual' else 2
+                    ),
                 )
             elif availability_mask is None:
                 availability_mask = intrinsic_mask
@@ -316,7 +556,7 @@ class UniEncoderAttention(nn.Module):
                 ) & intrinsic_mask
 
         fused_output, modality_attention = self.fuse_embeddings(embeddings, availability_mask)
-        visual_name = 'parallel' if self.fusion_type == 'parallel_attention' else 'flat'
+        visual_name = 'zero_gated_residual' if self.fusion_type == 'zero_gated_residual' else 'graph'
         self.unimodal_embedding = fused_output
         self.attention_visual_weights = modality_attention
         self.attention_visual_labels = list(self.modality_list)
@@ -336,16 +576,10 @@ class EncoderModule(nn.Module):
         freeze_encoder: bool,
         smiles_model_name: Optional[str] = None,
         gnn_model_name: Optional[str] = None,
-        geom_model_name: Optional[str] = None,
-        geometry_encoder: str = 'painn',
         graph_num_layers: int = 6,
         graph_emb_dim: int = 256,
         graph_dropout: float = 0.1,
-        graph_pooling: str = 'attention',
-        graph_jk: str = 'sum',
-        graph_norm: str = 'graph',
-        graph_residual: bool = True,
-        graph_encoder_type: str = 'gin',
+        graph_encoder_type: str = ROUTE_INTERNAL,
         scage_dist_bar=None,
         scage_num_heads: int = 16,
         scage_ffn_hidden_dim: int = 256,
@@ -367,26 +601,47 @@ class EncoderModule(nn.Module):
         scage_periodic_image_cap: int = 1,
         scage_periodic_image_temperature: float = 0.5,
         scage_force_topology_only: bool = False,
+        mips_core: str = "topology_plus",
+        mips_max_hops: Optional[int] = None,
+        mips_use_descriptors: bool = False,
+        spatial_mode: str = "trimer_scage",
+        graph_geometry_mode: str = "trimer_scage_mcl",
+        mcl_distance_percentiles=(0.20, 0.50),
+        trimer_num_candidates: int = 4,
+        trimer_max_heavy_atoms: int = 384,
+        mips_variant: str = None,
+        mips_atom_feature_mode: str = None,
+        mips_attention_scale: str = None,
+        mips_norm_mode: str = None,
+        mips_activation: str = None,
+        mips_spd_bias_mode: str = None,
+        mips_path_bias_mode: str = None,
+        mips_multi_scale_hop_gate: Optional[bool] = None,
+        mips_semantics: str = None,
+        mips_descriptor_fusion_mode: str = "graph_md_residual",
+        mips_descriptor_components: str = "md200",
+        mips_descriptor_disturbance: float = 0.0,
+        mips_backbone_mode: str = None,
+        mips_input_norm: bool = None,
+        mips_mask_mode: str = None,
+        mips_mask_policy: str = None,
+        mips_masked_loss_reduction: str = None,
         fp_mode: str = 'ecfp',
         fp_bit_dropout: float = 0.0,
+        low_capacity_adapter: bool = False,
     ):
         super().__init__()
         self.modality = modality
+        self.low_capacity_adapter = bool(low_capacity_adapter)
 
         encoder, input_dim = self._initialize_encoder(
             modality=modality,
             joint_embedding_dim=joint_embedding_dim,
             smiles_model_name=smiles_model_name,
             gnn_model_name=gnn_model_name,
-            geom_model_name=geom_model_name,
-            geometry_encoder=geometry_encoder,
             graph_num_layers=graph_num_layers,
             graph_emb_dim=graph_emb_dim,
             graph_dropout=graph_dropout,
-            graph_pooling=graph_pooling,
-            graph_jk=graph_jk,
-            graph_norm=graph_norm,
-            graph_residual=graph_residual,
             graph_encoder_type=graph_encoder_type,
             scage_dist_bar=scage_dist_bar,
             scage_num_heads=scage_num_heads,
@@ -409,17 +664,45 @@ class EncoderModule(nn.Module):
             scage_periodic_image_cap=scage_periodic_image_cap,
             scage_periodic_image_temperature=scage_periodic_image_temperature,
             scage_force_topology_only=scage_force_topology_only,
+            mips_core=mips_core,
+            mips_max_hops=mips_max_hops,
+            mips_use_descriptors=mips_use_descriptors,
+            spatial_mode=spatial_mode,
+            graph_geometry_mode=graph_geometry_mode,
+            mcl_distance_percentiles=mcl_distance_percentiles,
+            trimer_num_candidates=trimer_num_candidates,
+            trimer_max_heavy_atoms=trimer_max_heavy_atoms,
+            mips_variant=mips_variant,
+            mips_atom_feature_mode=mips_atom_feature_mode,
+            mips_attention_scale=mips_attention_scale,
+            mips_norm_mode=mips_norm_mode,
+            mips_activation=mips_activation,
+            mips_spd_bias_mode=mips_spd_bias_mode,
+            mips_path_bias_mode=mips_path_bias_mode,
+            mips_multi_scale_hop_gate=mips_multi_scale_hop_gate,
+            mips_semantics=mips_semantics,
+            mips_descriptor_fusion_mode=mips_descriptor_fusion_mode,
+            mips_descriptor_components=mips_descriptor_components,
+            mips_descriptor_disturbance=mips_descriptor_disturbance,
+            mips_backbone_mode=mips_backbone_mode,
+            mips_input_norm=mips_input_norm,
+            mips_mask_mode=mips_mask_mode,
+            mips_mask_policy=mips_mask_policy,
+            mips_masked_loss_reduction=mips_masked_loss_reduction,
             fp_mode=fp_mode,
             fp_bit_dropout=fp_bit_dropout,
         )
         self.encoder = encoder
         self.norm = nn.LayerNorm(input_dim) if encoder else None
-        self.projection = self._create_projection(input_dim, joint_embedding_dim)
-        self.geom_context_embedding = (
-            # 0=PBC/screw, 1=fallback, 2=repeat-unit, 3=s-mer center context.
-            nn.Embedding(4, joint_embedding_dim) if modality == 'geom' else None
+        self.projection = self._create_projection(
+            input_dim,
+            joint_embedding_dim,
+            hidden_dim=(
+                128
+                if self.low_capacity_adapter and modality == 'smiles'
+                else None
+            ),
         )
-
         if encoder and freeze_encoder:
             for param in self.encoder.parameters():
                 param.requires_grad = False
@@ -430,15 +713,9 @@ class EncoderModule(nn.Module):
         joint_embedding_dim: int,
         smiles_model_name: Optional[str],
         gnn_model_name: Optional[str],
-        geom_model_name: Optional[str],
-        geometry_encoder: str,
         graph_num_layers: int,
         graph_emb_dim: int,
         graph_dropout: float,
-        graph_pooling: str,
-        graph_jk: str,
-        graph_norm: str,
-        graph_residual: bool,
         graph_encoder_type: str,
         scage_dist_bar,
         scage_num_heads: int,
@@ -461,64 +738,104 @@ class EncoderModule(nn.Module):
         scage_periodic_image_cap: int,
         scage_periodic_image_temperature: float,
         scage_force_topology_only: bool,
+        mips_core: str,
+        mips_max_hops: Optional[int],
+        mips_use_descriptors: bool,
+        spatial_mode: str,
+        graph_geometry_mode: str,
+        mcl_distance_percentiles,
+        trimer_num_candidates: int,
+        trimer_max_heavy_atoms: int,
+        mips_variant: str,
+        mips_atom_feature_mode: str,
+        mips_attention_scale: str,
+        mips_norm_mode: str,
+        mips_activation: str,
+        mips_spd_bias_mode: str,
+        mips_path_bias_mode: str,
+        mips_multi_scale_hop_gate: Optional[bool],
+        mips_semantics: str,
+        mips_descriptor_fusion_mode: str,
+        mips_descriptor_components: str,
+        mips_descriptor_disturbance: float,
+        mips_backbone_mode: str,
+        mips_input_norm: bool,
+        mips_mask_mode: str,
+        mips_mask_policy: str,
+        mips_masked_loss_reduction: str,
         fp_mode: str,
         fp_bit_dropout: float,
     ):
         if modality == 'smiles':
-            encoder = RobertaModel.from_pretrained(smiles_model_name)
+            encoder = _load_roberta_encoder(smiles_model_name)
             input_dim = encoder.config.hidden_size
-            print(f"Loaded smiles pretrained weights from {smiles_model_name}")
-        elif modality == 'geom':
-            encoder = self._initialize_geometry_encoder(geometry_encoder, geom_model_name)
-            input_dim = encoder.hidden_channels
+            _model_load_log(
+                f"Loaded SMILES encoder: {smiles_model_name} "
+                "(MLM head intentionally omitted)."
+            )
         elif modality == 'graph':
             graph_encoder_type = str(graph_encoder_type).lower()
-            if graph_encoder_type == 'gin':
-                encoder = GNN_graphpred(
-                    num_layer=graph_num_layers,
-                    emb_dim=graph_emb_dim,
-                    num_tasks=1,
-                    JK=graph_jk,
-                    drop_ratio=graph_dropout,
-                    gnn_type='gin',
-                    graph_pooling=graph_pooling,
-                    norm_type=graph_norm,
-                    residual=graph_residual,
-                )
-                gnn_model_path = self._get_pretrained_path(gnn_model_name, "GNN")
-                if gnn_model_path:
-                    encoder.from_pretrained(model_file=gnn_model_path)
-                    print(f"Loaded GNN pretrained weights from {gnn_model_path}")
-                else:
-                    print("No GNN pretrained weights provided; using random initialization.")
-                input_dim = encoder.emb_dim
-            elif graph_encoder_type == 'scage':
-                encoder = MIPSPeriodicGraphEncoder(
+            if graph_encoder_type == 'mips_trimer_scage':
+                encoder = MIPSLocalGraphEncoder(
+                    core=mips_core,
                     num_layer=graph_num_layers,
                     emb_dim=graph_emb_dim,
                     num_heads=scage_num_heads,
                     dropout=graph_dropout,
-                    num_kernels=scage_num_kernels,
-                    max_hops=5,
-                    num_rbf=scage_distance_rbf,
-                    max_distance=scage_distance_cutoff,
+                    max_hops=mips_max_hops,
+                    use_descriptors=mips_use_descriptors,
+                    spatial_mode=spatial_mode,
+                    graph_geometry_mode=graph_geometry_mode,
+                    mcl_distance_percentiles=mcl_distance_percentiles,
+                    trimer_num_candidates=trimer_num_candidates,
+                    trimer_max_heavy_atoms=trimer_max_heavy_atoms,
+                    variant=mips_variant,
+                    atom_feature_mode=mips_atom_feature_mode,
+                    attention_scale=mips_attention_scale,
+                    norm_mode=mips_norm_mode,
+                    activation=mips_activation,
+                    spd_bias_mode=mips_spd_bias_mode,
+                    path_bias_mode=mips_path_bias_mode,
+                    multi_scale_hop_gate=mips_multi_scale_hop_gate,
+                    semantics=mips_semantics,
+                    descriptor_fusion_mode=mips_descriptor_fusion_mode,
+                    descriptor_components=mips_descriptor_components,
+                    descriptor_disturbance=mips_descriptor_disturbance,
+                    backbone_mode=mips_backbone_mode,
+                    input_norm=mips_input_norm,
+                    mask_mode=mips_mask_mode,
+                    mask_policy=mips_mask_policy,
+                    masked_loss_reduction=mips_masked_loss_reduction,
                 )
-                print(
-                    "Using sparse MIPS-PBC PyG graph encoder "
+                _model_load_log(
+                    "Using sparse non-PBC MIPS PyG graph encoder "
                     f"(layers={graph_num_layers}, emb_dim={graph_emb_dim}, "
-                    f"heads={scage_num_heads}, max_hops=5, "
-                    f"distance_rbf={scage_distance_rbf}, "
-                    f"distance_cutoff={scage_distance_cutoff}, readout=mean)."
+                    f"heads={scage_num_heads}, core={mips_core}, "
+                    f"variant={encoder.variant}, spatial={encoder.spatial_mode}, "
+                    f"geometry={encoder.graph_geometry_mode}, "
+                    f"max_hops={encoder.max_hops}, "
+                    f"feature_mode={encoder.feature_mode}, readout=mean)."
                 )
                 input_dim = encoder.emb_dim
             else:
-                raise ValueError("graph_encoder_type must be 'gin' or 'scage'")
+                raise ValueError(
+                    "graph_encoder_type must be 'mips_trimer_scage'; "
+                    "no other graph encoder is available"
+                )
         elif modality == 'fp':
-            input_dim = 1024 if fp_mode == 'ecfp' else 1048
+            input_dims = {
+                "ecfp": 1024,
+                "mixfp": 1048,
+                "attachment_count": 2570,
+            }
+            if fp_mode not in input_dims:
+                raise ValueError(f"Unsupported fp_mode: {fp_mode}")
+            input_dim = input_dims[fp_mode]
             encoder = FingerprintEncoder(
                 input_dim=input_dim,
                 joint_embedding_dim=joint_embedding_dim,
                 bit_dropout=fp_bit_dropout,
+                hidden_dim=(128 if self.low_capacity_adapter else None),
             )
         else:
             raise ValueError(
@@ -548,33 +865,19 @@ class EncoderModule(nn.Module):
         return model_path
 
     @staticmethod
-    def _initialize_geometry_encoder(geometry_encoder: str, geom_model_name: Optional[str]):
-        geometry_encoder = geometry_encoder.lower()
-        geom_model_path = EncoderModule._get_pretrained_path(geom_model_name, f"{geometry_encoder} geometry")
-        loaded_geom_path = geom_model_path
-        if geometry_encoder == 'painn':
-            load_path = geom_model_path
-            loaded_geom_path = load_path
-            encoder = PaiNNEncoder(
-                load_from_pretrain=load_path,
-                hidden_channels=128,
-                num_layers=6,
-                num_rbf=50,
-                cutoff=10,
-                max_num_neighbors=32,
-                readout='mean',
+    def _create_projection(
+        input_dim: int,
+        joint_embedding_dim: int,
+        hidden_dim: Optional[int] = None,
+    ):
+        if hidden_dim is not None:
+            return nn.Sequential(
+                nn.Linear(input_dim, int(hidden_dim)),
+                nn.LayerNorm(int(hidden_dim)),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(int(hidden_dim), joint_embedding_dim),
             )
-        else:
-            raise ValueError("geometry_encoder must be 'painn'")
-
-        if loaded_geom_path:
-            print(f"Loaded {geometry_encoder} geometry encoder; pretrained path: {loaded_geom_path}")
-        else:
-            print(f"No {geometry_encoder} geometry pretrained weights provided; using random initialization.")
-        return encoder
-
-    @staticmethod
-    def _create_projection(input_dim: int, joint_embedding_dim: int):
         return nn.Sequential(
             nn.Linear(input_dim, joint_embedding_dim),
             nn.LayerNorm(joint_embedding_dim),
@@ -584,32 +887,28 @@ class EncoderModule(nn.Module):
     def _encode_smiles(self, data):
         input_ids = data.input_ids_smiles.to(self.encoder.device)
         attention_mask = data.attention_mask_smiles.to(self.encoder.device)
+        view_count = 1
+        batch_size = input_ids.size(0)
+        if input_ids.ndim == 3:
+            view_count = input_ids.size(1)
+            input_ids = input_ids.flatten(0, 1)
+            attention_mask = attention_mask.flatten(0, 1)
         features = self.encoder(input_ids, attention_mask=attention_mask).last_hidden_state
-        return self.projection(self.norm(features[:, 0, :]))
+        pooled = self.projection(self.norm(features[:, 0, :]))
+        if view_count > 1:
+            pooled = pooled.reshape(batch_size, view_count, -1).mean(dim=1)
+        return pooled
 
     def encode_global_and_tokens(self, data):
         if self.modality == 'graph':
             if getattr(self.encoder, 'expects_data', False):
                 graph_features, node_features = self.encoder(data)
-            elif getattr(self.encoder, 'uses_geometry', False):
-                graph_features, node_features = self.encoder(data)
             else:
-                graph_features, node_features = self.encoder(data.x, data.edge_index, data.edge_attr, data.batch)
+                graph_features = self.encoder(data)
+                node_features = graph_features.unsqueeze(1)
             graph_features = self.projection(self.norm(graph_features))
             node_features = self.projection(self.norm(node_features))
             return graph_features, node_features, data.batch
-
-        if self.modality == 'geom':
-            graph_features = self.encoder(data)
-            node_features, node_batch = self.encoder.encode_nodes(data)
-            pool_mask = getattr(data, 'geom_pool_mask', None)
-            if pool_mask is not None:
-                pool_mask = pool_mask.bool()
-                node_features = node_features[pool_mask]
-                node_batch = node_batch[pool_mask]
-            graph_features = self._project_geom(graph_features, data)
-            node_features = self.projection(self.norm(node_features))
-            return graph_features, node_features, node_batch
 
         global_features = self(data)
         return global_features, global_features.unsqueeze(1), None
@@ -620,31 +919,15 @@ class EncoderModule(nn.Module):
         if self.modality == 'graph':
             if getattr(self.encoder, 'expects_data', False):
                 features, _ = self.encoder(data)
-            elif getattr(self.encoder, 'uses_geometry', False):
-                features, _ = self.encoder(data)
             else:
-                features, _ = self.encoder(data.x, data.edge_index, data.edge_attr, data.batch)
+                features = self.encoder(data)
             return self.projection(self.norm(features))
-        if self.modality == 'geom':
-            features = self.encoder(data)
-            return self._project_geom(features, data)
         if self.modality == 'fp':
             return self.encoder(data.fp)
         raise ValueError(
             f"Unsupported modality: {self.modality}. Current supported modalities are: "
             f"{', '.join(SUPPORTED_MODALITIES)}."
         )
-
-    def _project_geom(self, features, data):
-        projected = self.projection(self.norm(features))
-        if self.geom_context_embedding is None:
-            return projected
-        context = getattr(data, 'geom_context_id', None)
-        if context is None:
-            context = projected.new_full((projected.size(0),), 2, dtype=torch.long)
-        context = context.long().clamp_(0, 3).to(projected.device)
-        return projected + self.geom_context_embedding(context)
-
 
 class FingerprintEncoder(nn.Module):
     def __init__(
@@ -653,11 +936,17 @@ class FingerprintEncoder(nn.Module):
         joint_embedding_dim: int,
         dropout: float = 0.1,
         bit_dropout: float = 0.0,
+        hidden_dim: Optional[int] = None,
     ):
         super().__init__()
         self.bit_dropout = float(bit_dropout)
-        hidden_dim = max(joint_embedding_dim * 2, 256)
+        hidden_dim = (
+            int(hidden_dim)
+            if hidden_dim is not None
+            else max(joint_embedding_dim * 2, 256)
+        )
         self.network = nn.Sequential(
+            nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
@@ -672,183 +961,3 @@ class FingerprintEncoder(nn.Module):
         if self.training and self.bit_dropout > 0:
             fp = fp * (torch.rand_like(fp) >= self.bit_dropout).to(fp.dtype)
         return self.network(fp)
-
-
-class AttentionPooling(nn.Module):
-    def __init__(self, joint_embedding_dim: int):
-        super().__init__()
-        self.attention = nn.Linear(joint_embedding_dim, 1)
-
-    def forward(self, embeddings: torch.Tensor, availability_mask=None):
-        scores = self.attention(embeddings).squeeze(-1)
-        if availability_mask is not None:
-            if availability_mask.shape != scores.shape:
-                raise ValueError("availability_mask must have shape [batch, modalities]")
-            if not bool(availability_mask.any(dim=1).all()):
-                raise ValueError("Every sample must have at least one available modality")
-            scores = scores.masked_fill(~availability_mask, -1e12)
-        weights = F.softmax(scores, dim=1)
-        output = torch.sum(embeddings * weights.unsqueeze(-1), dim=1)
-        return output, weights
-
-
-class FusionModule(nn.Module):
-    def __init__(
-        self,
-        joint_embedding_dim: int,
-        num_heads: int,
-        ff_dim: int,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(
-            embed_dim=joint_embedding_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
-        self.layer_norm1 = nn.LayerNorm(joint_embedding_dim)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(joint_embedding_dim, ff_dim),
-            nn.ReLU(),
-            nn.Linear(ff_dim, joint_embedding_dim),
-        )
-        self.layer_norm2 = nn.LayerNorm(joint_embedding_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.attention_pooling = AttentionPooling(joint_embedding_dim)
-
-    def forward(self, embeddings: torch.Tensor):
-        embeddings = embeddings.permute(1, 0, 2)
-
-        attn_output, _ = self.multihead_attn(embeddings, embeddings, embeddings)
-        attn_output = attn_output.permute(1, 0, 2)
-
-        fused_embedding = embeddings.permute(1, 0, 2) + attn_output
-        fused_embedding = self.layer_norm1(fused_embedding)
-
-        ff_output = self.feed_forward(fused_embedding)
-        ff_output = self.dropout(ff_output)
-
-        fused_embedding = fused_embedding + ff_output
-        fused_embedding = self.layer_norm2(fused_embedding)
-
-        output, attention_weights = self.attention_pooling(fused_embedding)
-        return output, attention_weights
-
-
-
-class ParallelAttentionBlock(nn.Module):
-    def __init__(
-        self,
-        joint_embedding_dim: int,
-        num_heads: int,
-        ff_dim: int,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.attn_norm = nn.LayerNorm(joint_embedding_dim)
-        self.attention = nn.MultiheadAttention(
-            embed_dim=joint_embedding_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.ffn_norm = nn.LayerNorm(joint_embedding_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(joint_embedding_dim, ff_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, joint_embedding_dim),
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, tokens, availability_mask=None):
-        normalized = self.attn_norm(tokens)
-        key_padding_mask = None if availability_mask is None else ~availability_mask
-        attended, attention = self.attention(
-            normalized, normalized, normalized,
-            key_padding_mask=key_padding_mask,
-            need_weights=True,
-            average_attn_weights=False,
-        )
-        tokens = tokens + self.dropout(attended)
-        tokens = tokens + self.dropout(self.ffn(self.ffn_norm(tokens)))
-        return tokens, attention
-
-
-class ParallelAttentionFusion(nn.Module):
-    def __init__(
-        self,
-        joint_embedding_dim: int,
-        num_heads: int,
-        ff_dim: int,
-        modality_names,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        if num_layers < 1:
-            raise ValueError("parallel_attention_layers must be at least 1")
-        self.modality_names = tuple(modality_names)
-        self.input_norms = nn.ModuleDict({
-            name: nn.LayerNorm(joint_embedding_dim) for name in self.modality_names
-        })
-        self.modality_embeddings = nn.ParameterDict({
-            name: nn.Parameter(torch.zeros(joint_embedding_dim)) for name in self.modality_names
-        })
-        self.missing_tokens = nn.ParameterDict({
-            name: nn.Parameter(torch.zeros(joint_embedding_dim)) for name in self.modality_names
-        })
-        self.blocks = nn.ModuleList([
-            ParallelAttentionBlock(
-                joint_embedding_dim=joint_embedding_dim,
-                num_heads=num_heads,
-                ff_dim=ff_dim,
-                dropout=dropout,
-            )
-            for _ in range(num_layers)
-        ])
-        self.pooling = AttentionPooling(joint_embedding_dim)
-        self.output_norm = nn.LayerNorm(joint_embedding_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        for embedding in self.modality_embeddings.values():
-            nn.init.normal_(embedding, mean=0.0, std=0.02)
-        for token in self.missing_tokens.values():
-            nn.init.normal_(token, mean=0.0, std=0.02)
-
-    def forward(self, embeddings, availability_mask=None):
-        if embeddings.size(1) != len(self.modality_names):
-            raise ValueError(
-                f"Expected {len(self.modality_names)} modality tokens, got {embeddings.size(1)}"
-            )
-        if availability_mask is None:
-            availability_mask = torch.ones(
-                embeddings.shape[:2], dtype=torch.bool, device=embeddings.device
-            )
-        if availability_mask.shape != embeddings.shape[:2]:
-            raise ValueError("availability_mask must match [batch, modalities]")
-        if not bool(availability_mask.any(dim=1).all()):
-            raise ValueError("Every sample must retain at least one modality")
-        base_tokens = torch.stack([
-            self.input_norms[name](embeddings[:, idx])
-            for idx, name in enumerate(self.modality_names)
-        ], dim=1)
-        missing = torch.stack([
-            self.missing_tokens[name] for name in self.modality_names
-        ], dim=0).unsqueeze(0)
-        base_tokens = torch.where(availability_mask.unsqueeze(-1), base_tokens, missing)
-        type_embeddings = torch.stack([
-            self.modality_embeddings[name] for name in self.modality_names
-        ], dim=0).unsqueeze(0)
-        tokens = base_tokens + type_embeddings
-        for block in self.blocks:
-            tokens, _ = block(tokens, availability_mask=availability_mask)
-
-        attended, pooling_weights = self.pooling(tokens, availability_mask=availability_mask)
-        valid = availability_mask.unsqueeze(-1).to(base_tokens.dtype)
-        valid_count = valid.sum(dim=1).clamp_min(1.0)
-        mean_residual = (base_tokens * valid).sum(dim=1) / valid_count.sqrt()
-        output = self.output_norm(mean_residual + attended)
-        return self.dropout(output), pooling_weights

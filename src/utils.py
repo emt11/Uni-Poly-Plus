@@ -11,7 +11,7 @@ import sklearn.metrics as metrics
 from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
-from src.dataset.dataloader import custom_collate
+from src.dataset.dataloader import custom_collate, mips_trimer_collate
 
 
 def set_global_seed(seed, deterministic=True):
@@ -76,7 +76,12 @@ class TargetScaler:
 def scale_targets(dataset, task, train_indices=None, raw_targets=None, transform_mode='auto'):
     scaler = StandardScaler()
     if raw_targets is None:
-        raw_targets = np.array([data.y.item() for data in dataset], dtype=np.float64)
+        if hasattr(dataset, "raw_targets"):
+            raw_targets = np.asarray(dataset.raw_targets, dtype=np.float64)
+        else:
+            raw_targets = np.array(
+                [data.y.item() for data in dataset], dtype=np.float64
+            )
     else:
         raw_targets = np.asarray(raw_targets, dtype=np.float64)
 
@@ -99,15 +104,18 @@ def scale_targets(dataset, task, train_indices=None, raw_targets=None, transform
         print("Using natural-log target transform before standardization")
 
     scaled_targets = target_scaler.transform(raw_targets.reshape(-1, 1))
-    for data, value in zip(dataset, scaled_targets):
-        data.y = torch.tensor(value, dtype=torch.float)
+    if hasattr(dataset, "set_target_override"):
+        dataset.set_target_override(scaled_targets.reshape(-1))
+    else:
+        for data, value in zip(dataset, scaled_targets):
+            data.y = torch.tensor(value, dtype=torch.float)
 
     return target_scaler
 
 def get_data_loader(
     dataset, indices=None, batch_size=32, shuffle=False, drop_last=False,
     random_conformer=None, num_workers=0, pin_memory=None, persistent_workers=None,
-    sampler=None,
+    sampler=None, generator=None, prefetch_factor=2,
 ):
     if indices is None:
         indices = range(len(dataset))
@@ -115,17 +123,33 @@ def get_data_loader(
     if random_conformer is None:
         random_conformer = bool(shuffle)
 
-    loader = DataLoader(
-        subset_dataset,
+    # The graph-only production route must not allocate the legacy multimodal
+    # collator's SMILES/FP/PBC/geometry tensors.  ``dataset`` is the original
+    # UniDataset here (before Subset wrapping), so this branch is stable for
+    # both pretraining and downstream loaders.
+    collate = (
+        mips_trimer_collate
+        if bool(getattr(dataset, "is_mts_route", False))
+        else partial(custom_collate, random_conformer=random_conformer)
+    )
+    loader_kwargs = dict(
+        dataset=subset_dataset,
         batch_size=batch_size,
-        collate_fn=partial(custom_collate, random_conformer=random_conformer),
+        collate_fn=collate,
         shuffle=bool(shuffle and sampler is None),
         sampler=sampler,
         drop_last=drop_last,
         num_workers=int(num_workers),
         pin_memory=torch.cuda.is_available() if pin_memory is None else bool(pin_memory),
         persistent_workers=(int(num_workers) > 0) if persistent_workers is None else bool(persistent_workers),
+        generator=generator,
     )
+    # PyTorch rejects prefetch_factor when num_workers=0.  Keep the public
+    # parameter available for deterministic benchmark/config hashing while
+    # omitting it from the single-process loader.
+    if int(num_workers) > 0:
+        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+    loader = DataLoader(**loader_kwargs)
 
     print(f"Created dataloader with {len(subset_dataset)} samples")
     return loader
@@ -135,6 +159,7 @@ def train_epoch(
     max_grad_norm=1.0, unimodal_aux_weight=0.0,
     fusion_prior_kl_weight=0.0, fusion_prior=(0.30, 0.40, 0.30),
     cross_task_aux_weight=0.0,
+    pcgrad=False,
 ):
     model.train()
     train_losses = []
@@ -151,7 +176,26 @@ def train_epoch(
         optimizer.zero_grad()
 
         outputs, embeddings = model(batch)
-        fused_loss = criterion(outputs, batch.y)
+        multitask_component_losses = []
+        if hasattr(batch, 'mts_task_index'):
+            task_index = batch.mts_task_index.long().reshape(-1)
+            auxiliary_predictions = _base_model(model).predict_cross_tasks(
+                _base_model(model).unimodal_embedding
+            )
+            selected_outputs = outputs.clone()
+            for index in range(1, auxiliary_predictions.size(1) + 1):
+                selected_outputs[task_index == index] = auxiliary_predictions[
+                    task_index == index, index - 1:index
+                ]
+            for index in torch.unique(task_index).tolist():
+                valid = task_index == int(index)
+                multitask_component_losses.append(
+                    criterion(selected_outputs[valid], batch.y[valid])
+                )
+            outputs = selected_outputs
+            fused_loss = torch.stack(multitask_component_losses).mean()
+        else:
+            fused_loss = criterion(outputs, batch.y)
         auxiliary_loss = fused_loss.new_zeros(())
         if float(unimodal_aux_weight) > 0:
             base_model = _base_model(model)
@@ -191,7 +235,8 @@ def train_epoch(
                 * intrinsic_mask
             ).sum(dim=1).mean()
         cross_task_aux_loss = fused_loss.new_zeros(())
-        if float(cross_task_aux_weight) > 0:
+        cross_task_component_losses = []
+        if float(cross_task_aux_weight) > 0 and not hasattr(batch, 'mts_task_index'):
             auxiliary_targets = getattr(batch, 'cross_task_aux_y', None)
             auxiliary_mask = getattr(batch, 'cross_task_aux_mask', None)
             if auxiliary_targets is None or auxiliary_mask is None:
@@ -207,18 +252,77 @@ def train_epoch(
                     f'{tuple(auxiliary_predictions.shape)} vs '
                     f'{tuple(auxiliary_targets.shape)}'
                 )
-            if bool(auxiliary_mask.any()):
-                cross_task_aux_loss = criterion(
-                    auxiliary_predictions[auxiliary_mask],
-                    auxiliary_targets[auxiliary_mask],
-                )
+            for task_index in range(auxiliary_predictions.size(1)):
+                valid = auxiliary_mask[:, task_index]
+                if bool(valid.any()):
+                    cross_task_component_losses.append(criterion(
+                        auxiliary_predictions[valid, task_index],
+                        auxiliary_targets[valid, task_index],
+                    ))
+            if cross_task_component_losses:
+                cross_task_aux_loss = torch.stack(cross_task_component_losses).mean()
         loss = (
             fused_loss
             + float(unimodal_aux_weight) * auxiliary_loss
             + float(fusion_prior_kl_weight) * fusion_prior_loss
             + float(cross_task_aux_weight) * cross_task_aux_loss
         )
+        projected = None
+        shared_parameters = None
+        pcgrad_losses = (
+            multitask_component_losses
+            if multitask_component_losses else (
+                [fused_loss] + [
+                    float(cross_task_aux_weight) * value
+                    for value in cross_task_component_losses
+                ]
+            )
+        )
+        if bool(pcgrad) and len(pcgrad_losses) > 1:
+            base_model = _base_model(model)
+            excluded = {
+                id(parameter) for module in (
+                    base_model.mlp, base_model.cross_task_aux_heads
+                ) for parameter in module.parameters()
+            }
+            shared_parameters = [
+                parameter for parameter in base_model.parameters()
+                if parameter.requires_grad and id(parameter) not in excluded
+            ]
+            task_gradients = []
+            for task_loss in pcgrad_losses:
+                gradients = torch.autograd.grad(
+                    task_loss, shared_parameters, retain_graph=True,
+                    allow_unused=True,
+                )
+                task_gradients.append([
+                    torch.zeros_like(parameter) if gradient is None else gradient
+                    for parameter, gradient in zip(shared_parameters, gradients)
+                ])
+            projected = [[gradient.clone() for gradient in gradients]
+                         for gradients in task_gradients]
+            for left in range(len(projected)):
+                for right in range(len(task_gradients)):
+                    if left == right:
+                        continue
+                    dot = sum(
+                        (a * b).sum() for a, b in
+                        zip(projected[left], task_gradients[right])
+                    )
+                    norm = sum(
+                        (value * value).sum()
+                        for value in task_gradients[right]
+                    ).clamp_min(1e-12)
+                    if float(dot.detach()) < 0.0:
+                        coefficient = dot / norm
+                        projected[left] = [
+                            a - coefficient * b for a, b in
+                            zip(projected[left], task_gradients[right])
+                        ]
         loss.backward()
+        if projected is not None:
+            for parameter, gradients in zip(shared_parameters, zip(*projected)):
+                parameter.grad = torch.stack(list(gradients), dim=0).mean(dim=0)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
         scheduler.step()
@@ -242,7 +346,7 @@ def train_epoch(
         avg_auxiliary_loss, avg_fusion_prior_loss, avg_cross_task_aux_loss,
     )
 
-def evaluate(model, data_loader, criterion, device):
+def evaluate(model, data_loader, criterion, device, scaler=None):
     model.eval()
     losses = []
     preds = []
@@ -258,11 +362,17 @@ def evaluate(model, data_loader, criterion, device):
             targets.extend(batch.y.cpu().numpy())
 
     avg_loss = sum(losses) / len(losses)
-    r2 = r2_score(targets, preds)
+    if scaler is not None:
+        r2 = r2_score(
+            scaler.inverse_transform(np.asarray(targets)),
+            scaler.inverse_transform(np.asarray(preds)),
+        )
+    else:
+        r2 = r2_score(targets, preds)
     
     return avg_loss, r2, targets, preds
 
-def test_model(model, test_loader, scaler, device):
+def test_model(model, test_loader, scaler, device, return_predictions=False):
     model.eval()
     test_preds = []
     test_targets = []
@@ -282,7 +392,18 @@ def test_model(model, test_loader, scaler, device):
     test_mae = metrics.mean_absolute_error(y_true_unscaled, y_pred_unscaled)
     test_rmse = np.sqrt(metrics.mean_squared_error(y_true_unscaled, y_pred_unscaled))
 
-    return {'test_r2': test_r2, 'test_mae': test_mae, 'test_rmse': test_rmse}
+    result = {
+        'test_r2': float(test_r2),
+        'test_mae': float(test_mae),
+        'test_rmse': float(test_rmse),
+    }
+    if return_predictions:
+        # Keep these private to the in-process result dictionary.  train.py
+        # removes them before JSON/CSV serialization and writes the full-
+        # precision arrays to an atomic NPZ prediction shard instead.
+        result['_y_true'] = y_true_unscaled.reshape(-1).astype(np.float64)
+        result['_y_pred'] = y_pred_unscaled.reshape(-1).astype(np.float64)
+    return result
 
 
 def _base_model(model):
@@ -342,40 +463,80 @@ def _set_module_trainable(module, trainable):
             parameter.requires_grad = bool(trainable)
 
 
-def _configure_parallel_stage3_trainability(model, phase, fp_trainable=False):
-    """Apply staged encoder unfreezing while keeping fusion/head trainable."""
-    base = _base_model(model)
-    for encoder in base.encoders.values():
-        _set_module_trainable(encoder, False)
-    _set_module_trainable(getattr(base, 'alignment_projections', None), False)
-    _set_module_trainable(getattr(base, 'parallel_attention_fusion', None), True)
-    _set_module_trainable(getattr(base, 'mlp', None), True)
-    _set_module_trainable(getattr(base, 'modality_heads', None), True)
-    if fp_trainable and 'fp' in base.encoders:
-        _set_module_trainable(base.encoders['fp'], True)
-    if phase <= 0:
-        return
+def _configure_legacy_mts_trainability(model):
+    """Apply the explicit pre-F MTS trainability contract.
 
-    if 'graph' in base.encoders:
-        graph_module = base.encoders['graph']
-        _set_module_trainable(graph_module.norm, True)
-        _set_module_trainable(graph_module.projection, True)
-        graph_layers = list(getattr(graph_module.encoder, 'layers', []))
-        graph_count = 2 if phase == 1 else 3
-        for layer in graph_layers[-graph_count:]:
-            _set_module_trainable(layer, True)
-    if 'smiles' in base.encoders:
-        smiles_module = base.encoders['smiles']
-        _set_module_trainable(smiles_module.norm, True)
-        _set_module_trainable(smiles_module.projection, True)
-        layers = list(getattr(getattr(smiles_module.encoder, 'encoder', None), 'layer', []))
-        smiles_count = 2 if phase == 1 else 4
-        for layer in layers[-smiles_count:]:
-            _set_module_trainable(layer, True)
+    The old MTS baseline trained the complete graph wrapper from epoch zero,
+    but the optional V-stage modalities were deliberately low-capacity
+    adapters.  Keeping this policy explicit is important: a blanket
+    ``base.parameters()`` toggle would re-enable every RoBERTa parameter and
+    silently turn the V experiments into full language-model fine-tuning.
+    """
+    base = _base_model(model)
+    if not _is_mts_model(base):
+        raise ValueError('legacy MTS profile requested for a non-MTS model')
+
+    # Start from a frozen model and opt modules in explicitly.  This also
+    # handles LoRALinear.base parameters, which are intentionally frozen by
+    # inject_roberta_lora but must not be re-enabled here.
+    for parameter in base.parameters():
+        parameter.requires_grad = False
+
+    graph_module = base.encoders['graph'] if 'graph' in base.encoders else None
+    if graph_module is None:
+        raise ValueError('MTS model is missing its graph encoder module')
+    for parameter in graph_module.parameters():
+        parameter.requires_grad = True
+
+    for module in (
+        getattr(base, 'mlp', None),
+        getattr(base, 'modality_heads', None),
+        getattr(base, 'cross_task_aux_heads', None),
+        getattr(base, 'residual_modality_gates', None),
+    ):
+        _set_module_trainable(module, True)
+
+    smiles_module = base.encoders['smiles'] if 'smiles' in base.encoders else None
+    if smiles_module is not None:
+        # The RoBERTa base remains frozen.  Only the rank-8 LoRA matrices in
+        # the final four layers receive gradients; the external projection
+        # and normalization are the low-capacity trainable adapter.
+        for parameter_name, parameter in smiles_module.encoder.named_parameters():
+            parameter.requires_grad = (
+                parameter_name.endswith('lora_a')
+                or parameter_name.endswith('lora_b')
+            )
+        _set_module_trainable(getattr(smiles_module, 'norm', None), True)
+        _set_module_trainable(getattr(smiles_module, 'projection', None), True)
+
+    fp_module = base.encoders['fp'] if 'fp' in base.encoders else None
+    if fp_module is not None:
+        # CountFP has no large pretrained backbone; its compact encoder and
+        # projection are the adapter and are trainable at the FP learning
+        # rate.
+        _set_module_trainable(fp_module, True)
+
+
+def _is_mts_model(model):
+    base = _base_model(model)
+    # MTS experiments may append SMILES and/or CountFP to the graph anchor.
+    # Architecture detection must therefore inspect the graph encoder rather
+    # than requiring the production graph-only modality tuple.
+    if 'graph' not in tuple(getattr(base, 'modality_list', ())):
+        return False
+    encoders = getattr(base, 'encoders', {})
+    graph_module = encoders['graph'] if 'graph' in encoders else None
+    return (
+        graph_module is not None
+        and getattr(graph_module.encoder, 'architecture_name', '')
+        == 'MIPS-Trimer-SCAGE'
+    )
 
 
 def _build_downstream_optimizer(
-    model, smiles_lr, graph_lr, geom_lr, fp_lr, fusion_lr, head_lr, weight_decay
+    model, smiles_lr, graph_lr, geom_lr, fp_lr, fusion_lr, head_lr, weight_decay,
+    mts_o8_lr=5e-6, mts_geometry_lr=1e-5, mts_adapter_lr=5e-5,
+    mts_finetune_profile='default',
 ):
     base = _base_model(model)
     groups = []
@@ -384,9 +545,52 @@ def _build_downstream_optimizer(
     def add_group(module, lr, name):
         if module is None:
             return
-        params = [param for param in module.parameters() if id(param) not in used]
-        if params:
-            used.update(id(param) for param in params)
+        decay, no_decay = [], []
+        for parameter_name, param in module.named_parameters():
+            if id(param) in used:
+                continue
+            used.add(id(param))
+            normalized_name = parameter_name.lower()
+            if (
+                param.ndim <= 1
+                or normalized_name.endswith("bias")
+                or "norm" in normalized_name
+                or "gate" in normalized_name
+            ):
+                no_decay.append(param)
+            else:
+                decay.append(param)
+        if decay:
+            groups.append({
+                'params': decay,
+                'lr': float(lr),
+                'weight_decay': float(weight_decay),
+                'name': f'{name}/decay',
+            })
+        if no_decay:
+            groups.append({
+                'params': no_decay,
+                'lr': float(lr),
+                'weight_decay': 0.0,
+                'name': f'{name}/no_decay',
+            })
+
+    encoders = base.encoders
+    if _is_mts_model(base) and mts_finetune_profile == 'legacy_mts_huber_v1':
+        # Match the fixed legacy profile.  The historical graph optimizer had
+        # one group for the complete graph wrapper, so norm/projection are
+        # intentionally at graph_lr as well.  Optional V-stage adapters are
+        # registered separately without unfreezing a pretrained SMILES base.
+        def add_legacy_group(module, lr, name):
+            if module is None:
+                return
+            params = [
+                parameter for parameter in module.parameters()
+                if parameter.requires_grad and id(parameter) not in used
+            ]
+            if not params:
+                return
+            used.update(id(parameter) for parameter in params)
             groups.append({
                 'params': params,
                 'lr': float(lr),
@@ -394,29 +598,63 @@ def _build_downstream_optimizer(
                 'name': name,
             })
 
-    encoders = base.encoders
-    add_group(encoders['smiles'] if 'smiles' in encoders else None, smiles_lr, 'smiles')
-    add_group(encoders['graph'] if 'graph' in encoders else None, graph_lr, 'graph')
-    add_group(encoders['geom'] if 'geom' in encoders else None, geom_lr, 'geom')
-    add_group(encoders['fp'] if 'fp' in encoders else None, fp_lr, 'fp')
-    fusion_module = (
-        base.parallel_attention_fusion
-        if getattr(base, 'fusion_type', '') == 'parallel_attention'
-        else base.fusion_module
+        def add_legacy_group_from_params(params, lr, name):
+            params = [
+                parameter for parameter in params
+                if parameter.requires_grad and id(parameter) not in used
+            ]
+            if not params:
+                return
+            used.update(id(parameter) for parameter in params)
+            groups.append({
+                'params': params,
+                'lr': float(lr),
+                'weight_decay': float(weight_decay),
+                'name': name,
+            })
+
+        graph_module = encoders['graph'] if 'graph' in encoders else None
+        if graph_module is not None:
+            add_legacy_group(graph_module, graph_lr, 'graph')
+
+        smiles_module = encoders['smiles'] if 'smiles' in encoders else None
+        if smiles_module is not None:
+            lora_parameters = [
+                parameter for name, parameter in
+                smiles_module.encoder.named_parameters()
+                if parameter.requires_grad and (
+                    name.endswith('lora_a') or name.endswith('lora_b')
+                )
+            ]
+            add_legacy_group_from_params(lora_parameters, smiles_lr, 'smiles_lora')
+            add_legacy_group(
+                nn.ModuleList([smiles_module.norm, smiles_module.projection]),
+                fusion_lr, 'smiles_adapter'
+            )
+        add_legacy_group(
+            encoders['fp'] if 'fp' in encoders else None,
+            fp_lr, 'fp_adapter'
+        )
+        add_legacy_group(getattr(base, 'residual_modality_gates', None), fusion_lr, 'modality_gates')
+        add_legacy_group(base.mlp, head_lr, 'regression_head')
+        add_legacy_group(getattr(base, 'modality_heads', None), head_lr, 'modality_heads')
+        add_legacy_group(getattr(base, 'cross_task_aux_heads', None), head_lr, 'cross_task_aux_heads')
+        remaining = [
+            parameter for parameter in base.parameters()
+            if parameter.requires_grad and id(parameter) not in used
+        ]
+        if remaining:
+            groups.append({
+                'params': remaining,
+                'lr': float(fusion_lr),
+                'weight_decay': float(weight_decay),
+                'name': 'remaining',
+            })
+        return torch.optim.AdamW(groups)
+    raise ValueError(
+        'Only the explicit legacy_mts_huber_v1 MTS optimizer is active; '
+        'retired non-MTS/parallel optimizer paths are unavailable.'
     )
-    add_group(fusion_module, fusion_lr, 'fusion')
-    add_group(base.mlp, head_lr, 'regression_head')
-    add_group(getattr(base, 'modality_heads', None), head_lr, 'modality_heads')
-    add_group(getattr(base, 'cross_task_aux_heads', None), head_lr, 'cross_task_aux_heads')
-    remaining = [param for param in base.parameters() if id(param) not in used]
-    if remaining:
-        groups.append({
-            'params': remaining,
-            'lr': float(fusion_lr),
-            'weight_decay': float(weight_decay),
-            'name': 'remaining',
-        })
-    return torch.optim.AdamW(groups)
 
 
 def fit_fixed_epochs(
@@ -442,6 +680,10 @@ def fit_fixed_epochs(
     fusion_prior_kl_weight=0.0,
     fusion_prior=(0.30, 0.40, 0.30),
     cross_task_aux_weight=0.0,
+    mts_o8_lr=5e-6,
+    mts_geometry_lr=1e-5,
+    mts_adapter_lr=5e-5,
+    mts_finetune_profile='default',
 ):
     """Fit a fresh downstream model for a validation-selected epoch count."""
     num_epochs = int(num_epochs)
@@ -452,17 +694,24 @@ def fit_fixed_epochs(
         if regression_loss == 'huber' else nn.MSELoss()
     )
     base = _base_model(model)
-    parallel_staged = (
-        getattr(base, 'graph_encoder_type', '') in {'scage', 'mips'}
-        and getattr(base, 'fusion_type', '') == 'parallel_attention'
+    mts_legacy = (
+        _is_mts_model(base)
+        and mts_finetune_profile == 'legacy_mts_huber_v1'
     )
-    if parallel_staged:
-        _configure_parallel_stage3_trainability(model, phase=0, fp_trainable=False)
-    else:
-        _set_smiles_trainable(model, trainable=False)
+    if _is_mts_model(base) and not mts_legacy:
+        raise ValueError(
+            'MTS must use legacy_mts_huber_v1; staged Phase A/B/C logic is retired'
+        )
+    if not mts_legacy:
+        raise ValueError('Only legacy_mts_huber_v1 is active for MTS')
+    _configure_legacy_mts_trainability(model)
     optimizer = _build_downstream_optimizer(
         model, smiles_lr, graph_lr, geom_lr, fp_lr,
         fusion_lr, head_lr, weight_decay,
+        mts_o8_lr=mts_o8_lr,
+        mts_geometry_lr=mts_geometry_lr,
+        mts_adapter_lr=mts_adapter_lr,
+        mts_finetune_profile=mts_finetune_profile,
     )
     total_steps = max(1, len(train_loader) * num_epochs)
     warmup_steps = min(
@@ -481,28 +730,6 @@ def fit_fixed_epochs(
     final_train_r2 = float('nan')
     final_train_loss = float('nan')
     for epoch in range(num_epochs):
-        fp_trainable = (
-            int(fp_unfreeze_epoch) >= 0
-            and epoch >= int(fp_unfreeze_epoch)
-        )
-        if parallel_staged and epoch == int(freeze_smiles_epochs):
-            _configure_parallel_stage3_trainability(
-                model, phase=1, fp_trainable=fp_trainable
-            )
-        elif parallel_staged and epoch == int(deep_unfreeze_epoch):
-            _configure_parallel_stage3_trainability(
-                model, phase=2, fp_trainable=fp_trainable
-            )
-        elif parallel_staged and epoch == int(fp_unfreeze_epoch):
-            phase = 2 if epoch >= int(deep_unfreeze_epoch) else (
-                1 if epoch >= int(freeze_smiles_epochs) else 0
-            )
-            _configure_parallel_stage3_trainability(
-                model, phase=phase, fp_trainable=True
-            )
-        elif not parallel_staged and epoch == int(freeze_smiles_epochs):
-            _set_smiles_trainable(model, trainable=True)
-
         (
             final_train_loss, final_train_r2, _, _, _, _,
         ) = train_epoch(
@@ -557,20 +784,35 @@ def train_and_evaluate(
     cross_task_aux_weight=0.0,
     swa_start_epoch=-1,
     evaluate_test=True,
+    return_predictions=False,
+    mts_o8_lr=5e-6,
+    mts_geometry_lr=1e-5,
+    mts_adapter_lr=5e-5,
+    mts_finetune_profile='default',
+    pcgrad=False,
 ):
     # Define loss function and optimizer
     criterion = nn.SmoothL1Loss(beta=float(huber_beta)) if regression_loss == 'huber' else nn.MSELoss()
     base = _base_model(model)
-    parallel_staged = (
-        getattr(base, 'graph_encoder_type', '') in {'scage', 'mips'}
-        and getattr(base, 'fusion_type', '') == 'parallel_attention'
+    mts_legacy = (
+        _is_mts_model(base)
+        and mts_finetune_profile == 'legacy_mts_huber_v1'
     )
-    if parallel_staged:
-        _configure_parallel_stage3_trainability(model, phase=0, fp_trainable=False)
-    else:
-        _set_smiles_trainable(model, trainable=False)
+    if _is_mts_model(base) and not mts_legacy:
+        raise ValueError(
+            'MTS must use legacy_mts_huber_v1; staged Phase A/B/C logic is retired'
+        )
+    if not mts_legacy:
+        raise ValueError('Only legacy_mts_huber_v1 is active for MTS')
+    if int(swa_start_epoch) >= 0:
+        raise ValueError('legacy_mts_huber_v1 requires swa_start_epoch=-1')
+    _configure_legacy_mts_trainability(model)
     optimizer = _build_downstream_optimizer(
-        model, smiles_lr, graph_lr, geom_lr, fp_lr, fusion_lr, head_lr, weight_decay
+        model, smiles_lr, graph_lr, geom_lr, fp_lr, fusion_lr, head_lr,
+        weight_decay, mts_o8_lr=mts_o8_lr,
+        mts_geometry_lr=mts_geometry_lr,
+        mts_adapter_lr=mts_adapter_lr,
+        mts_finetune_profile=mts_finetune_profile,
     )
     total_steps = max(1, len(train_loader) * num_epochs)
     warmup_steps = min(total_steps - 1, max(0, int(warmup_epochs) * len(train_loader)))
@@ -582,6 +824,7 @@ def train_and_evaluate(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     best_val_r2 = -float('inf')
+    best_val_rmse = float('inf')
     best_epoch = -1
     best_model_state = None
     epochs_no_improve = 0
@@ -589,34 +832,6 @@ def train_and_evaluate(
     state_averager = _CpuStateAverager() if swa_start_epoch >= 0 else None
 
     for epoch in range(num_epochs):
-        fp_trainable = int(fp_unfreeze_epoch) >= 0 and epoch >= int(fp_unfreeze_epoch)
-        if parallel_staged and epoch == int(freeze_smiles_epochs):
-            _configure_parallel_stage3_trainability(
-                model, phase=1, fp_trainable=fp_trainable
-            )
-            print(
-                "Unfroze the last 2 graph and SMILES layers; "
-                f"FP is {'trainable' if fp_trainable else 'frozen'}."
-            )
-        elif parallel_staged and epoch == int(deep_unfreeze_epoch):
-            _configure_parallel_stage3_trainability(
-                model, phase=2, fp_trainable=fp_trainable
-            )
-            print(
-                "Unfroze the last 3 graph and last 4 SMILES layers; "
-                f"FP is {'trainable' if fp_trainable else 'frozen'}."
-            )
-        elif parallel_staged and epoch == int(fp_unfreeze_epoch):
-            phase = 2 if epoch >= int(deep_unfreeze_epoch) else (
-                1 if epoch >= int(freeze_smiles_epochs) else 0
-            )
-            _configure_parallel_stage3_trainability(
-                model, phase=phase, fp_trainable=True
-            )
-            print("Unfroze the FP encoder with its discriminative learning rate.")
-        elif not parallel_staged and epoch == int(freeze_smiles_epochs):
-            _set_smiles_trainable(model, trainable=True)
-            print("Unfroze the last four SMILES Transformer layers.")
         # Training phase
         (
             avg_train_loss, train_r2, avg_fused_loss,
@@ -634,16 +849,25 @@ def train_and_evaluate(
             fusion_prior_kl_weight=fusion_prior_kl_weight,
             fusion_prior=fusion_prior,
             cross_task_aux_weight=cross_task_aux_weight,
+            pcgrad=pcgrad,
         )
 
         if state_averager is not None and epoch >= swa_start_epoch:
             state_averager.update(model)
 
         # Validation phase
-        avg_val_loss, val_r2, _, _ = evaluate(model, val_loader, criterion, device)
+        avg_val_loss, val_r2, val_targets, val_predictions = evaluate(
+            model, val_loader, criterion, device, scaler=scaler
+        )
+        val_true_raw = scaler.inverse_transform(np.asarray(val_targets))
+        val_pred_raw = scaler.inverse_transform(np.asarray(val_predictions))
+        val_rmse = float(np.sqrt(metrics.mean_squared_error(
+            val_true_raw, val_pred_raw
+        )))
         # Early stopping
         if val_r2 > best_val_r2:
             best_val_r2 = val_r2
+            best_val_rmse = val_rmse
             best_epoch = epoch + 1
             best_model_state = copy.deepcopy(model.state_dict())
             epochs_no_improve = 0
@@ -681,9 +905,16 @@ def train_and_evaluate(
     swa_snapshots = state_averager.count if state_averager is not None else 0
     if state_averager is not None and swa_snapshots >= 2:
         model.load_state_dict(state_averager.state_dict())
-        _, swa_val_r2, _, _ = evaluate(model, val_loader, criterion, device)
+        _, swa_val_r2, swa_targets, swa_predictions = evaluate(
+            model, val_loader, criterion, device, scaler=scaler
+        )
+        swa_val_rmse = float(np.sqrt(metrics.mean_squared_error(
+            scaler.inverse_transform(np.asarray(swa_targets)),
+            scaler.inverse_transform(np.asarray(swa_predictions)),
+        )))
         if np.isfinite(swa_val_r2) and swa_val_r2 > best_val_r2:
             best_val_r2 = swa_val_r2
+            best_val_rmse = swa_val_rmse
             best_model_state = copy.deepcopy(state_averager.state_dict())
             swa_selected = True
             best_epoch = -1
@@ -706,11 +937,15 @@ def train_and_evaluate(
 
     # In refit mode, defer the only outer-test evaluation until after refitting.
     test_metrics = (
-        test_model(model, test_loader, scaler, device)
+        test_model(
+            model, test_loader, scaler, device,
+            return_predictions=return_predictions,
+        )
         if evaluate_test else {}
     )
     test_metrics.update({
         'best_val_r2': float(best_val_r2),
+        'best_val_rmse': float(best_val_rmse),
         'best_epoch': int(best_epoch),
         'swa_selected': swa_selected,
         'swa_snapshots': swa_snapshots,
