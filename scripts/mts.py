@@ -32,12 +32,16 @@ def main(argv=None):
             "benchmark-pretrain",
             "preflight-angle",
             "build-angle-v2",
+            "build-angle-cache",
+            "build-mcl-thresholds",
             "prepare-downstream",
+            "validate-cache",
             "finalize-cache",
             "pretrain",
             "finetune",
             "summarize",
             "sota-campaign",
+            "geometry-ablation",
         ),
     )
     parser.add_argument("args", nargs=argparse.REMAINDER)
@@ -54,6 +58,12 @@ def main(argv=None):
         if args.args:
             raise SystemExit("prepare-downstream takes no positional arguments")
         return _run([PYTHON, "scripts/prepare_mips_trimer_downstream.py"])
+    if args.command == "validate-cache":
+        return _run([PYTHON, "scripts/validate_mts_cache.py", *args.args])
+    if args.command == "build-angle-cache":
+        return _run([PYTHON, "scripts/prepare_mts_angle_cache.py", *args.args])
+    if args.command == "build-mcl-thresholds":
+        return _run([PYTHON, "scripts/build_mts_mcl_thresholds.py", *args.args])
     if args.command == "finalize-cache":
         return _run([PYTHON, "scripts/finalize_mips_trimer_cache.py", *args.args])
     if args.command == "summarize":
@@ -67,13 +77,36 @@ def main(argv=None):
         return _run([PYTHON, "scripts/summarize_mips_trimer_scage.py", *summary_args])
     if args.command == "sota-campaign":
         return _run([PYTHON, "scripts/run_mts_sota_campaign.py", *args.args])
+    if args.command == "geometry-ablation":
+        return _run([
+            PYTHON, "scripts/run_mts_geometry_injection_ablation.py", *args.args
+        ])
+    if args.command == "pretrain":
+        profile = "configs/mts/pretraining/canonical_ru_angle20_v1.json"
+        benchmark = ""
+        output = "pretrained_models/mts/mts_joint_pretraining_pi1m_v2_seed42_canonical_angle20_v1.pth"
+        resume = False
+        pretrain_parser = argparse.ArgumentParser(add_help=False)
+        pretrain_parser.add_argument("--profile", default=profile)
+        pretrain_parser.add_argument("--benchmark", default=benchmark)
+        pretrain_parser.add_argument("--output", default=output)
+        pretrain_parser.add_argument("--resume", action="store_true")
+        parsed = pretrain_parser.parse_args(args.args)
+        profile = str(parsed.profile)
+        env = {
+            "PRETRAIN_ONLY": "1",
+            "PRETRAIN_PROFILE": profile,
+            "JOINT_CKPT": str(parsed.output),
+        }
+        if parsed.benchmark:
+            env["PRETRAIN_BENCHMARK_JSON"] = str(parsed.benchmark)
+        if parsed.resume:
+            env["RESUME"] = "1"
+        return _run(["bash", "scripts/run_mts.sh"], env)
     if args.args:
         raise SystemExit(
-            "pretrain/finetune use environment variables; remove positional "
-            "arguments"
+            "finetune uses environment variables; remove positional arguments"
         )
-    if args.command == "pretrain":
-        return _run(["bash", "scripts/run_mts.sh"], {"PRETRAIN_ONLY": "1"})
     return _run(["bash", "scripts/run_mts.sh"], {"FINETUNE_ONLY": "1"})
 
 

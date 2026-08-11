@@ -11,6 +11,20 @@ PYTHON_BIN=${PYTHON_BIN:-/root/anaconda3/envs/Uni-Poly/bin/python}
 CONFIG=${EXPERIMENT_CONFIG:-configs/mts/default.json}
 eval "$("$PYTHON_BIN" scripts/resolve_mips_trimer_scage.py "$CONFIG" --shell)"
 
+# Causal geometry-ablation switches (Plan mts_geometry_injection A0-A4).  The
+# finetune subprocess reads these env vars; absent values default to the full
+# production recipe (A3 semantics).
+export MTS_ABLATION_ID="${ABLATION_ID:-}"
+export MTS_USE_STAR_RBF="${USE_STAR_RBF:-true}"
+export MTS_USE_MCL="${USE_MCL:-true}"
+export MTS_MCL_RANDOM_MASK="${MCL_RANDOM_MASK:-false}"
+export MTS_RANDOM_MASK_SIDECAR="${RANDOM_MASK_SIDECAR:-}"
+if [[ "${MTS_USE_STAR_RBF,,}" == "false" && "${MTS_USE_MCL,,}" == "false" ]]; then
+  MTS_TRAIN_CACHE_LAYERS="ru_base,topology,md200"
+else
+  MTS_TRAIN_CACHE_LAYERS="ru_base,topology,trimer,md200"
+fi
+
 PRETRAIN_DATASET=${PRETRAIN_DATASET:-PI1M_v2}
 SEED=${RANDOM_SEED:-42}
 NPROC=3
@@ -22,10 +36,14 @@ SAMPLER_VERSION=${MIPS_SAMPLER_VERSION:-cost_v1}
 BATCH_BALANCE=${MIPS_BATCH_BALANCE:-cost}
 REBUILD_FEATURE_CACHE=${REBUILD_FEATURE_CACHE:-0}
 PRETRAIN_CACHE_ONLY=${PRETRAIN_CACHE_ONLY:-0}
+MTS_EXPLICIT_VALIDATE_ONLY=${MTS_EXPLICIT_VALIDATE_ONLY:-0}
 PRETRAIN_ONLY=${PRETRAIN_ONLY:-0}
 PRETRAIN_BENCHMARK_ONLY=${PRETRAIN_BENCHMARK_ONLY:-0}
 PRETRAIN_BENCHMARK_BATCHES=${PRETRAIN_BENCHMARK_BATCHES:-100}
 PRETRAIN_BENCHMARK_STAGE=${PRETRAIN_BENCHMARK_STAGE:-joint}
+PRETRAIN_PROFILE=${PRETRAIN_PROFILE:-canonical_ru_angle20_v1}
+PRETRAIN_BENCHMARK_JSON=${PRETRAIN_BENCHMARK_JSON:-}
+PRETRAIN_SMOKE_STEPS=${PRETRAIN_SMOKE_STEPS:-0}
 # MIPS uses a global batch close to 1024.  With three ranks the production
 # target is exactly 1008; the default candidate is 168 samples/rank with two
 # accumulation steps.  The other benchmark candidates are 42/8, 84/4 and
@@ -34,6 +52,16 @@ PRETRAIN_BENCHMARK_STAGE=${PRETRAIN_BENCHMARK_STAGE:-joint}
 # reproducible alternative.
 PRETRAIN_BATCH_SIZE=${PRETRAIN_BATCH_SIZE:-168}
 PRETRAIN_ACCUMULATION=${PRETRAIN_ACCUMULATION:-2}
+if [[ -n "$PRETRAIN_BENCHMARK_JSON" && "$PRETRAIN_BENCHMARK_ONLY" != 1 ]]; then
+  read -r PRETRAIN_BATCH_SIZE PRETRAIN_ACCUMULATION < <(
+    "$PYTHON_BIN" - "$PRETRAIN_BENCHMARK_JSON" <<'PY'
+import json, sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+selected = payload.get("selected") or {}
+print(int(selected["batch_size_per_rank"]), int(selected["gradient_accumulation_steps"]))
+PY
+  )
+fi
 if [[ $((PRETRAIN_BATCH_SIZE * NPROC * PRETRAIN_ACCUMULATION)) -ne 1008 ]]; then
   echo "MTS Joint Pretraining requires global batch 1008: batch=${PRETRAIN_BATCH_SIZE}, ranks=${NPROC}, accumulation=${PRETRAIN_ACCUMULATION}. Use (42,8), (84,4), (168,2), or (336,1)." >&2
   exit 2
@@ -41,12 +69,18 @@ fi
 FINETUNE_ONLY=${FINETUNE_ONLY:-${STAGE3_ONLY:-0}}
 RESUME=${RESUME:-0}
 TRAIN_EPOCHS=${TRAIN_EPOCHS:-100}
+FINETUNE_EPOCHS=${MTS_FINETUNE_EPOCHS:-$TRAIN_EPOCHS}
+FINETUNE_PATIENCE=${MTS_FINETUNE_PATIENCE:-10}
+FINETUNE_BATCH_SIZE=${MTS_FINETUNE_BATCH_SIZE:-32}
 FINETUNE_SEEDS=${FINETUNE_SEEDS:-42}
 MTS_RUN_MULTI_SEED=${MTS_RUN_MULTI_SEED:-0}
 if [[ "$RESOLVED_CONFIG_SCHEMA" == "mts-experiment-v3" \
       && "$FINETUNE_ONLY" != 1 \
+      && "$PRETRAIN_CACHE_ONLY" != 1 \
+      && "$PRETRAIN_BENCHMARK_ONLY" != 1 \
+      && "$PRETRAIN_SMOKE_STEPS" -le 0 \
       && "${VALIDATE_ONLY:-0}" != 1 ]]; then
-  echo "mts-experiment-v3 reuses the completed joint checkpoint and is fine-tune-only; set FINETUNE_ONLY=1." >&2
+  echo "mts-experiment-v3 is fine-tune-only except for explicit benchmark/smoke validation; set FINETUNE_ONLY=1." >&2
   exit 2
 fi
 case "$MODALITIES" in
@@ -72,6 +106,14 @@ TASKS=${TASKS:-"eat eea egb egc ei eps nc xc"}
 FOLD_IDS=${FOLD_IDS:-"0 1 2 3 4"}
 read -r -a TASK_LIST <<< "$TASKS"
 read -r -a FOLD_LIST <<< "$FOLD_IDS"
+MTS_FINETUNE_SCHEDULE=${MTS_FINETUNE_SCHEDULE:-}
+# lpt_v1 reorders only the dispatch sequence of the 40 independent (task, fold)
+# finetune units, longest-predicted-task first per the historical
+# total_fold_wall_seconds.  It changes no seed, identity hash, command-line
+# argument, resume decision, or the three dynamic GPU slots; the schedule name
+# is never written into a fold's training_config_hash.
+LPT_V1_TASK_ORDER=(egc egb eat xc ei eps nc eea)
+LPT_V1_FOLD_ORDER=(0 1 2 3 4)
 
 if [[ "$PRETRAIN_DATASET" != "PI1M_v2" ]]; then
   echo "MTS pretraining accepts only PRETRAIN_DATASET=PI1M_v2." >&2
@@ -80,6 +122,10 @@ fi
 JOINT_STEPS=20000
 MTS_ANGLE_OBJECTIVE=${MTS_ANGLE_OBJECTIVE:-categorical}
 MTS_ANGLE_WEIGHT=${MTS_ANGLE_WEIGHT:-0.25}
+if [[ "$PRETRAIN_PROFILE" == "canonical_ru_angle20_v1" || "$PRETRAIN_PROFILE" == *"canonical_ru_angle20_v1.json" ]]; then
+  MTS_ANGLE_OBJECTIVE=categorical
+  MTS_ANGLE_WEIGHT=0.25
+fi
 FINETUNE_PROFILE=${FINETUNE_PROFILE:-legacy_mts_huber_v1}
 if [[ "$FINETUNE_PROFILE" != "legacy_mts_huber_v1" ]]; then
   echo "MTS only supports finetune_profile=legacy_mts_huber_v1; F/Phase-A-B-C logic is retired." >&2
@@ -110,7 +156,7 @@ PY
 }
 
 JOINT_TRAINING_HASH=$(hash_training_spec "$(cat <<JSON
-{"config_hash":"$CONFIG_HASH","feature_hash":"$FEATURE_CONFIG_HASH","graph_hash":"$GRAPH_MODEL_CONFIG_HASH","geometry_hash":"$GEOMETRY_MODEL_CONFIG_HASH","stage":"mts_joint_pretraining","dataset":"PI1M_v2","steps":20000,"epoch_cap":30,"batch_size":$PRETRAIN_BATCH_SIZE,"accumulation":$PRETRAIN_ACCUMULATION,"lr":0.0002,"weight_decay":0.0,"adam_betas":[0.9,0.98],"eps":1e-8,"warmup_steps":2000,"scheduler":"polynomial","scheduler_power":1,"end_lr":1e-9,"amp":"bf16","mask_ratio":0.30,"angle_objective":"$MTS_ANGLE_OBJECTIVE","angle_weight":$MTS_ANGLE_WEIGHT,"angle_bins":20,"angle_gamma":2.0,"max_grad_norm":-1.0,"seed":$SEED,"loader_workers":$LOADER_WORKERS,"loader_prefetch_factor":$LOADER_PREFETCH_FACTOR,"sampler_version":"$SAMPLER_VERSION","batch_balance":"$BATCH_BALANCE"}
+{"config_hash":"$CONFIG_HASH","feature_hash":"$FEATURE_CONFIG_HASH","graph_hash":"$GRAPH_MODEL_CONFIG_HASH","geometry_hash":"$GEOMETRY_MODEL_CONFIG_HASH","stage":"mts_joint_pretraining","dataset":"PI1M_v2","steps":20000,"epoch_cap":30,"batch_size":$PRETRAIN_BATCH_SIZE,"accumulation":$PRETRAIN_ACCUMULATION,"lr":0.0002,"weight_decay":0.0,"optimizer_impl":"adam","adam_betas":[0.9,0.98],"eps":1e-8,"warmup_steps":2000,"scheduler":"polynomial","scheduler_power":1,"end_lr":1e-9,"amp":"bf16","mask_ratio":0.30,"angle_objective":"$MTS_ANGLE_OBJECTIVE","angle_weight":$MTS_ANGLE_WEIGHT,"angle_bins":20,"angle_gamma":2.0,"max_grad_norm":-1.0,"checkpoint_interval_steps":0,"seed":$SEED,"loader_workers":$LOADER_WORKERS,"loader_prefetch_factor":$LOADER_PREFETCH_FACTOR,"sampler_version":"$SAMPLER_VERSION","batch_balance":"$BATCH_BALANCE"}
 JSON
 )")
 FINETUNE_PROFILE_HASH=$(hash_training_spec '{"profile":"legacy_mts_huber_v1","graph_wrapper_trainable_from_epoch":0,"loss":"huber","huber_beta":0.5,"epochs":100,"patience":10,"batch_size":32,"graph_wrapper_lr":1e-5,"smiles_lora_lr":5e-6,"adapter_lr":1e-4,"head_lr":1e-4,"weight_decay":0.02,"warmup_epochs":5,"scheduler":"cosine","swa_start_epoch":-1,"gradient_clip":1.0}')
@@ -156,14 +202,27 @@ if [[ "$RESOLVED_CONFIG_SCHEMA" == "mts-experiment-v3" ]]; then
   mkdir -p "$RESULTS_DIR/configs"
   cp -f "$CONFIG" "$RESULTS_DIR/configs/resolved_input.json"
 fi
-# A caller may provide an explicitly migrated/approved joint checkpoint.  Keep
-# the historical default for normal production runs, but do not hard-code the
-# path so a metadata-only contract migration can be tested without replacing
-# the immutable original artifact.
-JOINT_CKPT=${JOINT_CKPT:-"$ARTIFACT_DIR/mts_joint_pretraining_pi1m_v2_seed${SEED}.pth"}
+# The production default is the full dual-identity canonical checkpoint
+# (Plan contract-finalization §3).  A caller may still override JOINT_CKPT
+# explicitly, e.g. to load the historical 50b85b artifact for read-only reuse;
+# the loader itself rejects any checkpoint without source/target contract.
+JOINT_CKPT=${JOINT_CKPT:-"$ARTIFACT_DIR/mts_joint_pretraining_pi1m_v2_seed42_canonical_angle20_v1.pth"}
+if [[ "$PRETRAIN_ONLY" == 1 && "$PRETRAIN_BENCHMARK_ONLY" != 1 ]]; then
+  if [[ "$RESUME" == 1 ]]; then
+    [[ -f "${JOINT_CKPT}.last.pt" ]] || { echo "resume requested but ${JOINT_CKPT}.last.pt is missing" >&2; exit 2; }
+    [[ ! -f "$JOINT_CKPT" && ! -f "${JOINT_CKPT}.complete.json" ]] || { echo "resume refuses an already completed checkpoint: $JOINT_CKPT" >&2; exit 2; }
+  else
+    [[ ! -e "$JOINT_CKPT" && ! -e "${JOINT_CKPT}.last.pt" && ! -e "${JOINT_CKPT}.complete.json" ]] || {
+      echo "fresh pretraining refuses to overwrite existing output: $JOINT_CKPT" >&2
+      exit 2
+    }
+  fi
+fi
 JOINT_RESUME_ARGS=()
+JOINT_TEE_ARGS=()
 if [[ "$RESUME" == 1 && -f "${JOINT_CKPT}.last.pt" ]]; then
   JOINT_RESUME_ARGS=(--resume_state "${JOINT_CKPT}.last.pt")
+  JOINT_TEE_ARGS=(-a)
 fi
 
 COMMON=(
@@ -178,7 +237,8 @@ COMMON=(
   --source_geometry_model_config_hash "$SOURCE_GEOMETRY_MODEL_CONFIG_HASH"
   --alignment_model_config_hash none
     --training_config_hash "$CONFIG_HASH"
-  --graph_encoder_type mts
+  --graph_encoder_type mips_trimer_scage
+  --topology_representation "$TOPOLOGY_REPRESENTATION"
   --graph_input star_linking
   --modalities "${MTS_MODALITY_ARGS[@]}"
   --fp_mode "$MTS_FP_MODE"
@@ -229,6 +289,10 @@ BENCHMARK_ARGS=()
 if [[ "$PRETRAIN_BENCHMARK_ONLY" == 1 ]]; then
   BENCHMARK_ARGS=(--benchmark_only --benchmark_batches "$PRETRAIN_BENCHMARK_BATCHES")
 fi
+SMOKE_ARGS=()
+if [[ "$PRETRAIN_SMOKE_STEPS" -gt 0 ]]; then
+  SMOKE_ARGS=(--resume_smoke --max_optimizer_steps "$PRETRAIN_SMOKE_STEPS")
+fi
 
 run_cache() {
   local dataset=$1
@@ -239,7 +303,8 @@ run_cache() {
   # benchmark or training launch, even though the bundle gate below had
   # already verified the same .done/.frozen markers.  Only fall back to the
   # builder when a layer is not frozen or an explicit rebuild was requested.
-  if [[ "$REBUILD_FEATURE_CACHE" != 1 ]]; then
+  if [[ "$REBUILD_FEATURE_CACHE" != 1 \
+        && "$TOPOLOGY_REPRESENTATION" == "canonical_lifted" ]]; then
     if "$PYTHON_BIN" - "$layers" <<'PY'
 import sys
 from pathlib import Path
@@ -268,22 +333,55 @@ PY
 }
 
 if [[ "$FINETUNE_ONLY" != 1 ]]; then
-  run_cache "$PRETRAIN_DATASET" "topology" "${REBUILD[@]}"
-  run_cache "$PRETRAIN_DATASET" "trimer"
-  env CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" scripts/prepare_mts_angle_cache.py
-  if [[ "$MTS_ANGLE_OBJECTIVE" == "cosine" ]]; then
-    env CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" scripts/build_mts_angle_v2.py
+  if [[ "$PRETRAIN_ONLY" != 1 && "$PRETRAIN_BENCHMARK_ONLY" != 1 ]]; then
+    if [[ "$TOPOLOGY_REPRESENTATION" == "explicit_k_ru" \
+          && "$MTS_EXPLICIT_VALIDATE_ONLY" == 1 ]]; then
+      # Read-only joint validation: dependency closure opens RU, explicit
+      # Topology and the frozen canonical Trimer, with no missing writer jobs.
+      "$PYTHON_BIN" - <<'PY'
+from pathlib import Path
+from src.dataset.dataset import UniDataset
+from src.dataset.mips_trimer_contract import TOPOLOGY_EXPLICIT
+
+d = UniDataset.__new__(UniDataset)
+d.root = str(Path.cwd() / "data")
+d.cache_layers = ("ru_base", "topology", "trimer")
+d.topology_representation = TOPOLOGY_EXPLICIT
+specs = d._lmdb_cache_specs({})
+for layer in ("ru_base", "topology", "trimer"):
+    root = Path(specs[layer]["root"])
+    if not (root / ".done").is_file():
+        raise SystemExit(f"read-only explicit validation requires completed {layer}: {root}")
+if not (Path(specs["trimer"]["root"]) / ".frozen").is_file():
+    raise SystemExit("read-only explicit validation requires frozen canonical Trimer")
+PY
+      run_cache "$PRETRAIN_DATASET" "trimer"
+    else
+      run_cache "$PRETRAIN_DATASET" "topology" "${REBUILD[@]}"
+    fi
+    # Explicit k-RU changes only Topology.  Its finite Trimer is the existing
+    # frozen canonical-identity layer, so scanning PI1M_v2 a second time via a
+    # no-op Trimer cache pass is both unnecessary and misleading.
+    if [[ "$TOPOLOGY_REPRESENTATION" == "canonical_lifted" ]]; then
+      run_cache "$PRETRAIN_DATASET" "trimer"
+    fi
+    if [[ "$TOPOLOGY_REPRESENTATION" == "canonical_lifted" ]]; then
+      env CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" scripts/prepare_mts_angle_cache.py
+      if [[ "$MTS_ANGLE_OBJECTIVE" == "cosine" ]]; then
+        env CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" scripts/build_mts_angle_v2.py
+      fi
+    fi
   fi
 fi
 
 # Freeze-time cache preparation is deliberately completed before any GPU
 # pretraining.  The feature-source cohort is the downstream union only; it
 # is never used as a Stage 1/1.5 sampling cohort.
-if [[ "$FINETUNE_ONLY" != 1 || "$PRETRAIN_CACHE_ONLY" == 1 ]]; then
+if [[ "$FINETUNE_ONLY" != 1 && "$PRETRAIN_ONLY" != 1 && "$PRETRAIN_BENCHMARK_ONLY" != 1 || "$PRETRAIN_CACHE_ONLY" == 1 ]]; then
   env CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" scripts/train.py \
     "${COMMON[@]}" "${CACHE[@]}" \
     --feature_source_dataset smi_all \
-    --cache_layers ru_base,topology,trimer,md200 \
+    --cache_layers "$MTS_TRAIN_CACHE_LAYERS" \
     --tasks "${TASK_LIST[@]}" --fold_ids "${FOLD_LIST[@]}" --cache_only
 fi
 if [[ "$PRETRAIN_CACHE_ONLY" == 1 ]]; then
@@ -299,7 +397,8 @@ specs = _specs(Path.cwd())
 try:
     verify_frozen_cache_bundle(
         specs,
-        store_path=Path(specs["trimer"]["root"]) / "validation" / "store.json",
+        store_path=Path(specs["topology"]["root"]).parents[1]
+        / "validation" / "store.json",
         required_layers=specs.keys(),
     )
 except Exception as exc:
@@ -307,6 +406,31 @@ except Exception as exc:
         "cache bundle verification failed; run finalize_mips_trimer_cache.py: "
         + str(exc)
     )
+PY
+fi
+
+# A corrected explicit run is meaningful only after its independent exact-
+# union Topology artifact has passed joint validation against the frozen
+# canonical Trimer.  Cache-only materialisation is exempt because it creates
+# that artifact; benchmark/smoke must never train from a merely partial LMDB.
+if [[ "$TOPOLOGY_REPRESENTATION" == "explicit_k_ru" \
+      && "$PRETRAIN_CACHE_ONLY" != 1 ]]; then
+  "$PYTHON_BIN" - <<'PY'
+import json
+from pathlib import Path
+from src.dataset.dataset import UniDataset
+from src.dataset.mips_trimer_contract import TOPOLOGY_EXPLICIT
+
+d = UniDataset.__new__(UniDataset)
+d.root = str(Path.cwd() / "data")
+d.cache_layers = ("ru_base", "topology", "trimer")
+d.topology_representation = TOPOLOGY_EXPLICIT
+root = Path(d._lmdb_cache_specs({})["topology"]["root"])
+acceptance = Path("results/mts_explicit_k_ru/final_acceptance.json")
+if not (root / ".done").is_file() or not (root / ".frozen").is_file():
+    raise SystemExit("explicit_k_ru benchmark/smoke requires a frozen exact-union Topology cache")
+if not acceptance.is_file() or not bool(json.loads(acceptance.read_text()).get("passed")):
+    raise SystemExit("explicit_k_ru benchmark/smoke requires passed final_acceptance.json")
 PY
 fi
 
@@ -321,6 +445,7 @@ if [[ "$FINETUNE_ONLY" != 1 ]]; then
     --pretrain_stage mts_joint_pretraining \
     "${COMMON[@]}" "${CACHE[@]}" \
     --cache_layers topology,trimer \
+    --pretrain_profile "$PRETRAIN_PROFILE" \
     --training_config_hash "$JOINT_TRAINING_HASH" \
     --epochs 30 --max_optimizer_steps "$JOINT_STEPS" \
     --batch_size "$PRETRAIN_BATCH_SIZE" --gradient_accumulation_steps "$PRETRAIN_ACCUMULATION" \
@@ -328,11 +453,12 @@ if [[ "$FINETUNE_ONLY" != 1 ]]; then
     --lr 2e-4 --warmup_steps 2000 --mips_scheduler polynomial --scheduler_power 1 --end_lr 1e-9 \
     --graph_mask_ratio 0.30 --angle_objective "$MTS_ANGLE_OBJECTIVE" \
     --graph_angle_weight "$MTS_ANGLE_WEIGHT" --mips_spd_weight 0 --mips_path_bond_weight 0 \
-    --no-dynamic_pretrain_loss --max_grad_norm -1 \
+    --no-dynamic_pretrain_loss --max_grad_norm -1 --checkpoint_interval_steps 0 \
+    "${SMOKE_ARGS[@]}" \
     "${BENCHMARK_ARGS[@]}" \
     "${JOINT_RESUME_ARGS[@]}" \
     --save_path "$JOINT_CKPT" \
-    2>&1 | tee "$LOG_DIR/mts_joint_pretraining_pi1m_v2.log"
+    2>&1 | tee "${JOINT_TEE_ARGS[@]}" "$LOG_DIR/mts_joint_pretraining_pi1m_v2.log"
 fi
 if [[ "$PRETRAIN_BENCHMARK_ONLY" == 1 ]]; then
   exit 0
@@ -365,6 +491,10 @@ cleanup_stage3_children() {
   trap - INT TERM EXIT
   for pid in "${pids[@]:-}"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      # The slot child is a subshell wrapping the train process; kill the
+      # train process (direct child) first so no orphan survives the cleanup
+      # (Plan §7 failure-reaping test).
+      pkill -TERM -P "$pid" 2>/dev/null || true
       kill "$pid" 2>/dev/null || true
     fi
   done
@@ -380,7 +510,9 @@ mkdir -p "$RESULTS_DIR/shards" "$RESULTS_DIR/predictions" "$LOG_DIR"
 STORE_PATH=$("$PYTHON_BIN" - <<'PY'
 from pathlib import Path
 from scripts.audit_mips_trimer_cache import _specs
-print(Path(_specs(Path.cwd())["trimer"]["root"]).joinpath("validation", "store.json"))
+print(Path(_specs(Path.cwd())["topology"]["root"]).parents[1].joinpath(
+    "validation", "store.json"
+))
 PY
 )
 CHECKPOINT_SHA256=$(sha256sum "$JOINT_CKPT" | awk '{print $1}')
@@ -492,32 +624,42 @@ launch_stage3_unit() {
   training_hash=$(stage3_training_hash "$fine_seed")
   (
     export CUDA_VISIBLE_DEVICES=$gpu
-    "$PYTHON_BIN" scripts/train.py \
-      "${COMMON[@]}" "${CACHE[@]}" \
-      "${MTS_FINETUNE_MODE_ARGS[@]}" \
-      --cache_layers ru_base,topology,trimer,md200 \
-      --tasks "$task" --fold_ids "$fold" \
-      --pretrained_model_path "$JOINT_CKPT" \
-      --checkpoint_seed "$SEED" --seed "$fine_seed" \
-      --resolved_config_hash "$CONFIG_HASH" \
-      --checkpoint_sha256 "$CHECKPOINT_SHA256" \
-      --cache_store_sha256 "$CACHE_STORE_SHA256" \
-      --training_config_hash "$training_hash" \
-      --finetune_config_hash "$FINETUNE_CONFIG_HASH" \
-      --finetune_profile "$FINETUNE_PROFILE" \
-      --finetune_profile_hash "$FINETUNE_PROFILE_HASH" \
-      --predictions_dir "$RESULTS_DIR/predictions/$fine_seed" \
-      --checkpoint_pretraining_dataset "$PRETRAIN_DATASET" \
-      --checkpoint_tier 1m \
-      --epochs 100 --patience 10 --batch_size 32 \
-      --loader_workers "$LOADER_WORKERS" \
-      --evaluation_protocol "$EVALUATION_PROTOCOL" \
-      --target_transform recommended \
-      --regression_loss huber --huber_beta 0.5 --max_grad_norm 1.0 \
-      --graph_lr 1e-5 --fusion_lr 1e-4 --head_lr 1e-4 --weight_decay 0.02 \
-      --warmup_epochs 5 --head_dropout 0.25 \
-      --results_dir "$shard" \
-      2>&1 | tee "$LOG_DIR/finetune_seed${fine_seed}_${task}_fold${fold}.log"
+    if [[ "${MTS_FAKE_TRAIN:-0}" == "1" ]]; then
+      # Test-only injection (Plan §7): a fake training command drives the real
+      # three-slot dispatcher without GPU/Dataset.  It receives the unit and
+      # output paths; the real train.py path is untouched when unset.
+      "$PYTHON_BIN" "${MTS_FAKE_TRAIN_CMD}" \
+        --task "$task" --fold "$fold" \
+        --shard "$shard" --prediction "$prediction" \
+        >> "$LOG_DIR/finetune_seed${fine_seed}_${task}_fold${fold}.log" 2>&1
+    else
+      "$PYTHON_BIN" scripts/train.py \
+        "${COMMON[@]}" "${CACHE[@]}" \
+        "${MTS_FINETUNE_MODE_ARGS[@]}" \
+        --cache_layers "$MTS_TRAIN_CACHE_LAYERS" \
+        --tasks "$task" --fold_ids "$fold" \
+        --pretrained_model_path "$JOINT_CKPT" \
+        --checkpoint_seed "$SEED" --seed "$fine_seed" \
+        --resolved_config_hash "$CONFIG_HASH" \
+        --checkpoint_sha256 "$CHECKPOINT_SHA256" \
+        --cache_store_sha256 "$CACHE_STORE_SHA256" \
+        --training_config_hash "$training_hash" \
+        --finetune_config_hash "$FINETUNE_CONFIG_HASH" \
+        --finetune_profile "$FINETUNE_PROFILE" \
+        --finetune_profile_hash "$FINETUNE_PROFILE_HASH" \
+        --predictions_dir "$RESULTS_DIR/predictions/$fine_seed" \
+        --checkpoint_pretraining_dataset "$PRETRAIN_DATASET" \
+        --checkpoint_tier 1m \
+        --epochs "$FINETUNE_EPOCHS" --patience "$FINETUNE_PATIENCE" --batch_size "$FINETUNE_BATCH_SIZE" \
+        --loader_workers "$LOADER_WORKERS" \
+        --evaluation_protocol "$EVALUATION_PROTOCOL" \
+        --target_transform recommended \
+        --regression_loss huber --huber_beta 0.5 --max_grad_norm 1.0 \
+        --graph_lr 1e-5 --fusion_lr 1e-4 --head_lr 1e-4 --weight_decay 0.02 \
+        --warmup_epochs 5 --head_dropout 0.25 \
+        --results_dir "$shard" \
+        >> "$LOG_DIR/finetune_seed${fine_seed}_${task}_fold${fold}.log" 2>&1
+    fi
   ) &
   local pid=$!
   pids+=("$pid")
@@ -528,11 +670,39 @@ launch_stage3_unit() {
 run_finetune_seeds() {
   local -a requested=("$@") queue=() free_gpus=(0 1 2)
   local fine_seed task fold shard prediction training_hash
+  local -a dispatch_tasks=("${TASK_LIST[@]}") dispatch_folds=("${FOLD_LIST[@]}")
+  if [[ "$MTS_FINETUNE_SCHEDULE" == "lpt_v1" ]]; then
+    for task in "${TASK_LIST[@]}"; do
+      if ! printf '%s\n' "${LPT_V1_TASK_ORDER[@]}" | grep -qx "$task"; then
+        echo "[finetune] lpt_v1 schedule cannot order unknown task '$task'" >&2
+        exit 2
+      fi
+    done
+    for fold in "${FOLD_LIST[@]}"; do
+      if ! printf '%s\n' "${LPT_V1_FOLD_ORDER[@]}" | grep -qx "$fold"; then
+        echo "[finetune] lpt_v1 fold order is 0 1 2 3 4; got '$fold'" >&2
+        exit 2
+      fi
+    done
+    # Reorder only the requested tasks by the fixed LPT sequence (longest task
+    # first); the fold order stays as requested (0..4 for the full 8x5 run).
+    # A partial smoke run therefore dispatches exactly its requested subset.
+    dispatch_tasks=()
+    for task in "${LPT_V1_TASK_ORDER[@]}"; do
+      if printf '%s\n' "${TASK_LIST[@]}" | grep -qx "$task"; then
+        dispatch_tasks+=("$task")
+      fi
+    done
+    dispatch_folds=("${FOLD_LIST[@]}")
+  else
+    dispatch_tasks=("${TASK_LIST[@]}")
+    dispatch_folds=("${FOLD_LIST[@]}")
+  fi
   for fine_seed in "${requested[@]}"; do
     training_hash=$(stage3_training_hash "$fine_seed")
-    for task in "${TASK_LIST[@]}"; do
+    for task in "${dispatch_tasks[@]}"; do
       mkdir -p "$RESULTS_DIR/shards/$fine_seed/$task" "$RESULTS_DIR/predictions/$fine_seed/$task"
-      for fold in "${FOLD_LIST[@]}"; do
+      for fold in "${dispatch_folds[@]}"; do
         shard="$RESULTS_DIR/shards/$fine_seed/$task/fold_${fold}.csv"
         prediction="$RESULTS_DIR/predictions/$fine_seed/$task/fold_${fold}.npz"
         if validate_shard "$shard" "$prediction" "$task" "$fold" "$fine_seed" "$training_hash"; then
@@ -586,14 +756,22 @@ if (( ${#TASK_LIST[@]} != 8 || ${#FOLD_LIST[@]} != 5 )); then
   trap - INT TERM EXIT
   exit 0
 fi
+GATE_BASELINE_ARGS=()
+if [[ -f results/mts/mts_summary.csv ]]; then
+  GATE_BASELINE_ARGS=(
+    --gate-baseline-csv results/mts/mts_summary.csv
+    --gate-output "$RESULTS_DIR/seed42_promotion.json"
+  )
+else
+  echo "[finetune] historical baseline results/mts/mts_summary.csv missing; seed-42 promotion gate skipped (single-seed run unaffected)." >&2
+fi
 "$PYTHON_BIN" scripts/summarize_mips_trimer_scage.py \
   --results-root "$RESULTS_DIR" \
   --output-csv "$RESULTS_DIR/mts_seed42_summary.csv" \
   --output-md "$RESULTS_DIR/mts_seed42_summary.md" \
   --tasks "${TASK_LIST[@]}" --folds "${FOLD_LIST[@]}" --seeds 42 \
   --evaluation-protocol "$EVALUATION_PROTOCOL" \
-  --gate-baseline-csv results/mts/mts_summary.csv \
-  --gate-output "$RESULTS_DIR/seed42_promotion.json"
+  "${GATE_BASELINE_ARGS[@]}"
 
 remaining_seeds=()
 for fine_seed in "${FINETUNE_SEED_LIST[@]}"; do

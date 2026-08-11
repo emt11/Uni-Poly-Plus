@@ -22,7 +22,7 @@ def test_mts_public_route_and_stage_names():
     assert normalize_stage("stage2_geometry_adapt") == STAGE2_ID
 
 
-def test_mts_config_uses_new_identity_but_old_cache_schemas(tmp_path):
+def test_mts_config_uses_canonical_v3_v8_and_v6_cache_schemas(tmp_path):
     config = json.loads(
         Path("configs/mts/default.json").read_text(encoding="utf-8")
     )
@@ -32,4 +32,6 @@ def test_mts_config_uses_new_identity_but_old_cache_schemas(tmp_path):
     assert config["route_short_name"] == ROUTE_SHORT_NAME
     assert config["stage1"]["id"] == STAGE1_ID
     assert config["stage2"]["id"] == STAGE2_ID
-    assert config["feature_schema"].startswith("mips-trimer-scage-")
+    assert config["feature_schema"] == "mts-canonical-periodic-feature-v3"
+    assert config["trimer_cache_schema"] == "mips-trimer-scage-trimer-v8"
+    assert config["trimer_lmdb_schema"] == "mips-trimer-scage-trimer-lmdb-v6"

@@ -12,7 +12,11 @@ from src.dataset.mips_trimer_contract import (
     ROUTE_NAME,
     FEATURE_SCHEMA,
     LEGACY_FEATURE_SCHEMA,
+    EXPLICIT_FEATURE_SCHEMA,
+    EXPLICIT_LGA_SCHEMA_VERSION,
     CANONICAL_LGA_SCHEMA_VERSION,
+    TOPOLOGY_CANONICAL,
+    TOPOLOGY_EXPLICIT,
 )
 from .trimer_mcl import TrimerSCAGEMCLResidual
 
@@ -234,6 +238,9 @@ class MIPSLocalGraphEncoder(nn.Module):
         masked_loss_reduction="atom_mean",
         input_norm=False,
         qk_direction="paper",
+        use_star_rbf=True,
+        use_mcl=True,
+        mcl_mask_mode="real",
         **retired,
     ):
         super().__init__()
@@ -306,6 +313,19 @@ class MIPSLocalGraphEncoder(nn.Module):
         self.geometry_mode = resolved_geometry
         self.use_descriptors = True
         self.descriptor_components = "md200"
+        # Orthogonal causal-ablation axes (Plan mts_geometry_injection_ablation
+        # A0-A4): star-RBF and MCL can be independently bypassed in forward and
+        # excluded from the optimizer, while their parameters stay in the module
+        # so a shared pretrained checkpoint still loads with strict=True.
+        self.use_star_rbf = bool(use_star_rbf)
+        self.use_mcl = bool(use_mcl)
+        self.mcl_mask_mode = str(mcl_mask_mode)
+        if self.mcl_mask_mode not in ("real", "count_matched_random"):
+            raise ValueError(
+                f"unsupported MCL mask mode: {self.mcl_mask_mode!r}"
+            )
+        if self.mcl_mask_mode == "count_matched_random" and not self.use_mcl:
+            raise ValueError("random MCL masking requires use_mcl=True")
         if str(mask_policy) != "canonical_exact":
             raise ValueError(
                 "all canonical-equivalent O8 copies must be masked together"
@@ -332,8 +352,17 @@ class MIPSLocalGraphEncoder(nn.Module):
             percentiles=(0.20, 0.50), dropout=dropout,
             use_distance_bias=("mcl_rbf" in resolved_geometry),
             coordinate_shuffle=("coordinate_shuffled" in resolved_geometry),
+            mask_mode=self.mcl_mask_mode,
         )
         self.md_residual = MD200GraphResidual(self.emb_dim, dropout)
+        # Bypassed branches stay visible to strict state-dict loading but are
+        # frozen; the downstream optimizer only collects requires_grad params.
+        if not self.use_star_rbf:
+            for _parameter in self.star_distance_bias.parameters():
+                _parameter.requires_grad_(False)
+        if not self.use_mcl:
+            for _parameter in self.trimer_mcl.parameters():
+                _parameter.requires_grad_(False)
 
     def _validate(self, data, *, require_geometry, require_md):
         if getattr(data, "feature_schema", None) == LEGACY_FEATURE_SCHEMA:
@@ -346,6 +375,24 @@ class MIPSLocalGraphEncoder(nn.Module):
             or getattr(data, "mips_local_lga_schema_version", 0)
             == CANONICAL_LGA_SCHEMA_VERSION
         )
+        representation = str(getattr(
+            data, "topology_representation",
+            TOPOLOGY_CANONICAL if canonical_periodic else "",
+        ))
+        if representation not in {TOPOLOGY_CANONICAL, TOPOLOGY_EXPLICIT}:
+            raise ValueError("MTS batch has an unknown topology representation")
+        expected_feature = (
+            FEATURE_SCHEMA
+            if representation == TOPOLOGY_CANONICAL else EXPLICIT_FEATURE_SCHEMA
+        )
+        if getattr(data, "feature_schema", None) != expected_feature:
+            raise ValueError("MTS topology representation/feature schema mismatch")
+        expected_lga = (
+            CANONICAL_LGA_SCHEMA_VERSION
+            if representation == TOPOLOGY_CANONICAL else EXPLICIT_LGA_SCHEMA_VERSION
+        )
+        if int(getattr(data, "mips_local_lga_schema_version", -1)) != expected_lga:
+            raise ValueError("MTS topology representation/LGA schema mismatch")
         required = (
             "mips_x", "mips_backbone_mask", "lga_edge_index", "lga_spd",
             "lga_path_index", "lga_path_mask", "lga_star_edge_mask",
@@ -362,16 +409,25 @@ class MIPSLocalGraphEncoder(nn.Module):
                 "canonical_pair_index",
             )
         if require_geometry:
-            required += (
-                "star_3d_distance", "star_3d_asymmetry", "star_3d_valid",
-                "trimer_pos", "trimer_base_ru_atom_index",
-                "trimer_central_ru_mask", "mips_to_trimer_central_index",
-                "trimer_geometry_valid", "trimer_geometry_is_3d",
-                "trimer_2d_fallback", "trimer_batch",
-            )
+            if self.use_star_rbf:
+                required += (
+                    "star_3d_distance", "star_3d_asymmetry", "star_3d_valid",
+                )
+            if self.use_mcl:
+                required += (
+                    "trimer_pos",
+                    "trimer_central_ru_mask", "mips_to_trimer_central_index",
+                    "trimer_geometry_valid", "trimer_geometry_is_3d",
+                    "trimer_2d_fallback", "trimer_batch",
+                )
         if require_md:
             required += ("mips_md", "mips_md_valid")
         missing = [name for name in required if not hasattr(data, name)]
+        if require_geometry and self.use_mcl and not (
+            hasattr(data, "trimer_base_ru_atom_index")
+            or hasattr(data, "trimer_base_ru_atom_id")
+        ):
+            missing.append("trimer_base_ru_atom_index/trimer_base_ru_atom_id")
         if missing:
             raise ValueError(
                 f"{ROUTE_NAME} cache is missing " + ", ".join(missing)
@@ -404,6 +460,26 @@ class MIPSLocalGraphEncoder(nn.Module):
         ).bool().flatten()
         if not canonical_periodic and bool((available & ((boundary <= 5) | ~condition)).any()):
             raise ValueError("available O8 graph violates boundary distance >5")
+
+    @staticmethod
+    def _canonical_pool(nodes, data):
+        """Pool node copies to canonical atoms, then canonical atoms to graphs."""
+
+        canonical_index = data.canonical_ru_atom_index.long()
+        canonical_graph = data.canonical_graph_index.long()
+        canonical_count = int(canonical_graph.numel())
+        if canonical_index.numel() != nodes.size(0):
+            raise ValueError("canonical node identity length mismatch")
+        canonical_nodes = scatter(
+            nodes, canonical_index, dim=0,
+            dim_size=canonical_count, reduce="mean",
+        )
+        graph_count = int(data.graph_available.numel())
+        graph = scatter(
+            canonical_nodes, canonical_graph, dim=0,
+            dim_size=graph_count, reduce="mean",
+        )
+        return graph, canonical_nodes
 
     def _forward_impl(
         self, data, atom_mask=None, *,
@@ -445,7 +521,7 @@ class MIPSLocalGraphEncoder(nn.Module):
 
         graph_available = data.graph_available.bool().flatten()
         x = x * graph_available[data.batch.long()].unsqueeze(-1).to(x.dtype)
-        graph = global_mean_pool(x, data.batch.long())
+        graph, _ = self._canonical_pool(x, data)
         graph = graph * graph_available.unsqueeze(-1).to(graph.dtype)
         if use_md:
             graph = self.md_residual(graph, data)
@@ -469,7 +545,11 @@ class MIPSLocalGraphEncoder(nn.Module):
         return anchor
 
     def forward(self, data):
-        return self._forward_impl(data)
+        return self._forward_impl(
+            data,
+            use_star=self.use_star_rbf,
+            use_geometry=self.use_mcl,
+        )
 
     def forward_joint_pretrain(self, data, canonical_atom_mask):
         """One O8+Star-RBF+Trimer-MCL forward for both pretext tasks.
@@ -508,10 +588,11 @@ class MIPSLocalGraphEncoder(nn.Module):
         nodes = topology_nodes + geometry_delta
         graph_available = data.graph_available.bool().flatten()
         nodes = nodes * graph_available[data.batch.long()].unsqueeze(-1).to(nodes.dtype)
-        graph = global_mean_pool(nodes, data.batch.long())
+        graph, canonical_nodes = self._canonical_pool(nodes, data)
         graph = graph * graph_available.unsqueeze(-1).to(graph.dtype)
         return graph, nodes, {
             "final_trimer_states": trimer_states,
+            "canonical_node_states": canonical_nodes,
             "mcl_valid_graph_mask": mcl_valid,
             "angle_valid_graph_mask": getattr(
                 data, "trimer_angle_valid", torch.zeros_like(mcl_valid)

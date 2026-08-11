@@ -30,7 +30,13 @@ from src.dataset.mips_trimer_contract import (
     TOPOLOGY_LMDB_SCHEMA as MIPS_TRIMER_TOPOLOGY_SCHEMA,
     CANONICAL_LGA_SCHEMA_VERSION as MIPS_CANONICAL_LGA_SCHEMA_VERSION,
     CONFIG_SCHEMA as MIPS_TRIMER_CONFIG_SCHEMA,
+    EXPERIMENT_CONFIG_SCHEMA as MIPS_EXPERIMENT_CONFIG_SCHEMA,
     FEATURE_SCHEMA as MIPS_TRIMER_FEATURE_SCHEMA,
+    EXPLICIT_FEATURE_SCHEMA as MIPS_EXPLICIT_FEATURE_SCHEMA,
+    EXPLICIT_TOPOLOGY_LMDB_SCHEMA as MIPS_EXPLICIT_TOPOLOGY_SCHEMA,
+    EXPLICIT_LGA_SCHEMA_VERSION as MIPS_EXPLICIT_LGA_SCHEMA_VERSION,
+    TOPOLOGY_CANONICAL,
+    TOPOLOGY_EXPLICIT,
     TRIMER_BUILDER_VERSION as MIPS_TRIMER_BUILDER_VERSION,
     TRIMER_CONTENT_SCHEMA as MIPS_TRIMER_CONTENT_SCHEMA,
     TRIMER_LMDB_SCHEMA as MIPS_TRIMER_LMDB_SCHEMA,
@@ -44,6 +50,16 @@ from src.dataset.mips_trimer_contract import (
     ROUTE_INTERNAL as MTS_ROUTE_INTERNAL,
     STAGE1_ID as MTS_STAGE1_ID,
     STAGE2_ID as MTS_STAGE2_ID,
+    BUILDER_VERSION as MIPS_BUILDER_VERSION,
+    CACHE_TOPOLOGY_COST_SCHEMA as MIPS_CACHE_TOPOLOGY_COST_SCHEMA,
+    PRETRAIN_CHECKPOINT_SCHEMA,
+    PRETRAIN_TRAIN_STATE_SCHEMA,
+    PRETRAIN_TARGET_CONTRACT_SCHEMA,
+    PRETRAIN_PROFILE_SCHEMA,
+    PRETRAIN_PROFILE_ID,
+    CACHE_BOND_ANGLE_SCHEMA,
+    build_pretrain_target_contract,
+    _canonical_json_hash,
     stage_display_name,
     normalize_stage,
     cache_bundle_binding_hash,
@@ -74,6 +90,181 @@ def _path_tree_sha256(path):
             digest.update(relative.encode("utf-8"))
             digest.update(_file_sha256(filename).encode("ascii"))
     return digest.hexdigest()
+
+
+_PRETRAIN_CODE_FILES = (
+    "configs/mts/default.json",
+    "configs/mts/pretraining/canonical_ru_angle20_v1.json",
+    "scripts/pretrain.py",
+    "scripts/run_mips_trimer_scage.sh",
+    "src/dataset/dataloader.py",
+    "src/dataset/dataset.py",
+    "src/dataset/mips_trimer_contract.py",
+    "src/dataset/trimer_mcl.py",
+    "src/modules/mips_local_graph.py",
+    "src/modules/uni_encoder.py",
+)
+
+
+def _pretrain_code_identity(root=PROJECT_ROOT):
+    """Return the immutable source identity used by resume and checkpoints."""
+    root = Path(root)
+    files = {}
+    digest = hashlib.sha256()
+    for relative in _PRETRAIN_CODE_FILES:
+        path = root / relative
+        if not path.is_file():
+            continue
+        value = _file_sha256(path)
+        files[relative] = value
+        digest.update(relative.encode("utf-8"))
+        digest.update(value.encode("ascii"))
+    return {"files": files, "sha256": digest.hexdigest()}
+
+
+def _load_pretrain_profile(profile_id_or_path):
+    """Load and validate the one active formal pretraining profile."""
+    value = str(profile_id_or_path or "").strip()
+    if not value or value == "mips24h":
+        return None
+    path = Path(value)
+    if not path.is_file():
+        path = Path(PROJECT_ROOT) / "configs/mts/pretraining" / f"{value}.json"
+    if not path.is_file():
+        raise RuntimeError(f"pretraining profile is missing: {path}")
+    profile = json.loads(path.read_text(encoding="utf-8"))
+    required = {
+        "schema", "profile_id", "representation", "dataset", "cohort_hash",
+        "objective", "angle_objective", "angle_cache_schema",
+        "angle_cache_artifact", "masked_atom_ratio", "masked_atom_weight",
+        "angle_weight", "angle_bins", "focal_gamma", "optimizer_steps",
+        "seed", "world_size", "global_batch", "optimizer", "betas", "eps",
+        "weight_decay", "peak_lr", "warmup_steps", "scheduler",
+        "scheduler_power", "end_lr", "amp", "gradient_clipping",
+    }
+    missing = sorted(required - set(profile))
+    if missing or profile.get("schema") != PRETRAIN_PROFILE_SCHEMA:
+        raise RuntimeError(
+            f"invalid pretraining profile {path}: schema={profile.get('schema')!r}, "
+            f"missing={missing}"
+        )
+    if profile.get("profile_id") != PRETRAIN_PROFILE_ID:
+        raise RuntimeError("only canonical_ru_angle20_v1 is active in this cycle")
+    checks = {
+        "dataset": "PI1M_v2", "angle_objective": "categorical",
+        "angle_cache_schema": CACHE_BOND_ANGLE_SCHEMA,
+        "angle_cache_artifact": "6fa4c12268378566099afda1e56987da03fb65efc8b3a21c93a9b28a534b0e7c",
+        "representation": "canonical_lifted",
+        "objective": "masked_atom_plus_trimer_angle20_focal",
+        "angle_bins": 20, "optimizer_steps": 20000, "seed": 42,
+        "world_size": 3, "global_batch": 1008, "optimizer": "Adam",
+        "weight_decay": 0.0, "peak_lr": 2e-4, "warmup_steps": 2000,
+        "scheduler": "polynomial", "scheduler_power": 1,
+        "end_lr": 1e-9, "amp": "bf16", "gradient_clipping": "disabled",
+    }
+    for key, expected in checks.items():
+        if profile.get(key) != expected:
+            raise RuntimeError(
+                f"pretraining profile {key} mismatch: expected {expected!r}, "
+                f"got {profile.get(key)!r}"
+            )
+    if list(profile.get("betas", [])) != [0.9, 0.98] or float(profile.get("eps")) != 1e-8:
+        raise RuntimeError("pretraining profile Adam contract mismatch")
+    if (
+        float(profile.get("masked_atom_ratio")) != 0.30
+        or float(profile.get("masked_atom_weight")) != 1.0
+        or float(profile.get("angle_weight")) != 0.25
+        or float(profile.get("focal_gamma")) != 2.0
+    ):
+        raise RuntimeError("pretraining profile objective weights mismatch")
+    return profile
+
+
+def _build_final_cache_binding(profile=None):
+    """Read-only snapshot of the frozen cache and derived sidecars."""
+    from scripts.audit_mips_trimer_cache import _specs
+
+    specs = _specs(Path(PROJECT_ROOT))
+    topo_root = Path(specs["topology"]["root"])
+    trimer_root = Path(specs["trimer"]["root"])
+    store_path = topo_root.parents[1] / "validation" / "store.json"
+    exact_path = store_path.parent / "exact_union_validation.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    binding = {
+        "schema": "mts-final-cache-binding-v1",
+        "store_schema": str(store.get("schema", "")),
+        "store_sha256": _file_sha256(store_path),
+        "store_transaction_id": store.get("transaction_id"),
+        "exact_union_sha256": _file_sha256(exact_path),
+        "exact_union_validator_version": str(
+            store.get("full_validation", {}).get("validator_version", "")
+        ),
+        "done_artifact_id": {},
+        "done_file_sha256": {},
+        "frozen_file_sha256": {},
+        "layers": {},
+        "angle_sidecars": [],
+        "mcl_sidecars": [],
+    }
+    for layer in ("topology", "trimer"):
+        root = Path(specs[layer]["root"])
+        done_id = (root / ".done").read_text(encoding="utf-8").strip()
+        done_sha = _file_sha256(root / ".done")
+        frozen_sha = _file_sha256(root / ".frozen")
+        binding["done_artifact_id"][layer] = done_id
+        binding["done_file_sha256"][layer] = done_sha
+        binding["frozen_file_sha256"][layer] = frozen_sha
+        binding["layers"][layer] = {
+            "root": str(root),
+            "done_artifact_id": done_id,
+            "done_file_sha256": done_sha,
+            "frozen_file_sha256": frozen_sha,
+        }
+    cohorts = {
+        "PI1M_v2": "0098e20479194659840d5f093de7879180572f65d0020155ab7c91212ae09049",
+        "downstream_union": "ede5f8bc4ba277708c57787249ec85733b1a30a9c149ed9703ec55c80a843bb2",
+    }
+    for cohort_name, cohort_hash in cohorts.items():
+        angle_root = trimer_root / "derived" / "bond_angle" / cohort_hash
+        metadata = json.loads((angle_root / "metadata.json").read_text(encoding="utf-8"))
+        angle_item = {
+            "cohort": cohort_name,
+            "cohort_hash": cohort_hash,
+            "schema": metadata.get("schema"),
+            "artifact_hash": (angle_root / ".done").read_text(encoding="utf-8").strip(),
+            "metadata_sha256": _file_sha256(angle_root / "metadata.json"),
+            "done_file_sha256": _file_sha256(angle_root / ".done"),
+            "frozen_file_sha256": _file_sha256(angle_root / ".frozen"),
+            "trimer_artifact_hash": binding["done_artifact_id"]["trimer"],
+            "trimer_done_file_sha256": binding["done_file_sha256"]["trimer"],
+        }
+        if profile is not None and cohort_name == "PI1M_v2":
+            if (
+                angle_item["schema"] != profile["angle_cache_schema"]
+                or angle_item["artifact_hash"] != profile["angle_cache_artifact"]
+            ):
+                raise RuntimeError("frozen categorical Angle-20 sidecar binding is stale")
+        binding["angle_sidecars"].append(angle_item)
+        mcl_root = (
+            Path(PROJECT_ROOT) / "data/processed/mips_trimer_scage/cohorts"
+            / cohort_name / cohort_hash
+        )
+        mcl_meta_path = mcl_root / "mcl_thresholds_metadata.json"
+        mcl_values = mcl_root / "mcl_thresholds.npy"
+        if mcl_meta_path.is_file() and mcl_values.is_file():
+            mcl_metadata = json.loads(mcl_meta_path.read_text(encoding="utf-8"))
+            binding["mcl_sidecars"].append({
+                "cohort": cohort_name,
+                "cohort_hash": cohort_hash,
+                "schema": mcl_metadata.get("schema"),
+                "values_sha256": _file_sha256(mcl_values),
+                "metadata_sha256": _file_sha256(mcl_meta_path),
+                "trimer_artifact_hash": binding["done_artifact_id"]["trimer"],
+                "trimer_done_file_sha256": binding["done_file_sha256"]["trimer"],
+                "shape": mcl_metadata.get("shape"),
+            })
+    binding["frozen_bundle_sha256"] = _canonical_json_hash(binding)
+    return binding
 
 
 def _capture_rng_state():
@@ -142,6 +333,7 @@ def parse_arguments():
     parser.add_argument('--model_config_hash', default='manual')
     parser.add_argument('--graph_model_config_hash', default='manual')
     parser.add_argument('--geometry_model_config_hash', default='manual')
+    parser.add_argument('--source_geometry_model_config_hash', default='manual')
     parser.add_argument('--alignment_model_config_hash', default='manual')
     parser.add_argument('--training_config_hash', default='manual')
     parser.add_argument('--config_schema', default='manual')
@@ -168,6 +360,11 @@ def parse_arguments():
         help="Fingerprint implementation. ecfp keeps the original Morgan/ECFP 1024-bit FP; mixfp uses MACCSKeys + PubChemFingerprints.",
     )
     parser.add_argument('--fusion_dropout', type=float, default=0.0, help=argparse.SUPPRESS)
+    # Accepted for the shared launcher COMMON vector; joint pretraining does
+    # not consume per-modality dropout, the defaults mirror train.py.
+    parser.add_argument('--smiles_modality_dropout', type=float, default=0.10, help=argparse.SUPPRESS)
+    parser.add_argument('--fp_modality_dropout', type=float, default=0.25, help=argparse.SUPPRESS)
+    parser.add_argument('--graph_modality_dropout', type=float, default=0.05, help=argparse.SUPPRESS)
     parser.add_argument(
         '--mips_fusion_mode',
         choices=['none'],
@@ -213,8 +410,9 @@ def parse_arguments():
         )
     )
     parser.add_argument(
-        '--pretrain_profile', choices=['mips24h'], default='mips24h',
-        help='Fixed MIPS-compatible MTS joint-pretraining profile.'
+        '--pretrain_profile',
+        default=PRETRAIN_PROFILE_ID,
+        help='Fixed MTS joint-pretraining profile.'
     )
     parser.add_argument(
         '--pretrained_model_path',
@@ -250,6 +448,10 @@ def parse_arguments():
     parser.add_argument(
         '--benchmark_only', action='store_true',
         help='Run a finite forward/backward throughput benchmark and exit.',
+    )
+    parser.add_argument(
+        '--resume_smoke', action='store_true',
+        help='Test-only short run; never writes a production checkpoint.',
     )
     parser.add_argument('--benchmark_batches', type=int, default=0)
     parser.add_argument('--seed', type=int, default=42, help='Base random seed for reproducible pretraining.')
@@ -402,8 +604,13 @@ def parse_arguments():
     )
     parser.add_argument(
         '--graph_geometry_mode',
-        choices=['trimer_scage_mcl'],
+        choices=['trimer_scage_mcl', 'current_mcl'],
         default='trimer_scage_mcl',
+    )
+    parser.add_argument(
+        '--topology_representation',
+        choices=['canonical_lifted', 'explicit_k_ru'],
+        default='canonical_lifted',
     )
     parser.add_argument(
         '--mcl_distance_percentiles', nargs=2, type=float,
@@ -1090,12 +1297,28 @@ class _CostBalancedDistributedSampler(torch.utils.data.Sampler):
             if self.drop_last else int(math.ceil(self.dataset_size / global_batch))
         )
         self.epoch = 0
+        # Number of rank-local samples already consumed in the current epoch.
+        # This cursor is intentionally not included in ``__len__``: training
+        # uses absolute batch indices for accumulation and end-of-epoch logic.
+        # A resumed iterator can therefore start directly at the checkpointed
+        # batch without deserializing every preceding LMDB record.
+        self.start_sample_index = 0
 
     def __len__(self):
         return self.num_batches * self.batch_size
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
+        self.start_sample_index = 0
+
+    def set_start_batch(self, batch_index):
+        sample_index = int(batch_index) * self.batch_size
+        if sample_index < 0 or sample_index > len(self):
+            raise ValueError(
+                f"invalid cost-sampler resume batch {batch_index}: "
+                f"sample offset {sample_index}, length {len(self)}"
+            )
+        self.start_sample_index = sample_index
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
@@ -1122,7 +1345,7 @@ class _CostBalancedDistributedSampler(torch.utils.data.Sampler):
                 rank_indices[target].append(int(index))
                 rank_costs[target] += float(self.costs[index])
             output.extend(rank_indices[self.rank])
-        return iter(output)
+        return iter(output[self.start_sample_index:])
 
 
 def _polymer_ecfp_pos_weight(dataset, indices, device):
@@ -3326,6 +3549,25 @@ def _module_gradient_norm(module):
     return float(torch.sqrt(torch.stack(squares).sum()).cpu().item())
 
 
+def _module_gradient_diagnostic(module):
+    if module is None:
+        return {"finite": None, "nonzero": None, "norm": None}
+    if isinstance(module, torch.Tensor):
+        parameters = (module,)
+    else:
+        parameters = module.parameters()
+    gradients = [
+        parameter.grad.detach().float()
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not gradients:
+        return {"finite": False, "nonzero": False, "norm": 0.0}
+    finite = all(bool(torch.isfinite(value).all()) for value in gradients)
+    norm = float(torch.sqrt(torch.stack([value.pow(2).sum() for value in gradients]).sum()).cpu().item())
+    return {"finite": bool(finite), "nonzero": bool(norm > 0.0), "norm": norm}
+
+
 def _batched_shortest_path_targets(data, max_distance):
     targets = []
     pair_indices = []
@@ -3532,6 +3774,7 @@ def _dataset_kwargs_from_args(args):
         mips_descriptor_protocol=args.mips_descriptor_protocol,
         spatial_mode=args.spatial_mode,
         graph_geometry_mode=args.graph_geometry_mode,
+        topology_representation=args.topology_representation,
         mcl_distance_percentiles=args.mcl_distance_percentiles,
         trimer_num_candidates=args.trimer_num_candidates,
         trimer_max_heavy_atoms=args.trimer_max_heavy_atoms,
@@ -3549,6 +3792,75 @@ def _dataset_kwargs_from_args(args):
 def main():
     pretrain_started = time.monotonic()
     args = parse_arguments()
+    # Cache materialisation has no optimizer/objective identity and must not
+    # be rejected merely because an explicit topology comparison does not use
+    # the canonical-only formal training profile.
+    pretrain_profile = (
+        None if args.cache_only
+        else _load_pretrain_profile(args.pretrain_profile)
+    )
+    if pretrain_profile is not None:
+        if str(pretrain_profile["representation"]) != str(
+            args.topology_representation
+        ):
+            raise RuntimeError(
+                "formal pretraining profile/topology representation mismatch: "
+                f"profile={pretrain_profile['representation']!r}, "
+                f"requested={args.topology_representation!r}"
+            )
+        # Scientific choices in the formal profile are immutable.  Batch and
+        # accumulation are the only values selected by the external benchmark.
+        args.dataset_name = "PI1M_v2"
+        args.seed = int(pretrain_profile["seed"])
+        if not args.resume_smoke:
+            args.max_optimizer_steps = int(pretrain_profile["optimizer_steps"])
+        elif int(args.max_optimizer_steps) <= 0 or int(args.max_optimizer_steps) > 300:
+            raise ValueError("resume_smoke requires 1 <= max_optimizer_steps <= 300")
+        args.graph_mask_ratio = float(pretrain_profile["masked_atom_ratio"])
+        args.scage_mips_mask_weight = float(pretrain_profile["masked_atom_weight"])
+        args.graph_angle_weight = float(pretrain_profile["angle_weight"])
+        args.scage_angle_bins = int(pretrain_profile["angle_bins"])
+        args.scage_focal_gamma = float(pretrain_profile["focal_gamma"])
+        args.lr = float(pretrain_profile["peak_lr"])
+        args.warmup_steps = int(pretrain_profile["warmup_steps"])
+        args.mips_scheduler = str(pretrain_profile["scheduler"])
+        args.scheduler_power = float(pretrain_profile["scheduler_power"])
+        args.end_lr = float(pretrain_profile["end_lr"])
+        args.amp_dtype = "bf16"
+        args.max_grad_norm = -1.0
+        args.angle_objective = "categorical"
+        if int(args.batch_size) * 3 * int(args.gradient_accumulation_steps) != int(
+            pretrain_profile["global_batch"]
+        ):
+            raise ValueError(
+                "canonical_ru_angle20_v1 requires batch_size * 3 * "
+                "gradient_accumulation_steps = 1008"
+            )
+        if args.pretrained_model_path:
+            raise RuntimeError(
+                "canonical_ru_angle20_v1 must start from random initialization; "
+                "parent checkpoints are forbidden"
+            )
+        if not args.cache_only and not args.benchmark_only and not args.resume_smoke:
+            output_path = Path(args.save_path).resolve()
+            historical = "mts_joint_pretraining_pi1m_v2_seed42_canonical_20260808"
+            if historical in output_path.name:
+                raise RuntimeError(
+                    "formal canonical pretraining cannot target the historical "
+                    "20260808 checkpoint"
+                )
+            complete_path = Path(str(output_path) + ".complete.json")
+            last_path = Path(str(output_path) + ".last.pt")
+            if args.resume_state:
+                if output_path.exists() or complete_path.exists() or not last_path.exists():
+                    raise RuntimeError(
+                        "resume requires an existing matching .last.pt and no final/complete output"
+                    )
+            elif output_path.exists() or complete_path.exists() or last_path.exists():
+                raise RuntimeError(
+                    "fresh canonical pretraining refuses to overwrite an existing output; "
+                    "use --resume with its matching .last.pt or choose a new path"
+                )
     validate_mips_trimer_runtime(args)
     if (
         args.graph_encoder_type == MTS_ROUTE_INTERNAL
@@ -3588,18 +3900,27 @@ def main():
     if (
         args.graph_encoder_type == "mips_trimer_scage"
         and not args.cache_only
+        and not args.resume_smoke
         and int(args.max_optimizer_steps) != 20000
     ):
         raise ValueError(
             f"{MTS_STAGE1_ID} is fixed to exactly 20000 optimizer steps"
         )
+    allowed_config_schema = (
+        args.config_schema == MIPS_TRIMER_CONFIG_SCHEMA
+        or (
+            args.config_schema == MIPS_EXPERIMENT_CONFIG_SCHEMA
+            and (args.cache_only or args.resume_smoke)
+        )
+    )
     if (
         args.graph_encoder_type == "mips_trimer_scage"
-        and args.config_schema != MIPS_TRIMER_CONFIG_SCHEMA
+        and not allowed_config_schema
     ):
         raise ValueError(
-            f"{MTS_ROUTE_NAME} only accepts "
-            f"{MIPS_TRIMER_CONFIG_SCHEMA}"
+            f"{MTS_ROUTE_NAME} formal training accepts only "
+            f"{MIPS_TRIMER_CONFIG_SCHEMA}; experiment configs are limited "
+            "to cache-only and short resume-smoke runs"
         )
     stage1_weights = (
         args.scage_mips_mask_weight,
@@ -3739,7 +4060,7 @@ def main():
         cache_specs = _cache_specs(Path(PROJECT_ROOT))
         verify_frozen_cache_bundle(
             cache_specs,
-            store_path=Path(cache_specs["trimer"]["root"])
+            store_path=Path(cache_specs["topology"]["root"]).parents[1]
             / "validation" / "store.json",
             required_layers=cache_specs.keys(),
         )
@@ -3803,6 +4124,14 @@ def main():
                 f"{MTS_ROUTE_NAME} topology/geometry stages require the complete "
                 "PI1M_v2 cohort (995799 records)."
             )
+        if pretrain_profile is not None:
+            observed_cohort_hash = str(cohort["manifest"].get("cohort_hash", ""))
+            if observed_cohort_hash != str(pretrain_profile["cohort_hash"]):
+                raise RuntimeError(
+                    "canonical_ru_angle20_v1 cohort hash mismatch: "
+                    f"expected={pretrain_profile['cohort_hash']} "
+                    f"observed={observed_cohort_hash}"
+                )
         # Resolve all production layers for the lifecycle gate, even though
         # Stage 1 itself only requests ru_base/topology and Stage 2 adds
         # Trimer.  The finalized downstream union is frozen before training.
@@ -3824,6 +4153,17 @@ def main():
                 "MTS joint pretraining requires the frozen Trimer bond-angle "
                 "cache; run scripts/prepare_mts_angle_cache.py first"
             )
+        if pretrain_profile is not None:
+            angle_meta = getattr(dataset, "angle_cache_metadata", None) or {}
+            if (
+                angle_meta.get("schema") != pretrain_profile["angle_cache_schema"]
+                or getattr(dataset, "angle_cache_artifact_hash", None)
+                != pretrain_profile["angle_cache_artifact"]
+            ):
+                raise RuntimeError(
+                    "canonical_ru_angle20_v1 requires the frozen categorical "
+                    "Angle-20 v2 sidecar; continuous or stale sidecars are rejected"
+                )
         if args.angle_objective == 'categorical':
             angle_counts = np.asarray(
                 getattr(dataset, "angle_class_counts", np.zeros(20, dtype=np.int64)),
@@ -3912,15 +4252,31 @@ def main():
                 cost_artifact = getattr(
                     dataset, "topology_cache_artifact_hash", None
                 )
+                topology_content_hash = None
+                try:
+                    from scripts.audit_mips_trimer_cache import _specs as _cache_specs
+                    topo_manifest = json.loads(
+                        (
+                            Path(_cache_specs(Path(PROJECT_ROOT))["topology"]["root"])
+                            / "manifest.json"
+                        ).read_text(encoding="utf-8")
+                    )
+                    topology_content_hash = topo_manifest.get("metadata_hash")
+                except (OSError, KeyError, ValueError, json.JSONDecodeError):
+                    topology_content_hash = None
                 expected_cost_meta = {
-                    "schema": "mips-trimer-scage-topology-cost-v1",
+                    "schema": MIPS_CACHE_TOPOLOGY_COST_SCHEMA,
                     "cohort_hash": cohort["manifest"]["cohort_hash"],
-                    "ordered_sample_key_hash": cohort["manifest"][
+                    "ordered_key_hash": cohort["manifest"][
                         "ordered_sample_key_hash"
                     ],
-                    "topology_artifact_hash": cost_artifact,
+                    "topology_done_artifact_hash": cost_artifact,
+                    "topology_content_hash": topology_content_hash,
                     "shape": [len(dataset), 2],
                     "dtype": "uint32",
+                    "file_sha256": _file_sha256(cost_path),
+                    "builder_version": MIPS_BUILDER_VERSION,
+                    "columns": ["node_count", "lga_edge_count"],
                 }
                 if any(
                     cost_meta.get(key) != value
@@ -3934,7 +4290,7 @@ def main():
                     costs.ndim != 2
                     or tuple(costs.shape) != (len(dataset), 2)
                     or costs.dtype != np.uint32
-                    or cost_meta.get("sha256") != _file_sha256(cost_path)
+                    or cost_meta.get("file_sha256") != _file_sha256(cost_path)
                 ):
                     raise RuntimeError(
                         "topology_cost.npy is incomplete or has a stale hash"
@@ -4078,6 +4434,17 @@ def main():
                     f"received stage={checkpoint_stage!r}."
                 )
             meta = checkpoint.get("meta", {})
+            checkpoint_representation = meta.get(
+                "topology_representation", TOPOLOGY_CANONICAL
+            )
+            if checkpoint_representation != args.topology_representation:
+                raise RuntimeError(
+                    "MTS checkpoint topology representation mismatch: "
+                    f"checkpoint={checkpoint_representation!r}, "
+                    f"requested={args.topology_representation!r}. "
+                    "canonical_lifted and explicit_k_ru checkpoints are not "
+                    "cross-loadable."
+                )
             if (
                 meta.get("baseline") != MTS_ROUTE_NAME
                 or meta.get("route_short_name") != MTS_ROUTE_SHORT_NAME
@@ -4369,15 +4736,9 @@ def main():
         adam_kwargs = dict(
             lr=args.lr, betas=(0.9, 0.98), eps=1e-8, weight_decay=0.0,
         )
-        if device.type == "cuda":
-            try:
-                optimizer = optim.Adam(
-                    trainable_parameters, fused=True, **adam_kwargs
-                )
-            except (TypeError, RuntimeError):
-                optimizer = optim.Adam(trainable_parameters, **adam_kwargs)
-        else:
-            optimizer = optim.Adam(trainable_parameters, **adam_kwargs)
+        # Match the public MIPS implementation: ordinary torch.optim.Adam,
+        # without forcing a backend solely for bitwise interruption parity.
+        optimizer = optim.Adam(trainable_parameters, **adam_kwargs)
     else:
         optimizer = optim.AdamW(
             list(model.parameters()) + list(aux_modules.parameters()),
@@ -4430,11 +4791,12 @@ def main():
     resume_contract = {
         "config_schema": args.config_schema,
         "stage": args.checkpoint_stage,
+        "topology_representation": args.topology_representation,
         "feature_config_hash": args.feature_config_hash,
         "o8_feature_config_hash": args.o8_feature_config_hash,
         "graph_model_config_hash": args.graph_model_config_hash,
         "geometry_model_config_hash": args.geometry_model_config_hash,
-        "source_geometry_model_config_hash": args.geometry_model_config_hash,
+        "source_geometry_model_config_hash": args.source_geometry_model_config_hash,
         "training_config_hash": args.training_config_hash,
         "pretraining_dataset": args.dataset_name,
         "source_cohort_hash": getattr(dataset, "feature_cohort_hash", None),
@@ -4457,6 +4819,16 @@ def main():
     # changing accumulation, AMP, the polynomial schedule, or the angle
     # objective must force a fresh run.
     resume_contract.update({
+        "pretrain_profile": (
+            str(pretrain_profile.get("profile_id"))
+            if pretrain_profile is not None else str(args.pretrain_profile)
+        ),
+        "pretrain_profile_hash": (
+            _canonical_json_hash(pretrain_profile)
+            if pretrain_profile is not None else None
+        ),
+        "pretrain_code_hash": _pretrain_code_identity()["sha256"],
+        "pretrain_code_files": _pretrain_code_identity()["files"],
         "batch_size": int(args.batch_size),
         "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
         "lr": float(args.lr),
@@ -4475,9 +4847,10 @@ def main():
         "angle_bins": int(args.scage_angle_bins),
         "angle_focal_gamma": float(args.scage_focal_gamma),
         "angle_objective": str(args.angle_objective),
-        "angle_cache_artifact_hash": getattr(
-            dataset, "angle_cache_artifact_hash", None
-        ),
+        "angle_cache_schema": getattr(
+            dataset, "angle_cache_metadata", {}
+        ).get("schema") if getattr(dataset, "angle_cache_metadata", None) else None,
+        "angle_cache_artifact_hash": getattr(dataset, "angle_cache_artifact_hash", None),
         "masked_atom_weight": float(args.scage_mips_mask_weight),
         "trimer_bond_angle_weight": float(args.graph_angle_weight),
         "pretraining_objective": (
@@ -4489,20 +4862,42 @@ def main():
     resume_step_idx = 0
     global_step = 0
     optimizer_steps_completed = 0
+    # Iterating over already-consumed batches to reconstruct the sampler
+    # position can itself consume Python/NumPy/Torch/CUDA RNG state (for
+    # example through dataset-side stochastic feature handling).  Keep the
+    # checkpointed per-rank state and restore it again immediately before the
+    # first batch that is actually optimized after a resume.
+    resume_rng_state = None
     if args.resume_state:
         resume_path = os.path.abspath(args.resume_state)
         if not os.path.isfile(resume_path):
             raise RuntimeError(f"resume state does not exist: {resume_path}")
-        resume_payload = torch.load(resume_path, map_location="cpu")
-        if resume_payload.get("schema") != "mts-train-state-v2":
+        # This is an internally generated, identity-bound train-state file.
+        # PyTorch 2.6+ defaults to ``weights_only=True``; that mode cannot
+        # deserialize the NumPy/RNG state captured for exact trajectory
+        # resumption.  The resume contract is validated immediately below,
+        # and the file is only accepted from the explicit user-provided path.
+        resume_payload = torch.load(
+            resume_path, map_location="cpu", weights_only=False
+        )
+        if resume_payload.get("schema") != PRETRAIN_TRAIN_STATE_SCHEMA:
             raise RuntimeError(
                 "resume state uses an obsolete checkpoint schema; rerun from "
                 "the latest stage checkpoint"
             )
         resume_meta = resume_payload.get("meta", {})
         if (
-            resume_meta.get("config_schema") != args.config_schema
+            resume_meta.get("pretrain_profile") != resume_contract["pretrain_profile"]
+            or resume_meta.get("pretrain_profile_hash")
+                != resume_contract["pretrain_profile_hash"]
+            or resume_meta.get("pretrain_code_hash")
+                != resume_contract["pretrain_code_hash"]
+            or resume_meta.get("pretrain_code_files", {})
+                != resume_contract["pretrain_code_files"]
+            or resume_meta.get("config_schema") != args.config_schema
             or resume_meta.get("stage") != args.checkpoint_stage
+            or resume_meta.get("topology_representation")
+                != args.topology_representation
             or resume_meta.get("feature_config_hash") != args.feature_config_hash
             or resume_meta.get("o8_feature_config_hash")
                 != args.o8_feature_config_hash
@@ -4552,6 +4947,10 @@ def main():
             or float(resume_meta.get("max_grad_norm", float("nan")))
                 != float(resume_contract["max_grad_norm"])
             or resume_meta.get("amp_dtype") != resume_contract["amp_dtype"]
+            or resume_meta.get("angle_cache_schema")
+                != resume_contract["angle_cache_schema"]
+            or resume_meta.get("angle_cache_artifact_hash")
+                != resume_contract["angle_cache_artifact_hash"]
             or int(resume_meta.get("angle_bins", -1))
                 != int(resume_contract["angle_bins"])
             or float(resume_meta.get("angle_focal_gamma", float("nan")))
@@ -4573,9 +4972,7 @@ def main():
                 != (type(sampler).__name__ if sampler is not None else "random")
             or resume_meta.get("batch_balance", "none")
                 != str(args.batch_balance)
-            or resume_meta.get("optimizer_impl")
-                != ("adam_fused" if bool(optimizer.defaults.get("fused", False))
-                    else optimizer.__class__.__name__.lower())
+            or resume_meta.get("optimizer_impl") != "adam"
             or resume_meta.get("matmul_precision")
                 != ("high_tf32" if device.type == "cuda" else "default")
         ):
@@ -4605,7 +5002,8 @@ def main():
         else:
             if int(rank) >= len(rng_by_rank):
                 raise RuntimeError("checkpoint has no RNG state for this rank")
-            _restore_rng_state(rng_by_rank[int(rank)])
+            resume_rng_state = rng_by_rank[int(rank)]
+            _restore_rng_state(resume_rng_state)
         loader_states = resume_payload.get("loader_generator_state_by_rank")
         if loader_states is None:
             # A rank-zero loader state is not sufficient for a distributed
@@ -4785,11 +5183,13 @@ def main():
         return
 
     def save_train_state(epoch_number, next_step_idx):
+        local_rng_state = _capture_rng_state()
+        local_loader_state = loader_generator.get_state()
         rng_state_by_rank = _gather_rng_states(
-            _capture_rng_state(), distributed, rank, world_size
+            local_rng_state, distributed, rank, world_size
         )
         loader_state_by_rank = _gather_rank_states(
-            loader_generator.get_state(), distributed, rank, world_size
+            local_loader_state, distributed, rank, world_size
         )
         sampler_state_by_rank = _gather_rank_states(
             {
@@ -4802,45 +5202,80 @@ def main():
             rank,
             world_size,
         )
-        if rank != 0:
+        if rank == 0:
+            payload = {
+                "schema": PRETRAIN_TRAIN_STATE_SCHEMA,
+                "meta": {
+                    **resume_contract,
+                    "target_optimizer_steps": int(args.max_optimizer_steps),
+                    "epoch_cap": int(args.epochs),
+                    "random_seed": int(args.seed),
+                    "loader_workers": int(args.loader_workers),
+                    "loader_prefetch_factor": int(args.loader_prefetch_factor),
+                    "sampler_type": (
+                        type(sampler).__name__ if sampler is not None else "random"
+                    ),
+                    "batch_balance": str(args.batch_balance),
+                    "warmup_ratio": float(args.warmup_ratio),
+                    "optimizer_impl": "adam",
+                    "matmul_precision": (
+                        "high_tf32" if device.type == "cuda" else "default"
+                    ),
+                },
+                "train_module": {
+                    key: value.detach().cpu()
+                    for key, value in train_module.state_dict().items()
+                },
+                "aux_modules": {
+                    key: value.detach().cpu()
+                    for key, value in aux_modules.state_dict().items()
+                },
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": int(epoch_number),
+                "next_step_idx": int(next_step_idx),
+                "global_step": int(global_step),
+                "optimizer_steps_completed": int(optimizer_steps_completed),
+                "rng_state_by_rank": rng_state_by_rank,
+                "loader_generator_state_by_rank": loader_state_by_rank,
+                "sampler_state_by_rank": sampler_state_by_rank,
+            }
+            _atomic_torch_save(payload, train_state_path)
+        # Checkpointing must be transparent to every rank's stochastic stream.
+        # Synchronize the atomic rank-zero write, then restore the exact local
+        # states captured before object collectives and serialization.
+        if distributed:
+            dist.barrier()
+        _restore_rng_state(local_rng_state)
+        loader_generator.set_state(local_loader_state)
+
+    def save_categorical_milestone(step):
+        """Persist an immutable, optimizer-free graph milestone."""
+        if rank != 0 or pretrain_profile is None:
             return
-        payload = {
-            "schema": "mts-train-state-v2",
-            "meta": {
-                **resume_contract,
-                "target_optimizer_steps": int(args.max_optimizer_steps),
-                "epoch_cap": int(args.epochs),
-                "random_seed": int(args.seed),
-                "loader_workers": int(args.loader_workers),
-                "loader_prefetch_factor": int(args.loader_prefetch_factor),
-                "sampler_type": type(sampler).__name__ if sampler is not None else "random",
-                "batch_balance": str(args.batch_balance),
-                "warmup_ratio": float(args.warmup_ratio),
-                "optimizer_impl": (
-                    "adam_fused" if bool(optimizer.defaults.get("fused", False))
-                    else optimizer.__class__.__name__.lower()
-                ),
-                "matmul_precision": "high_tf32" if device.type == "cuda" else "default",
-            },
-            "train_module": {
-                key: value.detach().cpu()
-                for key, value in train_module.state_dict().items()
-            },
-            "aux_modules": {
-                key: value.detach().cpu()
-                for key, value in aux_modules.state_dict().items()
-            },
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "epoch": int(epoch_number),
-            "next_step_idx": int(next_step_idx),
-            "global_step": int(global_step),
-            "optimizer_steps_completed": int(optimizer_steps_completed),
-            "rng_state_by_rank": rng_state_by_rank,
-            "loader_generator_state_by_rank": loader_state_by_rank,
-            "sampler_state_by_rank": sampler_state_by_rank,
+        base_state = {
+            key: value.detach().cpu().clone()
+            for key, value in _base_model(model).state_dict().items()
         }
-        _atomic_torch_save(payload, train_state_path)
+        head_owner = train_module.module if hasattr(train_module, "module") else train_module
+        heads = {
+            key: value.detach().cpu().clone()
+            for key, value in head_owner.heads.state_dict().items()
+        }
+        milestone = Path(args.save_path).with_name(
+            Path(args.save_path).stem + f".step_{int(step):05d}.pth"
+        )
+        _atomic_torch_save({
+            "schema": "mts-pretrain-milestone-v1",
+            "checkpoint_schema": PRETRAIN_CHECKPOINT_SCHEMA,
+            "optimizer_step": int(step),
+            "profile_id": str(pretrain_profile["profile_id"]),
+            "profile_sha256": _canonical_json_hash(pretrain_profile),
+            "pretrain_code_identity": _pretrain_code_identity(),
+            "resume_contract": dict(resume_contract),
+            "state_dict": base_state,
+            "heads": heads,
+        }, milestone)
 
     if args.dynamic_pretrain_loss:
         active_loss_names = []
@@ -4968,9 +5403,29 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         structured_log_time = time.monotonic()
         structured_log_step = optimizer_steps_completed
-        for step_idx, data in enumerate(progress_bar):
-            if step_idx < first_step_idx:
-                continue
+        # Reconstruct the iterator position without fetching the first
+        # optimized batch under a stale RNG state.  The collate function may
+        # sample a 3D conformer with torch.randint(); restoring only after
+        # that batch has been fetched changes the input (and can consume a
+        # different number of random draws inside the loss).  Consume the
+        # skipped batches first, restore the checkpointed per-rank RNG, then
+        # fetch the first actual optimization batch.
+        direct_sampler_resume = bool(
+            first_step_idx and hasattr(sampler, "set_start_batch")
+        )
+        if direct_sampler_resume:
+            sampler.set_start_batch(first_step_idx)
+        data_iterator = iter(progress_bar)
+        if first_step_idx and not direct_sampler_resume:
+            for _ in range(first_step_idx):
+                try:
+                    next(data_iterator)
+                except StopIteration:
+                    break
+        if resume_rng_state is not None:
+            _restore_rng_state(resume_rng_state)
+            resume_rng_state = None
+        for step_idx, data in enumerate(data_iterator, start=first_step_idx):
             if (
                 (args.max_steps > 0 and global_step >= args.max_steps)
                 or (
@@ -4981,6 +5436,27 @@ def main():
                 break
             global_step += 1
             data = data.to(device)
+            trace_record = None
+            if (
+                args.pretrain_stage == MTS_STAGE1_ID
+                and rank == 0
+                and os.environ.get("MTS_RESUME_TRACE")
+            ):
+                mask_preview = _joint_canonical_mask(
+                    data, args.seed, global_step, args.graph_mask_ratio
+                )
+                trace_record = {
+                    "global_step": int(global_step),
+                    "optimizer_step": int(
+                        optimizer_steps_completed + (1 if ((step_idx + 1) % accumulation_steps == 0) else 0)
+                    ),
+                    "sample_hash": hashlib.sha256(
+                        json.dumps([str(value) for value in data.smiles], sort_keys=False).encode()
+                    ).hexdigest(),
+                    "mask_hash": hashlib.sha256(
+                        mask_preview.detach().cpu().numpy().tobytes()
+                    ).hexdigest(),
+                }
             should_step = (
                 (step_idx + 1) % accumulation_steps == 0
                 or (step_idx + 1) == len(dataloader)
@@ -5030,8 +5506,34 @@ def main():
                             f"Non-finite MTS joint loss for batch smiles={data.smiles}"
                         )
                     (loss / accumulation_steps).backward()
+                if trace_record is not None:
+                    trace_record.update({
+                        "loss": float(loss.detach().float().item()),
+                        "lr": float(optimizer.param_groups[0]["lr"]),
+                    })
+                    with open(os.environ["MTS_RESUME_TRACE"], "a", encoding="utf-8") as trace_handle:
+                        trace_handle.write(json.dumps(trace_record, sort_keys=True) + "\n")
                 gradient_norm = loss.new_tensor(0.0)
+                gradient_diag = None
                 if should_step:
+                    # Clipping is disabled for the canonical profile, but the
+                    # diagnostic norm must still reflect the actual gradient.
+                    gradient_norm = loss.new_tensor(_module_gradient_norm(train_module))
+                    if (
+                        optimizer_steps_completed < 3
+                        or (optimizer_steps_completed + 1) % 50 == 0
+                    ):
+                        graph_encoder = _base_model(model).encoders["graph"].encoder
+                        gradient_diag = {
+                            "o8": _module_gradient_diagnostic(graph_encoder.layers),
+                            "star_rbf": _module_gradient_diagnostic(graph_encoder.star_distance_bias),
+                            "trimer_mcl": _module_gradient_diagnostic(graph_encoder.trimer_mcl),
+                            "geometry_gate": _module_gradient_diagnostic(
+                                getattr(graph_encoder.trimer_mcl, "geometry_gate", None)
+                            ),
+                            "masked_atom_head": _module_gradient_diagnostic(mips_atom_head),
+                            "angle_head": _module_gradient_diagnostic(graph_angle_head),
+                        }
                     if float(args.max_grad_norm) > 0:
                         gradient_norm = torch.nn.utils.clip_grad_norm_(
                             train_module.parameters(), args.max_grad_norm
@@ -5085,10 +5587,20 @@ def main():
                             f"angle_targets={global_angle_targets} "
                             f"angle_majority={getattr(args, 'angle_majority_baseline', 0.0):.4f} "
                             f"mcl_rate={global_mcl_valid/max(1, global_graphs):.4f} "
+                            f"grad_norm={float(gradient_norm.detach().float().item()):.6g} "
                             f"peak_mem_gib={peak_gib:.2f} "
                             f"eta_h={eta_seconds/3600.0:.2f}",
                             flush=True,
                         )
+                        if gradient_diag is not None:
+                            print(
+                                "[pretrain-gradient] "
+                                + json.dumps({
+                                    "step": int(optimizer_steps_completed),
+                                    "modules": gradient_diag,
+                                }, sort_keys=True),
+                                flush=True,
+                            )
                         structured_log_time = time.monotonic()
                         structured_log_step = optimizer_steps_completed
                     if (
@@ -5110,6 +5622,12 @@ def main():
                         next_epoch = epoch + 1 if step_idx + 1 >= len(dataloader) else epoch
                         next_step = 0 if next_epoch > epoch else step_idx + 1
                         save_train_state(next_epoch, next_step)
+                    if (
+                        pretrain_profile is not None
+                        and optimizer_steps_completed > 0
+                        and optimizer_steps_completed % 2000 == 0
+                    ):
+                        save_categorical_milestone(optimizer_steps_completed)
                     if (
                         args.angle_objective == 'cosine'
                         and optimizer_steps_completed > 0
@@ -5160,7 +5678,8 @@ def main():
                                     for key, value in _base_model(model).state_dict().items()
                                 }
                 epoch_loss += float(loss.detach().item())
-                gradient_norms.append(float(gradient_norm.detach().cpu().item()))
+                if should_step:
+                    gradient_norms.append(float(gradient_norm.detach().cpu().item()))
                 epoch_term_steps += 1
                 epoch_target_counts["masked_atoms"] = (
                     epoch_target_counts.get("masked_atoms", 0) + global_atom_count
@@ -5667,6 +6186,12 @@ def main():
     if joint_progress is not None:
         joint_progress.close()
 
+    if args.resume_smoke:
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
+
     if distributed and rank != 0:
         dist.barrier()
         dist.destroy_process_group()
@@ -5840,6 +6365,7 @@ def main():
             "descriptors": bool(args.mips_use_descriptors),
             "modalities": list(args.modalities),
             "fusion_type": args.fusion_type,
+            "topology_representation": args.topology_representation,
         }
         calculated_model_hash = hashlib.sha256(
             json.dumps(model_config, sort_keys=True).encode()
@@ -5880,6 +6406,9 @@ def main():
             _path_tree_sha256(args.smiles_model_name)
             if "smiles" in base_model.encoders else None
         )
+        trimer_geometry_active = args.graph_geometry_mode in {
+            "trimer_scage_mcl", "current_mcl"
+        }
         cache_bundle_hash = cache_bundle_binding_hash(
             cohort_hash=getattr(dataset, "feature_cohort_hash", None),
             topology_artifact_hash=getattr(
@@ -5887,14 +6416,81 @@ def main():
             ),
             trimer_artifact_hash=(
                 getattr(dataset, "trimer_cache_artifact_hash", None)
-                if args.graph_geometry_mode == "trimer_scage_mcl"
+                if trimer_geometry_active
                 else None
             ),
         )
+        final_cache_binding = _build_final_cache_binding(pretrain_profile)
+        pretrain_code_identity = _pretrain_code_identity()
+        source_contract = {
+            "schema": PRETRAIN_CHECKPOINT_SCHEMA,
+            "profile_id": (
+                str(pretrain_profile["profile_id"])
+                if pretrain_profile is not None else str(args.pretrain_profile)
+            ),
+            "stage": str(args.checkpoint_stage),
+            "baseline": MTS_ROUTE_NAME,
+            "topology_representation": args.topology_representation,
+            "pretraining_dataset": str(args.dataset_name),
+            "source_cohort_hash": getattr(dataset, "feature_cohort_hash", None),
+            "topology_artifact_hash": getattr(dataset, "topology_cache_artifact_hash", None),
+            "trimer_artifact_hash": getattr(dataset, "trimer_cache_artifact_hash", None),
+            "angle_cache_schema": getattr(dataset, "angle_cache_metadata", {}).get("schema"),
+            "angle_cache_artifact_hash": getattr(dataset, "angle_cache_artifact_hash", None),
+            "cache_store_sha256": final_cache_binding["store_sha256"],
+            "topology_frozen_sha256": final_cache_binding["frozen_file_sha256"]["topology"],
+            "trimer_frozen_sha256": final_cache_binding["frozen_file_sha256"]["trimer"],
+            "feature_config_hash": str(args.feature_config_hash),
+            "graph_model_config_hash": str(args.graph_model_config_hash),
+            "geometry_model_config_hash": str(args.geometry_model_config_hash),
+            "source_geometry_model_config_hash": str(args.source_geometry_model_config_hash),
+            "pretrain_code_identity": pretrain_code_identity,
+            "training_hash": str(args.training_config_hash),
+            "seed": int(args.seed),
+            "world_size": int(world_size),
+            "batch_size": int(args.batch_size),
+            "gradient_accumulation_steps": int(accumulation_steps),
+            "optimizer": "Adam",
+            "optimizer_steps": int(optimizer_steps_completed),
+            "random_initialization": True,
+            "parent_checkpoint": None,
+        }
+        source_contract_sha256 = _canonical_json_hash(source_contract)
+        target_contract = None
+        if pretrain_profile is not None:
+            target_contract = build_pretrain_target_contract(
+                profile_id=pretrain_profile["profile_id"],
+                source_cohort_hash=getattr(dataset, "feature_cohort_hash", None),
+                feature_config_hash=args.feature_config_hash,
+                graph_model_config_hash=args.graph_model_config_hash,
+                geometry_model_config_hash=args.source_geometry_model_config_hash,
+                topology_cache_artifact_hash=getattr(
+                    dataset, "topology_cache_artifact_hash", None
+                ),
+                trimer_cache_artifact_hash=getattr(
+                    dataset, "trimer_cache_artifact_hash", None
+                ),
+                angle_cache_schema=pretrain_profile["angle_cache_schema"],
+                angle_cache_artifact_hash=pretrain_profile["angle_cache_artifact"],
+                cache_bundle_hash=cache_bundle_hash,
+                store_json_sha256=final_cache_binding["store_sha256"],
+                topology_frozen_payload_sha256=final_cache_binding[
+                    "frozen_file_sha256"
+                ]["topology"],
+                trimer_frozen_payload_sha256=final_cache_binding[
+                    "frozen_file_sha256"
+                ]["trimer"],
+                optimizer_steps=optimizer_steps_completed,
+                pretraining_objective="masked_atom_plus_trimer_angle20_focal",
+                topology_representation=args.topology_representation,
+            )
         _atomic_torch_save({
             'state_dict': state_dict,
             'meta': {
-                'schema': MIPS_TRIMER_CHECKPOINT_SCHEMA,
+                'schema': (
+                    PRETRAIN_CHECKPOINT_SCHEMA
+                    if pretrain_profile is not None else MIPS_TRIMER_CHECKPOINT_SCHEMA
+                ),
                 'baseline': MTS_ROUTE_NAME,
                 'route_short_name': MTS_ROUTE_SHORT_NAME,
                 'config_schema': args.config_schema,
@@ -5904,12 +6500,39 @@ def main():
                 'geom_input': args.geom_input,
                 'fusion_type': args.fusion_type,
                 'pretraining_unique_smiles': bool(args.pretrain_unique_smiles),
-                'feature_schema': MIPS_TRIMER_FEATURE_SCHEMA,
+                'feature_schema': (
+                    MIPS_EXPLICIT_FEATURE_SCHEMA
+                    if args.topology_representation == TOPOLOGY_EXPLICIT
+                    else MIPS_TRIMER_FEATURE_SCHEMA
+                ),
+                'topology_representation': args.topology_representation,
                 'cache_layout_schema': MIPS_TRIMER_CACHE_LAYOUT_SCHEMA,
                 'cache_bundle_schema': MIPS_TRIMER_CACHE_BUNDLE_SCHEMA,
-                'topology_lmdb_schema': MIPS_TRIMER_TOPOLOGY_SCHEMA,
+                'topology_lmdb_schema': (
+                    MIPS_EXPLICIT_TOPOLOGY_SCHEMA
+                    if args.topology_representation == TOPOLOGY_EXPLICIT
+                    else MIPS_TRIMER_TOPOLOGY_SCHEMA
+                ),
                 'cache_bundle_hash': cache_bundle_hash,
-                'mips_local_lga_schema_version': MIPS_CANONICAL_LGA_SCHEMA_VERSION,
+                'pretrain_profile': (
+                    dict(pretrain_profile) if pretrain_profile is not None else None
+                ),
+                'pretrain_profile_sha256': (
+                    _canonical_json_hash(pretrain_profile)
+                    if pretrain_profile is not None else None
+                ),
+                'pretrain_code_identity': pretrain_code_identity,
+                'source_contract': source_contract if pretrain_profile is not None else None,
+                'source_contract_sha256': (
+                    source_contract_sha256 if pretrain_profile is not None else None
+                ),
+                'target_contract': target_contract,
+                'final_cache_binding': final_cache_binding if pretrain_profile is not None else None,
+                'mips_local_lga_schema_version': (
+                    MIPS_EXPLICIT_LGA_SCHEMA_VERSION
+                    if args.topology_representation == TOPOLOGY_EXPLICIT
+                    else MIPS_CANONICAL_LGA_SCHEMA_VERSION
+                ),
                 'mips_core': args.mips_core,
                 'mips_max_hops': int(args.mips_max_hops),
                 'mips_use_descriptors': bool(args.mips_use_descriptors),
@@ -5933,12 +6556,12 @@ def main():
                 'graph_geometry_mode': args.graph_geometry_mode,
                 'trimer_cache_hash': (
                     getattr(dataset, 'trimer_cache_hash', None)
-                    if args.graph_geometry_mode == 'trimer_scage_mcl'
+                    if trimer_geometry_active
                     else None
                 ),
                 'trimer_cache_artifact_hash': (
                     getattr(dataset, 'trimer_cache_artifact_hash', None)
-                    if args.graph_geometry_mode == 'trimer_scage_mcl'
+                    if trimer_geometry_active
                     else None
                 ),
                 'topology_cache_hash': getattr(
@@ -5958,42 +6581,42 @@ def main():
                 ),
                 'trimer_conformer_protocol': (
                     MIPS_TRIMER_PROTOCOL
-                    if args.graph_geometry_mode == 'trimer_scage_mcl'
+                    if trimer_geometry_active
                     else 'none'
                 ),
                 'trimer_content_schema': (
                     MIPS_TRIMER_CONTENT_SCHEMA
-                    if args.graph_geometry_mode == 'trimer_scage_mcl'
+                    if trimer_geometry_active
                     else None
                 ),
                 'trimer_lmdb_schema': (
                     MIPS_TRIMER_LMDB_SCHEMA
-                    if args.graph_geometry_mode == 'trimer_scage_mcl'
+                    if trimer_geometry_active
                     else None
                 ),
                 'trimer_builder_version': (
                     MIPS_TRIMER_BUILDER_VERSION
-                    if args.graph_geometry_mode == 'trimer_scage_mcl'
+                    if trimer_geometry_active
                     else None
                 ),
                 'trimer_mmff_relax_steps': (
                     MIPS_TRIMER_MMFF_RELAX_STEPS
-                    if args.graph_geometry_mode == 'trimer_scage_mcl'
+                    if trimer_geometry_active
                     else None
                 ),
                 'trimer_require_mmff_convergence': (
                     MIPS_TRIMER_REQUIRE_MMFF_CONVERGENCE
-                    if args.graph_geometry_mode == 'trimer_scage_mcl'
+                    if trimer_geometry_active
                     else None
                 ),
                 'trimer_acceptance': (
                     MIPS_TRIMER_ACCEPTANCE
-                    if args.graph_geometry_mode == 'trimer_scage_mcl'
+                    if trimer_geometry_active
                     else None
                 ),
                 'trimer_selection': (
                     MIPS_TRIMER_SELECTION
-                    if args.graph_geometry_mode == 'trimer_scage_mcl'
+                    if trimer_geometry_active
                     else None
                 ),
                 'trimer_num_candidates': int(args.trimer_num_candidates),
@@ -6004,7 +6627,7 @@ def main():
                 'angle_cache_schema': (
                     'mts-angle-continuous-cache-v1'
                     if args.angle_objective == 'cosine'
-                    else 'mts-trimer-bond-angle-cache-v1'
+                    else 'mts-trimer-bond-angle-cache-v2'
                 ),
                 'angle_objective': str(args.angle_objective),
                 'angle_cache_artifact_hash': getattr(
@@ -6098,6 +6721,27 @@ def main():
                 'fusion_dropout': args.fusion_dropout,
             },
         }, args.save_path)
+        if pretrain_profile is not None:
+            if optimizer_steps_completed != int(pretrain_profile["optimizer_steps"]):
+                raise RuntimeError(
+                    "formal pretraining ended before the fixed optimizer-step budget"
+                )
+            complete_path = Path(args.save_path).with_name(
+                Path(args.save_path).name + ".complete.json"
+            )
+            complete_tmp = complete_path.with_name(
+                complete_path.name + f".tmp.{os.getpid()}"
+            )
+            complete_tmp.write_text(json.dumps({
+                "schema": "mts-pretrain-complete-v1",
+                "checkpoint_schema": PRETRAIN_CHECKPOINT_SCHEMA,
+                "checkpoint": str(Path(args.save_path).resolve()),
+                "checkpoint_sha256": _file_sha256(args.save_path),
+                "optimizer_steps": int(optimizer_steps_completed),
+                "profile_id": str(pretrain_profile["profile_id"]),
+                "pretrain_code_sha256": pretrain_code_identity["sha256"],
+            }, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            os.replace(complete_tmp, complete_path)
     else:
         torch.save(state_dict, args.save_path)
     print(f"Pretrained model saved at {args.save_path}")

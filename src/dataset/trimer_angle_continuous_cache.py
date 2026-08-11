@@ -30,12 +30,18 @@ def continuous_angle_root(trimer_root, cohort_hash):
 def build_continuous_angle_cache(cohort, trimer_store, trimer_root, trimer_artifact_hash):
     manifest = cohort["manifest"]
     categorical_root = angle_cache_root(trimer_root, manifest["cohort_hash"])
+    trimer_done_file_sha256 = _sha(Path(trimer_root) / ".done")
+    trimer_contract_hash = json.loads(
+        (Path(trimer_root) / "metadata.json").read_text(encoding="utf-8")
+    ).get("feature_config_hash")
     categorical = validate_angle_cache(
         categorical_root,
         cohort_hash=manifest["cohort_hash"],
         ordered_key_hash=manifest["ordered_sample_key_hash"],
         trimer_artifact_hash=trimer_artifact_hash,
         record_count=len(cohort["keys"]),
+        trimer_done_file_sha256=trimer_done_file_sha256,
+        trimer_contract_hash=trimer_contract_hash,
     )
     offsets = np.load(categorical_root / "angle_offsets.npy", mmap_mode="r")
     indices = np.load(categorical_root / "angle_indices.npy", mmap_mode="r")
@@ -83,6 +89,9 @@ def build_continuous_angle_cache(cohort, trimer_store, trimer_root, trimer_artif
         "cohort_hash": manifest["cohort_hash"],
         "ordered_sample_key_hash": manifest["ordered_sample_key_hash"],
         "trimer_artifact_hash": str(trimer_artifact_hash),
+        "trimer_done_artifact_id": str(trimer_artifact_hash),
+        "trimer_done_file_sha256": str(trimer_done_file_sha256),
+        "trimer_contract_hash": str(trimer_contract_hash),
         "categorical_angle_artifact_hash": (
             categorical_root / ".done"
         ).read_text().strip(),
@@ -100,7 +109,13 @@ def build_continuous_angle_cache(cohort, trimer_store, trimer_root, trimer_artif
     os.replace(temporary, root / "metadata.json")
     (root / ".done.tmp").write_text(artifact + "\n")
     os.replace(root / ".done.tmp", root / ".done")
-    frozen = {"schema": CACHE_CONTINUOUS_ANGLE_SCHEMA, "artifact_hash": artifact}
+    frozen = {
+        "schema": CACHE_CONTINUOUS_ANGLE_SCHEMA,
+        "artifact_hash": artifact,
+        "trimer_done_artifact_id": str(trimer_artifact_hash),
+        "trimer_done_file_sha256": str(trimer_done_file_sha256),
+        "trimer_contract_hash": str(trimer_contract_hash),
+    }
     (root / ".frozen.tmp").write_text(json.dumps(frozen, sort_keys=True) + "\n")
     os.replace(root / ".frozen.tmp", root / ".frozen")
     return root, metadata

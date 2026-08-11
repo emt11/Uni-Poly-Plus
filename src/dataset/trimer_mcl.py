@@ -12,6 +12,7 @@ finite 3-D coordinates and finite post-relaxation MMFF energy.
 from __future__ import annotations
 
 import hashlib
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -37,6 +38,26 @@ TRIMER_ETKDG_TIMEOUT_SECONDS = 60
 TRIMER_ETKDG_RETRY_CANDIDATES = 2
 TRIMER_ETKDG_RETRY_MAX_ITERATIONS = 200
 TRIMER_MMFF_RELAX_MAX_ITERATIONS = CONTRACT_MMFF_RELAX_MAX_ITERATIONS
+
+_ETKDG_CALL_COUNT = 0
+_ETKDG_CALL_LOCK = threading.Lock()
+
+
+def reset_etkdg_call_counter():
+    global _ETKDG_CALL_COUNT
+    with _ETKDG_CALL_LOCK:
+        _ETKDG_CALL_COUNT = 0
+
+
+def get_etkdg_call_count():
+    with _ETKDG_CALL_LOCK:
+        return int(_ETKDG_CALL_COUNT)
+
+
+def _count_etkdg_call():
+    global _ETKDG_CALL_COUNT
+    with _ETKDG_CALL_LOCK:
+        _ETKDG_CALL_COUNT += 1
 
 
 def _sample_seed(smiles_or_mol) -> int:
@@ -77,6 +98,8 @@ def _embed_attempt(
     max_iterations: int,
 ):
     """Run one deterministic ETKDG attempt on a fresh molecule copy."""
+
+    _count_etkdg_call()
 
     candidate = Chem.Mol(molecule)
     candidate.RemoveAllConformers()
@@ -267,9 +290,11 @@ def _attach_placeholder(data, reason: str, seed: int = 0):
     data.trimer_edge_index = torch.empty((2, 0), dtype=torch.long)
     data.trimer_bond_type = torch.empty((0,), dtype=torch.long)
     data.trimer_base_ru_atom_id = torch.empty((0,), dtype=torch.long)
+    data.trimer_base_ru_atom_index = data.trimer_base_ru_atom_id
     data.trimer_ru_offset = torch.empty((0,), dtype=torch.long)
     data.trimer_central_ru_mask = torch.empty((0,), dtype=torch.bool)
     data.trimer_central_atom_index = torch.empty((0,), dtype=torch.long)
+    data.trimer_central_ru_atom_index = data.trimer_central_atom_index
     data.mips_to_trimer_central_index = torch.full(
         (node_count,), -1, dtype=torch.long
     )
@@ -389,14 +414,21 @@ def attach_finite_trimer_mcl(
             raise ValueError("trimer_inter_ru_bond_type_mismatch")
 
         canonical = data.canonical_ru_atom_index.long()
-        if canonical.numel() != int(data.num_nodes):
+        canonical_to_trimer = getattr(
+            data, "canonical_to_trimer_base_atom_id", canonical
+        )
+        canonical_to_trimer = torch.as_tensor(
+            canonical_to_trimer, dtype=torch.long
+        ).reshape(-1)
+        if canonical.numel() != int(data.num_nodes) or canonical_to_trimer.numel() != int(data.num_nodes):
             raise ValueError("o8_canonical_mapping_length_mismatch")
-        if canonical.numel() and (
-            int(canonical.min()) < 0 or int(canonical.max()) + 1 != base_count
+        if canonical_to_trimer.numel() and (
+            int(canonical_to_trimer.min()) < 0
+            or int(canonical_to_trimer.max()) + 1 != base_count
         ):
             raise ValueError(
                 "o8_trimer_canonical_count_mismatch:"
-                f"{int(canonical.max()) + 1}!={base_count}"
+                f"{int(canonical_to_trimer.max()) + 1}!={base_count}"
             )
         if hasattr(data, "z"):
             o8_atomic_numbers = data.z.long()
@@ -404,7 +436,7 @@ def attach_finite_trimer_mcl(
                 reference_atomic_numbers
             ):
                 observed_z = torch.unique(
-                    o8_atomic_numbers[canonical == canonical_id]
+                    o8_atomic_numbers[canonical_to_trimer == canonical_id]
                 )
                 if (
                     observed_z.numel() != 1
@@ -488,7 +520,7 @@ def attach_finite_trimer_mcl(
             torch.tensor([-1, 0, 1], dtype=torch.long), base_count
         )
         central_mask = ru_offsets == 0
-        mapping = central[canonical]
+        mapping = central[canonical_to_trimer]
         if mapping.numel() != int(data.num_nodes) or bool((mapping < 0).any()):
             raise ValueError("incomplete_o8_to_trimer_mapping")
 
@@ -502,9 +534,11 @@ def attach_finite_trimer_mcl(
         )
         data.trimer_bond_type = torch.tensor(bond_types, dtype=torch.long)
         data.trimer_base_ru_atom_id = base_ids
+        data.trimer_base_ru_atom_index = data.trimer_base_ru_atom_id
         data.trimer_ru_offset = ru_offsets
         data.trimer_central_ru_mask = central_mask
         data.trimer_central_atom_index = central
+        data.trimer_central_ru_atom_index = central
         data.mips_to_trimer_central_index = mapping
         data.trimer_geometry_valid = bool(geometry_is_3d)
         data.trimer_geometry_is_3d = torch.tensor(

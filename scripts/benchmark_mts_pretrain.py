@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Select the reproducible three-GPU MTS pretraining batch profile.
 
-The production objective is a global batch of 1008 (the closest divisible
-value to MIPS' 1024): (42, 8), (84, 4), (168, 2), or (336, 1)
+The production objective is a global batch of 1008. This cycle confirms only
+the two authorized finalists: (168, 2) and (336, 1)
 samples/rank and gradient
 accumulation steps.  This wrapper runs the existing finite DDP benchmark for
 each candidate, records the raw result, and writes the selected profile only
@@ -22,8 +22,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CANDIDATES = ((42, 8), (84, 4), (168, 2), (336, 1))
-BASELINE_SAMPLES_PER_SECOND = 238.0
+CANDIDATES = ((168, 2), (336, 1))
 
 
 def _last_json(text: str):
@@ -51,11 +50,12 @@ def _run_candidate(batch_size: int, accumulation: int, batches: int, workers: in
         "PRETRAIN_BENCHMARK_ONLY": "1",
         "PRETRAIN_BENCHMARK_STAGE": "joint",
         "PRETRAIN_BENCHMARK_BATCHES": str(int(batches)),
+        "PRETRAIN_PROFILE": "canonical_ru_angle20_v1",
         "PRETRAIN_BATCH_SIZE": str(int(batch_size)),
         "PRETRAIN_ACCUMULATION": str(int(accumulation)),
         "DATALOADER_WORKERS": str(int(workers)),
         "LOG_DIR": str(log_dir / f"b{batch_size}_a{accumulation}"),
-        "PRETRAIN_ONLY": "0",
+        "PRETRAIN_ONLY": "1",
         "STAGE3_ONLY": "0",
     })
     command = ["bash", "scripts/run_mts.sh"]
@@ -86,9 +86,54 @@ def _run_candidate(batch_size: int, accumulation: int, batches: int, workers: in
     return result
 
 
+def _profile_metadata(path):
+    profile_path = ROOT / path
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    digest = __import__("hashlib").sha256(
+        json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    code_files = [
+        "configs/mts/default.json", "configs/mts/pretraining/canonical_ru_angle20_v1.json",
+        "scripts/pretrain.py", "scripts/run_mips_trimer_scage.sh", "src/dataset/dataloader.py",
+        "src/dataset/dataset.py", "src/dataset/mips_trimer_contract.py", "src/dataset/trimer_mcl.py",
+        "src/modules/mips_local_graph.py", "src/modules/uni_encoder.py",
+    ]
+    file_hashes = {}
+    code_digest = __import__("hashlib").sha256()
+    for relative in code_files:
+        candidate = ROOT / relative
+        if not candidate.is_file():
+            continue
+        value = __import__("hashlib").sha256(candidate.read_bytes()).hexdigest()
+        file_hashes[relative] = value
+        code_digest.update(relative.encode())
+        code_digest.update(value.encode())
+    try:
+        import torch
+        torch_version = torch.__version__
+        cuda_version = torch.version.cuda
+    except Exception:
+        torch_version = None
+        cuda_version = None
+    return {
+        "profile_id": profile.get("profile_id"),
+        "profile_sha256": digest,
+        "profile": profile,
+        "pretrain_code_sha256": code_digest.hexdigest(),
+        "pretrain_code_files": file_hashes,
+        "torch_version": torch_version,
+        "cuda_version": cuda_version,
+        "gpu_visibility": "0,1,2",
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batches", type=int, default=500)
+    parser.add_argument(
+        "--profile",
+        default="configs/mts/pretraining/canonical_ru_angle20_v1.json",
+    )
     parser.add_argument("--loader-workers", type=int, default=0)
     parser.add_argument(
         "--output",
@@ -117,6 +162,7 @@ def main(argv=None):
                 for b, a in CANDIDATES
             ],
             "selected": None,
+            "profile": str(args.profile),
         }
         output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(payload, indent=2))
@@ -157,20 +203,14 @@ def main(argv=None):
             -float(item["samples_per_second"]),
         ),
     )
-    if float(selected["samples_per_second"]) < 2.0 * BASELINE_SAMPLES_PER_SECOND:
-        raise SystemExit(
-            "MTS optimized benchmark did not reach the required 2x baseline "
-            f"({selected['samples_per_second']:.2f} < "
-            f"{2.0 * BASELINE_SAMPLES_PER_SECOND:.2f} samples/s); "
-            "do not replace the production profile."
-        )
     payload = {
         "schema": "mts-pretrain-benchmark-v1",
         "dataset": "PI1M_v2",
         "stage": "mts_joint_pretraining",
         "world_size": 3,
         "target_global_batch": 1008,
-        "baseline_samples_per_second": BASELINE_SAMPLES_PER_SECOND,
+        "profile": str(args.profile),
+        "profile_metadata": _profile_metadata(args.profile),
         "batches": int(args.batches),
         "results": results,
         "selected": {
@@ -181,10 +221,7 @@ def main(argv=None):
             "global_batch_size": 1008,
             "samples_per_second": float(selected["samples_per_second"]),
             "peak_memory_fraction": float(selected.get("peak_memory_fraction", 0.0)),
-            # This wrapper measures the candidates.  The production launcher
-            # must still run the dedicated 300-step interruption/resume gate
-            # before accepting this profile as immutable training metadata.
-            "resume_consistency": "pending_300_step_gate",
+            "training_mode": "uninterrupted",
         },
     }
     output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

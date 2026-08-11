@@ -1,0 +1,20 @@
+{
+  "schema_version": "mts-experiment-v3",
+  "experiment_id": "A4_star_mcl_random_mask",
+  "parent_config": "configs/mts/default.json",
+  "geometry_mode": "current_mcl",
+  "modalities": ["graph"],
+  "fusion_mode": "none",
+  "finetune_mode": "single_task",
+  "evaluation_protocol": "historical_shared5",
+  "regression_loss": "huber",
+  "huber_beta": 0.5,
+  "finetune_profile": "legacy_mts_huber_v1",
+  "ablation": {
+    "id": "A4_star_mcl_random_mask",
+    "shared_checkpoint": "pretrained_models/mts/mts_joint_pretraining_pi1m_v2_seed42_canonical_angle20_v1.pth",
+    "star": true,
+    "mcl": true,
+    "mcl_random_mask": true
+  }
+}

@@ -2,6 +2,10 @@ import torch
 from torch_geometric.data import Batch
 from .mips_trimer_contract import (
     FEATURE_SCHEMA,
+    EXPLICIT_FEATURE_SCHEMA,
+    EXPLICIT_LGA_SCHEMA_VERSION,
+    TOPOLOGY_CANONICAL,
+    TOPOLOGY_EXPLICIT,
     TRIMER_CONTENT_SCHEMA,
     TRIMER_SCHEMA_VERSION,
 )
@@ -26,6 +30,24 @@ def mips_trimer_collate(data_list):
         or int(getattr(item, "mips_local_lga_schema_version", 0)) == 2
         for item in data_list
     )
+    representations = {
+        str(getattr(
+            item,
+            "topology_representation",
+            TOPOLOGY_CANONICAL
+            if (
+                bool(getattr(item, "mts_canonical_periodic", False))
+                or int(getattr(item, "mips_local_lga_schema_version", 0)) == 2
+            )
+            else TOPOLOGY_EXPLICIT,
+        ))
+        for item in data_list
+    }
+    if len(representations) != 1:
+        raise ValueError("cannot mix MTS topology representations in one batch")
+    topology_representation = next(iter(representations))
+    if topology_representation not in {TOPOLOGY_CANONICAL, TOPOLOGY_EXPLICIT}:
+        raise ValueError("unsupported MTS topology representation")
     if any(
         bool(getattr(item, "mts_canonical_periodic", False))
         or int(getattr(item, "mips_local_lga_schema_version", 0)) == 2
@@ -41,6 +63,7 @@ def mips_trimer_collate(data_list):
     lga_path_shifts = []
     lga_hist, lga_star = [], []
     canonical_parts, copy_parts, pair_parts = [], [], []
+    canonical_to_trimer_parts = []
     canonical_id_parts, relation_shift_parts, polymer_link_parts = [], [], []
     canonical_graph_parts, canonical_local_parts, canonical_first_parts = [], [], []
     sample_hash64 = []
@@ -59,6 +82,19 @@ def mips_trimer_collate(data_list):
         hasattr(item, "mts_task_index") for item in data_list
     )
     trimer_fields_present = all(hasattr(item, "trimer_pos") for item in data_list)
+    ablation_ids = {
+        getattr(item, "mts_ablation_id", None) for item in data_list
+    }
+    if len(ablation_ids) > 1:
+        raise ValueError("cannot mix MTS geometry ablations in one batch")
+    ablation_id = next(iter(ablation_ids))
+    mcl_enabled = all(
+        bool(getattr(item, "mts_use_mcl", True)) for item in data_list
+    )
+    star_enabled = all(
+        bool(getattr(item, "mts_use_star_rbf", True)) for item in data_list
+    )
+    random_mask_enabled = ablation_id == "A4_star_mcl_random_mask"
     trimer_pos, trimer_z, trimer_edges, trimer_bonds = [], [], [], []
     trimer_base, trimer_offset, trimer_central = [], [], []
     trimer_central_index, trimer_mapping, trimer_batch = [], [], []
@@ -86,8 +122,42 @@ def mips_trimer_collate(data_list):
     pair_offset = 0
     trimer_offset_global = 0
     trimer_ptr = [0]
+    # A4 count-matched random MCL sidecar rows (Plan mts_geometry_injection
+    # A4): per-graph visible-key tables and graph query/trimer start offsets.
+    mcl_random_visible20_rows = []
+    mcl_random_visible50_rows = []
+    mcl_query_start = []
+    mcl_trimer_start = []
+    mcl_random_mask_valid = []
+    query_row_offset = 0
 
     for graph_id, item in enumerate(data_list):
+        # A legacy single-node canonical placeholder carries a one-column path
+        # chain (lga_path_index/lga_path_mask/lga_path_shift of width 1) and no
+        # bond histogram.  Normalize it to the canonical 3-column chain width
+        # with inert -1/False/zero padding so the batch stays collatable.  Such
+        # graphs never enter MCL (their Trimer geometry is invalid) or the
+        # masked objective, so the padding is numerically inert.
+        if (
+            hasattr(item, "lga_path_index")
+            and int(item.lga_path_index.size(1)) < 3
+        ):
+            chain = item.lga_path_index
+            item.lga_path_index = torch.nn.functional.pad(
+                chain, (0, 3 - int(chain.size(1))), value=-1
+            )
+            for name in ("lga_path_mask", "lga_path_shift"):
+                if hasattr(item, name):
+                    field = getattr(item, name)
+                    setattr(item, name, torch.nn.functional.pad(
+                        field, (0, 3 - int(field.size(1))),
+                        value=(False if name == "lga_path_mask" else 0),
+                    ))
+            if not hasattr(item, "lga_path_bond_hist"):
+                item.lga_path_bond_hist = torch.zeros(
+                    (int(item.lga_path_index.size(0)), 2, 6),
+                    dtype=torch.float32,
+                )
         num_nodes = int(item.x.size(0))
         x_parts.append(item.x)
         graph_parts.append(torch.full((num_nodes,), graph_id, dtype=torch.long))
@@ -118,6 +188,11 @@ def mips_trimer_collate(data_list):
 
         if canonical_periodic_batch:
             local_canonical = torch.arange(num_nodes, dtype=torch.long)
+            canonical_to_trimer_parts.append(torch.as_tensor(
+                getattr(
+                    item, "canonical_to_trimer_base_atom_id", local_canonical
+                )
+            ).long())
         else:
             local_canonical = item.canonical_ru_atom_index.long()
         canonical_parts.append(local_canonical + canonical_offset)
@@ -287,6 +362,49 @@ def mips_trimer_collate(data_list):
                     raise ValueError(
                         "MCL central-RU local index exceeds Trimer atom count"
                     )
+            # A4 random-mask sidecar rows (Plan mts_geometry_injection A4):
+            # expand the compact per-query visible key sets into [Q, 384] bool
+            # tables aligned to the batched query index, and record this
+            # graph's query/trimer start offsets.
+            if random_mask_enabled:
+                if not all(hasattr(item, name) for name in (
+                    "mcl_random_ptr20", "mcl_random_ptr50",
+                    "mcl_random_keys20", "mcl_random_keys50",
+                    "mcl_random_mask_valid",
+                )):
+                    raise ValueError("A4 item is missing random-mask placeholder fields")
+                n_q = int(central_count)
+                vis20 = torch.zeros((n_q, 384), dtype=torch.bool)
+                vis50 = torch.zeros((n_q, 384), dtype=torch.bool)
+                random_valid = bool(getattr(item, "mcl_random_mask_valid", False))
+                if random_valid and item_mcl_valid and bucket_size and n_q:
+                    p20 = item.mcl_random_ptr20
+                    p50 = item.mcl_random_ptr50
+                    if len(p20) != n_q + 1 or len(p50) != n_q + 1:
+                        raise ValueError("A4 compact mask pointer/query mismatch")
+                    k20 = torch.as_tensor(
+                        item.mcl_random_keys20, dtype=torch.long
+                    )
+                    k50 = torch.as_tensor(
+                        item.mcl_random_keys50, dtype=torch.long
+                    )
+                    for q in range(n_q):
+                        a, b = int(p20[q]), int(p20[q + 1])
+                        a5, b5 = int(p50[q]), int(p50[q + 1])
+                        if not (0 <= a <= b <= k20.numel() and 0 <= a5 <= b5 <= k50.numel()):
+                            raise ValueError("A4 compact mask pointer is out of bounds")
+                        if k20[a:b].numel() and bool(((k20[a:b] < 0) | (k20[a:b] >= n_trimer)).any()):
+                            raise ValueError("A4 random 20% mask selects invalid Trimer atom")
+                        if k50[a5:b5].numel() and bool(((k50[a5:b5] < 0) | (k50[a5:b5] >= n_trimer)).any()):
+                            raise ValueError("A4 random 50% mask selects invalid Trimer atom")
+                        vis20[q, k20[a:b]] = True
+                        vis50[q, k50[a5:b5]] = True
+                mcl_random_visible20_rows.append(vis20)
+                mcl_random_visible50_rows.append(vis50)
+                mcl_query_start.append(query_row_offset)
+                mcl_trimer_start.append(trimer_offset_global)
+                mcl_random_mask_valid.append(random_valid and item_mcl_valid and bool(bucket_size))
+                query_row_offset += n_q
             mcl_bucket_sizes.append(bucket_size)
             mcl_key_rows.append(key_row)
             mcl_query_rows.append(query_row)
@@ -317,6 +435,12 @@ def mips_trimer_collate(data_list):
     batch.canonical_ru_atom_index = torch.cat(canonical_parts, dim=0)
     if canonical_periodic_batch:
         batch.canonical_atom_id = torch.cat(canonical_id_parts, dim=0)
+        batch.canonical_to_trimer_base_atom_id = torch.cat(
+            canonical_to_trimer_parts, dim=0
+        )
+        batch.canonical_to_trimer_base_atom_index = (
+            batch.canonical_to_trimer_base_atom_id
+        )
     batch.canonical_graph_index = torch.cat(canonical_graph_parts, dim=0)
     batch.canonical_local_index = torch.cat(canonical_local_parts, dim=0)
     batch.canonical_first_node_index = torch.cat(
@@ -369,9 +493,18 @@ def mips_trimer_collate(data_list):
     if md_fields_present:
         batch.mips_md = torch.stack(md_parts, dim=0)
         batch.mips_md_valid = torch.tensor(md_valid, dtype=torch.bool)
-    batch.feature_schema = FEATURE_SCHEMA
-    batch.mips_local_lga_schema_version = 2 if canonical_periodic_batch else 1
+    batch.feature_schema = (
+        FEATURE_SCHEMA
+        if topology_representation == TOPOLOGY_CANONICAL
+        else EXPLICIT_FEATURE_SCHEMA
+    )
+    batch.mips_local_lga_schema_version = (
+        2 if topology_representation == TOPOLOGY_CANONICAL
+        else EXPLICIT_LGA_SCHEMA_VERSION
+    )
     batch.mts_canonical_periodic = bool(canonical_periodic_batch)
+    batch.topology_representation = topology_representation
+    batch.mts_topology_representation = topology_representation
 
     if trimer_fields_present:
         batch.trimer_pos = torch.cat(trimer_pos, dim=0)
@@ -379,43 +512,69 @@ def mips_trimer_collate(data_list):
         batch.trimer_edge_index = torch.cat(trimer_edges, dim=1)
         batch.trimer_bond_type = torch.cat(trimer_bonds, dim=0)
         batch.trimer_base_ru_atom_index = torch.cat(trimer_base, dim=0)
+        batch.trimer_base_ru_atom_id = batch.trimer_base_ru_atom_index
         batch.trimer_ru_offset = torch.cat(trimer_offset, dim=0)
         batch.trimer_central_ru_mask = torch.cat(trimer_central, dim=0)
         batch.trimer_central_atom_index = torch.cat(trimer_central_index, dim=0)
+        batch.trimer_central_ru_atom_index = batch.trimer_central_atom_index
         batch.mips_to_trimer_central_index = torch.cat(trimer_mapping, dim=0)
         batch.trimer_batch = torch.cat(trimer_batch, dim=0)
         batch.trimer_ptr = torch.tensor(trimer_ptr, dtype=torch.long)
         batch.trimer_geometry_valid = torch.tensor(trimer_valid, dtype=torch.bool)
         batch.trimer_geometry_is_3d = torch.tensor(trimer_is_3d, dtype=torch.bool)
         batch.trimer_2d_fallback = torch.tensor(trimer_2d, dtype=torch.bool)
-        batch.mcl_valid = torch.tensor(mcl_valid, dtype=torch.bool)
-        batch.star_3d_distance = torch.tensor(star_distance, dtype=torch.float)
-        batch.star_3d_asymmetry = torch.tensor(star_asymmetry, dtype=torch.float)
-        batch.star_3d_valid = torch.tensor(star_valid, dtype=torch.bool)
-        batch.trimer_mcl_thresholds = torch.stack(mcl_thresholds, dim=0)
-        batch.trimer_angle_index = torch.cat(angle_indices, dim=0)
-        batch.trimer_angle_bins = torch.cat(angle_bins, dim=0)
-        batch.trimer_angle_cos = torch.cat(angle_cos, dim=0)
-        batch.trimer_angle_ptr = torch.tensor(angle_ptr, dtype=torch.long)
-        batch.trimer_angle_valid = torch.tensor(angle_valid, dtype=torch.bool)
-        schemas = {
-            str(getattr(item, "trimer_angle_cache_schema", ""))
-            for item in data_list if hasattr(item, "trimer_angle_cache_schema")
-        }
-        batch.trimer_angle_cache_schema = (
-            next(iter(schemas)) if len(schemas) == 1 else "mixed-or-missing"
-        )
-        batch.mcl_bucket_size = torch.tensor(mcl_bucket_sizes, dtype=torch.int16)
-        batch.mcl_key_index_padded = torch.stack(mcl_key_rows, dim=0)
-        batch.mcl_query_index_padded = torch.stack(mcl_query_rows, dim=0)
-        batch.mcl_query_local_index_padded = torch.stack(
-            mcl_query_local_rows, dim=0
-        )
-        batch.mcl_query_canonical_index_padded = torch.stack(
-            mcl_query_canonical_rows, dim=0
-        )
-        batch.trimer_mcl_schema = TRIMER_CONTENT_SCHEMA
-        batch.trimer_mcl_schema_version = TRIMER_SCHEMA_VERSION
+        if mcl_enabled:
+            batch.mcl_valid = torch.tensor(mcl_valid, dtype=torch.bool)
+        if star_enabled:
+            batch.star_3d_distance = torch.tensor(star_distance, dtype=torch.float)
+            batch.star_3d_asymmetry = torch.tensor(star_asymmetry, dtype=torch.float)
+            batch.star_3d_valid = torch.tensor(star_valid, dtype=torch.bool)
+        if mcl_enabled:
+            batch.trimer_mcl_thresholds = torch.stack(mcl_thresholds, dim=0)
+        if ablation_id is None:
+            batch.trimer_angle_index = torch.cat(angle_indices, dim=0)
+            batch.trimer_angle_bins = torch.cat(angle_bins, dim=0)
+            batch.trimer_angle_cos = torch.cat(angle_cos, dim=0)
+            batch.trimer_angle_ptr = torch.tensor(angle_ptr, dtype=torch.long)
+            batch.trimer_angle_valid = torch.tensor(angle_valid, dtype=torch.bool)
+            schemas = {
+                str(getattr(item, "trimer_angle_cache_schema", ""))
+                for item in data_list if hasattr(item, "trimer_angle_cache_schema")
+            }
+            batch.trimer_angle_cache_schema = (
+                next(iter(schemas)) if len(schemas) == 1 else "mixed-or-missing"
+            )
+        if mcl_enabled:
+            batch.mcl_bucket_size = torch.tensor(mcl_bucket_sizes, dtype=torch.int16)
+            batch.mcl_key_index_padded = torch.stack(mcl_key_rows, dim=0)
+            batch.mcl_query_index_padded = torch.stack(mcl_query_rows, dim=0)
+            batch.mcl_query_local_index_padded = torch.stack(
+                mcl_query_local_rows, dim=0
+            )
+            batch.mcl_query_canonical_index_padded = torch.stack(
+                mcl_query_canonical_rows, dim=0
+            )
+        if random_mask_enabled:
+            if len(mcl_random_visible20_rows) != len(data_list):
+                raise ValueError("A4 random visibility rows are not graph-aligned")
+            batch.mcl_random_visible20 = torch.cat(
+                mcl_random_visible20_rows, dim=0
+            )
+            batch.mcl_random_visible50 = torch.cat(
+                mcl_random_visible50_rows, dim=0
+            )
+            batch.mcl_query_start = torch.tensor(
+                mcl_query_start, dtype=torch.int32
+            )
+            batch.mcl_trimer_start = torch.tensor(
+                mcl_trimer_start, dtype=torch.int32
+            )
+            batch.mcl_random_mask_valid = torch.tensor(
+                mcl_random_mask_valid, dtype=torch.bool
+            )
+        if mcl_enabled:
+            batch.trimer_mcl_schema = TRIMER_CONTENT_SCHEMA
+            batch.trimer_mcl_schema_version = TRIMER_SCHEMA_VERSION
     return batch
 
 

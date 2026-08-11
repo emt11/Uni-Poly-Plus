@@ -29,8 +29,10 @@ from rdkit import Chem, rdBase
 from torch_geometric.data import Data
 from .mips_trimer_contract import (
     CACHE_LAYOUT_SCHEMA,
+    CACHE_MCL_THRESHOLD_SCHEMA,
     TRIMER_LMDB_SCHEMA as CONTRACT_TRIMER_LMDB_SCHEMA,
     TOPOLOGY_LMDB_SCHEMA as CONTRACT_TOPOLOGY_LMDB_SCHEMA,
+    TOPOLOGY_EXPLICIT,
 )
 
 
@@ -39,12 +41,26 @@ TOPOLOGY_LMDB_SCHEMA = CONTRACT_TOPOLOGY_LMDB_SCHEMA
 TRIMER_LMDB_SCHEMA = CONTRACT_TRIMER_LMDB_SCHEMA
 MD200_LMDB_SCHEMA = "mips-trimer-scage-md200-lmdb-v1"
 MD200_ARRAY_SCHEMA = "mips-trimer-scage-md200-array-v1"
-MCL_THRESHOLDS_ARRAY_SCHEMA = "mips-trimer-scage-mcl-thresholds-array-v1"
+MCL_THRESHOLDS_ARRAY_SCHEMA = CACHE_MCL_THRESHOLD_SCHEMA
 COHORT_SCHEMA = "mips-trimer-scage-cohort-v1"
 COHORT_INTEGRITY_SCHEMA = "mips-trimer-scage-cohort-manifest-v2"
 
 _INITIAL_MAP_SIZE = 64 * 1024 ** 3
 _MAX_MAP_SIZE = 1024 * 1024 ** 3
+
+# These schemas are retained only for read-only migration/audit code.  The
+# normal Dataset/cache APIs must never silently consume them as a production
+# canonical bundle.
+_REJECTED_CANONICAL_SCHEMAS = {
+    "mts-canonical-periodic-feature-v1",
+    "mts-canonical-periodic-feature-v2",
+    "mts-canonical-periodic-topology-lmdb-v1",
+    "mts-canonical-periodic-topology-lmdb-v2",
+    "mips-trimer-scage-trimer-v6",
+    "mips-trimer-scage-trimer-v7",
+    "mips-trimer-scage-trimer-lmdb-v4",
+    "mips-trimer-scage-trimer-lmdb-v5",
+}
 
 # python-lmdb rejects opening the same environment twice in one process when
 # the handles are created with slightly different flags.  A training process
@@ -55,6 +71,127 @@ _MAX_MAP_SIZE = 1024 * 1024 ** 3
 # forked DataLoader workers get their own handles through ``__getstate__``.
 _READ_ENV_REGISTRY = {}
 _READ_ENV_REGISTRY_LOCK = threading.RLock()
+
+# Exact allowlist of topology-layer placeholders that the Trimer layer may
+# legitimately override after the canonical single-RU migration (Plan §5).
+# Any other duplicated field must compare equal or fail loudly; there is no
+# generic "all-minus-one topology tensor may be overwritten" rule.
+_TRIMER_PLACEHOLDER_ALLOWLIST = frozenset({"mips_to_trimer_central_index"})
+
+
+def _tensor_values_equal(left, right) -> bool:
+    try:
+        if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+            return bool(torch.equal(left, right))
+        return bool(left == right)
+    except (TypeError, RuntimeError):
+        return False
+
+
+def _validate_trimer_placeholder_override(
+    name, topology_value, trimer_value, *, n_nodes, central_ru_mask, sample_key,
+) -> bool:
+    """Return True when a Trimer field may replace a canonical Topology
+    placeholder (Plan §5).  Only the exact allowlisted mapping placeholder may
+    replace an all-minus-one topology value, and every added constraint must
+    hold; any other overlap raises a contract error containing the field and
+    sample key.
+    """
+    key_hex = bytes(sample_key).hex()[:16]
+    if name not in _TRIMER_PLACEHOLDER_ALLOWLIST:
+        raise RuntimeError(
+            f"duplicate LMDB cache field: {name} (sample_key={key_hex})"
+        )
+    if not (
+        isinstance(topology_value, torch.Tensor)
+        and topology_value.numel() > 0
+        and bool(torch.all(topology_value == -1))
+    ):
+        raise RuntimeError(
+            f"duplicate LMDB cache field: {name} (sample_key={key_hex})"
+        )
+    if not isinstance(trimer_value, torch.Tensor) or trimer_value.dtype != torch.long:
+        raise RuntimeError(
+            f"invalid {name} override dtype (sample_key={key_hex})"
+        )
+    if trimer_value.ndim != 1 or int(trimer_value.size(0)) != int(n_nodes):
+        raise RuntimeError(
+            f"invalid {name} override shape (sample_key={key_hex})"
+        )
+    if bool((trimer_value < 0).any()):
+        raise RuntimeError(
+            f"invalid {name} override negative index (sample_key={key_hex})"
+        )
+    if central_ru_mask is None:
+        raise RuntimeError(
+            f"{name} central_ru_mask is missing (sample_key={key_hex})"
+        )
+    raw_mask = torch.as_tensor(central_ru_mask)
+    if (
+        raw_mask.ndim != 1
+        or raw_mask.size(0) == 0
+        or raw_mask.dtype != torch.bool
+    ):
+        raise RuntimeError(
+            f"invalid {name} central_ru_mask shape/dtype "
+            f"(sample_key={key_hex})"
+        )
+    mask = raw_mask
+    if trimer_value.numel() > 0:
+        indices = trimer_value.long()
+        if bool((indices >= int(mask.size(0))).any()):
+            raise RuntimeError(
+                f"invalid {name} override index range (sample_key={key_hex})"
+            )
+        if not bool(mask[indices].all()):
+            raise RuntimeError(
+                f"{name} mapping does not point to the central RU "
+                f"(sample_key={key_hex})"
+            )
+    return True
+
+
+def _expand_explicit_trimer_mapping(topology, name, value, *, sample_key):
+    """Lift one canonical Trimer mapping onto every explicit RU copy.
+
+    Frozen Trimer records are keyed by canonical RU identity and therefore
+    contain exactly one mapping entry per canonical atom.  The corrected
+    explicit topology stores ``k`` copies of those atoms.  Expansion is
+    consequently an identity lookup through ``canonical_ru_atom_index``; the
+    copy index is intentionally irrelevant and is never interpreted as a
+    Trimer ``ru_offset``.
+    """
+
+    representation = str(getattr(
+        topology, "topology_representation",
+        getattr(topology, "mts_topology_representation", ""),
+    ))
+    if representation != TOPOLOGY_EXPLICIT or name not in {
+        "mips_to_trimer_central_index",
+    }:
+        return value
+    mapping = torch.as_tensor(value).long()
+    canonical_index = torch.as_tensor(
+        getattr(topology, "canonical_ru_atom_index", torch.empty(0))
+    ).long()
+    key_hex = bytes(sample_key).hex()[:16]
+    if mapping.ndim != 1 or canonical_index.ndim != 1:
+        raise RuntimeError(
+            f"invalid explicit {name} rank (sample_key={key_hex})"
+        )
+    if canonical_index.numel() != int(topology.x.size(0)):
+        raise RuntimeError(
+            f"explicit canonical identity length mismatch (sample_key={key_hex})"
+        )
+    if canonical_index.numel() and (
+        bool((canonical_index < 0).any())
+        or int(canonical_index.max()) >= int(mapping.numel())
+    ):
+        raise RuntimeError(
+            f"explicit canonical identity is out of mapping range "
+            f"(sample_key={key_hex})"
+        )
+    return mapping[canonical_index]
 
 
 def _json_digest(value) -> str:
@@ -158,7 +295,7 @@ def _deserialize_record(payload: bytes, schema: str, key: bytes) -> Data:
 class LmdbLayerStore:
     """Read-only, one-record-at-a-time immutable layer store."""
 
-    def __init__(self, root, expected_meta=None, require_done=True):
+    def __init__(self, root, expected_meta=None, require_done=True, *, allow_legacy=False):
         self.root = str(root)
         # Initialize handles before any validation can raise so destruction of
         # a partially constructed reader is always safe.
@@ -179,16 +316,27 @@ class LmdbLayerStore:
         if expected_meta is not None and self.meta != expected_meta:
             raise RuntimeError(f"LMDB layer metadata mismatch: {self.root}")
         self.schema = str(self.meta["schema"])
-        if self.schema in {
-            "mips-trimer-scage-topology-lmdb-v1",
-            "mips-trimer-scage-topology-lmdb-v2",
-        } or self.meta.get("feature_content_schema") == (
-            "mips-trimer-scage-feature-v4"
+        if not allow_legacy and (
+            self.schema in {
+                "mips-trimer-scage-topology-lmdb-v1",
+                "mips-trimer-scage-topology-lmdb-v2",
+                *_REJECTED_CANONICAL_SCHEMAS,
+            }
+            or self.meta.get("feature_content_schema") in {
+                "mips-trimer-scage-feature-v4",
+                "mts-canonical-periodic-feature-v1",
+                "mts-canonical-periodic-feature-v2",
+            }
+            or self.meta.get("feature_schema") in {
+                "mts-canonical-periodic-feature-v1",
+                "mts-canonical-periodic-feature-v2",
+            }
         ):
             raise RuntimeError(
-                "legacy explicit MTS topology cache is rejected; rebuild "
-                "with mts-canonical-periodic-topology-lmdb-v1"
+                "legacy canonical/explicit MTS cache is rejected; rebuild "
+                "with the active v3/v6 canonical contracts"
             )
+        self.allow_legacy = bool(allow_legacy)
         if require_done:
             self._validate_done()
 
@@ -262,10 +410,10 @@ class LmdbLayerStore:
         self.close()
 
     def __getstate__(self):
-        return {"root": self.root}
+        return {"root": self.root, "allow_legacy": bool(getattr(self, "allow_legacy", False))}
 
     def __setstate__(self, state):
-        self.__init__(state["root"])
+        self.__init__(state["root"], allow_legacy=bool(state.get("allow_legacy", False)))
 
     def __len__(self):
         if hasattr(self, "manifest"):
@@ -325,6 +473,8 @@ class LmdbLayerWriter:
         commit_size=128,
         commit_seconds=30.0,
         rebuild=False,
+        allow_legacy=False,
+        preserve_done=False,
     ):
         self.root = str(root)
         self._writer_lock_handle = None
@@ -336,15 +486,25 @@ class LmdbLayerWriter:
         self.meta = copy.deepcopy(meta)
         self.meta["cache_layout_schema"] = CACHE_LAYOUT_SCHEMA
         self.schema = str(self.meta["schema"])
-        if self.schema in {
-            "mips-trimer-scage-topology-lmdb-v1",
-            "mips-trimer-scage-topology-lmdb-v2",
-        } or self.meta.get("feature_content_schema") == (
-            "mips-trimer-scage-feature-v4"
+        if not allow_legacy and (
+            self.schema in {
+                "mips-trimer-scage-topology-lmdb-v1",
+                "mips-trimer-scage-topology-lmdb-v2",
+                *_REJECTED_CANONICAL_SCHEMAS,
+            }
+            or self.meta.get("feature_content_schema") in {
+                "mips-trimer-scage-feature-v4",
+                "mts-canonical-periodic-feature-v1",
+                "mts-canonical-periodic-feature-v2",
+            }
+            or self.meta.get("feature_schema") in {
+                "mts-canonical-periodic-feature-v1",
+                "mts-canonical-periodic-feature-v2",
+            }
         ):
             raise RuntimeError(
-                "legacy explicit MTS topology cannot be written; use "
-                "mts-canonical-periodic-topology-lmdb-v1"
+                "legacy canonical/explicit MTS cache cannot be written; use "
+                "the active v3/v6 canonical contracts"
             )
         self._acquire_lifecycle_lock()
         self._acquire_writer_lock()
@@ -387,7 +547,7 @@ class LmdbLayerWriter:
                     raise RuntimeError(f"incomplete LMDB layer metadata mismatch: {self.root}")
             else:
                 _atomic_json(self.metadata_path, self.meta)
-            if os.path.isfile(self.done_path):
+            if os.path.isfile(self.done_path) and not bool(preserve_done):
                 os.remove(self.done_path)
             os.makedirs(self.data_path, exist_ok=True)
             existing_data = os.path.join(self.data_path, "data.mdb")
@@ -491,6 +651,60 @@ class LmdbLayerWriter:
         with self.environment.begin(write=False) as transaction:
             return transaction.get(key) is not None
 
+    def raw_get(self, key):
+        """Return an already-stored serialized payload without decoding it.
+
+        Migration workers can serialize a target record before sending it to
+        the parent.  The parent writer must be able to compare an orphaned
+        layer's bytes without materialising a PyG ``Data`` object again.
+        """
+
+        key = coerce_sample_key(key)
+        for buffered_key, payload in reversed(self.buffer):
+            if buffered_key == key:
+                return bytes(payload)
+        with self.environment.begin(write=False) as transaction:
+            value = transaction.get(key)
+        return None if value is None else bytes(value)
+
+    def add_raw_known_missing(self, key, payload):
+        """Queue a pre-serialized record known to be absent from LMDB.
+
+        This deliberately does not call :meth:`__contains__`, deserialize the
+        payload, or serialize it again.  The migration reconciler proves
+        absence once before the worker queue starts; a duplicate in the local
+        buffer is a programming error and is rejected explicitly.
+        """
+
+        key = coerce_sample_key(key)
+        if key in self.buffer_keys:
+            raise KeyError(f"duplicate buffered LMDB key: {key.hex()}")
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise TypeError("raw LMDB payload must be bytes-like")
+        self.buffer.append((key, bytes(payload)))
+        self.buffer_keys.add(key)
+        if (
+            len(self.buffer) >= self.commit_size
+            or time.monotonic() - self.last_commit >= self.commit_seconds
+        ):
+            self.flush()
+        return True
+
+    def put_raw_batch(self, records):
+        """Queue a batch of pre-serialized records in one writer buffer.
+
+        The eventual flush uses one LMDB write transaction for the whole
+        buffer.  ``records`` is intentionally a small iterable so callers can
+        keep Topology and Trimer batches aligned without retaining a full
+        cohort in memory.
+        """
+
+        count = 0
+        for key, payload in records:
+            self.add_raw_known_missing(key, payload)
+            count += 1
+        return count
+
     def missing(self, keys):
         output = []
         with self.environment.begin(write=False) as transaction:
@@ -511,6 +725,16 @@ class LmdbLayerWriter:
                 if key not in self.buffer_keys and transaction.get(key) is None:
                     mask[index] = 1
         return mask
+
+    def present_mask(self, keys):
+        """Return a uint8 presence mask from one read transaction."""
+
+        keys = [coerce_sample_key(key) for key in keys]
+        output = np.zeros(len(keys), dtype=np.uint8)
+        with self.environment.begin(write=False) as transaction:
+            for index, key in enumerate(keys):
+                output[index] = int(transaction.get(key) is not None)
+        return output
 
     def get(self, key):
         """Read one already committed record while the single writer is open."""
@@ -538,6 +762,124 @@ class LmdbLayerWriter:
             self.flush()
         return True
 
+    def replace(self, key, data):
+        """Replace one committed record while retaining single-writer safety.
+
+        Normal migration is append-only and uses :meth:`add`; selective
+        obsolete-geometry regeneration is the one explicit exception because
+        it must overwrite the already-migrated Trimer payload for a manifest
+        key.  The replacement is committed immediately so an interruption can
+        lose at most that one record and the writer remains resumable.
+        """
+
+        key = coerce_sample_key(key)
+        self.flush()
+        payload = _serialize_record(self.schema, key, data)
+        while True:
+            try:
+                with self.environment.begin(write=True) as transaction:
+                    transaction.put(key, payload, overwrite=True)
+                break
+            except lmdb.MapFullError:
+                current = int(self.environment.info()["map_size"])
+                target = min(
+                    _MAX_MAP_SIZE,
+                    max(current * 2, current + _INITIAL_MAP_SIZE),
+                )
+                if target <= current:
+                    raise RuntimeError(
+                        f"LMDB layer exceeded maximum map size: {self.root}"
+                    )
+                self.environment.set_mapsize(target)
+        self.environment.sync(True)
+        return True
+
+    def replace_batch(self, records):
+        """Atomically replace many committed records in a single transaction.
+
+        Selective obsolete-geometry regeneration batches its replacements so
+        the cost of a transaction and ``sync(True)`` is paid once per batch
+        instead of once per record.  Every ``(key, data)`` pair is serialized
+        first, then all of them are written with ``overwrite=True`` in one
+        LMDB write transaction followed by one synchronous flush.  The
+        caller remains the single writer, so no concurrency guard is needed
+        beyond the existing writer lock.
+        """
+
+        if not records:
+            return True
+        self.flush()
+        serialized = []
+        for key, data in records:
+            key = coerce_sample_key(key)
+            serialized.append((key, _serialize_record(self.schema, key, data)))
+        while True:
+            try:
+                with self.environment.begin(write=True) as transaction:
+                    for key, payload in serialized:
+                        transaction.put(key, payload, overwrite=True)
+                break
+            except lmdb.MapFullError:
+                current = int(self.environment.info()["map_size"])
+                target = min(
+                    _MAX_MAP_SIZE,
+                    max(current * 2, current + _INITIAL_MAP_SIZE),
+                )
+                if target <= current:
+                    raise RuntimeError(
+                        f"LMDB layer exceeded maximum map size: {self.root}"
+                    )
+                self.environment.set_mapsize(target)
+        self.environment.sync(True)
+        return True
+
+    def replace_raw_verified(self, key, expected_old_sha256, new_payload):
+        """Atomically replace one raw value after verifying its old digest.
+
+        Any buffered appends are committed before the compare-and-swap.  The
+        old value is read and the replacement is written in the same LMDB
+        write transaction, so a digest mismatch aborts without changing the
+        target record.  The committed pages are synchronised before returning
+        ``(old_sha256, new_sha256)``.
+        """
+
+        key = coerce_sample_key(key)
+        if not isinstance(new_payload, (bytes, bytearray, memoryview)):
+            raise TypeError("raw LMDB payload must be bytes-like")
+        new_payload = bytes(new_payload)
+        expected = str(expected_old_sha256).lower()
+        if len(expected) != 64:
+            raise ValueError("expected_old_sha256 must be a SHA-256 hex digest")
+        self.flush()
+        while True:
+            try:
+                with self.environment.begin(write=True) as transaction:
+                    old_value = transaction.get(key)
+                    if old_value is None:
+                        raise KeyError(key.hex())
+                    old_payload = bytes(old_value)
+                    old_sha256 = hashlib.sha256(old_payload).hexdigest()
+                    if old_sha256 != expected:
+                        raise ValueError(
+                            f"old payload SHA-256 mismatch for {key.hex()}: "
+                            f"expected {expected}, observed {old_sha256}"
+                        )
+                    transaction.put(key, new_payload, overwrite=True)
+                break
+            except lmdb.MapFullError:
+                current = int(self.environment.info()["map_size"])
+                target = min(
+                    _MAX_MAP_SIZE,
+                    max(current * 2, current + _INITIAL_MAP_SIZE),
+                )
+                if target <= current:
+                    raise RuntimeError(
+                        f"LMDB layer exceeded maximum map size: {self.root}"
+                    )
+                self.environment.set_mapsize(target)
+        self.environment.sync(True)
+        return old_sha256, hashlib.sha256(new_payload).hexdigest()
+
     def _write_buffer(self):
         while True:
             try:
@@ -561,8 +903,13 @@ class LmdbLayerWriter:
         self.inserted += len(self.buffer)
         self.buffer = []
         self.buffer_keys.clear()
-        self.environment.sync(True)
         self.last_commit = time.monotonic()
+
+    def sync(self):
+        """Synchronize committed pages at an explicit durability boundary."""
+
+        if self.environment is not None:
+            self.environment.sync(True)
 
     def finalize(self, *, cohort_hashes=None, failure_count=0):
         self.flush()
@@ -977,6 +1324,101 @@ def compute_mcl_thresholds(data):
         return invalid
 
 
+def _mcl_threshold_expected(cohort, trimer_root, shape):
+    """Return the content-bound metadata fields for a ``[N,2]`` threshold array.
+
+    The same contract is shared by the in-memory materialisation path, the
+    streamed mmap finalizer and the resume check, so the bound fields can
+    never drift between them.
+    """
+    done_path = Path(trimer_root) / ".done"
+    if not done_path.is_file():
+        raise RuntimeError("cannot materialize MCL thresholds without Trimer .done")
+    trimer_artifact_hash = done_path.read_text(encoding="utf-8").strip()
+    trimer_done_file_sha256 = _sha256_file(done_path)
+    trimer_metadata_path = Path(trimer_root) / "metadata.json"
+    trimer_contract_hash = None
+    if trimer_metadata_path.is_file():
+        try:
+            trimer_contract_hash = json.loads(
+                trimer_metadata_path.read_text(encoding="utf-8")
+            ).get("feature_config_hash")
+        except (OSError, ValueError, json.JSONDecodeError):
+            trimer_contract_hash = None
+    return {
+        "schema": MCL_THRESHOLDS_ARRAY_SCHEMA,
+        "cohort_hash": cohort["manifest"]["cohort_hash"],
+        "ordered_sample_key_hash": cohort["manifest"]["ordered_sample_key_hash"],
+        "trimer_artifact_hash": trimer_artifact_hash,
+        "trimer_done_artifact_id": trimer_artifact_hash,
+        "trimer_done_file_sha256": trimer_done_file_sha256,
+        "trimer_contract_hash": trimer_contract_hash,
+        "shape": list(shape),
+        "dtype": "float32",
+    }
+
+
+def mcl_thresholds_cached(cohort, trimer_root, shape):
+    """Return ``(path, metadata)`` if a persisted array already binds the
+    current Trimer artifact and cohort identity, else ``None``.
+
+    This is the resume check used before any streaming computation: a valid
+    existing array is content-bound to the same artifact, so recomputation
+    would be wasted work (Plan.MD §8.2).
+    """
+    cohort_root = Path(cohort["root"])
+    values_path = cohort_root / "mcl_thresholds.npy"
+    metadata_path = cohort_root / "mcl_thresholds_metadata.json"
+    if not (values_path.is_file() and metadata_path.is_file()):
+        return None
+    try:
+        expected = _mcl_threshold_expected(cohort, trimer_root, list(shape))
+    except RuntimeError:
+        return None
+    try:
+        observed = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if {key: observed.get(key) for key in expected} != expected:
+        return None
+    try:
+        loaded = np.load(values_path, mmap_mode="r")
+    except (OSError, ValueError):
+        return None
+    if tuple(loaded.shape) != tuple(shape):
+        return None
+    return str(values_path), observed
+
+
+def finalize_mcl_threshold_mmap(cohort, trimer_root, tmp_path):
+    """Hash and atomically publish a streamed ``[N,2]`` thresholds tmp file.
+
+    The caller owns the pre-allocated ``.tmp`` mmap and must have flushed it.
+    This finalizer validates the shape, hashes the bytes, renames over the
+    final path, then writes the content-bound metadata (Plan.MD §5.4).
+    """
+    cohort_root = Path(cohort["root"])
+    values_path = cohort_root / "mcl_thresholds.npy"
+    metadata_path = cohort_root / "mcl_thresholds_metadata.json"
+    tmp_path = Path(tmp_path)
+    array = np.load(tmp_path, mmap_mode="r")
+    shape = tuple(array.shape)
+    del array
+    if len(shape) != 2 or shape[1] != 2:
+        raise ValueError("MCL thresholds must have shape [N,2]")
+    expected = _mcl_threshold_expected(cohort, trimer_root, list(shape))
+    values_sha256 = _sha256_file(tmp_path)
+    cohort_root.mkdir(parents=True, exist_ok=True)
+    os.replace(tmp_path, values_path)
+    metadata = {
+        **expected,
+        "values_sha256": values_sha256,
+        "created_at": time.time(),
+    }
+    _atomic_json(metadata_path, metadata)
+    return str(values_path), metadata
+
+
 def materialize_mcl_threshold_array(cohort, thresholds, trimer_root):
     """Atomically persist ``[N,2]`` thresholds in cohort order.
 
@@ -987,21 +1429,10 @@ def materialize_mcl_threshold_array(cohort, thresholds, trimer_root):
     cohort_root = Path(cohort["root"])
     values_path = cohort_root / "mcl_thresholds.npy"
     metadata_path = cohort_root / "mcl_thresholds_metadata.json"
-    done_path = Path(trimer_root) / ".done"
-    if not done_path.is_file():
-        raise RuntimeError("cannot materialize MCL thresholds without Trimer .done")
-    trimer_artifact_hash = done_path.read_text(encoding="utf-8").strip()
     thresholds = np.asarray(thresholds, dtype=np.float32)
-    expected = {
-        "schema": MCL_THRESHOLDS_ARRAY_SCHEMA,
-        "cohort_hash": cohort["manifest"]["cohort_hash"],
-        "ordered_sample_key_hash": cohort["manifest"]["ordered_sample_key_hash"],
-        "trimer_artifact_hash": trimer_artifact_hash,
-        "shape": list(thresholds.shape),
-        "dtype": "float32",
-    }
     if thresholds.ndim != 2 or thresholds.shape[1] != 2:
         raise ValueError("MCL thresholds must have shape [N,2]")
+    expected = _mcl_threshold_expected(cohort, trimer_root, list(thresholds.shape))
     if values_path.is_file() and metadata_path.is_file():
         try:
             observed = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1088,6 +1519,11 @@ class LmdbFeatureStore:
                     and threshold_meta.get("ordered_sample_key_hash")
                     == cohort["manifest"]["ordered_sample_key_hash"]
                     and threshold_meta.get("trimer_artifact_hash") == trimer_hash
+                    and threshold_meta.get("trimer_done_artifact_id", trimer_hash)
+                    == trimer_hash
+                    and threshold_meta.get(
+                        "trimer_done_file_sha256", _sha256_file(trimer_done)
+                    ) == _sha256_file(trimer_done)
                     and tuple(threshold_meta.get("shape", ()))
                     == (len(self.keys), 2)
                 ):
@@ -1126,8 +1562,10 @@ class LmdbFeatureStore:
                     frozen_path = angle_root / ".frozen"
                     angle_schema = angle_meta.get("schema")
                     if (
-                        angle_schema not in {
+                        angle_schema
+                        not in {
                             "mts-trimer-bond-angle-cache-v1",
+                            "mts-trimer-bond-angle-cache-v2",
                             "mts-angle-continuous-cache-v1",
                         }
                         or not done_path.is_file()
@@ -1148,7 +1586,10 @@ class LmdbFeatureStore:
                     if all(angle_meta.get(key) == value for key, value in expected.items()):
                         self.angle_offsets = np.load(angle_root / "angle_offsets.npy", mmap_mode="r")
                         self.angle_indices = np.load(angle_root / "angle_indices.npy", mmap_mode="r")
-                        if angle_schema == "mts-trimer-bond-angle-cache-v1":
+                        if angle_schema in {
+                            "mts-trimer-bond-angle-cache-v1",
+                            "mts-trimer-bond-angle-cache-v2",
+                        }:
                             self.angle_bins = np.load(
                                 angle_root / "angle_bins.npy", mmap_mode="r"
                             )
@@ -1183,7 +1624,8 @@ class LmdbFeatureStore:
                             or self.angle_valid.shape != (len(self.keys),)
                         )
                         categorical_invalid = (
-                            angle_schema == "mts-trimer-bond-angle-cache-v1"
+                            angle_schema
+                            in {"mts-trimer-bond-angle-cache-v1", "mts-trimer-bond-angle-cache-v2"}
                             and (
                                 self.angle_bins.shape
                                 != (self.angle_indices.shape[0],)
@@ -1295,9 +1737,34 @@ class LmdbFeatureStore:
         if self.trimer is not None:
             layer = self.trimer[key]
             for name in layer.keys():
+                layer_value = _expand_explicit_trimer_mapping(
+                    merged, name, layer[name], sample_key=key
+                )
                 if name in merged:
-                    raise RuntimeError(f"duplicate LMDB cache field: {name}")
-                merged[name] = layer[name]
+                    # Plan §5: only the exact allowlisted mapping placeholder
+                    # may override an all-minus-one topology placeholder, and
+                    # every added constraint is validated.  Any other overlap
+                    # must compare equal or fail loudly with field + sample key.
+                    if name in _TRIMER_PLACEHOLDER_ALLOWLIST:
+                        if _validate_trimer_placeholder_override(
+                            name,
+                            merged[name],
+                            layer_value,
+                            n_nodes=int(merged.x.size(0)),
+                            central_ru_mask=layer.get(
+                                "trimer_central_ru_mask"
+                            ),
+                            sample_key=key,
+                        ):
+                            merged[name] = layer_value
+                        continue
+                    if _tensor_values_equal(merged[name], layer_value):
+                        continue
+                    raise RuntimeError(
+                        f"duplicate LMDB cache field: {name} "
+                        f"(sample_key={bytes(key).hex()[:16]})"
+                    )
+                merged[name] = layer_value
             if not hasattr(merged, "trimer_mcl_thresholds"):
                 row = self._row_for_key(key) if self.mcl_thresholds is not None else None
                 if row is not None:

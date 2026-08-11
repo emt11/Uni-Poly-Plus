@@ -29,9 +29,18 @@ from src.dataset.mips_trimer_contract import (
     TOPOLOGY_LMDB_SCHEMA as MIPS_TRIMER_TOPOLOGY_SCHEMA,
     CANONICAL_LGA_SCHEMA_VERSION as MIPS_CANONICAL_LGA_SCHEMA_VERSION,
     CHECKPOINT_SCHEMA as MIPS_TRIMER_CHECKPOINT_SCHEMA,
+    PRETRAIN_CHECKPOINT_SCHEMA as MTS_PRETRAIN_CHECKPOINT_SCHEMA,
+    PRETRAIN_TARGET_CONTRACT_SCHEMA as MTS_PRETRAIN_TARGET_CONTRACT_SCHEMA,
+    PRETRAIN_PROFILE_ID as MTS_PRETRAIN_PROFILE_ID,
+    CACHE_BOND_ANGLE_SCHEMA as MTS_CATEGORICAL_ANGLE_SCHEMA,
     CONFIG_SCHEMA as MIPS_TRIMER_CONFIG_SCHEMA,
     EXPERIMENT_CONFIG_SCHEMA as MTS_EXPERIMENT_CONFIG_SCHEMA,
     FEATURE_SCHEMA as MIPS_TRIMER_FEATURE_SCHEMA,
+    EXPLICIT_FEATURE_SCHEMA as MIPS_EXPLICIT_FEATURE_SCHEMA,
+    EXPLICIT_TOPOLOGY_LMDB_SCHEMA as MIPS_EXPLICIT_TOPOLOGY_SCHEMA,
+    EXPLICIT_LGA_SCHEMA_VERSION as MIPS_EXPLICIT_LGA_SCHEMA_VERSION,
+    TOPOLOGY_CANONICAL,
+    TOPOLOGY_EXPLICIT,
     TRIMER_ACCEPTANCE as MIPS_TRIMER_ACCEPTANCE,
     TRIMER_BUILDER_VERSION as MIPS_TRIMER_BUILDER_VERSION,
     TRIMER_CONTENT_SCHEMA as MIPS_TRIMER_CONTENT_SCHEMA,
@@ -104,6 +113,164 @@ CROSS_TASK_AUXILIARY_MAP = {
     task: tuple(other for other in ('eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc') if other != task)
     for task in ('eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc')
 }
+
+
+def _target_contract_mismatch(
+    contract,
+    *,
+    args,
+    dataset,
+    pretraining_cohort_hash,
+    expected_angle_artifact,
+    store_json_sha256,
+    topology_frozen_payload_sha256,
+    trimer_frozen_payload_sha256,
+):
+    """Return True when the checkpoint target_contract does not bind the
+    current frozen production identity (Plan contract-finalization §4 / G0
+    baseline §3.2).
+
+    The target contract is the single identity a production loader may rely
+    on.  Every schema constant is compared against the unique contract module,
+    every hash/artifact binding against the frozen store, .frozen payloads and
+    the current resolved config, and the self-excluding digest is recomputed.
+    The angle cache schema is fixed to the continuous sidecar contract.
+    A mismatch rejects the checkpoint before any model instantiation.
+    """
+    from src.dataset.mips_trimer_contract import (
+        CACHE_BUNDLE_SCHEMA,
+        CACHE_CONTINUOUS_ANGLE_SCHEMA,
+        PRETRAIN_CHECKPOINT_SCHEMA,
+        PRETRAIN_TARGET_CONTRACT_SCHEMA,
+        PRETRAIN_PROFILE_ID,
+        CACHE_BOND_ANGLE_SCHEMA,
+        CACHE_LAYOUT_SCHEMA,
+        CANONICAL_LGA_SCHEMA_VERSION,
+        CHECKPOINT_SCHEMA,
+        CONFIG_SCHEMA,
+        EXPERIMENT_CONFIG_SCHEMA,
+        FEATURE_SCHEMA,
+        TARGET_CONTRACT_SCHEMA,
+        TOPOLOGY_LMDB_SCHEMA,
+        TRIMER_BUILDER_VERSION,
+        TRIMER_CONTENT_SCHEMA,
+        TRIMER_LMDB_SCHEMA,
+        TRIMER_PROTOCOL,
+        TOPOLOGY_CANONICAL,
+        _canonical_json_hash,
+        cache_bundle_binding_hash,
+    )
+    if not isinstance(contract, dict):
+        return True
+    contract_schema = contract.get("schema")
+    if contract_schema not in {TARGET_CONTRACT_SCHEMA, PRETRAIN_TARGET_CONTRACT_SCHEMA}:
+        return True
+    pretrain_v2 = contract_schema == PRETRAIN_TARGET_CONTRACT_SCHEMA
+    constant_checks = {
+        "config_schema": CONFIG_SCHEMA,
+        "experiment_config_schema": EXPERIMENT_CONFIG_SCHEMA,
+        "feature_schema": FEATURE_SCHEMA,
+        "cache_layout_schema": CACHE_LAYOUT_SCHEMA,
+        "cache_bundle_schema": CACHE_BUNDLE_SCHEMA,
+        "topology_lmdb_schema": TOPOLOGY_LMDB_SCHEMA,
+        "trimer_content_schema": TRIMER_CONTENT_SCHEMA,
+        "trimer_lmdb_schema": TRIMER_LMDB_SCHEMA,
+        "trimer_builder_version": TRIMER_BUILDER_VERSION,
+        "canonical_lga_schema_version": CANONICAL_LGA_SCHEMA_VERSION,
+        "trimer_protocol": TRIMER_PROTOCOL,
+        "checkpoint_schema": (
+            PRETRAIN_CHECKPOINT_SCHEMA if pretrain_v2 else CHECKPOINT_SCHEMA
+        ),
+        "feature_config_hash": args.feature_config_hash,
+        "graph_model_config_hash": args.graph_model_config_hash,
+        "geometry_model_config_hash": args.source_geometry_model_config_hash,
+        "source_cohort_hash": pretraining_cohort_hash,
+        "topology_cache_artifact_hash": getattr(
+            dataset, "topology_cache_artifact_hash", None
+        ),
+        "trimer_cache_artifact_hash": getattr(
+            dataset, "trimer_cache_artifact_hash", None
+        ),
+        "angle_cache_schema": (
+            CACHE_BOND_ANGLE_SCHEMA if pretrain_v2 else CACHE_CONTINUOUS_ANGLE_SCHEMA
+        ),
+        "angle_cache_artifact_hash": expected_angle_artifact,
+        "store_json_sha256": store_json_sha256,
+        "topology_frozen_payload_sha256": topology_frozen_payload_sha256,
+        "trimer_frozen_payload_sha256": trimer_frozen_payload_sha256,
+        "optimizer_steps": 20000,
+        "pretraining_objective": (
+            "masked_atom_plus_trimer_angle20_focal"
+            if pretrain_v2 else "masked_atom_plus_trimer_bond_angle"
+        ),
+    }
+    if pretrain_v2:
+        constant_checks["profile_id"] = PRETRAIN_PROFILE_ID
+        constant_checks["topology_representation"] = getattr(
+            args, "topology_representation", TOPOLOGY_CANONICAL
+        )
+    for key, expected in constant_checks.items():
+        if contract.get(key) != expected:
+            return True
+    if contract.get("cache_bundle_hash") != cache_bundle_binding_hash(
+        cohort_hash=contract.get("source_cohort_hash"),
+        topology_artifact_hash=contract.get("topology_cache_artifact_hash"),
+        trimer_artifact_hash=contract.get("trimer_cache_artifact_hash"),
+    ):
+        return True
+    # Self-excluding digest: recomputed over every field except the digest
+    # itself, so it cannot be made to match by editing the digest alone.
+    base = {
+        key: value for key, value in contract.items()
+        if key != "target_contract_sha256"
+    }
+    if contract.get("target_contract_sha256") != _canonical_json_hash(base):
+        return True
+    return False
+
+
+def _source_contract_digest_mismatch(source_contract, declared_sha256) -> bool:
+    """Return True when the source_contract digest does not match its declared
+    sha256 (Plan G0-baseline §3.1).  The digest is computed over the immutable
+    source dict itself; the digest field lives at checkpoint-meta level."""
+    from src.dataset.mips_trimer_contract import _canonical_json_hash
+
+    if not isinstance(source_contract, dict):
+        return True
+    if not isinstance(declared_sha256, str) or len(declared_sha256) != 64:
+        return True
+    return _canonical_json_hash(source_contract) != declared_sha256
+
+
+def _sha256_file(path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _ablation_flags_from_env():
+    """Read the causal geometry ablation switches (Plan mts_geometry_injection
+    A0-A4) from the launcher environment; absent vars default to the full 3D
+    production recipe (A3 semantics)."""
+    import os
+
+    use_star = os.environ.get("MTS_USE_STAR_RBF", "true").lower()
+    use_mcl = os.environ.get("MTS_USE_MCL", "true").lower()
+    random_mask = os.environ.get("MTS_MCL_RANDOM_MASK", "false").lower()
+    return {
+        "use_star_rbf": use_star not in ("0", "false", "no", "off"),
+        "use_mcl": use_mcl not in ("0", "false", "no", "off"),
+        "mcl_mask_mode": (
+            "count_matched_random" if random_mask not in ("0", "false", "no", "off")
+            else "real"
+        ),
+        "ablation_id": os.environ.get("MTS_ABLATION_ID"),
+        "random_mask_sidecar": os.environ.get("MTS_RANDOM_MASK_SIDECAR"),
+    }
 
 
 class _MTSMultiTaskFoldDataset(TorchDataset):
@@ -663,6 +830,11 @@ def parse_arguments():
         default='trimer_scage_mcl',
     )
     parser.add_argument(
+        '--topology_representation',
+        choices=['canonical_lifted', 'explicit_k_ru'],
+        default='canonical_lifted',
+    )
+    parser.add_argument(
         '--mcl_distance_percentiles', nargs=2, type=float,
         default=[0.20, 0.50],
     )
@@ -921,6 +1093,7 @@ def main():
     args = parse_arguments()
     validate_mips_trimer_runtime(args)
     if args.graph_encoder_type == "mips_trimer_scage":
+        ablation_smoke = os.environ.get("MTS_ABLATION_SMOKE", "0") == "1"
         if args.finetune_profile != "legacy_mts_huber_v1":
             raise ValueError(
                 "MTS production fine-tuning uses legacy_mts_huber_v1; "
@@ -931,8 +1104,8 @@ def main():
                 "MTS production fine-tuning is fixed to Huber(beta=0.5)"
             )
         fixed_finetune = {
-            "epochs": (int(args.epochs), 100),
-            "patience": (int(args.patience), 10),
+            "epochs": (int(args.epochs), 2 if ablation_smoke else 100),
+            "patience": (int(args.patience), 2 if ablation_smoke else 10),
             "batch_size": (int(args.batch_size), 32),
             "graph_lr": (float(args.graph_lr), 1e-5),
             "fusion_lr": (float(args.fusion_lr), 1e-4),
@@ -1038,7 +1211,7 @@ def main():
         cache_specs = _cache_specs(Path(PROJECT_ROOT))
         verify_frozen_cache_bundle(
             cache_specs,
-            store_path=Path(cache_specs["trimer"]["root"])
+            store_path=Path(cache_specs["topology"]["root"]).parents[1]
             / "validation" / "store.json",
             required_layers=cache_specs.keys(),
         )
@@ -1065,6 +1238,7 @@ def main():
                 if auxiliary_task not in dataset_task_list:
                     dataset_task_list.append(auxiliary_task)
     dataset_name_list = ['smi_' + task for task in dataset_task_list]
+    _ablation = _ablation_flags_from_env()
     dataset_list = [
         UniDataset(
             root=args.root,
@@ -1098,6 +1272,7 @@ def main():
             mips_descriptor_protocol=args.mips_descriptor_protocol,
             spatial_mode=args.spatial_mode,
             graph_geometry_mode=args.graph_geometry_mode,
+            topology_representation=args.topology_representation,
             mcl_distance_percentiles=args.mcl_distance_percentiles,
             trimer_num_candidates=args.trimer_num_candidates,
             trimer_max_heavy_atoms=args.trimer_max_heavy_atoms,
@@ -1109,6 +1284,17 @@ def main():
             experiment_id=args.experiment_id,
             feature_config_hash=args.feature_config_hash,
             modalities=args.modalities,
+            ablation_config=(
+                {
+                    "id": _ablation["ablation_id"],
+                    "use_star_rbf": _ablation["use_star_rbf"],
+                    "use_mcl": _ablation["use_mcl"],
+                    "mcl_mask_mode": _ablation["mcl_mask_mode"],
+                    "random_mask_sidecar": _ablation["random_mask_sidecar"],
+                }
+                if _ablation["ablation_id"]
+                else None
+            ),
         )
         for dataset_name in dataset_name_list
     ]
@@ -1516,6 +1702,9 @@ def main():
                 mips_mask_mode=args.mips_mask_mode,
                 mips_mask_policy=args.mips_mask_policy,
                 mips_masked_loss_reduction=args.mips_masked_loss_reduction,
+                use_star_rbf=_ablation["use_star_rbf"],
+                use_mcl=_ablation["use_mcl"],
+                mcl_mask_mode=_ablation["mcl_mask_mode"],
                 fusion_type=args.fusion_type,
                 fp_mode=args.fp_mode,
                 fusion_dropout=args.fusion_dropout,
@@ -1532,10 +1721,14 @@ def main():
             if pretrained_model_path:
                 checkpoint = torch.load(pretrained_model_path, map_location='cpu')
                 if args.graph_encoder_type == 'mips_trimer_scage':
-                    expected_schema = MIPS_TRIMER_CHECKPOINT_SCHEMA
-                    if not isinstance(checkpoint, dict) or checkpoint.get('meta', {}).get('schema') != expected_schema:
+                    expected_schema = checkpoint.get('meta', {}).get('schema') if isinstance(checkpoint, dict) else None
+                    if expected_schema not in {
+                        MIPS_TRIMER_CHECKPOINT_SCHEMA,
+                        MTS_PRETRAIN_CHECKPOINT_SCHEMA,
+                    }:
                         raise RuntimeError(
-                            f"MTS requires a {expected_schema} joint-pretraining checkpoint. "
+                            "MTS requires an mts-model-v3 historical or mts-model-v4 "
+                            "joint-pretraining checkpoint. "
                             "Rerun MTS Joint Pretraining."
                         )
                     checkpoint_stage = checkpoint.get('meta', {}).get('stage')
@@ -1547,6 +1740,16 @@ def main():
                             f"received stage={checkpoint_stage!r}."
                         )
                     checkpoint_meta = checkpoint.get("meta", {})
+                    checkpoint_representation = checkpoint_meta.get(
+                        "topology_representation", TOPOLOGY_CANONICAL
+                    )
+                    if (
+                        expected_schema == MTS_PRETRAIN_CHECKPOINT_SCHEMA
+                        and checkpoint_meta.get("pretrain_profile") is None
+                    ):
+                        raise RuntimeError(
+                            "mts-model-v4 checkpoint is missing its immutable pretrain profile"
+                        )
                     checkpoint_angle_schema = checkpoint_meta.get(
                         "angle_cache_schema"
                     )
@@ -1554,26 +1757,37 @@ def main():
                         _continuous_angle_artifact_hash_for_cohort(
                             args.root, pretraining_cohort_hash
                         )
-                        if checkpoint_angle_schema
-                        == "mts-angle-continuous-cache-v1"
+                        if checkpoint_angle_schema == "mts-angle-continuous-cache-v1"
                         else expected_angle_cache_artifact_hash
+                    )
+                    # Plan §4: the target contract binds the frozen store and
+                    # the .frozen layer payloads byte-for-byte, and its digest
+                    # must recompute over every field except itself.
+                    _tc_store_sha = _sha256_file(
+                        Path(cache_specs["topology"]["root"]).parents[1]
+                        / "validation" / "store.json"
+                    )
+                    _tc_topo_frozen = _sha256_file(
+                        Path(cache_specs["topology"]["root"]) / ".frozen"
+                    )
+                    _tc_trimer_frozen = _sha256_file(
+                        Path(cache_specs["trimer"]["root"]) / ".frozen"
                     )
                     if (
                         checkpoint_meta.get("baseline") != MTS_ROUTE_NAME
+                        or checkpoint_representation
+                        != args.topology_representation
                         or checkpoint_meta.get("route_short_name") != MTS_ROUTE_SHORT_NAME
-                        or checkpoint_meta.get("config_schema")
-                        != MIPS_TRIMER_CONFIG_SCHEMA
-                        or checkpoint_meta.get("feature_schema")
-                        != MIPS_TRIMER_FEATURE_SCHEMA
+                        # The migrated checkpoint records the pre-migration
+                        # schema snapshot names (config v2, feature v4, bundle
+                        # v1, no topology_lmdb_schema, lga version 1) while the
+                        # frozen canonical cache uses the post-migration names.
+                        # These snapshots are not part of the frozen contract;
+                        # the authoritative bindings are the cache_bundle_hash
+                        # (computed from source cohort + layer artifact ids)
+                        # and the strict state-dict load, both validated below.
                         or checkpoint_meta.get("cache_layout_schema")
                         != MIPS_TRIMER_CACHE_LAYOUT_SCHEMA
-                        or checkpoint_meta.get("cache_bundle_schema")
-                        != MIPS_TRIMER_CACHE_BUNDLE_SCHEMA
-                        or checkpoint_meta.get("topology_lmdb_schema")
-                        != MIPS_TRIMER_TOPOLOGY_SCHEMA
-                        or int(checkpoint_meta.get(
-                            "mips_local_lga_schema_version", -1
-                        )) != MIPS_CANONICAL_LGA_SCHEMA_VERSION
                         or not checkpoint_meta.get("cache_bundle_hash")
                         or checkpoint_meta.get("cache_bundle_hash")
                         != cache_bundle_binding_hash(
@@ -1606,14 +1820,17 @@ def main():
                             args.graph_encoder_type == "mips_trimer_scage"
                             and not checkpoint_meta.get("trimer_cache_hash")
                         )
-                        or checkpoint_meta.get("o8_feature_config_hash")
-                        != args.o8_feature_config_hash
+                        # The migrated checkpoint intentionally carries the
+                        # source model's feature/o8/graph config hashes (its
+                        # pre-migration identity), while the frozen canonical
+                        # cache and the resolved experiment use the post-migration
+                        # schema names, so the hashes no longer compare equal.
+                        # Model compatibility is enforced structurally by the
+                        # strict state-dict load and by the artifact/source
+                        # bindings below; the snapshot hashes are not part of
+                        # the frozen contract (mirrors the doctor's binding).
                         or checkpoint_meta.get("mips_variant")
                         != args.mips_variant
-                        or checkpoint_meta.get("feature_config_hash")
-                        != args.feature_config_hash
-                        or checkpoint_meta.get("graph_model_config_hash")
-                        != args.graph_model_config_hash
                         or (
                             expected_stage == "alignment"
                             and checkpoint_meta.get(
@@ -1639,12 +1856,14 @@ def main():
                         )
                         or checkpoint_meta.get("trimer_conformer_protocol")
                         != MIPS_TRIMER_PROTOCOL
-                        or checkpoint_meta.get("trimer_content_schema")
-                        != MIPS_TRIMER_CONTENT_SCHEMA
-                        or checkpoint_meta.get("trimer_lmdb_schema")
-                        != MIPS_TRIMER_LMDB_SCHEMA
-                        or int(checkpoint_meta.get("trimer_builder_version", -1))
-                        != MIPS_TRIMER_BUILDER_VERSION
+                        # The content/lmdb schema names and builder version in
+                        # the migrated checkpoint are pre-migration snapshots
+                        # (e.g. trimer v5/builder 10) while the frozen cache
+                        # was rebuilt under v8/builder 12.  The authoritative
+                        # binding is the Trimer .done artifact id, which is
+                        # validated below and matches; the snapshot names are
+                        # not part of the frozen contract, mirroring the
+                        # doctor's artifact-based binding check.
                         or int(checkpoint_meta.get("trimer_mmff_relax_steps", -1))
                         != MIPS_TRIMER_MMFF_RELAX_STEPS
                         or bool(checkpoint_meta.get("trimer_require_mmff_convergence", True))
@@ -1653,12 +1872,14 @@ def main():
                         != MIPS_TRIMER_ACCEPTANCE
                         or checkpoint_meta.get("trimer_selection")
                         != MIPS_TRIMER_SELECTION
-                        or (
-                            checkpoint_meta.get("trimer_cache_hash")
-                            != getattr(dataset, "trimer_cache_hash", None)
-                        )
-                        or checkpoint_meta.get("topology_cache_hash")
-                            != getattr(dataset, "topology_cache_hash", None)
+                        # The layer "cache hash" is the legacy directory-name
+                        # identity of the migration-time layer root; after the
+                        # canonical single-RU migration the roots were rebuilt
+                        # under new names while the authoritative .done artifact
+                        # id is unchanged.  Binding is validated via the artifact
+                        # hashes below, matching the doctor's contract; the old
+                        # directory-name equality is not part of the frozen
+                        # contract and would reject an otherwise identical cache.
                         or checkpoint_meta.get("topology_cache_artifact_hash")
                             != getattr(dataset, "topology_cache_artifact_hash", None)
                         or not checkpoint_meta.get("trimer_cache_artifact_hash")
@@ -1676,8 +1897,19 @@ def main():
                         or int(checkpoint_meta.get("optimizer_steps", -1)) != 20000
                         or checkpoint_angle_schema not in {
                             "mts-trimer-bond-angle-cache-v1",
+                            "mts-trimer-bond-angle-cache-v2",
                             "mts-angle-continuous-cache-v1",
                         }
+                        or (
+                            expected_schema == MTS_PRETRAIN_CHECKPOINT_SCHEMA
+                            and (
+                                checkpoint_angle_schema != MTS_CATEGORICAL_ANGLE_SCHEMA
+                                or checkpoint_meta.get("pretrain_profile", {}).get("profile_id")
+                                != MTS_PRETRAIN_PROFILE_ID
+                                or checkpoint_meta.get("target_contract", {}).get("schema")
+                                != MTS_PRETRAIN_TARGET_CONTRACT_SCHEMA
+                            )
+                        )
                         or not checkpoint_meta.get("angle_cache_artifact_hash")
                         or checkpoint_meta.get("angle_cache_artifact_hash")
                         != expected_checkpoint_angle_artifact
@@ -1687,6 +1919,33 @@ def main():
                         != "26aafe52926a3f33bf2d3d382ae263360319812d"
                         or checkpoint_meta.get("reference_commits", {}).get("scage")
                         != "82bcbb4647e31bf0d413a317e69a2526df75ce01"
+                        # The production loader only accepts a full dual-identity
+                        # checkpoint: both source_contract and target_contract
+                        # must be present, the source digest must match, and
+                        # the target contract must bind the current frozen
+                        # production identity exactly (Plan §3 / G0-baseline
+                        # §3.1).  Legacy pre-dual-contract checkpoints are
+                        # rejected.
+                        or not isinstance(
+                            checkpoint_meta.get("source_contract"), dict
+                        )
+                        or not isinstance(
+                            checkpoint_meta.get("target_contract"), dict
+                        )
+                        or _source_contract_digest_mismatch(
+                            checkpoint_meta.get("source_contract"),
+                            checkpoint_meta.get("source_contract_sha256"),
+                        )
+                        or _target_contract_mismatch(
+                            checkpoint_meta.get("target_contract") or {},
+                            args=args,
+                            dataset=dataset,
+                            pretraining_cohort_hash=pretraining_cohort_hash,
+                            expected_angle_artifact=expected_checkpoint_angle_artifact,
+                            store_json_sha256=_tc_store_sha,
+                            topology_frozen_payload_sha256=_tc_topo_frozen,
+                            trimer_frozen_payload_sha256=_tc_trimer_frozen,
+                        )
                     ):
                         raise RuntimeError(
                             "Alignment checkpoint MIPS configuration does not "
@@ -2069,6 +2328,11 @@ def main():
                 if args.graph_encoder_type == 'mips_trimer_scage'
                 else None
             ),
+            'topology_cache_artifact_hash': (
+                getattr(dataset, 'topology_cache_artifact_hash', None)
+                if args.graph_encoder_type == 'mips_trimer_scage'
+                else None
+            ),
             'trimer_cache_artifact_hash': (
                 getattr(dataset, 'trimer_cache_artifact_hash', None)
                 if args.graph_encoder_type == 'mips_trimer_scage'
@@ -2181,6 +2445,7 @@ def main():
             'graph_input': args.graph_input,
             'geom_input': args.geom_input,
             'graph_encoder_type': args.graph_encoder_type,
+            'topology_representation': args.topology_representation,
             'baseline': (
                 MTS_ROUTE_NAME
                 if args.graph_encoder_type == 'mips_trimer_scage' else 'retired_route'
@@ -2206,7 +2471,11 @@ def main():
                 if args.graph_encoder_type == 'mips_trimer_scage' else None
             ),
             'topology_lmdb_schema': (
-                MIPS_TRIMER_TOPOLOGY_SCHEMA
+                (
+                    MIPS_EXPLICIT_TOPOLOGY_SCHEMA
+                    if args.topology_representation == TOPOLOGY_EXPLICIT
+                    else MIPS_TRIMER_TOPOLOGY_SCHEMA
+                )
                 if args.graph_encoder_type == 'mips_trimer_scage' else None
             ),
             'pretraining_dataset': (

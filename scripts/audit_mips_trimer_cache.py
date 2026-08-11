@@ -38,6 +38,7 @@ from src.dataset.lmdb_cache import (  # noqa: E402
     build_or_load_cohort,
 )
 from src.dataset.mips_cache_validation import validate_mcl_record  # noqa: E402
+from src.dataset.mips_trimer_contract import MIGRATION_SCHEMA  # noqa: E402
 
 
 def _specs(project_root: Path):
@@ -124,7 +125,8 @@ def main():
         topology_done = Path(specs["topology"]["root"]) / ".done"
         trimer_done = Path(specs["trimer"]["root"]) / ".done"
         report = {
-            "schema": "mips-trimer-scage-cache-audit-v1",
+            "schema": "mts-canonical-cache-audit-v2",
+            "migration_schema": MIGRATION_SCHEMA,
             "cache_layout_schema": stores["trimer"].meta.get(
                 "cache_layout_schema"
             ),
@@ -132,12 +134,22 @@ def main():
             "trimer_feature_config_hash": stores["trimer"].meta.get(
                 "feature_config_hash"
             ),
-            "topology_artifact_hash": topology_done.read_text(
-                encoding="utf-8"
-            ).strip(),
-            "trimer_artifact_hash": trimer_done.read_text(
-                encoding="utf-8"
-            ).strip(),
+            "done_artifact_id": {
+                "topology": topology_done.read_text(encoding="utf-8").strip(),
+                "trimer": trimer_done.read_text(encoding="utf-8").strip(),
+            },
+            "done_file_sha256": {
+                "topology": hashlib.sha256(topology_done.read_bytes()).hexdigest(),
+                "trimer": hashlib.sha256(trimer_done.read_bytes()).hexdigest(),
+            },
+            "metadata_file_sha256": {
+                "topology": hashlib.sha256((Path(specs["topology"]["root"]) / "metadata.json").read_bytes()).hexdigest(),
+                "trimer": hashlib.sha256((Path(specs["trimer"]["root"]) / "metadata.json").read_bytes()).hexdigest(),
+            },
+            "lmdb_manifest_sha256": {
+                "topology": hashlib.sha256((Path(specs["topology"]["root"]) / "manifest.json").read_bytes()).hexdigest(),
+                "trimer": hashlib.sha256((Path(specs["trimer"]["root"]) / "manifest.json").read_bytes()).hexdigest(),
+            },
             "cohort_hash": manifest["cohort_hash"],
             "ordered_sample_key_hash": manifest["ordered_sample_key_hash"],
             "record_count": len(cohort["keys"]),

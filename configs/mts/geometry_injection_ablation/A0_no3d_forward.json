@@ -1,6 +1,6 @@
 {
   "schema_version": "mts-experiment-v3",
-  "experiment_id": "G0_current_mcl",
+  "experiment_id": "A0_no3d_forward",
   "parent_config": "configs/mts/default.json",
   "geometry_mode": "current_mcl",
   "modalities": ["graph"],
@@ -9,5 +9,12 @@
   "evaluation_protocol": "historical_shared5",
   "regression_loss": "huber",
   "huber_beta": 0.5,
-  "finetune_profile": "legacy_mts_huber_v1"
+  "finetune_profile": "legacy_mts_huber_v1",
+  "ablation": {
+    "id": "A0_no3d_forward",
+    "shared_checkpoint": "pretrained_models/mts/mts_joint_pretraining_pi1m_v2_seed42_canonical_angle20_v1.pth",
+    "star": false,
+    "mcl": false,
+    "mcl_random_mask": false
+  }
 }

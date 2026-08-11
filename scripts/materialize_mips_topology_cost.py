@@ -25,6 +25,45 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.dataset.lmdb_cache import LmdbLayerStore
+from src.dataset.mips_trimer_contract import (
+    BUILDER_VERSION,
+    CACHE_TOPOLOGY_COST_SCHEMA,
+)
+
+
+def _build_cost_metadata(
+    manifest, keys, topology_root, output, size, chunk_size,
+) -> dict:
+    """Build the active topology-cost contract metadata.
+
+    Every identity comes from the cohort manifest, the topology manifest and
+    the frozen .done artifact; no second set of constants is hand-written.
+    """
+    artifact_hash = Path(topology_root, ".done").read_text(encoding="utf-8").strip()
+    topology_manifest = json.loads(
+        Path(topology_root, "manifest.json").read_text(encoding="utf-8")
+    )
+    return {
+        "schema": CACHE_TOPOLOGY_COST_SCHEMA,
+        "cohort_hash": manifest["cohort_hash"],
+        "ordered_key_hash": manifest["ordered_sample_key_hash"],
+        "file_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "topology_content_hash": topology_manifest.get("metadata_hash"),
+        "topology_done_artifact_hash": artifact_hash,
+        "builder_version": BUILDER_VERSION,
+        "columns": ["node_count", "lga_edge_count"],
+        "shape": [int(size), 2],
+        "dtype": "uint32",
+        "chunk_size": int(chunk_size),
+    }
+
+
+def _write_cost_metadata(metadata_path, metadata) -> None:
+    temporary = Path(metadata_path).with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(metadata, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, metadata_path)
 
 
 def _read_cost_chunk(cohort_root, topology_root, start, end, part_path):
@@ -92,18 +131,43 @@ def main():
     if output.is_file() and metadata_path.is_file():
         try:
             observed = json.loads(metadata_path.read_text())
-            if (
-                observed.get("schema") == "mips-trimer-scage-topology-cost-v1"
-                and observed.get("cohort_hash") == manifest["cohort_hash"]
-                and observed.get("ordered_sample_key_hash")
-                == manifest["ordered_sample_key_hash"]
-                and observed.get("topology_artifact_hash") == artifact_hash
+            file_digest = hashlib.sha256(output.read_bytes()).hexdigest()
+            # Accept the active field name first, then the legacy one so a
+            # v1-schema file written before the rename still reuses without
+            # rescanning; writes always use the active name (Plan §6).
+            observed_key_hash = observed.get(
+                "ordered_key_hash",
+                observed.get("ordered_sample_key_hash"),
+            )
+            bytes_consistent = (
+                observed.get("cohort_hash") == manifest["cohort_hash"]
+                and observed_key_hash == manifest["ordered_sample_key_hash"]
                 and observed.get("shape") == [len(keys), 2]
                 and observed.get("dtype") == "uint32"
-                and observed.get("sha256")
-                == hashlib.sha256(output.read_bytes()).hexdigest()
+                and (
+                    observed.get("sha256") == file_digest
+                    or observed.get("file_sha256") == file_digest
+                )
+                and (
+                    observed.get("topology_artifact_hash") == artifact_hash
+                    or observed.get("topology_done_artifact_hash") == artifact_hash
+                )
+            )
+            if (
+                observed.get("schema") == CACHE_TOPOLOGY_COST_SCHEMA
+                and bytes_consistent
             ):
                 print(json.dumps(observed, sort_keys=True))
+                return
+            if bytes_consistent:
+                # Legacy or partial metadata bound to the same bytes/artifact:
+                # upgrade to the active contract without rescanning (Plan §6).
+                upgraded = _build_cost_metadata(
+                    manifest, keys, args.topology_root, output,
+                    len(keys), args.chunk_size,
+                )
+                _write_cost_metadata(metadata_path, upgraded)
+                print(json.dumps(upgraded, sort_keys=True))
                 return
         except (OSError, ValueError, json.JSONDecodeError):
             pass
@@ -177,22 +241,10 @@ def main():
             part_file.unlink()
         except OSError:
             pass
-    digest = hashlib.sha256(output.read_bytes()).hexdigest()
-    metadata = {
-        "schema": "mips-trimer-scage-topology-cost-v1",
-        "cohort_hash": manifest["cohort_hash"],
-        "ordered_sample_key_hash": manifest["ordered_sample_key_hash"],
-        "topology_artifact_hash": artifact_hash,
-        "shape": [size, 2],
-        "dtype": "uint32",
-        "sha256": digest,
-        "chunk_size": int(args.chunk_size),
-    }
-    metadata_temporary = metadata_path.with_suffix(".tmp")
-    metadata_temporary.write_text(
-        json.dumps(metadata, sort_keys=True, indent=2) + "\n"
+    metadata = _build_cost_metadata(
+        manifest, keys, args.topology_root, output, size, args.chunk_size,
     )
-    os.replace(metadata_temporary, metadata_path)
+    _write_cost_metadata(metadata_path, metadata)
     print(json.dumps(metadata, sort_keys=True))
 
 

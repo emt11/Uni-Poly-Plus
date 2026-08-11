@@ -9,6 +9,15 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .mips_trimer_contract import (
+    CACHE_BUNDLE_SCHEMA,
+    CACHE_MCL_THRESHOLD_SCHEMA,
+    FEATURE_SCHEMA,
+    MIGRATION_SCHEMA,
+    TARGET_CONTRACT_SCHEMA,
+    BUILDER_VERSION,
+)
+
 
 def _bool_value(value, default=False):
     if value is None:
@@ -231,7 +240,7 @@ def _verify_md200_artifacts(md_spec, downstream, cache_root):
             f"MD200 LMDB coverage is incomplete: {count} < {expected_count}"
         )
     cohort_hash = downstream.get("cohort_hash")
-    cohort_dir = Path(cache_root) / "cohorts" / "smi_all" / str(cohort_hash)
+    cohort_dir = Path(cache_root) / "cohorts" / "downstream_union" / str(cohort_hash)
     if not cohort_dir.is_dir():
         raise RuntimeError("downstream cohort directory is missing")
     candidates = sorted(cohort_dir.glob("md200_*/md200_metadata.json"))
@@ -284,21 +293,33 @@ def verify_frozen_cache_bundle(specs, *, store_path, required_layers=None,
     if not store_path.is_file():
         raise RuntimeError(f"cache store validation is missing: {store_path}")
     store = json.loads(store_path.read_text(encoding="utf-8"))
-    if store.get("schema") != "mips-trimer-scage-store-validation-v2":
+    if store.get("schema") != CACHE_BUNDLE_SCHEMA:
         raise RuntimeError("unsupported or stale cache store schema")
+    if (
+        store.get("migration_schema") != MIGRATION_SCHEMA
+        or store.get("contract_schema") != TARGET_CONTRACT_SCHEMA
+        or int(store.get("builder_version", -1)) != BUILDER_VERSION
+        or not store.get("transaction_id")
+    ):
+        raise RuntimeError("cache bundle contract binding is missing or stale")
     if (
         pretraining_cohort_hash is not None
         and store.get("pretraining_cohort_hash") != pretraining_cohort_hash
     ):
         raise RuntimeError("cache store pretraining cohort hash mismatch")
-    artifact_hashes = store.get("artifact_hashes", {})
+    artifact_hashes = store.get("done_artifact_id", {})
+    if not artifact_hashes:
+        raise RuntimeError("cache bundle is missing done_artifact_id bindings")
     full_validation = store.get("full_validation", {})
-    if full_validation.get("record_count") != 995799:
-        raise RuntimeError("cache store does not contain full PI1M_v2 validation")
+    if full_validation.get("record_count") != 999224:
+        raise RuntimeError("cache store does not contain exact-union validation")
     for key in ("mapping_failure", "two_d_mcl"):
         if int(full_validation.get(key, -1)) != 0:
             raise RuntimeError(f"cache full validation failed: {key}")
-    full_rate = full_validation.get("geometry_rate_given_graph")
+    full_rate = full_validation.get(
+        "geometry_rate_given_graph",
+        full_validation.get("mcl_rate_given_graph"),
+    )
     if full_rate is None or float(full_rate) < 0.90:
         raise RuntimeError("cache full validation is below the 90% MCL gate")
     audit = store.get("audit", {})
@@ -318,25 +339,42 @@ def verify_frozen_cache_bundle(specs, *, store_path, required_layers=None,
         manifest = root / "manifest.json"
         if not done.is_file() or not marker.is_file() or not manifest.is_file():
             raise RuntimeError(f"cache layer is not frozen and complete: {name}")
-        done_hash = done.read_text(encoding="utf-8").strip()
-        if len(done_hash) != 64 or artifact_hashes.get(name) != done_hash:
+        done_artifact_id = done.read_text(encoding="utf-8").strip()
+        done_file_sha256 = _sha256_file(done)
+        if len(done_artifact_id) != 64 or artifact_hashes.get(name) != done_artifact_id:
             raise RuntimeError(f"cache layer artifact hash mismatch: {name}")
         payload = json.loads(marker.read_text(encoding="utf-8"))
         metadata_hash = _json_digest(specs[name]["meta"])
         manifest_hash = _json_digest(
             json.loads(manifest.read_text(encoding="utf-8"))
         )
+        if payload.get("done_artifact_id") != done_artifact_id:
+            raise RuntimeError(f"frozen marker done artifact mismatch: {name}")
+        if payload.get("done_file_sha256") != done_file_sha256:
+            raise RuntimeError(f"frozen marker done file mismatch: {name}")
         if (
             payload.get("layer") != name
-            or payload.get("schema") != "mips-trimer-scage-cache-freeze-v1"
+            or payload.get("schema") != "mts-canonical-cache-freeze-v2"
             or payload.get("cache_layout_schema") != specs[name]["meta"].get(
                 "cache_layout_schema"
             )
-            or payload.get("done_hash") != done_hash
             or payload.get("metadata_hash") != metadata_hash
             or payload.get("manifest_hash") != manifest_hash
+            or payload.get("contract_schema") != TARGET_CONTRACT_SCHEMA
+            or int(payload.get("builder_version", -1)) != BUILDER_VERSION
+            or not payload.get("transaction_id")
         ):
             raise RuntimeError(f"invalid frozen marker payload: {name}")
+        if payload.get("transaction_id") != store.get("transaction_id"):
+            raise RuntimeError(f"frozen marker transaction mismatch: {name}")
+        meta = specs[name].get("meta", {})
+        if name in {"topology", "trimer"} and (
+            meta.get("migration_schema") != MIGRATION_SCHEMA
+            or meta.get("contract_schema") != TARGET_CONTRACT_SCHEMA
+            or int(meta.get("builder_version", -1)) != BUILDER_VERSION
+            or meta.get("feature_schema") != FEATURE_SCHEMA
+        ):
+            raise RuntimeError(f"cache layer metadata contract mismatch: {name}")
         manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
         if int(payload.get("record_count", -1)) != int(
             manifest_value.get("count", -2)
@@ -352,13 +390,21 @@ def verify_frozen_cache_bundle(specs, *, store_path, required_layers=None,
     # and ordered-key hash; a stale array is never silently reused.
     trimer_root = Path(specs["trimer"]["root"])
     cohort_root = trimer_root.parents[1] / "cohorts"
+    # The exact-union report is the production key-set gate, while the
+    # pretraining threshold mmap is row-ordered to the PI1M_v2 subset.  The
+    # finalizer embeds that subset diagnostic under ``pretraining_subset`` so
+    # threshold verification does not accidentally demand a 999,224-row PI1M
+    # array.
+    pretraining_threshold_report = full_validation.get(
+        "pretraining_subset", full_validation
+    )
     for report_name, report in (
-        ("pretraining", full_validation),
+        ("pretraining", pretraining_threshold_report),
         ("downstream", downstream),
     ):
         cohort_name = report.get(
             "cohort_name",
-            "PI1M_v2" if report_name == "pretraining" else "smi_all",
+            "PI1M_v2" if report_name == "pretraining" else "downstream_union",
         )
         cohort_hash = report.get("cohort_hash")
         threshold_dir = cohort_root / str(cohort_name) / str(cohort_hash)
@@ -373,13 +419,18 @@ def verify_frozen_cache_bundle(specs, *, store_path, required_layers=None,
         )
         expected_count = int(report.get("record_count", -1))
         if (
-            threshold_meta.get("schema")
-            != "mips-trimer-scage-mcl-thresholds-array-v1"
+            threshold_meta.get("schema") != CACHE_MCL_THRESHOLD_SCHEMA
             or threshold_meta.get("cohort_hash") != cohort_hash
             or threshold_meta.get("ordered_sample_key_hash")
             != report.get("ordered_sample_key_hash")
             or threshold_meta.get("trimer_artifact_hash")
             != artifact_hashes.get("trimer")
+            or threshold_meta.get("trimer_done_artifact_id")
+            != artifact_hashes.get("trimer")
+            or threshold_meta.get("trimer_done_file_sha256")
+            != _sha256_file(trimer_root / ".done")
+            or threshold_meta.get("trimer_contract_hash")
+            != specs["trimer"]["meta"].get("feature_config_hash")
             or threshold_meta.get("shape") != [expected_count, 2]
         ):
             raise RuntimeError(
@@ -400,7 +451,7 @@ def verify_frozen_cache_bundle(specs, *, store_path, required_layers=None,
             downstream.get("record_count", 0)
         ):
             raise RuntimeError("MD200 cache does not cover downstream union")
-        cohort_dir = Path(md_spec["root"]).parents[1] / "cohorts" / "smi_all"
+        cohort_dir = Path(md_spec["root"]).parents[1] / "cohorts" / "downstream_union"
         pointer = cohort_dir / "current.json"
         if not pointer.is_file():
             raise RuntimeError("downstream cohort pointer is missing")

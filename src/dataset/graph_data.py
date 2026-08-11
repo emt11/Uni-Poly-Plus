@@ -597,6 +597,15 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
     # attachment boundaries before inter-unit bonds are added. The completed
     # finite chain is sanitized once below.
     base_mol.UpdatePropertyCache(strict=False)
+    missing_attachment_neighbors = [
+        int(index) for index in neighbors if int(index) not in old_to_base
+    ]
+    if missing_attachment_neighbors:
+        raise ValueError(
+            "periodic multimer attachment neighbor is a dummy atom or "
+            "otherwise absent from the base RU: "
+            + ",".join(str(index) for index in missing_attachment_neighbors)
+        )
     left_base = int(old_to_base[int(neighbors[0])])
     right_base = int(old_to_base[int(neighbors[1])])
     shared_boundary = left_base == right_base
@@ -1463,22 +1472,6 @@ def build_canonical_periodic_topology(smiles_or_mol, max_hops=2):
 
     from .canonical_periodic import build_canonical_periodic_topology as _build
     return _build(smiles_or_mol, max_hops=max_hops)
-
-
-def migrate_explicit_topology_to_canonical(old_topology, ru_base=None, **kwargs):
-    """Copy verified canonical feature rows and rebuild lifted relations."""
-
-    from .canonical_periodic import migrate_explicit_topology_to_canonical as _migrate
-    return _migrate(old_topology, ru_base, **kwargs)
-
-
-def build_corrected_explicit_k_ru_reference(canonical_topology, repeat_factor):
-    """Build the corrected translation-symmetric explicit test reference."""
-
-    from .canonical_periodic import (
-        build_corrected_explicit_k_ru_reference as _build_reference,
-    )
-    return _build_reference(canonical_topology, repeat_factor)
 
 
 def build_lifted_periodic_relations(smiles_or_mol, max_hops=2):

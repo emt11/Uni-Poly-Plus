@@ -124,9 +124,14 @@ class _TrimerMCLLayer(nn.Module):
 
     def forward_batched(
         self, central_state, memory, distances, thresholds,
-        key_mask=None, query_mask=None,
+        key_mask=None, query_mask=None, precomputed_visible=None,
     ):
-        """Padded batched MCL with exact masks for ragged Trimer records."""
+        """Padded batched MCL with exact masks for ragged Trimer records.
+
+        ``precomputed_visible`` (A4 random-mask mode) is an optional fixed
+        [B, Q, K] bool set that replaces the distance-threshold visibility so
+        the only difference vs A3 is the key identity, never the sparsity.
+        """
         query = self.query(central_state).view(
             central_state.size(0), central_state.size(1),
             self.num_heads, self.head_dim
@@ -150,10 +155,18 @@ class _TrimerMCLLayer(nn.Module):
         distance_bias = self._project_distance(distances)
         if self.debug_attention:
             self.last_attention = []
-        for scale_index in range(thresholds.size(1)):
-            visible = (
-                distances <= thresholds[:, scale_index].view(-1, 1, 1)
-            ) & key_mask.unsqueeze(1) & query_mask.unsqueeze(-1)
+        num_scales = (
+            2 if precomputed_visible is not None
+            else thresholds.size(1)
+        )
+        for scale_index in range(num_scales):
+            if precomputed_visible is not None:
+                visible = precomputed_visible[:, :, :, scale_index].bool()
+                visible = visible & key_mask.unsqueeze(1) & query_mask.unsqueeze(-1)
+            else:
+                visible = (
+                    distances <= thresholds[:, scale_index].view(-1, 1, 1)
+                ) & key_mask.unsqueeze(1) & query_mask.unsqueeze(-1)
             # Padded query rows need one finite logit to keep softmax finite;
             # their output is zeroed immediately afterwards.
             if visible.size(-1):
@@ -199,12 +212,18 @@ class TrimerSCAGEMCLResidual(nn.Module):
         dropout: float = 0.10,
         use_distance_bias: bool = False,
         coordinate_shuffle: bool = False,
+        mask_mode: str = "real",
     ):
         super().__init__()
         if tuple(float(value) for value in percentiles) != (0.20, 0.50):
             raise ValueError("MIPS-Trimer-SCAGE requires percentiles 0.20/0.50")
+        if mask_mode not in ("real", "count_matched_random"):
+            raise ValueError(
+                f"unsupported MCL mask mode: {mask_mode!r}"
+            )
         self.dim = int(dim)
         self.percentiles = (0.20, 0.50)
+        self.mask_mode = str(mask_mode)
         self.input_norm = nn.LayerNorm(self.dim)
         self.layers = nn.ModuleList(
             _TrimerMCLLayer(
@@ -234,6 +253,18 @@ class TrimerSCAGEMCLResidual(nn.Module):
         )
         thresholds_all = data.trimer_mcl_thresholds.float()
         valid = valid.clone()
+        if self.mask_mode == "count_matched_random":
+            random_valid = getattr(data, "mcl_random_mask_valid", None)
+            if random_valid is None:
+                raise ValueError(
+                    "count_matched_random MCL requires mcl_random_mask_valid"
+                )
+            random_valid = torch.as_tensor(
+                random_valid, dtype=torch.bool, device=valid.device
+            ).flatten()
+            if random_valid.numel() != valid.numel():
+                raise ValueError("random-mask validity length mismatch")
+            valid &= random_valid
 
         for key_capacity in (24, 48, 96, 192, 384):
             graph_ids = torch.nonzero(
@@ -279,6 +310,50 @@ class TrimerSCAGEMCLResidual(nn.Module):
             valid[invalid_graphs] = False
             query_mask = query_mask & threshold_valid.unsqueeze(1)
 
+            precomputed_visible = None
+            if self.mask_mode == "count_matched_random":
+                # A4: replace distance-threshold visibility with the fixed
+                # count-matched random sets from the sidecar (Plan §4).  Same
+                # per-query sparsity as A3, different key identity.
+                if not hasattr(data, "mcl_random_visible20") or not hasattr(
+                    data, "mcl_random_visible50"
+                ):
+                    raise ValueError("random-mask visible tables are missing")
+                trimer_start = data.mcl_trimer_start[graph_ids]
+                query_start = data.mcl_query_start[graph_ids]
+                # The sidecar rows are ordered by the central-query column
+                # (0..Q-1), whereas ``safe_query_local`` is the Trimer atom
+                # position used to replace the central token in ``memory``.
+                # Mixing those two coordinate systems sends padded MCL
+                # batches to arbitrary/out-of-range sidecar rows.  Index the
+                # sidecar with the query column and clamp only padded columns
+                # to a harmless real row; ``query_mask`` below prevents them
+                # from contributing to the update.
+                query_columns = torch.arange(
+                    query_capacity, device=query_start.device
+                ).view(1, -1).expand(graph_ids.numel(), -1)
+                q_global = query_start.unsqueeze(1) + query_columns
+                sidecar_rows = int(data.mcl_random_visible20.size(0))
+                if sidecar_rows <= 0:
+                    raise ValueError("A4 random sidecar has no query rows")
+                q_global = q_global.clamp(0, sidecar_rows - 1)
+                vis20 = data.mcl_random_visible20[q_global]
+                vis50 = data.mcl_random_visible50[q_global]
+                keys_local = keys.unsqueeze(1) - trimer_start[:, None, None]
+                valid_key = (keys_local >= 0) & (keys_local < 384)
+                kl = keys_local.clamp(0, 383).expand(
+                    -1, q_global.size(1), -1
+                )
+                v20 = (
+                    vis20.gather(-1, kl)
+                    & valid_key & key_mask.unsqueeze(1)
+                )
+                v50 = (
+                    vis50.gather(-1, kl)
+                    & valid_key & key_mask.unsqueeze(1)
+                )
+                precomputed_visible = torch.stack([v20, v50], dim=-1)
+
             for layer in self.layers:
                 memory_current = memory.clone()
                 batch_index, query_index = torch.nonzero(
@@ -294,6 +369,7 @@ class TrimerSCAGEMCLResidual(nn.Module):
                     thresholds,
                     key_mask=key_mask,
                     query_mask=query_mask,
+                    precomputed_visible=precomputed_visible,
                 )
 
             final_memory = memory.clone()
@@ -453,6 +529,10 @@ class TrimerSCAGEMCLResidual(nn.Module):
             return self._forward_padded(
                 topology_nodes, data, canonical, tokens,
                 final_trimer_states, delta_canonical, valid,
+            )
+        if self.mask_mode == "count_matched_random":
+            raise ValueError(
+                "count_matched_random MCL requires the padded production collator"
             )
 
         # Validate records once, then group equal (Trimer atom count, central

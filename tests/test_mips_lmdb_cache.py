@@ -108,6 +108,26 @@ def test_lmdb_writer_lock_rejects_second_writer(tmp_path):
     recovered.close()
 
 
+def test_lmdb_writer_can_replace_one_obsolete_record(tmp_path):
+    root = tmp_path / "replace-layer"
+    meta = {
+        "cache_layout_schema": CACHE_LAYOUT_SCHEMA,
+        "schema": "unit-layer-v1",
+        "feature_config_hash": "replace",
+    }
+    key = sample_key_from_smiles("*CC*")
+    writer = LmdbLayerWriter(root, meta, commit_size=1)
+    writer.add(key, Data(x=torch.ones(1, 1)))
+    writer.finalize()
+
+    writer = LmdbLayerWriter(root, meta, commit_size=1)
+    assert writer.replace(key, Data(x=torch.zeros(1, 1)))
+    writer.finalize()
+    store = LmdbLayerStore(root, expected_meta=meta)
+    assert torch.equal(store[key].x, torch.zeros(1, 1))
+    store.close()
+
+
 def test_graph_only_bypasses_tokenizer_and_token_fields(tmp_path):
     root = _tiny_root(tmp_path)
     dataset = UniDataset(**_dataset_kwargs(
@@ -184,7 +204,9 @@ def test_shared_attachment_boundary_builds_valid_repeated_graph(tmp_path):
     assert bool(sample.ru_shared_boundary)
     star_edges = sample.lga_edge_index[:, sample.lga_star_edge_mask]
     assert star_edges.size(1) > 0
-    assert torch.all(star_edges[0] != star_edges[1])
+    # Canonical lifted relations intentionally retain the shared-boundary
+    # self rows at relative shifts -1/+1; they are not finite-copy Star edges.
+    assert torch.any(star_edges[0] == star_edges[1])
     topology._lazy_feature_store.close()
 
     trimer = UniDataset(**_dataset_kwargs(

@@ -2,6 +2,7 @@
   "schema_version": "mts-config-v3",
   "route": "MIPS-Trimer-SCAGE",
   "route_short_name": "MTS",
+  "topology_representation": "canonical_lifted",
   "baseline": "MIPS-Trimer-SCAGE",
   "architecture": "canonical_periodic_O8_star_rbf_trimer_mcl_md200",
   "modalities": ["graph"],
@@ -32,6 +33,7 @@
   },
   "trimer": {
     "protocol": "etkdgv3x4-mmff94-relax200-lowest-finite-v1",
+    "builder_version": 12,
     "num_candidates": 4,
     "max_heavy_atoms": 384,
     "large_molecule_policy": "rdkit_2d_diagnostic_mcl_star3d_disabled",
@@ -95,12 +97,13 @@
     "id": "mts_property_finetune",
     "name": "MTS Property Fine-tuning"
   },
-  "feature_schema": "mts-canonical-periodic-feature-v1",
-  "trimer_cache_schema": "mips-trimer-scage-trimer-v5",
-  "trimer_lmdb_schema": "mips-trimer-scage-trimer-lmdb-v3",
+  "feature_schema": "mts-canonical-periodic-feature-v3",
+  "trimer_cache_schema": "mips-trimer-scage-trimer-v8",
+  "trimer_lmdb_schema": "mips-trimer-scage-trimer-lmdb-v6",
   "cache_layout_schema": "mips-trimer-scage-lmdb-layout-v2",
-  "topology_lmdb_schema": "mts-canonical-periodic-topology-lmdb-v1",
+  "topology_lmdb_schema": "mts-canonical-periodic-topology-lmdb-v3",
   "lga_schema_version": 2,
-  "cache_bundle_schema": "mips-trimer-scage-cache-bundle-v2",
+  "cache_bundle_schema": "mts-canonical-cache-bundle-v3",
+  "trimer_builder_version": 12,
   "checkpoint_schema": "mts-model-v3"
 }

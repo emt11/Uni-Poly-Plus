@@ -372,6 +372,6 @@ def test_protocol_constant_reflects_v1():
     assert TRIMER_MMFF_RELAX_MAX_ITERATIONS == 200
 
 
-def test_schema_version_is_5():
-    assert TRIMER_MCL_SCHEMA == "mips-trimer-scage-trimer-v5"
-    assert TRIMER_MCL_SCHEMA_VERSION == 5
+def test_schema_version_is_8():
+    assert TRIMER_MCL_SCHEMA == "mips-trimer-scage-trimer-v8"
+    assert TRIMER_MCL_SCHEMA_VERSION == 8

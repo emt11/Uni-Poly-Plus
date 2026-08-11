@@ -488,6 +488,21 @@ def _configure_legacy_mts_trainability(model):
     for parameter in graph_module.parameters():
         parameter.requires_grad = True
 
+    # The legacy profile intentionally enables the graph wrapper wholesale,
+    # but geometry-injection ablations are stricter: disabled branches remain
+    # in the state dict for shared-checkpoint loading while staying frozen and
+    # absent from every optimizer group.
+    mts_encoder = getattr(graph_module, "encoder", None)
+    if getattr(mts_encoder, "architecture_name", "") == "MIPS-Trimer-SCAGE":
+        if not bool(getattr(mts_encoder, "use_star_rbf", True)):
+            _set_module_trainable(
+                getattr(mts_encoder, "star_distance_bias", None), False
+            )
+        if not bool(getattr(mts_encoder, "use_mcl", True)):
+            _set_module_trainable(
+                getattr(mts_encoder, "trimer_mcl", None), False
+            )
+
     for module in (
         getattr(base, 'mlp', None),
         getattr(base, 'modality_heads', None),

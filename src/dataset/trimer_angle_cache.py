@@ -11,16 +11,46 @@ import hashlib
 import json
 import os
 import time
+import atexit
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
 import torch
 
+from .lmdb_cache import LmdbLayerStore
 from .mips_trimer_contract import CACHE_BOND_ANGLE_SCHEMA
 
 
 ANGLE_CACHE_BUILDER_VERSION = 1
 ANGLE_BIN_COUNT = 20
+
+# ProcessPool initializer state: each worker opens its read-only Trimer LMDB
+# exactly once per build (Plan.MD §5.1), so chunk tasks never reopen the store.
+_WORKER_ANGLE_TRIMER = None
+
+
+def _close_angle_worker():
+    global _WORKER_ANGLE_TRIMER
+    if _WORKER_ANGLE_TRIMER is not None:
+        _WORKER_ANGLE_TRIMER.close()
+        _WORKER_ANGLE_TRIMER = None
+
+
+def _init_angle_worker(trimer_root):
+    """Run once per worker before any chunk task (Plan.MD §5.1).
+
+    The read-only handle is kept in a module global for the lifetime of the
+    worker process and closed at worker shutdown.  ``LmdbLayerStore``'s
+    ``__getstate__`` drops the env before pickling, so passing the root string
+    through the initializer avoids the cost of reopening per chunk.
+    """
+    global _WORKER_ANGLE_TRIMER
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    torch.set_num_threads(1)
+    _WORKER_ANGLE_TRIMER = LmdbLayerStore(trimer_root, require_done=True)
+    atexit.register(_close_angle_worker)
 
 
 def _sha256_file(path: Path) -> str:
@@ -118,7 +148,10 @@ def _record_angles(data):
     )
 
 
-def validate_angle_cache(root, *, cohort_hash, ordered_key_hash, trimer_artifact_hash, record_count):
+def validate_angle_cache(
+    root, *, cohort_hash, ordered_key_hash, trimer_artifact_hash, record_count,
+    trimer_done_file_sha256=None, trimer_contract_hash=None,
+):
     root = Path(root)
     metadata_path = root / "metadata.json"
     required = [
@@ -144,6 +177,14 @@ def validate_angle_cache(root, *, cohort_hash, ordered_key_hash, trimer_artifact
     }.items():
         if metadata.get(key) != expected:
             raise RuntimeError(f"MTS angle cache {key} mismatch")
+    if trimer_done_file_sha256 is not None and metadata.get(
+        "trimer_done_file_sha256"
+    ) != str(trimer_done_file_sha256):
+        raise RuntimeError("MTS angle cache Trimer .done file hash mismatch")
+    if trimer_contract_hash is not None and metadata.get(
+        "trimer_contract_hash"
+    ) != str(trimer_contract_hash):
+        raise RuntimeError("MTS angle cache Trimer contract hash mismatch")
     metadata_artifact = hashlib.sha256(
         json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -154,6 +195,14 @@ def validate_angle_cache(root, *, cohort_hash, ordered_key_hash, trimer_artifact
     if (
         frozen.get("schema") != CACHE_BOND_ANGLE_SCHEMA
         or frozen.get("artifact_hash") != done_artifact
+        or (
+            trimer_done_file_sha256 is not None
+            and frozen.get("trimer_done_file_sha256") != str(trimer_done_file_sha256)
+        )
+        or (
+            trimer_contract_hash is not None
+            and frozen.get("trimer_contract_hash") != str(trimer_contract_hash)
+        )
     ):
         raise RuntimeError("MTS angle cache frozen marker is stale")
     offsets = np.load(root / "angle_offsets.npy", mmap_mode="r")
@@ -185,11 +234,62 @@ def validate_angle_cache(root, *, cohort_hash, ordered_key_hash, trimer_artifact
     return metadata
 
 
-def build_angle_cache(cohort, trimer_store, trimer_root, trimer_artifact_hash):
-    """Build or reuse a row-ordered angle cache from an immutable Trimer store."""
+def _angle_chunk_worker(chunk_keys, chunk_index):
+    """ProcessPool worker: compute angles for one chunk of keys.
+
+    The read-only Trimer store is the module global opened once by
+    ``_init_angle_worker``.  The returned dictionary contains compact byte
+    blobs so the parent can write them in chunk-index order without further
+    deserialisation.
+    """
+    tri = _WORKER_ANGLE_TRIMER
+    row_lengths = []
+    row_valid = []
+    indices_bytes = b""
+    bins_bytes = b""
+    class_counts = np.zeros(ANGLE_BIN_COUNT, dtype=np.int64)
+    for key in chunk_keys:
+        data = tri[key]
+        local_indices, local_bins, geometry_available = _record_angles(data)
+        valid_flag = bool(geometry_available and len(local_bins) > 0)
+        row_valid.append(valid_flag)
+        if len(local_indices):
+            idx = local_indices.astype(np.int32, copy=False)
+            bn = local_bins.astype(np.uint8, copy=False)
+            indices_bytes += idx.tobytes()
+            bins_bytes += bn.tobytes()
+            class_counts += np.bincount(
+                local_bins.astype(np.int64), minlength=ANGLE_BIN_COUNT
+            )
+            row_lengths.append(int(len(local_indices)))
+        else:
+            row_lengths.append(0)
+    return {
+        "chunk_index": chunk_index,
+        "row_lengths": row_lengths,
+        "row_valid": row_valid,
+        "indices_bytes": indices_bytes,
+        "bins_bytes": bins_bytes,
+        "class_counts": class_counts,
+    }
+
+
+def build_angle_cache(cohort, trimer_store, trimer_root, trimer_artifact_hash,
+                      workers=1, chunk_size=128):
+    """Build or reuse a row-ordered angle cache from an immutable Trimer store.
+
+    When *workers* > 1 the per-record loop is distributed across a
+    ``ProcessPoolExecutor``.  Each worker opens its own read-only LMDB
+    handle; the parent merges results in chunk-index order to produce
+    output that is element-wise identical to the serial path.
+    """
     manifest = cohort["manifest"]
     root = angle_cache_root(trimer_root, manifest["cohort_hash"])
     root.mkdir(parents=True, exist_ok=True)
+    trimer_done_file_sha256 = _sha256_file(Path(trimer_root) / ".done")
+    trimer_contract_hash = json.loads(
+        (Path(trimer_root) / "metadata.json").read_text(encoding="utf-8")
+    ).get("feature_config_hash")
     try:
         metadata = validate_angle_cache(
             root,
@@ -197,6 +297,8 @@ def build_angle_cache(cohort, trimer_store, trimer_root, trimer_artifact_hash):
             ordered_key_hash=manifest["ordered_sample_key_hash"],
             trimer_artifact_hash=trimer_artifact_hash,
             record_count=len(cohort["keys"]),
+            trimer_done_file_sha256=trimer_done_file_sha256,
+            trimer_contract_hash=trimer_contract_hash,
         )
         return root, metadata
     except Exception:
@@ -206,34 +308,129 @@ def build_angle_cache(cohort, trimer_store, trimer_root, trimer_artifact_hash):
     valid = np.zeros(len(cohort["keys"]), dtype=np.bool_)
     counts = np.zeros(ANGLE_BIN_COUNT, dtype=np.int64)
     started = time.monotonic()
-    # Do not retain one Python object per angle: a million-row cohort can
-    # contain several million targets.  Append compact records to raw
-    # temporary streams, then materialize the final NPY arrays in one bounded
-    # pass.  If interrupted, the temporary streams are harmless and the next
-    # invocation rebuilds them before publishing .done.
     indices_raw = root / "angle_indices.raw.tmp"
     bins_raw = root / "angle_bins.raw.tmp"
     angle_count = 0
-    with indices_raw.open("wb") as indices_handle, bins_raw.open("wb") as bins_handle:
-        for row, key in enumerate(cohort["keys"]):
-            data = trimer_store[key]
-            local_indices, local_bins, geometry_available = _record_angles(data)
-            valid[row] = bool(geometry_available and len(local_bins) > 0)
-            if len(local_indices):
-                local_indices.astype(np.int32, copy=False).tofile(indices_handle)
-                local_bins.astype(np.uint8, copy=False).tofile(bins_handle)
-                counts += np.bincount(
-                    local_bins.astype(np.int64), minlength=ANGLE_BIN_COUNT
-                )
-                angle_count += int(len(local_bins))
-            offsets[row + 1] = angle_count
-            if row and row % 5000 == 0:
-                elapsed = max(time.monotonic() - started, 1e-9)
-                print(
-                    f"[mts-angle-cache] {row}/{len(cohort['keys'])} "
-                    f"angles={angle_count} samples/s={row/elapsed:.1f}",
-                    flush=True,
-                )
+    keys = cohort["keys"]
+
+    if workers > 1:
+        # --- parallel path (Plan.MD §5.2/§5.3) ----------------------------
+        import multiprocessing as _mp
+        ctx = _mp.get_context("spawn")
+        total_chunks = (len(keys) + chunk_size - 1) // chunk_size
+        max_in_flight = max(workers * 3, workers)
+        print(
+            f"[mts-angle-cache] dispatching {len(keys)} records in "
+            f"{total_chunks} chunks (workers={workers}, chunk={chunk_size}, "
+            f"max_in_flight={max_in_flight})",
+            flush=True,
+        )
+
+        reorder = {}
+        next_to_write = 0
+        submitted = 0
+        done_records = 0
+        valid_done = 0
+        last_log = time.monotonic()
+
+        def _log_progress(force=False):
+            nonlocal last_log
+            now = time.monotonic()
+            if not force and now - last_log < 5.0:
+                return
+            last_log = now
+            elapsed = max(now - started, 1e-9)
+            rate = done_records / elapsed
+            eta = (len(keys) - done_records) / max(rate, 1e-9)
+            rss_kb = 0
+            try:
+                with open("/proc/self/status", encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.startswith("VmRSS:"):
+                            rss_kb = int(line.split()[1])
+                            break
+            except (OSError, ValueError):
+                pass
+            print(
+                f"[mts-angle-cache] {done_records}/{len(keys)} "
+                f"({100.0 * done_records / max(len(keys), 1):.1f}%) "
+                f"records/s={rate:.0f} ETA={eta:.0f}s "
+                f"valid={valid_done} invalid={done_records - valid_done} "
+                f"in_flight={len(pending)} reorder={len(reorder)} "
+                f"RSS={rss_kb / (1024.0 * 1024.0):.1f}GB",
+                flush=True,
+            )
+
+        with indices_raw.open("wb") as indices_handle, \
+             bins_raw.open("wb") as bins_handle, \
+             ProcessPoolExecutor(
+                 max_workers=workers,
+                 mp_context=ctx,
+                 initializer=_init_angle_worker,
+                 initargs=(str(trimer_root),),
+             ) as executor:
+            pending = {}
+            while submitted < total_chunks or pending:
+                while submitted < total_chunks and len(pending) < max_in_flight:
+                    chunk = keys[submitted * chunk_size:(submitted + 1) * chunk_size]
+                    pending[executor.submit(
+                        _angle_chunk_worker, chunk, submitted
+                    )] = submitted
+                    submitted += 1
+                if not pending:
+                    break
+                done_set, _pending_set = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done_set:
+                    del pending[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"angle chunk worker failed: {exc}"
+                        ) from exc
+                    reorder[result["chunk_index"]] = result
+                while next_to_write in reorder:
+                    result = reorder.pop(next_to_write)
+                    chunk_start = next_to_write * chunk_size
+                    indices_handle.write(result["indices_bytes"])
+                    bins_handle.write(result["bins_bytes"])
+                    for i, (length, is_valid) in enumerate(
+                        zip(result["row_lengths"], result["row_valid"])
+                    ):
+                        row = chunk_start + i
+                        valid[row] = is_valid
+                        if is_valid:
+                            valid_done += 1
+                        angle_count += length
+                        offsets[row + 1] = angle_count
+                    counts += result["class_counts"]
+                    next_to_write += 1
+                    done_records += len(result["row_lengths"])
+                    _log_progress()
+            _log_progress(force=True)
+    else:
+        # --- serial path (unchanged) -------------------------------------
+        with indices_raw.open("wb") as indices_handle, \
+             bins_raw.open("wb") as bins_handle:
+            for row, key in enumerate(keys):
+                data = trimer_store[key]
+                local_indices, local_bins, geometry_available = _record_angles(data)
+                valid[row] = bool(geometry_available and len(local_bins) > 0)
+                if len(local_indices):
+                    local_indices.astype(np.int32, copy=False).tofile(indices_handle)
+                    local_bins.astype(np.uint8, copy=False).tofile(bins_handle)
+                    counts += np.bincount(
+                        local_bins.astype(np.int64), minlength=ANGLE_BIN_COUNT
+                    )
+                    angle_count += int(len(local_bins))
+                offsets[row + 1] = angle_count
+                if row and row % 5000 == 0:
+                    elapsed = max(time.monotonic() - started, 1e-9)
+                    print(
+                        f"[mts-angle-cache] {row}/{len(keys)} "
+                        f"angles={angle_count} samples/s={row/elapsed:.1f}",
+                        flush=True,
+                    )
 
     # Small arrays are written normally; the two potentially large arrays are
     # filled from the raw streams in chunks so peak RAM is independent of the
@@ -289,6 +486,9 @@ def build_angle_cache(cohort, trimer_store, trimer_root, trimer_artifact_hash):
         "cohort_hash": manifest["cohort_hash"],
         "ordered_sample_key_hash": manifest["ordered_sample_key_hash"],
         "trimer_artifact_hash": str(trimer_artifact_hash),
+        "trimer_done_artifact_id": str(trimer_artifact_hash),
+        "trimer_done_file_sha256": str(trimer_done_file_sha256),
+        "trimer_contract_hash": str(trimer_contract_hash),
         "record_count": len(cohort["keys"]),
         "angle_count": int(angle_count),
         "angle_bin_count": ANGLE_BIN_COUNT,
@@ -310,12 +510,24 @@ def build_angle_cache(cohort, trimer_store, trimer_root, trimer_artifact_hash):
     ).hexdigest()
     (root / ".done.tmp").write_text(artifact_hash + "\n", encoding="utf-8")
     os.replace(root / ".done.tmp", root / ".done")
-    _atomic_json(root / ".frozen", {"schema": CACHE_BOND_ANGLE_SCHEMA, "artifact_hash": artifact_hash, "metadata_hash": artifact_hash})
+    _atomic_json(
+        root / ".frozen",
+        {
+            "schema": CACHE_BOND_ANGLE_SCHEMA,
+            "artifact_hash": artifact_hash,
+            "metadata_hash": artifact_hash,
+            "trimer_done_artifact_id": str(trimer_artifact_hash),
+            "trimer_done_file_sha256": str(trimer_done_file_sha256),
+            "trimer_contract_hash": str(trimer_contract_hash),
+        },
+    )
     validate_angle_cache(
         root,
         cohort_hash=manifest["cohort_hash"],
         ordered_key_hash=manifest["ordered_sample_key_hash"],
         trimer_artifact_hash=trimer_artifact_hash,
         record_count=len(cohort["keys"]),
+        trimer_done_file_sha256=trimer_done_file_sha256,
+        trimer_contract_hash=trimer_contract_hash,
     )
     return root, metadata

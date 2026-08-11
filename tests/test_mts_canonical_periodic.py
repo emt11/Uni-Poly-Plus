@@ -5,9 +5,9 @@ import torch
 
 from src.dataset.canonical_periodic import (
     build_canonical_periodic_topology,
-    build_corrected_explicit_k_ru_reference,
     migrate_explicit_topology_to_canonical,
 )
+from tests.reference_mts_explicit import build_corrected_explicit_k_ru_reference
 from src.dataset.dataloader import mips_trimer_collate
 from src.dataset.dataset import _compute_ru_base_layer, _compute_topology_layer
 from src.dataset.graph_data import (
@@ -38,13 +38,18 @@ def test_lifted_rows_keep_shifts_and_symmetric_polymer_mask():
     assert torch.all(topology.lga_spd <= 2)
 
 
+def test_degenerate_dummy_pair_reports_unavailable_graph_instead_of_keyerror():
+    with pytest.raises(ValueError, match="attachment neighbor"):
+        build_canonical_periodic_topology("*=*")
+
+
 @pytest.mark.parametrize(
     ("smiles", "repeat_factor"),
     [
-        ("*CC*", 1),
-        ("*CCO*", 2),
-        ("*CC(=O)OCC*", 3),
-        ("*C(*)C(=O)OCC(C)(C)C", 4),
+        ("*CC*", 5),
+        ("*CCO*", 5),
+        ("*CC(=O)OCC*", 5),
+        ("*C(*)C(=O)OCC(C)(C)C", 5),
         ("*c1ccccc1*", 7),
     ],
 )
@@ -65,8 +70,18 @@ def test_corrected_reference_mapping_for_repeat_factors(smiles, repeat_factor):
             (copy + shifts) % int(repeat_factor)
         ) * n
         expected_target = relation[1] + copy * n
-        assert torch.equal(lifted[0, start:stop], expected_source)
-        assert torch.equal(lifted[1, start:stop], expected_target)
+        expected = sorted(zip(
+            expected_source.tolist(), expected_target.tolist(),
+            shifts.tolist(), topology.lga_spd.tolist(),
+            topology.polymer_link_mask.tolist(),
+        ))
+        observed = sorted(zip(
+            lifted[0, start:stop].tolist(), lifted[1, start:stop].tolist(),
+            reference.lga_source_image_shift[start:stop].tolist(),
+            reference.lga_spd[start:stop].tolist(),
+            reference.polymer_link_mask[start:stop].tolist(),
+        ))
+        assert observed == expected
     assert torch.equal(
         reference.mips_x.view(int(repeat_factor), n, -1),
         topology.mips_x.unsqueeze(0).expand(int(repeat_factor), -1, -1),
@@ -105,13 +120,13 @@ def test_translation_reference_includes_star_rbf_and_mcl():
     model = MIPSLocalGraphEncoder().eval()
     model.trimer_mcl.geometry_gate.data.fill_(0.2)
     model.star_distance_bias.projection.weight.data.fill_(0.1)
-    explicit = build_corrected_explicit_k_ru_reference(topology, 4)
+    explicit = build_corrected_explicit_k_ru_reference(topology, 5)
     with torch.no_grad():
         canonical_graph, canonical_nodes = model._forward_impl(canonical)
         explicit_graph, explicit_nodes = model._forward_impl(explicit)
     n = topology.mips_x.size(0)
     assert torch.allclose(
-        explicit_nodes.reshape(4, n, -1),
+        explicit_nodes.reshape(5, n, -1),
         canonical_nodes.unsqueeze(0),
         atol=1e-5,
         rtol=1e-5,

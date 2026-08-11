@@ -25,20 +25,18 @@ from rdkit import Chem
 
 from .graph_data import (
     MIPS_ATOM_FEATURE_DIM,
+    _graph_backbone_annotations,
     _mips_atom_feature_rows,
     build_periodic_multimer_mol,
 )
-
-
-# New immutable identities.  Keep these in one module as well as the public
-# contract so small cache/build tools can import them without constructing the
-# full Dataset.
-CANONICAL_CONFIG_SCHEMA = "mts-config-v3"
-CANONICAL_FEATURE_SCHEMA = "mts-canonical-periodic-feature-v1"
-CANONICAL_TOPOLOGY_SCHEMA = "mts-canonical-periodic-topology-lmdb-v1"
-CANONICAL_LGA_SCHEMA_VERSION = 2
-CANONICAL_CHECKPOINT_SCHEMA = "mts-model-v3"
-CANONICAL_CACHE_BUNDLE_SCHEMA = "mips-trimer-scage-cache-bundle-v2"
+from .mips_trimer_contract import (
+    CACHE_BUNDLE_SCHEMA as CANONICAL_CACHE_BUNDLE_SCHEMA,
+    CANONICAL_LGA_SCHEMA_VERSION,
+    CHECKPOINT_SCHEMA as CANONICAL_CHECKPOINT_SCHEMA,
+    CONFIG_SCHEMA as CANONICAL_CONFIG_SCHEMA,
+    FEATURE_SCHEMA as CANONICAL_FEATURE_SCHEMA,
+    TOPOLOGY_LMDB_SCHEMA as CANONICAL_TOPOLOGY_SCHEMA,
+)
 
 
 def _as_mol(smiles_or_mol) -> Chem.Mol:
@@ -49,6 +47,164 @@ def _as_mol(smiles_or_mol) -> Chem.Mol:
     if molecule is None:
         raise ValueError("invalid P-SMILES")
     return molecule
+
+
+def _atom_signature(atom):
+    """Return the identity fields used by migration graph matching.
+
+    RDKit's canonical SMILES atom order is not an identity contract.  The
+    migration path therefore compares chemical graph fields explicitly and
+    only uses the atom index as a deterministic tie-breaker after all
+    candidates have been validated.
+    """
+
+    return (
+        int(atom.GetAtomicNum()),
+        int(atom.GetFormalCharge()),
+        bool(atom.GetIsAromatic()),
+        int(atom.GetIsotope()),
+        int(atom.GetNumRadicalElectrons()),
+        int(atom.GetChiralTag()),
+    )
+
+
+def _bond_signature(bond):
+    return (
+        bool(bond.GetIsAromatic()),
+        str(bond.GetBondType()),
+        bool(bond.GetIsConjugated()),
+        bool(bond.IsInRing()),
+        int(bond.GetStereo()),
+    )
+
+
+def _validate_full_atom_mapping(source, target, match):
+    if source.GetNumAtoms() != target.GetNumAtoms():
+        return False
+    if len(match) != source.GetNumAtoms() or len(set(match)) != len(match):
+        return False
+    for source_idx, target_idx in enumerate(match):
+        source_atom = source.GetAtomWithIdx(int(source_idx))
+        target_atom = target.GetAtomWithIdx(int(target_idx))
+        if _atom_signature(source_atom) != _atom_signature(target_atom):
+            return False
+        if source_atom.GetDegree() != target_atom.GetDegree():
+            return False
+    for source_bond in source.GetBonds():
+        begin = int(match[source_bond.GetBeginAtomIdx()])
+        end = int(match[source_bond.GetEndAtomIdx()])
+        target_bond = target.GetBondBetweenAtoms(begin, end)
+        if target_bond is None or _bond_signature(source_bond) != _bond_signature(target_bond):
+            return False
+    # Attachment semantics are part of the identity table.  A legal
+    # automorphism may swap the two dummy sites, but each dummy must still map
+    # to a dummy with exactly one corresponding boundary neighbour.
+    source_attachments = []
+    target_attachments = []
+    for atom in source.GetAtoms():
+        if atom.GetAtomicNum() == 0:
+            neighbors = tuple(sorted(int(n.GetIdx()) for n in atom.GetNeighbors()))
+            if len(neighbors) != 1:
+                return False
+            source_attachments.append((int(atom.GetIdx()), neighbors[0]))
+    for atom in target.GetAtoms():
+        if atom.GetAtomicNum() == 0:
+            neighbors = tuple(sorted(int(n.GetIdx()) for n in atom.GetNeighbors()))
+            if len(neighbors) != 1:
+                return False
+            target_attachments.append((int(atom.GetIdx()), neighbors[0]))
+    if len(source_attachments) != 2 or len(target_attachments) != 2:
+        return False
+    mapped = sorted(
+        (int(match[dummy]), int(match[neighbor]))
+        for dummy, neighbor in source_attachments
+    )
+    if mapped != sorted(target_attachments):
+        return False
+    return True
+
+
+def find_atom_graph_mapping(source, target):
+    """Return a deterministic ``source_atom_id -> target_atom_id`` mapping.
+
+    The function intentionally does not rely on canonical-SMILES order.  It
+    enumerates RDKit graph-isomorphism candidates, validates atom/bond and
+    attachment fields, and chooses the lexicographically smallest valid
+    permutation.  Ambiguous automorphisms are therefore stable while a
+    genuinely incompatible graph fails loudly instead of guessing.
+    """
+
+    source = _as_mol(source)
+    target = _as_mol(target)
+    if source.GetNumAtoms() != target.GetNumAtoms():
+        raise ValueError("atom mapping failed: atom counts differ")
+    # ``target.GetSubstructMatches(source)`` returns one target index for each
+    # query atom in ``source`` (the direction needed by the callers below).
+    # RDKit's ``uniquify=False`` can expose an enormous automorphism group for
+    # long fluorinated chains and symmetric aromatic substituents.  Asking for
+    # every match in those cases is both unnecessary (all such atoms have the
+    # same graph identity) and can make a migration appear hung.  Keep the
+    # historical exhaustive/lexicographic behaviour for genuinely small RUs;
+    # use a deterministic bounded prefix for larger graphs.  RDKit enumerates
+    # these matches deterministically for a fixed source/target atom order,
+    # and every returned candidate still passes the complete identity check
+    # below.  A failure to find one is therefore reported rather than guessed.
+    atom_count = int(source.GetNumAtoms())
+    max_matches = 100000 if atom_count <= 24 else 512
+    candidates = target.GetSubstructMatches(
+        source, uniquify=False, useChirality=True, maxMatches=max_matches
+    )
+    valid = [
+        tuple(int(value) for value in match)
+        for match in candidates
+        if _validate_full_atom_mapping(source, target, match)
+    ]
+    if not valid:
+        raise ValueError("atom mapping failed: no validated graph isomorphism")
+    return torch.tensor(min(valid), dtype=torch.long)
+
+
+def _base_atom_order(molecule):
+    return [
+        int(atom.GetIdx())
+        for atom in molecule.GetAtoms()
+        if int(atom.GetAtomicNum()) != 0
+    ]
+
+
+def find_base_atom_mapping(source, target):
+    """Map non-dummy RU atom ranks between two equivalent P-SMILES graphs."""
+
+    source = _as_mol(source)
+    target = _as_mol(target)
+    full = find_atom_graph_mapping(source, target)
+    source_order = _base_atom_order(source)
+    target_order = _base_atom_order(target)
+    target_rank = {atom_idx: rank for rank, atom_idx in enumerate(target_order)}
+    mapped = [target_rank[int(full[source_idx])] for source_idx in source_order]
+    if len(mapped) != len(target_order) or sorted(mapped) != list(range(len(mapped))):
+        raise ValueError("atom mapping failed: non-dummy RU mapping is incomplete")
+    return torch.tensor(mapped, dtype=torch.long)
+
+
+def remap_rows_by_base_atom(rows, source_to_target, *, target_count=None):
+    """Reorder per-RU rows from source base order into target base order."""
+
+    rows = torch.as_tensor(rows)
+    mapping = torch.as_tensor(source_to_target, dtype=torch.long).reshape(-1)
+    target_count = int(target_count if target_count is not None else mapping.numel())
+    if rows.ndim < 1 or rows.size(0) != mapping.numel():
+        raise ValueError("row/mapping lengths differ")
+    output = rows.new_empty((target_count,) + tuple(rows.shape[1:]))
+    seen = torch.zeros(target_count, dtype=torch.bool)
+    for source_idx, target_idx in enumerate(mapping.tolist()):
+        if target_idx < 0 or target_idx >= target_count or bool(seen[target_idx]):
+            raise ValueError("row/mapping is not a permutation")
+        output[target_idx] = rows[source_idx]
+        seen[target_idx] = True
+    if not bool(seen.all()):
+        raise ValueError("row/mapping omits a target atom")
+    return output
 
 
 def _lift_neighbors(
@@ -149,8 +305,10 @@ def _path_from_source_to_target(
     target: Tuple[int, int],
     predecessor: Mapping[Tuple[int, int], Tuple[int, int] | None],
 ):
-    # The predecessor table was generated by BFS from target.  Walk source to
-    # target, then reverse to expose the usual source -> ... -> target path.
+    # The predecessor table was generated by BFS from target.  Walking from
+    # source through predecessors already yields the usual source -> ... ->
+    # target path; do not reverse it (the source/target direction is part of
+    # the single-path-node bias contract).
     path = [tuple(source)]
     current = tuple(source)
     while current != tuple(target):
@@ -158,7 +316,6 @@ def _path_from_source_to_target(
         if current is None:
             raise RuntimeError("lifted BFS predecessor chain is incomplete")
         path.append(tuple(current))
-    path.reverse()
     return path
 
 
@@ -178,10 +335,24 @@ def _canonical_feature_rows(molecule, metadata):
     rows = _mips_atom_feature_rows(trimer)[central]
     if rows.ndim != 2 or rows.size(1) != MIPS_ATOM_FEATURE_DIM:
         raise ValueError("MIPS137 feature row width mismatch")
+    # Match the frozen MIPS backbone-role semantics, including ring atoms
+    # touched by a boundary path.  Merely copying ``backbone_base`` would omit
+    # those ring members and make old explicit backbone rows fail migration
+    # validation even though their atom features are otherwise identical.
+    base_ru, base_metadata = build_periodic_multimer_mol(
+        molecule, num_repeat_units=1, close_periodic=False
+    )
+    base_backbone, _, _, _ = _graph_backbone_annotations(
+        base_ru,
+        original_neighbors=[
+            int(base_metadata["left_boundary"]),
+            int(base_metadata["right_boundary"]),
+        ],
+        ordered_backbone_path=base_metadata.get("backbone_base") or [],
+    )
     backbone = torch.zeros(rows.size(0), dtype=torch.long)
-    backbone_ids = metadata.get("backbone_base") or []
-    if backbone_ids:
-        backbone[torch.as_tensor(backbone_ids, dtype=torch.long)] = 1
+    if base_backbone:
+        backbone[torch.as_tensor(sorted(base_backbone), dtype=torch.long)] = 1
     return rows.float(), backbone
 
 
@@ -211,6 +382,10 @@ def _empty_canonical_placeholder() -> Data:
     data.lga_star_edge_mask = data.polymer_link_mask
     data.canonical_atom_id = torch.arange(2, dtype=torch.long)
     data.canonical_ru_atom_index = data.canonical_atom_id.clone()
+    data.canonical_to_trimer_base_atom_id = data.canonical_atom_id.clone()
+    data.canonical_to_trimer_base_atom_index = (
+        data.canonical_to_trimer_base_atom_id
+    )
     data.mips_to_trimer_central_index = torch.full((2,), -1, dtype=torch.long)
     data.graph_available = False
     data.mips_condition_valid = False
@@ -350,6 +525,14 @@ def build_canonical_periodic_topology(smiles_or_mol, max_hops: int = 2) -> Data:
     # This alias is retained only as an atom-identity table for Trimer mapping;
     # it is not a copy index and does not imply explicit O8 nodes.
     data.canonical_ru_atom_index = data.canonical_atom_id.clone()
+    # The native topology is built from the normalized P-SMILES molecule, so
+    # its canonical and Trimer base atom ranks coincide.  Keeping this table
+    # explicit lets migration and non-canonical input paths replace it with a
+    # validated graph-isomorphism permutation rather than assuming RDKit order.
+    data.canonical_to_trimer_base_atom_id = data.canonical_atom_id.clone()
+    data.canonical_to_trimer_base_atom_index = (
+        data.canonical_to_trimer_base_atom_id
+    )
     data.canonical_atom_count = atom_count
     data.canonical_lga_max_hops = int(max_hops)
     # Minimal repeat factor/boundary distance are retained strictly as
@@ -418,46 +601,94 @@ def migrate_explicit_topology_to_canonical(
     canonical = torch.as_tensor(old.canonical_ru_atom_index).long().reshape(-1)
     if canonical.numel() == 0 or bool((canonical < 0).any()):
         raise ValueError("old topology canonical mapping is invalid")
-    count = int(canonical.max().item()) + 1
+    source_count = int(canonical.max().item()) + 1
     if not hasattr(old, "mips_x"):
         raise ValueError("old topology has no MIPS137 rows")
     old_rows = torch.as_tensor(old.mips_x).float()
     if old_rows.ndim != 2 or old_rows.size(1) != MIPS_ATOM_FEATURE_DIM:
         raise ValueError("old topology MIPS137 width mismatch")
-    copied = torch.empty((count, old_rows.size(1)), dtype=old_rows.dtype)
-    for atom_id in range(count):
-        rows = old_rows[canonical == atom_id]
+    if ru_base is not None and hasattr(ru_base, "ru_mol_binary"):
+        source_molecule = Chem.Mol(bytes(ru_base.ru_mol_binary))
+    else:
+        source_smiles = getattr(old, "smiles", None)
+        if source_smiles is None:
+            raise ValueError("migration requires ru_base or source smiles")
+        source_molecule = _as_mol(source_smiles)
+    normalized_text = getattr(ru_base, "normalized_polymer_smiles", None)
+    if normalized_text is None:
+        normalized_text = Chem.MolToSmiles(source_molecule, canonical=True)
+    target_molecule = _as_mol(normalized_text)
+    source_to_target = find_base_atom_mapping(source_molecule, target_molecule)
+    target_count = int(target_molecule.GetNumAtoms()) - sum(
+        int(atom.GetAtomicNum() == 0) for atom in target_molecule.GetAtoms()
+    )
+    if source_count != int(source_to_target.numel()) or target_count != source_count:
+        raise ValueError("old topology and normalized RU atom counts differ")
+    old_atomic = getattr(old, "atomic_numbers", getattr(old, "z", None))
+    if old_atomic is not None:
+        old_atomic = torch.as_tensor(old_atomic).long().reshape(-1)
+        if old_atomic.numel() != canonical.numel():
+            raise ValueError("old topology atomic-number mapping is incomplete")
+        source_order = _base_atom_order(source_molecule)
+        expected_atomic = torch.tensor(
+            [int(source_molecule.GetAtomWithIdx(idx).GetAtomicNum()) for idx in source_order],
+            dtype=torch.long,
+        )
+        for source_atom in range(source_count):
+            observed = torch.unique(old_atomic[canonical == source_atom])
+            if observed.numel() != 1 or int(observed.item()) != int(expected_atomic[source_atom]):
+                raise ValueError("old topology atomic-number validation failed")
+    copied = torch.empty((target_count, old_rows.size(1)), dtype=old_rows.dtype)
+    for target_atom in range(target_count):
+        source_atom = int(torch.nonzero(
+            source_to_target == target_atom, as_tuple=False
+        ).flatten()[0])
+        rows = old_rows[canonical == source_atom]
         if rows.numel() == 0:
             raise ValueError("old topology mapping omits a canonical atom")
         if verify_features and not bool(torch.equal(rows, rows[:1].expand_as(rows))):
             raise ValueError("old topology copies disagree for a canonical atom")
-        copied[atom_id] = rows[0]
-    if ru_base is None:
-        smiles = getattr(old, "smiles", None)
-        if smiles is None:
-            raise ValueError("migration requires ru_base or source smiles")
-        migrated = build_canonical_periodic_topology(smiles, max_hops=max_hops)
-    else:
-        if hasattr(ru_base, "ru_mol_binary"):
-            molecule = Chem.Mol(bytes(ru_base.ru_mol_binary))
-        else:
-            molecule = _as_mol(ru_base)
-        migrated = build_canonical_periodic_topology(molecule, max_hops=max_hops)
-    if int(migrated.mips_x.size(0)) != count:
+        copied[target_atom] = rows[0]
+    migrated = build_canonical_periodic_topology(
+        target_molecule, max_hops=max_hops
+    )
+    if int(migrated.mips_x.size(0)) != target_count:
         raise ValueError("RU base and old topology atom counts differ")
+    if verify_features and not torch.equal(copied, migrated.mips_x.to(copied.dtype)):
+        raise ValueError(
+            "old topology MIPS137 rows disagree with native canonical features"
+        )
     migrated.mips_x = copied.clone()
     migrated.x = copied.clone()
     if hasattr(old, "mips_backbone_mask"):
         old_backbone = torch.as_tensor(old.mips_backbone_mask).long().reshape(-1)
-        backbone = torch.empty(count, dtype=torch.long)
-        for atom_id in range(count):
-            rows = old_backbone[canonical == atom_id]
+        backbone = torch.empty(target_count, dtype=torch.long)
+        for target_atom in range(target_count):
+            source_atom = int(torch.nonzero(
+                source_to_target == target_atom, as_tuple=False
+            ).flatten()[0])
+            rows = old_backbone[canonical == source_atom]
             if rows.numel() == 0:
                 raise ValueError("old topology backbone mapping is incomplete")
             if verify_features and not bool(torch.equal(rows, rows[:1].expand_as(rows))):
                 raise ValueError("old topology copies disagree in backbone mask")
-            backbone[atom_id] = rows[0]
+            backbone[target_atom] = rows[0]
+        if verify_features and not torch.equal(
+            backbone, torch.as_tensor(migrated.mips_backbone_mask).long()
+        ):
+            raise ValueError(
+                "old topology backbone mask disagrees with native canonical features"
+            )
         migrated.mips_backbone_mask = backbone
+    migrated.source_to_normalized_canonical_atom_id = source_to_target
+    migrated.normalized_canonical_smiles = str(normalized_text)
+    migrated.canonical_to_trimer_base_atom_id = torch.arange(
+        target_count, dtype=torch.long
+    )
+    migrated.canonical_to_trimer_base_atom_index = (
+        migrated.canonical_to_trimer_base_atom_id
+    )
+    migrated.migration_atom_mapping_verified = True
     migrated.migration_source_schema = str(
         getattr(old, "feature_schema", "legacy-explicit-topology")
     )
@@ -465,194 +696,6 @@ def migrate_explicit_topology_to_canonical(
     return migrated
 
 
-def build_corrected_explicit_k_ru_reference(canonical_topology, repeat_factor: int):
-    """Lift canonical rows to a corrected translation-symmetric explicit graph.
-
-    For each canonical relation ``(source, shift) -> target`` and target copy
-    ``c``, the source copy is ``(c + shift) mod k``.  There is no seam branch;
-    duplicate canonical source/destination rows remain distinct relations.
-    """
-
-    k = int(repeat_factor)
-    if k < 1:
-        raise ValueError("repeat_factor must be >= 1")
-    relation = torch.as_tensor(canonical_topology.lga_edge_index).long()
-    shifts = torch.as_tensor(
-        getattr(canonical_topology, "lga_source_image_shift", torch.zeros(relation.size(1))),
-    ).long().reshape(-1)
-    if shifts.numel() != relation.size(1):
-        raise ValueError("canonical relation shift length mismatch")
-    n = int(canonical_topology.mips_x.size(0))
-    source_rows, target_rows, shift_rows = [], [], []
-    spd_rows, polymer_rows = [], []
-    path_rows, path_shift_rows = [], []
-    canonical_polymer = torch.as_tensor(
-        getattr(canonical_topology, "polymer_link_mask", torch.zeros(relation.size(1))),
-    ).bool().reshape(-1)
-    canonical_spd = torch.as_tensor(canonical_topology.lga_spd).long().reshape(-1)
-    canonical_path = torch.as_tensor(canonical_topology.lga_path_index).long()
-    canonical_path_shift = torch.as_tensor(
-        getattr(
-            canonical_topology, "lga_path_shift",
-            torch.zeros_like(canonical_path),
-        )
-    ).long()
-    for copy in range(k):
-        for row in range(relation.size(1)):
-            source_atom, target_atom = map(int, relation[:, row])
-            source_copy = (copy + int(shifts[row])) % k
-            source_rows.append(source_atom + source_copy * n)
-            target_rows.append(target_atom + copy * n)
-            shift_rows.append(int(shifts[row]))
-            spd_rows.append(int(canonical_spd[row]))
-            polymer_rows.append(bool(canonical_polymer[row]))
-            path = canonical_path[row].clone()
-            path_shift = canonical_path_shift[row].clone()
-            valid = path >= 0
-            lifted_path = path.clone()
-            lifted_path[valid] += (
-                (copy + path_shift[valid]) % k
-            ) * n
-            path_rows.append(lifted_path)
-            path_shift_rows.append(path_shift)
-    output = Data()
-    output.mips_x = torch.as_tensor(canonical_topology.mips_x).float().repeat(k, 1)
-    output.x = output.mips_x.clone()
-    output.mips_backbone_mask = torch.as_tensor(
-        canonical_topology.mips_backbone_mask
-    ).long().repeat(k)
-    atomic = torch.as_tensor(
-        getattr(canonical_topology, "atomic_numbers", canonical_topology.z)
-    ).long()
-    output.atomic_numbers = atomic.repeat(k)
-    output.atomic_number = output.atomic_numbers
-    output.z = output.atomic_numbers
-    output.lga_edge_index = torch.tensor([source_rows, target_rows], dtype=torch.long)
-    output.canonical_lga_edge_index = output.lga_edge_index.clone()
-    output.lga_spd = torch.tensor(spd_rows, dtype=torch.long)
-    output.lga_path_index = torch.stack(path_rows, dim=0)
-    output.lga_path_shift = torch.stack(path_shift_rows, dim=0)
-    output.lga_path_shifts = output.lga_path_shift
-    output.lga_path_mask = output.lga_path_index >= 0
-    output.lga_path_bond_hist = torch.zeros(
-        (len(path_rows), max(0, output.lga_path_index.size(1) - 1), 6),
-        dtype=torch.float,
-    )
-    output.lga_source_image_shift = torch.tensor(shift_rows, dtype=torch.long)
-    output.lga_relation_shift = output.lga_source_image_shift
-    output.polymer_link_mask = torch.tensor(polymer_rows, dtype=torch.bool)
-    output.lga_polymer_link_mask = output.polymer_link_mask
-    output.lga_star_edge_mask = output.polymer_link_mask
-    output.canonical_ru_atom_index = torch.arange(n, dtype=torch.long).repeat(k)
-    output.ru_copy_index = torch.arange(k, dtype=torch.long).repeat_interleave(n)
-    output.canonical_pair_index = torch.zeros(
-        output.lga_edge_index.size(1), dtype=torch.long
-    )
-    output.graph_available = torch.tensor(True, dtype=torch.bool)
-    output.mips_condition_valid = torch.tensor(True, dtype=torch.bool)
-    output.mips_boundary_distance = torch.full((k,), 6, dtype=torch.long)
-    for name in ("mips_md", "mips_md_valid"):
-        if hasattr(canonical_topology, name):
-            value = getattr(canonical_topology, name)
-            if name == "mips_md":
-                # A direct, uncollated record stores MD200 as [200], whereas
-                # the graph encoder consumes one row per graph.  Preserve an
-                # already-batched [B,200] sidecar and lift a scalar record to
-                # [1,200] so strict canonical/explicit prediction parity can
-                # include the MD residual as well.
-                value = torch.as_tensor(value).float()
-                if value.ndim == 1:
-                    value = value.unsqueeze(0)
-            elif name == "mips_md_valid":
-                value = torch.as_tensor(value).bool().reshape(-1)
-            elif torch.is_tensor(value):
-                value = value.clone()
-            setattr(output, name, value)
-    output.batch = torch.zeros(k * n, dtype=torch.long)
-    output.num_nodes = k * n
-    # If a canonical record already carries a frozen Trimer, reuse that same
-    # geometry for the explicit equivalence reference.  Only the O8-to-central
-    # mapping is lifted; the Trimer itself remains the shared three-RU object.
-    if hasattr(canonical_topology, "trimer_pos"):
-        for name in (
-            "trimer_pos", "trimer_atomic_number", "trimer_edge_index",
-            "trimer_bond_type", "trimer_base_ru_atom_id",
-            "trimer_base_ru_atom_index", "trimer_ru_offset",
-            "trimer_central_ru_mask", "trimer_central_atom_index",
-            "trimer_geometry_valid", "trimer_geometry_is_3d",
-            "trimer_2d_fallback", "trimer_geometry_source",
-            "trimer_failure_code", "trimer_conformer_energy",
-            "star_3d_distance", "star_3d_asymmetry", "star_3d_valid",
-            "trimer_conformer_seed", "trimer_conformer_method",
-            "trimer_mcl_schema", "trimer_mcl_schema_version",
-            "trimer_mcl_thresholds", "mcl_valid", "trimer_angle_index",
-            "trimer_angle_bins", "trimer_angle_cos", "trimer_angle_valid",
-        ):
-            if hasattr(canonical_topology, name):
-                value = getattr(canonical_topology, name)
-                if torch.is_tensor(value):
-                    value = value.clone()
-                setattr(output, name, value)
-        mapping = getattr(canonical_topology, "mips_to_trimer_central_index", None)
-        if mapping is not None:
-            output.mips_to_trimer_central_index = torch.as_tensor(
-                mapping
-            ).long().repeat(k)
-        output.trimer_batch = torch.zeros(
-            int(output.trimer_pos.size(0)), dtype=torch.long
-        )
-        if hasattr(output, "trimer_base_ru_atom_id") and not hasattr(
-            output, "trimer_base_ru_atom_index"
-        ):
-            output.trimer_base_ru_atom_index = output.trimer_base_ru_atom_id
-        for name in (
-            "trimer_geometry_valid", "trimer_geometry_is_3d",
-            "trimer_2d_fallback", "star_3d_distance", "star_3d_asymmetry",
-            "star_3d_valid", "mcl_valid", "trimer_mcl_thresholds",
-            "trimer_angle_valid",
-        ):
-            if hasattr(output, name) and not torch.is_tensor(getattr(output, name)):
-                value = getattr(output, name)
-                setattr(output, name, torch.as_tensor(value).reshape(-1))
-    output.repeat_factor = k
-    output.canonical_node_count = n
-    output.translation_symmetric_reference = True
-    output.canonical_periodic_topology_schema = CANONICAL_TOPOLOGY_SCHEMA
-    output.mts_canonical_periodic = False
-    return output
-
-
-def load_test_only_equivalence_checkpoint(model, checkpoint):
-    """Load frozen legacy/current weights for strict equivalence tests only.
-
-    Production training validates ``mts-model-v3`` in the CLI.  This helper
-    intentionally accepts the previous metadata identity because the model
-    parameter layout is unchanged and a fixed old checkpoint is useful for
-    proving translation symmetry without retraining.
-    """
-
-    payload = checkpoint
-    if isinstance(checkpoint, (str, bytes)) or hasattr(checkpoint, "__fspath__"):
-        import torch as _torch
-        payload = _torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if not isinstance(payload, Mapping) or not isinstance(payload.get("meta"), Mapping):
-        raise ValueError("equivalence checkpoint must contain metadata")
-    schema = payload["meta"].get("schema")
-    if schema not in {"mts-model-v2", CANONICAL_CHECKPOINT_SCHEMA}:
-        raise ValueError("unsupported checkpoint for test-only equivalence")
-    state = payload.get("state_dict")
-    if not isinstance(state, Mapping):
-        raise ValueError("equivalence checkpoint has no state_dict")
-    model.load_state_dict(state, strict=True)
-    return model
-
-
-# Friendly aliases used by focused equivalence tests and migration scripts.
-lift_canonical_topology_to_explicit = build_corrected_explicit_k_ru_reference
-build_explicit_translation_symmetric_reference = build_corrected_explicit_k_ru_reference
-build_corrected_translation_symmetric_explicit_reference = (
-    build_corrected_explicit_k_ru_reference
-)
 build_lifted_periodic_relations = build_canonical_periodic_topology
 build_mts_canonical_periodic_topology = build_canonical_periodic_topology
 build_canonical_periodic_lga = build_canonical_periodic_topology
@@ -665,10 +708,8 @@ __all__ = [
     "CANONICAL_CHECKPOINT_SCHEMA", "CANONICAL_CACHE_BUNDLE_SCHEMA",
     "build_canonical_periodic_topology", "build_mts_canonical_periodic_topology",
     "build_canonical_periodic_lga", "migrate_explicit_topology_to_canonical",
+    "find_atom_graph_mapping", "find_base_atom_mapping",
+    "remap_rows_by_base_atom",
     "attach_canonical_periodic_lga",
-    "build_corrected_explicit_k_ru_reference", "lift_canonical_topology_to_explicit",
-    "build_explicit_translation_symmetric_reference",
-    "build_corrected_translation_symmetric_explicit_reference",
     "build_lifted_periodic_relations",
-    "load_test_only_equivalence_checkpoint",
 ]

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -163,3 +164,194 @@ def test_prediction_ensemble_and_three_decimal_sample_std(tmp_path):
         "--seeds", "42", "43", "44", "--best-results", str(best),
     ])
     assert failed.returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# lpt_v1 finetune dispatch schedule (Plan.MD A0.4 / CODEX handoff A0.4).
+#
+# MTS_FINETUNE_SCHEDULE=lpt_v1 reorders only the dispatch sequence of the 40
+# independent (task, fold) units inside run_mips_trimer_scage.sh: longest
+# task first per historical total_fold_wall_seconds, folds ascending within a
+# task, while preserving every fold's training identity, resume semantics and
+# the three dynamic GPU slots.
+# ---------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parents[1]
+_LPT_SCRIPT = ROOT / "scripts" / "run_mips_trimer_scage.sh"
+LPT_TASKS = ("egc", "egb", "eat", "xc", "ei", "eps", "nc", "eea")
+LPT_FOLDS = (0, 1, 2, 3, 4)
+LPT_UNITS = [(task, fold) for task in LPT_TASKS for fold in LPT_FOLDS]
+
+
+def _lpt_script_text():
+    return _LPT_SCRIPT.read_text(encoding="utf-8")
+
+
+def _parse_lpt_array(name):
+    text = _lpt_script_text()
+    match = re.search(rf"{name}=\(([^)]+)\)", text)
+    assert match, f"{name} not found in run_mips_trimer_scage.sh"
+    return match.group(1).split()
+
+
+class _DispatchSimulator:
+    """Reference 3-slot dispatch loop matching run_finetune_seeds.
+
+    The shell loop fills three dynamic GPU slots, `wait -n` on the earliest
+    finishing child, refills the freed slot, skips shards whose identity
+    already validates, and stops dispatching (keeping in-flight children for
+    reaping) the moment a unit fails.  This is a pure reimplementation used to
+    pin those semantics against the fixed lpt_v1 unit order.
+    """
+
+    def __init__(self, units, *, duration, resume, fail_at):
+        self.queue = list(units)
+        self.duration = duration  # unit -> int ticks
+        self.resume = resume      # unit -> True => already verified, skip
+        self.fail_at = fail_at    # unit -> True => dispatch fails here
+        self.events = []          # ("start"|"end", unit, gpu)
+        self.finished = []
+        self.failed = None
+        self.in_flight_at_fail = 0
+
+    def run(self):
+        pending = [u for u in self.queue if not self.resume(u)]
+        free = list(range(3))
+        active = {}  # pid -> [unit, gpu, remaining ticks]
+        pid = 0
+        next_idx = 0
+        while next_idx < len(pending) or active:
+            while next_idx < len(pending) and free:
+                gpu = free.pop(0)
+                unit = pending[next_idx]
+                next_idx += 1
+                pid += 1
+                active[pid] = [unit, gpu, self.duration(unit)]
+                self.events.append(("start", unit, gpu))
+            if not active:
+                continue
+            done_pid = min(active, key=lambda p: active[p][2])
+            unit, gpu, _ = active.pop(done_pid)
+            self.events.append(("end", unit, gpu))
+            self.finished.append((unit, gpu))
+            free.append(gpu)
+            if self.fail_at(unit):
+                self.failed = unit
+                self.in_flight_at_fail = len(active)
+                return
+
+    def started_order(self):
+        return [unit for kind, unit, _ in self.events if kind == "start"]
+
+
+def test_lpt_v1_schedule_is_fixed_40_unique_units_egc_first():
+    tasks = _parse_lpt_array("LPT_V1_TASK_ORDER")
+    folds = [int(fold) for fold in _parse_lpt_array("LPT_V1_FOLD_ORDER")]
+    assert tasks == list(LPT_TASKS)
+    assert folds == list(LPT_FOLDS)
+    assert len(LPT_UNITS) == 40
+    assert len(set(LPT_UNITS)) == 40, "duplicate (task, fold) units"
+    assert {task for task, _ in LPT_UNITS} == set(LPT_TASKS), "missing task"
+    assert {fold for _, fold in LPT_UNITS} == set(range(5)), "missing fold"
+    # egc's five folds sit at the head of the dispatch queue.
+    assert LPT_UNITS[:5] == [("egc", fold) for fold in LPT_FOLDS]
+    # Longest-predicted-task-first order, folds ascending within each task.
+    expected = []
+    for task in LPT_TASKS:
+        for fold in LPT_FOLDS:
+            expected.append((task, fold))
+    assert LPT_UNITS == expected
+
+
+def test_lpt_v1_does_not_change_training_identity():
+    text = _lpt_script_text()
+    # The schedule must never leak into a fold's training_config_hash, which
+    # is derived only from finetune_config_hash, seed and loader_workers.
+    match = re.search(r"stage3_training_hash\(\)\s*\{.*?\}", text, re.S)
+    assert match
+    body = match.group(0)
+    assert "MTS_FINETUNE_SCHEDULE" not in body
+    assert "task" not in body and "fold" not in body
+    # The lpt_v1 dispatch branch only selects dispatch_tasks/dispatch_folds;
+    # it must not touch hashes, launch arguments, or the resume gate.
+    branch = re.search(
+        r'if \[\[ "\$MTS_FINETUNE_SCHEDULE" == "lpt_v1" \]\].*?^  fi$',
+        text, re.M | re.S,
+    )
+    assert branch
+    branch_text = branch.group(0)
+    for forbidden in (
+        "stage3_training_hash", "training_config_hash", "launch_stage3_unit",
+        "validate_shard", "CHECKPOINT_SHA256", "CACHE_STORE_SHA256",
+    ):
+        assert forbidden not in branch_text
+
+
+def test_lpt_v1_three_slots_refill_immediately():
+    cost = {task: len(LPT_TASKS) - i for i, task in enumerate(LPT_TASKS)}
+    sim = _DispatchSimulator(
+        LPT_UNITS,
+        duration=lambda unit: cost[unit[0]],
+        resume=lambda unit: False,
+        fail_at=lambda unit: False,
+    )
+    sim.run()
+    assert sim.started_order() == LPT_UNITS
+    assert len(sim.finished) == 40
+    # Concurrency never exceeds the three dynamic GPU slots.
+    active = 0
+    peak = 0
+    for kind, _, _ in sim.events:
+        active += 1 if kind == "start" else -1
+        peak = max(peak, active)
+        assert 0 <= active <= 3, "more than three slots busy at once"
+    assert peak == 3
+    # Every freed slot is refilled from the queue head before more work waits.
+    starts = 0
+    for kind, unit, _ in sim.events:
+        if kind == "start":
+            starts += 1
+        else:
+            starts -= 1
+        assert 0 <= starts <= 3
+    # All 40 units complete exactly once; completion order follows each
+    # unit's own duration, only the dispatch order is pinned by lpt_v1.
+    assert {unit for unit, _ in sim.finished} == set(LPT_UNITS)
+
+
+def test_lpt_v1_resume_skips_verified_shards():
+    cost = {task: len(LPT_TASKS) - i for i, task in enumerate(LPT_TASKS)}
+    verified = {(task, 3) for task in LPT_TASKS}
+    sim = _DispatchSimulator(
+        LPT_UNITS,
+        duration=lambda unit: cost[unit[0]],
+        resume=lambda unit: unit in verified,
+        fail_at=lambda unit: False,
+    )
+    sim.run()
+    assert not any(unit in verified for unit in sim.started_order())
+    assert len(sim.finished) == 40 - len(verified)
+
+
+def test_lpt_v1_failure_stops_dispatch_and_keeps_in_flight_children():
+    cost = {task: len(LPT_TASKS) - i for i, task in enumerate(LPT_TASKS)}
+    sim = _DispatchSimulator(
+        LPT_UNITS,
+        duration=lambda unit: cost[unit[0]],
+        resume=lambda unit: False,
+        fail_at=lambda unit: unit == ("egc", 2),
+    )
+    sim.run()
+    assert sim.failed == ("egc", 2)
+    started = sim.started_order()
+    assert ("egc", 2) in started
+    # Once the failing unit ends, no further unit is dispatched, and the
+    # children still in flight are left for the cleanup handler to reap.
+    end_index = next(
+        i for i, (kind, unit, _) in enumerate(sim.events)
+        if kind == "end" and unit == ("egc", 2)
+    )
+    assert not any(
+        kind == "start" for kind, _, _ in sim.events[end_index + 1:]
+    )
+    assert sim.in_flight_at_fail == 2  # egc/3 and egc/4 still running

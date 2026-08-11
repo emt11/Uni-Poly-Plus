@@ -171,6 +171,9 @@ class UniEncoderAttention(nn.Module):
         mips_mask_mode: str = None,
         mips_mask_policy: str = None,
         mips_masked_loss_reduction: str = None,
+        use_star_rbf: bool = True,
+        use_mcl: bool = True,
+        mcl_mask_mode: str = "real",
         fusion_type: str = 'none',
         fp_mode: str = 'ecfp',
         fusion_dropout: Optional[float] = None,
@@ -282,6 +285,9 @@ class UniEncoderAttention(nn.Module):
                 mips_mask_mode=mips_mask_mode,
                 mips_mask_policy=mips_mask_policy,
                 mips_masked_loss_reduction=mips_masked_loss_reduction,
+                use_star_rbf=use_star_rbf,
+                use_mcl=use_mcl,
+                mcl_mask_mode=mcl_mask_mode,
                 fp_mode=fp_mode,
                 fp_bit_dropout=fp_bit_dropout,
                 low_capacity_adapter=(
@@ -626,6 +632,9 @@ class EncoderModule(nn.Module):
         mips_mask_mode: str = None,
         mips_mask_policy: str = None,
         mips_masked_loss_reduction: str = None,
+        use_star_rbf: bool = True,
+        use_mcl: bool = True,
+        mcl_mask_mode: str = "real",
         fp_mode: str = 'ecfp',
         fp_bit_dropout: float = 0.0,
         low_capacity_adapter: bool = False,
@@ -689,6 +698,9 @@ class EncoderModule(nn.Module):
             mips_mask_mode=mips_mask_mode,
             mips_mask_policy=mips_mask_policy,
             mips_masked_loss_reduction=mips_masked_loss_reduction,
+            use_star_rbf=use_star_rbf,
+            use_mcl=use_mcl,
+            mcl_mask_mode=mcl_mask_mode,
             fp_mode=fp_mode,
             fp_bit_dropout=fp_bit_dropout,
         )
@@ -763,6 +775,9 @@ class EncoderModule(nn.Module):
         mips_mask_mode: str,
         mips_mask_policy: str,
         mips_masked_loss_reduction: str,
+        use_star_rbf: bool,
+        use_mcl: bool,
+        mcl_mask_mode: str,
         fp_mode: str,
         fp_bit_dropout: float,
     ):
@@ -806,6 +821,9 @@ class EncoderModule(nn.Module):
                     mask_mode=mips_mask_mode,
                     mask_policy=mips_mask_policy,
                     masked_loss_reduction=mips_masked_loss_reduction,
+                    use_star_rbf=use_star_rbf,
+                    use_mcl=use_mcl,
+                    mcl_mask_mode=mcl_mask_mode,
                 )
                 _model_load_log(
                     "Using sparse non-PBC MIPS PyG graph encoder "
