@@ -91,6 +91,7 @@ from .trimer_mcl import (
 )
 from .mips_cache_validation import validate_mcl_record
 from .mts_relation_geometry import RelationGeometryPermutation, RelationGeometrySidecar
+from .mts_star_rbf_v2 import StarRBFV2Sidecar
 from .mts_target_contract import make_target_contract
 from transformers import AutoTokenizer
 from rdkit.Chem import rdFingerprintGenerator
@@ -2204,6 +2205,8 @@ class UniDataset(Dataset):
         relation_geometry_artifact_hash=None,
         g3_permutation_sidecar=None,
         g3_permutation_artifact_hash=None,
+        star_rbf_v2_sidecar=None,
+        star_rbf_v2_artifact_hash=None,
     ):
         self.dataset = dataset
         self.ablation_config = ablation_config or {}
@@ -2228,6 +2231,13 @@ class UniDataset(Dataset):
         )
         self._relation_geometry_sidecar = None
         self._g3_permutation = None
+        self.star_rbf_v2_sidecar_root = (
+            str(star_rbf_v2_sidecar) if star_rbf_v2_sidecar else None
+        )
+        self.star_rbf_v2_artifact_hash = (
+            str(star_rbf_v2_artifact_hash) if star_rbf_v2_artifact_hash else None
+        )
+        self._star_rbf_v2_sidecar = None
         self.ablation_id = self.ablation_config.get("id")
         if self.ablation_id is not None:
             self.ablation_id = str(self.ablation_id)
@@ -2524,6 +2534,11 @@ class UniDataset(Dataset):
             self._init_legacy(processed_dir=processed_dir, graph_tag=f"{graph_tag}_{geom_tag}_{fp_tag}")
         if self.g_family_arm is not None:
             self._init_relation_geometry_sidecar()
+        if self.star_rbf_v2_sidecar_root is not None:
+            self._star_rbf_v2_sidecar = StarRBFV2Sidecar(
+                self.star_rbf_v2_sidecar_root,
+                expected_artifact_hash=self.star_rbf_v2_artifact_hash,
+            )
 
     # ------------------------------------------------------------------
     # Legacy path (--disable_feature_cache)
@@ -5451,6 +5466,24 @@ class UniDataset(Dataset):
             data = self._attach_relation_geometry(
                 data, lookup_key_for_hash, row_hint=row_hint
             )
+        if self._star_rbf_v2_sidecar is not None:
+            row_hint = int(idx) if self._cohort_row_mode else None
+            sidecar_row = self._star_rbf_v2_sidecar.row(
+                self._star_rbf_v2_sidecar.index_for_key(
+                    lookup_key_for_hash, row_hint=row_hint
+                )
+            )
+            relations, pairs = sidecar_row["relations"], sidecar_row["pairs"]
+            data.mts_star_v2_relation_row = torch.as_tensor(relations["relation_row"], dtype=torch.long)
+            data.mts_star_v2_relation_pair_index = torch.as_tensor(relations["relation_pair_index"], dtype=torch.long)
+            data.mts_star_v2_relation_spd = torch.as_tensor(relations["relation_spd"], dtype=torch.long)
+            data.mts_star_v2_pair_observation_distances = torch.as_tensor(pairs["pair_observation_distances"], dtype=torch.float32)
+            data.mts_star_v2_pair_observation_count = torch.as_tensor(pairs["pair_observation_count"], dtype=torch.long)
+            data.mts_star_v2_pair_valid = torch.as_tensor(pairs["pair_valid"], dtype=torch.bool)
+            data.mts_star_v2_pair_geometry_source = torch.as_tensor(pairs["pair_geometry_source"], dtype=torch.long)
+            data.mts_star_v2_sidecar_artifact = self._star_rbf_v2_sidecar.artifact_hash
+            data.mts_star_v2_model_semantic_hash = self._star_rbf_v2_sidecar.model_semantic_hash
+            data.mts_star_v2_rbf_upper = float(self._star_rbf_v2_sidecar.rbf_upper)
         # A4 random-mask sidecar (Plan mts_geometry_injection A4): attach the
         # sample-local compact visible key sets so the collator can expand them
         # into batch rows without dense [Q, K] storage on disk.

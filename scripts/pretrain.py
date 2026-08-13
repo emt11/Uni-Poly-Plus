@@ -108,7 +108,9 @@ _PRETRAIN_CODE_FILES = (
     "configs/mts/experiments/T0_o8_pretrain20k_matched_v1.json",
     "configs/mts/experiments/T1_msta_pretrain20k_matched_v1.json",
     "configs/mts/experiments/T1_msta_readiness.json",
+    "configs/mts/experiments/R2_g1_periodic_relation_rbf_v2_legacy_backbone_formal_v1.json",
     "scripts/initialize_mts_t_pretrain0.py",
+    "scripts/initialize_mts_star_rbf_v2.py",
     "scripts/audit_mts_t_pretrain0.py",
     "scripts/initialize_mts_t1.py",
     "scripts/pretrain.py",
@@ -116,6 +118,7 @@ _PRETRAIN_CODE_FILES = (
     "src/dataset/dataloader.py",
     "src/dataset/dataset.py",
     "src/dataset/mips_trimer_contract.py",
+    "src/dataset/mts_star_rbf_v2.py",
     "src/dataset/trimer_mcl.py",
     "src/modules/mips_local_graph.py",
     "src/modules/uni_encoder.py",
@@ -672,6 +675,12 @@ def parse_arguments():
     parser.add_argument('--g3_permutation_sidecar', default=None)
     parser.add_argument('--g3_permutation_artifact_hash', default=None)
     parser.add_argument('--g_family_bundle_hash', default=None)
+    parser.add_argument('--star_rbf_definition', choices=['legacy_sample_direct_link_v1', 'trimer_periodic_relation_rbf_v2'], default='legacy_sample_direct_link_v1')
+    parser.add_argument('--star_rbf_upper', type=float, default=3.0)
+    parser.add_argument('--star_rbf_v2_sidecar', default=None)
+    parser.add_argument('--star_rbf_v2_artifact_hash', default=None)
+    parser.add_argument('--star_rbf_v2_model_semantic_hash', default=None)
+    parser.add_argument('--backbone_definition', default=None)
     parser.add_argument('--pretraining_objective', choices=['joint', 'masked_atom_only'], default='joint')
     parser.add_argument('--angle_loss_weight', type=float, default=0.25)
     parser.add_argument('--shared_step0_id', default=None)
@@ -1147,6 +1156,26 @@ def _load_fresh_paired_initialization(model, args):
                     "G-family step-0 initialization metadata mismatch for "
                     f"{key}: expected={expected!r}, observed={observed!r}"
                 )
+        if getattr(args, "star_rbf_definition", None) == "trimer_periodic_relation_rbf_v2":
+            star_required = {
+                "star_rbf_definition": "trimer_periodic_relation_rbf_v2",
+                "star_rbf_v2_upper": float(args.star_rbf_upper),
+                "star_rbf_v2_model_semantic_hash": getattr(
+                    args, "star_rbf_v2_model_semantic_hash", None
+                ),
+                "backbone_definition": "legacy_g1_frozen",
+            }
+            for key, expected in star_required.items():
+                observed = meta.get(key)
+                matches = (
+                    float(observed) == expected if key == "star_rbf_v2_upper"
+                    else observed == expected
+                )
+                if not matches:
+                    raise RuntimeError(
+                        f"Star-RBF v2 step-0 metadata mismatch for {key}: "
+                        f"expected={expected!r}, observed={observed!r}"
+                    )
     state = payload["state_dict"]
     expected_state = model.state_dict()
     missing = sorted(set(expected_state) - set(state))
@@ -4078,6 +4107,8 @@ def _dataset_kwargs_from_args(args):
         relation_geometry_artifact_hash=args.relation_geometry_artifact_hash,
         g3_permutation_sidecar=args.g3_permutation_sidecar,
         g3_permutation_artifact_hash=args.g3_permutation_artifact_hash,
+        star_rbf_v2_sidecar=args.star_rbf_v2_sidecar,
+        star_rbf_v2_artifact_hash=args.star_rbf_v2_artifact_hash,
         angle_cache_root_override=getattr(args, 'angle_cache_root_override', None),
     )
 
@@ -4150,6 +4181,12 @@ def main():
                 or not args.relation_geometry_artifact_hash
             ):
                 raise RuntimeError("G1/G2/G3 pretraining requires the active PI1M_v2 artifact binding")
+            if args.star_rbf_definition == "trimer_periodic_relation_rbf_v2" and (
+                not args.star_rbf_v2_sidecar
+                or not args.star_rbf_v2_artifact_hash
+                or float(args.star_rbf_upper) <= 0.0
+            ):
+                raise RuntimeError("Star-RBF v2 pretraining requires sidecar, artifact and positive upper")
             if args.g_family_arm == "g3" and (
                 not args.g3_permutation_sidecar
                 or not args.g3_permutation_artifact_hash
@@ -4250,13 +4287,15 @@ def main():
     # descriptor cannot silently become a formal pretraining entry point.
     g_family_formal = (
         args.config_schema == MIPS_EXPERIMENT_CONFIG_SCHEMA
-        and getattr(args, "g_family_arm", None) in {"g0", "g1"}
+        and getattr(args, "g_family_arm", None) in {"g0", "g1", "g2"}
         and not args.cache_only
         and not args.resume_smoke
         and getattr(args, "pretraining_objective", None) == "masked_atom_only"
         and float(getattr(args, "angle_loss_weight", 1.0)) == 0.0
-        and getattr(args, "shared_step0_id", None)
-        == "mts_g_family_step0_v2_seed42"
+        and getattr(args, "shared_step0_id", None) in {
+            "mts_g_family_step0_v2_seed42",
+            "mts_star_rbf_v2_r2_step0_seed42",
+        }
     )
     allowed_config_schema = (
         args.config_schema == MIPS_TRIMER_CONFIG_SCHEMA
@@ -4778,6 +4817,8 @@ def main():
         g_family_arm=args.g_family_arm,
         relation_geometry_sidecar=args.relation_geometry_sidecar,
         g3_permutation_sidecar=args.g3_permutation_sidecar,
+        star_rbf_definition=args.star_rbf_definition,
+        star_rbf_upper=args.star_rbf_upper,
         fusion_type=args.fusion_type,
         fp_mode=args.fp_mode,
         fusion_dropout=args.fusion_dropout,
@@ -5091,6 +5132,11 @@ def main():
             )
         elif str(graph_encoder.g_family_arm) in {"g1", "g2", "g3"}:
             active_modules = active_modules + (graph_encoder.relation_geometry_bias,)
+            if (
+                getattr(graph_encoder, "star_rbf_definition", None)
+                == "trimer_periodic_relation_rbf_v2"
+            ):
+                active_modules = active_modules + (graph_encoder.star_distance_bias,)
         for module in active_modules:
             for parameter in module.parameters():
                 parameter.requires_grad = True
@@ -5197,6 +5243,12 @@ def main():
         "msta_local_output_init": args.msta_local_output_init,
         "g_family_arm": getattr(args, "g_family_arm", None),
         "g_family_bundle_hash": getattr(args, "g_family_bundle_hash", None),
+        "star_rbf_definition": getattr(args, "star_rbf_definition", None),
+        "star_rbf_upper": getattr(args, "star_rbf_upper", None),
+        "star_rbf_v2_sidecar": getattr(args, "star_rbf_v2_sidecar", None),
+        "star_rbf_v2_artifact_hash": getattr(args, "star_rbf_v2_artifact_hash", None),
+        "star_rbf_v2_model_semantic_hash": getattr(args, "star_rbf_v2_model_semantic_hash", None),
+        "backbone_definition": getattr(args, "backbone_definition", None),
         "relation_geometry_sidecar": getattr(args, "relation_geometry_sidecar", None),
         "relation_geometry_artifact_hash": getattr(args, "relation_geometry_artifact_hash", None),
         "g3_permutation_sidecar": getattr(args, "g3_permutation_sidecar", None),
@@ -6720,6 +6772,12 @@ def main():
             "relation_geometry_artifact_hash": getattr(args, "relation_geometry_artifact_hash", None),
             "g3_permutation_sidecar": getattr(args, "g3_permutation_sidecar", None),
             "g3_permutation_artifact_hash": getattr(args, "g3_permutation_artifact_hash", None),
+            "star_rbf_definition": getattr(args, "star_rbf_definition", None),
+            "star_rbf_upper": getattr(args, "star_rbf_upper", None),
+            "star_rbf_v2_sidecar": getattr(args, "star_rbf_v2_sidecar", None),
+            "star_rbf_v2_artifact_hash": getattr(args, "star_rbf_v2_artifact_hash", None),
+            "star_rbf_v2_model_semantic_hash": getattr(args, "star_rbf_v2_model_semantic_hash", None),
+            "backbone_definition": getattr(args, "backbone_definition", None),
             "pretraining_objective": getattr(args, "pretraining_objective", "joint"),
             "angle_loss_weight": float(getattr(args, "angle_loss_weight", 0.25)),
             "shared_step0_id": getattr(args, "shared_step0_id", None),
@@ -6967,6 +7025,12 @@ def main():
                 'relation_geometry_artifact_hash': getattr(args, 'relation_geometry_artifact_hash', None),
                 'g3_permutation_sidecar': getattr(args, 'g3_permutation_sidecar', None),
                 'g3_permutation_artifact_hash': getattr(args, 'g3_permutation_artifact_hash', None),
+                'star_rbf_definition': getattr(args, 'star_rbf_definition', None),
+                'star_rbf_upper': getattr(args, 'star_rbf_upper', None),
+                'star_rbf_v2_sidecar': getattr(args, 'star_rbf_v2_sidecar', None),
+                'star_rbf_v2_artifact_hash': getattr(args, 'star_rbf_v2_artifact_hash', None),
+                'star_rbf_v2_model_semantic_hash': getattr(args, 'star_rbf_v2_model_semantic_hash', None),
+                'backbone_definition': getattr(args, 'backbone_definition', None),
                 'shared_step0_id': getattr(args, 'shared_step0_id', None),
                 'initialization': (
                     'fresh_paired' if initialization_info is not None else 'random'

@@ -312,18 +312,6 @@ def _graph_backbone_annotations(
                             path_mol.RemoveBond(star_left, star_right)
                     path = Chem.rdmolops.GetShortestPath(path_mol.GetMol(), left, right)
                 backbone.update(int(i) for i in path)
-                path_bonds = {
-                    int(mol.GetBondBetweenAtoms(int(i), int(j)).GetIdx())
-                    for i, j in zip(path[:-1], path[1:])
-                    if mol.GetBondBetweenAtoms(int(i), int(j)) is not None
-                }
-                # MIPS treats a ring as backbone only when the attachment path
-                # actually traverses one of its bonds. Merely touching a ring
-                # atom is insufficient.
-                ring_info = mol.GetRingInfo()
-                for atom_ring, bond_ring in zip(ring_info.AtomRings(), ring_info.BondRings()):
-                    if path_bonds.intersection(int(idx) for idx in bond_ring):
-                        backbone.update(int(idx) for idx in atom_ring)
             except Exception:
                 backbone.update(int(i) for i in (left, right) if int(i) < n_atoms)
 

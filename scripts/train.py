@@ -273,6 +273,29 @@ def validate_g_family_checkpoint_binding(checkpoint_meta, args, *, allow_smoke=F
     permutation_hash = checkpoint_meta.get("g3_permutation_artifact_hash")
     if arm == "g3" and (not isinstance(permutation_hash, str) or len(permutation_hash) != 64):
         mismatches["g3_permutation_artifact_hash"] = (permutation_hash, "bound SHA256")
+    if getattr(args, "star_rbf_definition", None) == "trimer_periodic_relation_rbf_v2":
+        star_expected = {
+            "star_rbf_definition": "trimer_periodic_relation_rbf_v2",
+            "star_rbf_upper": float(args.star_rbf_upper),
+            "star_rbf_v2_artifact_hash": getattr(
+                args, "star_rbf_v2_source_artifact_hash", None
+            ),
+            "star_rbf_v2_model_semantic_hash": getattr(
+                args, "star_rbf_v2_model_semantic_hash", None
+            ),
+            "backbone_definition": "legacy_g1_frozen",
+        }
+        for key, expected_value in star_expected.items():
+            observed = checkpoint_meta.get(key)
+            if key == "star_rbf_upper":
+                try:
+                    matches = float(observed) == expected_value
+                except (TypeError, ValueError):
+                    matches = False
+            else:
+                matches = observed == expected_value
+            if not matches:
+                mismatches[key] = (observed, expected_value)
     if mismatches:
         raise RuntimeError(f"G-family checkpoint identity mismatch: {mismatches}")
 
@@ -935,6 +958,13 @@ def parse_arguments():
     parser.add_argument('--g3_permutation_sidecar', default=None)
     parser.add_argument('--g3_permutation_artifact_hash', default=None)
     parser.add_argument('--g_family_bundle_hash', default=None)
+    parser.add_argument('--star_rbf_definition', choices=['legacy_sample_direct_link_v1', 'trimer_periodic_relation_rbf_v2'], default='legacy_sample_direct_link_v1')
+    parser.add_argument('--star_rbf_upper', type=float, default=3.0)
+    parser.add_argument('--star_rbf_v2_sidecar', default=None)
+    parser.add_argument('--star_rbf_v2_artifact_hash', default=None)
+    parser.add_argument('--star_rbf_v2_source_artifact_hash', default=None)
+    parser.add_argument('--star_rbf_v2_model_semantic_hash', default=None)
+    parser.add_argument('--backbone_definition', default=None)
     parser.add_argument('--shared_step0_id', default=None)
     parser.add_argument(
         '--topology_representation',
@@ -1246,6 +1276,18 @@ def main():
                 or not args.g3_permutation_artifact_hash
             ):
                 raise ValueError("G3 fine-tuning requires the active permutation artifact binding")
+            if args.star_rbf_definition == "trimer_periodic_relation_rbf_v2" and (
+                not args.star_rbf_v2_sidecar
+                or not args.star_rbf_v2_artifact_hash
+                or not args.star_rbf_v2_source_artifact_hash
+                or not args.star_rbf_v2_model_semantic_hash
+                or args.backbone_definition != "legacy_g1_frozen"
+                or float(args.star_rbf_upper) <= 0.0
+            ):
+                raise ValueError(
+                    "Star-RBF v2 fine-tuning requires sidecar/artifact/semantic/upper "
+                    "and legacy_g1_frozen backbone bindings"
+                )
         if args.finetune_profile != "legacy_mts_huber_v1":
             raise ValueError(
                 "MTS production fine-tuning uses legacy_mts_huber_v1; "
@@ -1441,6 +1483,8 @@ def main():
         relation_geometry_artifact_hash=args.relation_geometry_artifact_hash,
         g3_permutation_sidecar=args.g3_permutation_sidecar,
         g3_permutation_artifact_hash=args.g3_permutation_artifact_hash,
+        star_rbf_v2_sidecar=args.star_rbf_v2_sidecar,
+        star_rbf_v2_artifact_hash=args.star_rbf_v2_artifact_hash,
             ablation_config=(
                 {
                     "id": _ablation["ablation_id"],
@@ -1871,6 +1915,8 @@ def main():
                 g_family_arm=args.g_family_arm,
                 relation_geometry_sidecar=args.relation_geometry_sidecar,
                 g3_permutation_sidecar=args.g3_permutation_sidecar,
+                star_rbf_definition=args.star_rbf_definition,
+                star_rbf_upper=args.star_rbf_upper,
                 use_star_rbf=_ablation["use_star_rbf"],
                 use_mcl=_ablation["use_mcl"],
                 mcl_mask_mode=_ablation["mcl_mask_mode"],
@@ -2743,6 +2789,19 @@ def main():
             'relation_geometry_artifact_hash': getattr(args, 'relation_geometry_artifact_hash', None),
             'g3_permutation_sidecar': getattr(args, 'g3_permutation_sidecar', None),
             'g3_permutation_artifact_hash': getattr(args, 'g3_permutation_artifact_hash', None),
+            'star_rbf_definition': getattr(args, 'star_rbf_definition', None),
+            'star_rbf_upper': getattr(args, 'star_rbf_upper', None),
+            'star_rbf_v2_sidecar': getattr(args, 'star_rbf_v2_sidecar', None),
+            'star_rbf_v2_artifact_hash': getattr(args, 'star_rbf_v2_artifact_hash', None),
+            'checkpoint_star_rbf_v2_artifact_hash': (
+                checkpoint_meta.get('star_rbf_v2_artifact_hash')
+                if pretrained_model_path else None
+            ),
+            'star_rbf_v2_source_artifact_hash': getattr(
+                args, 'star_rbf_v2_source_artifact_hash', None
+            ),
+            'star_rbf_v2_model_semantic_hash': getattr(args, 'star_rbf_v2_model_semantic_hash', None),
+            'backbone_definition': getattr(args, 'backbone_definition', None),
             'smoke_only': bool(g_family_smoke),
             'shared_step0_id': getattr(args, 'shared_step0_id', None),
             'trimer_cache_hash': (

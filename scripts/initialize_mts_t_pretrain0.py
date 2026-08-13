@@ -68,6 +68,8 @@ def build_model(
     g3_permutation_sidecar: str | None = None,
     use_star_rbf: bool = True,
     use_mcl: bool = True,
+    star_rbf_definition: str = "legacy_sample_direct_link_v1",
+    star_rbf_upper: float = 3.0,
 ) -> UniEncoderAttention:
     """Mirror the fixed graph-only MTS constructor used by pretrain.py."""
 
@@ -133,6 +135,8 @@ def build_model(
         mips_mask_policy="canonical_exact",
         mips_masked_loss_reduction="atom_mean",
         use_star_rbf=use_star_rbf,
+        star_rbf_definition=star_rbf_definition,
+        star_rbf_upper=star_rbf_upper,
         use_mcl=use_mcl,
         mcl_mask_mode="real",
         topology_attention_variant=variant,

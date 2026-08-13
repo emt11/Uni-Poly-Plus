@@ -35,6 +35,8 @@ CACHE_BUNDLE_SCHEMA = "mts-canonical-cache-bundle-v3"
 CACHE_TOPOLOGY_COST_SCHEMA = "mts-topology-cost-v1"
 CACHE_RELATION_GEOMETRY_SCHEMA = "mts-relation-geometry-sidecar-v1"
 RELATION_GEOMETRY_BUILDER_VERSION = 1
+STAR_RBF_V2_SIDECAR_SCHEMA = "mts-star-rbf-v2-sidecar-v1"
+STAR_RBF_V2_BUILDER_VERSION = 1
 # Geometry-injection ablation (A0--A4).  These identifiers are part of the
 # experiment contract, not a free-form naming convention.
 ABLATION_IDS = (

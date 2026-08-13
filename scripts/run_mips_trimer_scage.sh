@@ -90,6 +90,32 @@ if [[ -n "${G_FAMILY_ARM:-}" ]]; then
     )
   fi
 fi
+if [[ "${STAR_RBF_DEFINITION:-}" == "trimer_periodic_relation_rbf_v2" ]]; then
+  SHARED_STEP0_ID=${SHARED_STEP0_ID:-mts_star_rbf_v2_r2_step0_seed42}
+  MTS_PAIRED_INIT_ID=${MTS_PAIRED_INIT_ID:-$SHARED_STEP0_ID}
+  MTS_INITIALIZATION_STATE=${MTS_INITIALIZATION_STATE:-pretrained_models/mts_star_rbf_v2/legacy_backbone_formal_v1/R2/r2_step0.pth}
+fi
+STAR_RBF_V2_ARGS_PRETRAIN=()
+STAR_RBF_V2_ARGS_TRAIN=()
+if [[ "${STAR_RBF_DEFINITION:-legacy_sample_direct_link_v1}" == "trimer_periodic_relation_rbf_v2" ]]; then
+  STAR_RBF_V2_ARGS_PRETRAIN=(
+    --star_rbf_definition "$STAR_RBF_DEFINITION"
+    --star_rbf_upper "$STAR_RBF_V2_UPPER"
+    --star_rbf_v2_sidecar "$STAR_RBF_V2_SIDECAR_PI1M_V2"
+    --star_rbf_v2_artifact_hash "$STAR_RBF_V2_ARTIFACT_PI1M_V2"
+    --star_rbf_v2_model_semantic_hash "$STAR_RBF_V2_MODEL_SEMANTIC_HASH"
+    --backbone_definition "$BACKBONE_DEFINITION"
+  )
+  STAR_RBF_V2_ARGS_TRAIN=(
+    --star_rbf_definition "$STAR_RBF_DEFINITION"
+    --star_rbf_upper "$STAR_RBF_V2_UPPER"
+    --star_rbf_v2_sidecar "$STAR_RBF_V2_SIDECAR_DOWNSTREAM_UNION"
+    --star_rbf_v2_artifact_hash "$STAR_RBF_V2_ARTIFACT_DOWNSTREAM_UNION"
+    --star_rbf_v2_source_artifact_hash "$STAR_RBF_V2_ARTIFACT_PI1M_V2"
+    --star_rbf_v2_model_semantic_hash "$STAR_RBF_V2_MODEL_SEMANTIC_HASH"
+    --backbone_definition "$BACKBONE_DEFINITION"
+  )
+fi
 MTS_T1_INIT_ARGS=()
 if [[ "${MTS_ALLOW_T1_FUNCTION_PRESERVING_INIT:-0}" == "1" ]]; then
   if [[ "$TOPOLOGY_ATTENTION_VARIANT" != "msta_last2" ]]; then
@@ -184,11 +210,12 @@ FINETUNE_AMP_DTYPE=${MTS_FINETUNE_AMP_DTYPE:-fp32}
 FINETUNE_SEEDS=${FINETUNE_SEEDS:-42}
 MTS_RUN_MULTI_SEED=${MTS_RUN_MULTI_SEED:-0}
 G_FAMILY_FORMAL_PRETRAIN=0
-if [[ ( "${G_FAMILY_ARM:-}" == "g0" || "${G_FAMILY_ARM:-}" == "g1" ) \
+if [[ ( "${G_FAMILY_ARM:-}" == "g0" || "${G_FAMILY_ARM:-}" == "g1" || "${G_FAMILY_ARM:-}" == "g2" ) \
       && "$PRETRAIN_ONLY" == 1 \
       && "${PRETRAINING_OBJECTIVE:-}" == "masked_atom_only" \
       && ( "${ANGLE_LOSS_WEIGHT:-1}" == "0" || "${ANGLE_LOSS_WEIGHT:-1}" == "0.0" ) \
-      && "${SHARED_STEP0_ID:-}" == "mts_g_family_step0_v2_seed42" ]]; then
+      && ( "${SHARED_STEP0_ID:-}" == "mts_g_family_step0_v2_seed42" \
+           || "${SHARED_STEP0_ID:-}" == "mts_star_rbf_v2_r2_step0_seed42" ) ]]; then
   G_FAMILY_FORMAL_PRETRAIN=1
 fi
 if [[ "$RESOLVED_CONFIG_SCHEMA" == "mts-experiment-v3" \
@@ -496,6 +523,7 @@ PY
   env CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" scripts/pretrain.py \
     --dataset_name "$dataset" --pretrain_stage mts_joint_pretraining \
     "${COMMON[@]}" "${CACHE[@]}" "${PRETRAIN_G_FAMILY_ARGS[@]}" \
+    "${STAR_RBF_V2_ARGS_PRETRAIN[@]}" \
     "${PRETRAIN_IDENTITY_ARGS[@]}" "$@" \
     --cache_layers "$layers" --cache_only
 }
@@ -548,6 +576,7 @@ fi
 if [[ "$FINETUNE_ONLY" != 1 && "$PRETRAIN_ONLY" != 1 && "$PRETRAIN_BENCHMARK_ONLY" != 1 || "$PRETRAIN_CACHE_ONLY" == 1 ]]; then
   env CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" scripts/train.py \
     "${COMMON[@]}" "${CACHE[@]}" "${TRAIN_G_FAMILY_ARGS[@]}" \
+    "${STAR_RBF_V2_ARGS_TRAIN[@]}" \
     --feature_source_dataset smi_all \
     --cache_layers "$MTS_TRAIN_CACHE_LAYERS" \
     --tasks "${TASK_LIST[@]}" --fold_ids "${FOLD_LIST[@]}" --cache_only
@@ -612,6 +641,7 @@ if [[ "$FINETUNE_ONLY" != 1 ]]; then
     --feature_source_dataset "$PRETRAIN_DATASET" \
     --pretrain_stage mts_joint_pretraining \
     "${COMMON[@]}" "${CACHE[@]}" "${PRETRAIN_G_FAMILY_ARGS[@]}" \
+    "${STAR_RBF_V2_ARGS_PRETRAIN[@]}" \
     "${PRETRAIN_IDENTITY_ARGS[@]}" \
     --cache_layers topology,trimer \
     --pretrain_profile "$PRETRAIN_PROFILE" \
@@ -807,6 +837,7 @@ launch_stage3_unit() {
     else
       "$PYTHON_BIN" scripts/train.py \
         "${COMMON[@]}" "${CACHE[@]}" "${TRAIN_G_FAMILY_ARGS[@]}" \
+        "${STAR_RBF_V2_ARGS_TRAIN[@]}" \
         "${TRAIN_IDENTITY_ARGS[@]}" \
         "${MTS_T1_INIT_ARGS[@]}" \
         "${MTS_FINETUNE_MODE_ARGS[@]}" \

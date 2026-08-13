@@ -165,6 +165,50 @@ class SymmetricStarDistanceBias(nn.Module):
         output[selected_edges] = projected.to(dtype=output.dtype)
         return output
 
+    def forward_periodic_relation_v2(self, data, dtype):
+        """Encode unique periodic pairs, then gather one shared value per inverse relation."""
+        edge_count = int(data.lga_edge_index.size(1))
+        output = data.lga_spd.new_zeros(
+            (edge_count, self.projection.out_features), dtype=dtype
+        )
+        rows = data.mts_star_v2_relation_row.long().reshape(-1)
+        pair_index = data.mts_star_v2_relation_pair_index.long().reshape(-1)
+        distances = data.mts_star_v2_pair_observation_distances.float().reshape(-1, 2)
+        counts = data.mts_star_v2_pair_observation_count.long().reshape(-1)
+        valid = data.mts_star_v2_pair_valid.bool().reshape(-1)
+        sources = data.mts_star_v2_pair_geometry_source.long().reshape(-1)
+        pair_count = int(valid.numel())
+        if distances.size(0) != pair_count or counts.numel() != pair_count:
+            raise ValueError("Star-RBF v2 pair tensor length mismatch")
+        if rows.numel() != pair_index.numel() or (
+            rows.numel() and (int(rows.min()) < 0 or int(rows.max()) >= edge_count)
+        ):
+            raise ValueError("Star-RBF v2 relation mapping mismatch")
+        if pair_index.numel() and (
+            int(pair_index.min()) < 0 or int(pair_index.max()) >= pair_count
+        ):
+            raise ValueError("Star-RBF v2 pair mapping out of bounds")
+        # Source code 1 is the audited true self relation: it deliberately
+        # stays zero instead of encoding RBF(0).
+        encode = valid & (sources != 1) & (counts > 0)
+        pair_bias = output.new_zeros((pair_count, self.projection.out_features))
+        if bool(encode.any()):
+            selected = distances[encode]
+            rbf = torch.exp(
+                -self.gamma
+                * (selected.unsqueeze(-1) - self.centers.float().reshape(1, 1, -1)) ** 2
+            )
+            observation_mask = (
+                torch.arange(2, device=counts.device).reshape(1, 2)
+                < counts[encode].reshape(-1, 1)
+            ).unsqueeze(-1)
+            rbf = (rbf * observation_mask).sum(dim=1) / counts[encode].clamp_min(1).unsqueeze(-1)
+            projected = self.projection(rbf.to(self.projection.weight.dtype))
+            pair_bias[encode] = projected.to(pair_bias.dtype)
+        if rows.numel():
+            output[rows] = pair_bias[pair_index]
+        return output
+
 
 class MTSRelationGeometryBias(nn.Module):
     """Encode frozen SPD=2 relation/path geometry into per-head bias.
@@ -751,6 +795,8 @@ class MIPSLocalGraphEncoder(nn.Module):
         input_norm=False,
         qk_direction="paper",
         use_star_rbf=True,
+        star_rbf_definition="legacy_sample_direct_link_v1",
+        star_rbf_upper=3.0,
         use_mcl=True,
         mcl_mask_mode="real",
         # Low-level constructor keeps the historical T0 default for explicit
@@ -875,6 +921,11 @@ class MIPSLocalGraphEncoder(nn.Module):
         self.g_family_arm = resolved_g_arm
         self.relation_geometry_sidecar = relation_geometry_sidecar
         self.g3_permutation_sidecar = g3_permutation_sidecar
+        self.star_rbf_definition = str(star_rbf_definition)
+        if self.star_rbf_definition not in {
+            "legacy_sample_direct_link_v1", "trimer_periodic_relation_rbf_v2"
+        }:
+            raise ValueError("unsupported Star-RBF definition")
         self.topology_attention_variant = topology_attention_variant
         self.model_identity = (
             "T1" if topology_attention_variant == "msta_last2" else "T0"
@@ -897,7 +948,10 @@ class MIPSLocalGraphEncoder(nn.Module):
         # A0-A4): star-RBF and MCL can be independently bypassed in forward and
         # excluded from the optimizer, while their parameters stay in the module
         # so a shared pretrained checkpoint still loads with strict=True.
-        self.use_star_rbf = False if self.g_family_arm is not None else bool(use_star_rbf)
+        self.use_star_rbf = bool(use_star_rbf) and (
+            self.g_family_arm is None
+            or self.star_rbf_definition == "trimer_periodic_relation_rbf_v2"
+        )
         self.use_mcl = False if self.g_family_arm is not None else bool(use_mcl)
         self.mcl_mask_mode = str(mcl_mask_mode)
         if self.mcl_mask_mode not in ("real", "count_matched_random"):
@@ -921,7 +975,9 @@ class MIPSLocalGraphEncoder(nn.Module):
         self.path_bias = MIPSSinglePathNodeBias(
             self.emb_dim, self.num_heads, self.max_hops
         )
-        self.star_distance_bias = SymmetricStarDistanceBias(self.num_heads)
+        self.star_distance_bias = SymmetricStarDistanceBias(
+            self.num_heads, upper=float(star_rbf_upper)
+        )
         layers = []
         for index in range(6):
             if (
@@ -1011,7 +1067,16 @@ class MIPSLocalGraphEncoder(nn.Module):
         if require_geometry:
             if self.use_star_rbf:
                 required += (
-                    "star_3d_distance", "star_3d_asymmetry", "star_3d_valid",
+                    (
+                        "mts_star_v2_relation_row",
+                        "mts_star_v2_relation_pair_index",
+                        "mts_star_v2_pair_observation_distances",
+                        "mts_star_v2_pair_observation_count",
+                        "mts_star_v2_pair_valid",
+                        "mts_star_v2_pair_geometry_source",
+                    ) if self.star_rbf_definition == "trimer_periodic_relation_rbf_v2" else (
+                        "star_3d_distance", "star_3d_asymmetry", "star_3d_valid",
+                    )
                 )
             if self.use_mcl:
                 required += (
@@ -1102,10 +1167,13 @@ class MIPSLocalGraphEncoder(nn.Module):
         initial = self.atom_embedding(data, atom_mask=atom_mask)
         spd_bias = self.spd_embedding(data.lga_spd.long())
         path_bias = self.path_bias(initial, data)
-        star_bias = (
-            self.star_distance_bias(data, initial.dtype)
-            if use_star else torch.zeros_like(spd_bias)
-        )
+        star_bias = torch.zeros_like(spd_bias)
+        if use_star:
+            star_bias = (
+                self.star_distance_bias.forward_periodic_relation_v2(data, initial.dtype)
+                if self.star_rbf_definition == "trimer_periodic_relation_rbf_v2"
+                else self.star_distance_bias(data, initial.dtype)
+            )
         if "coordinate_shuffled" in self.geometry_mode:
             # The negative control must destroy every learned coordinate
             # channel.  Cached d_star cannot be consistently atom-permuted
@@ -1196,10 +1264,13 @@ class MIPSLocalGraphEncoder(nn.Module):
         initial = self.atom_embedding(data, atom_mask=canonical_atom_mask)
         spd_bias = self.spd_embedding(data.lga_spd.long())
         path_bias = self.path_bias(initial, data)
-        star_bias = (
-            self.star_distance_bias(data, initial.dtype)
-            if self.use_star_rbf else torch.zeros_like(spd_bias)
-        )
+        star_bias = torch.zeros_like(spd_bias)
+        if self.use_star_rbf:
+            star_bias = (
+                self.star_distance_bias.forward_periodic_relation_v2(data, initial.dtype)
+                if self.star_rbf_definition == "trimer_periodic_relation_rbf_v2"
+                else self.star_distance_bias(data, initial.dtype)
+            )
         relation_mask = getattr(data, "lga_relation_mask", None)
         if relation_mask is not None:
             keep = (~relation_mask.bool()).unsqueeze(-1).to(initial.dtype)

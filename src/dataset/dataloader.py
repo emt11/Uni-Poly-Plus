@@ -82,6 +82,10 @@ def mips_trimer_collate(data_list):
     geometry_cohort_hashes = set()
     geometry_arms = set()
     geometry_items = 0
+    star_v2_relation_rows, star_v2_relation_pairs = [], []
+    star_v2_pair_distances, star_v2_pair_counts = [], []
+    star_v2_pair_valid, star_v2_pair_sources = [], []
+    star_v2_artifacts, star_v2_semantics, star_v2_uppers = set(), set(), set()
     smiles_ids, smiles_masks, fp_parts = [], [], []
     smiles_available, fp_available = [], []
     smiles_fields_present = all(
@@ -143,6 +147,7 @@ def mips_trimer_collate(data_list):
     query_row_offset = 0
     lga_relation_offset = 0
     geometry_path_offset = 0
+    star_v2_pair_offset = 0
 
     for graph_id, item in enumerate(data_list):
         # A legacy single-node canonical placeholder carries a one-column path
@@ -198,6 +203,29 @@ def mips_trimer_collate(data_list):
         lga_masks.append(item.lga_path_mask.bool())
         lga_hist.append(item.lga_path_bond_hist.float())
         lga_star.append(item.lga_star_edge_mask.bool())
+
+        if hasattr(item, "mts_star_v2_relation_row"):
+            rows = item.mts_star_v2_relation_row.long()
+            pairs = item.mts_star_v2_relation_pair_index.long()
+            if rows.numel() != pairs.numel():
+                raise ValueError("Star-RBF v2 relation/pair length mismatch")
+            if rows.numel() and (int(rows.min()) < 0 or int(rows.max()) >= int(item.lga_spd.numel())):
+                raise ValueError("Star-RBF v2 relation row out of bounds")
+            if not torch.equal(item.mts_star_v2_relation_spd.long(), item.lga_spd[rows].long()):
+                raise ValueError("Star-RBF v2 relation SPD mismatch")
+            pair_count = int(item.mts_star_v2_pair_valid.numel())
+            if pairs.numel() and (int(pairs.min()) < 0 or int(pairs.max()) >= pair_count):
+                raise ValueError("Star-RBF v2 pair index out of bounds")
+            star_v2_relation_rows.append(rows + lga_relation_offset)
+            star_v2_relation_pairs.append(pairs + star_v2_pair_offset)
+            star_v2_pair_distances.append(item.mts_star_v2_pair_observation_distances.float())
+            star_v2_pair_counts.append(item.mts_star_v2_pair_observation_count.long())
+            star_v2_pair_valid.append(item.mts_star_v2_pair_valid.bool())
+            star_v2_pair_sources.append(item.mts_star_v2_pair_geometry_source.long())
+            star_v2_artifacts.add(str(item.mts_star_v2_sidecar_artifact))
+            star_v2_semantics.add(str(item.mts_star_v2_model_semantic_hash))
+            star_v2_uppers.add(float(item.mts_star_v2_rbf_upper))
+            star_v2_pair_offset += pair_count
 
         item_arm = getattr(item, "mts_relation_geometry_arm", None)
         if item_arm is not None:
@@ -491,6 +519,18 @@ def mips_trimer_collate(data_list):
         batch.lifted_single_path_mask = batch.lga_path_mask
     batch.lga_path_bond_hist = torch.cat(lga_hist, dim=0)
     batch.lga_star_edge_mask = torch.cat(lga_star, dim=0)
+    if star_v2_relation_rows:
+        if not (len(star_v2_artifacts) == len(star_v2_semantics) == len(star_v2_uppers) == 1):
+            raise ValueError("Star-RBF v2 batch identity mismatch")
+        batch.mts_star_v2_relation_row = torch.cat(star_v2_relation_rows)
+        batch.mts_star_v2_relation_pair_index = torch.cat(star_v2_relation_pairs)
+        batch.mts_star_v2_pair_observation_distances = torch.cat(star_v2_pair_distances)
+        batch.mts_star_v2_pair_observation_count = torch.cat(star_v2_pair_counts)
+        batch.mts_star_v2_pair_valid = torch.cat(star_v2_pair_valid)
+        batch.mts_star_v2_pair_geometry_source = torch.cat(star_v2_pair_sources)
+        batch.mts_star_v2_sidecar_artifact = next(iter(star_v2_artifacts))
+        batch.mts_star_v2_model_semantic_hash = next(iter(star_v2_semantics))
+        batch.mts_star_v2_rbf_upper = next(iter(star_v2_uppers))
     if geometry_arms:
         if len(geometry_arms) != 1:
             raise ValueError("cannot mix G-family arms in one batch")

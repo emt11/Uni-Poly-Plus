@@ -8,6 +8,7 @@ import shlex
 from pathlib import Path
 
 import sys
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -44,6 +45,7 @@ from src.dataset.mips_trimer_contract import (
     ROUTE_SHORT_NAME,
     MTS_SHARED_CHECKPOINT,
     MTS_SHARED_CHECKPOINT_SHA256,
+    STAR_RBF_V2_SIDECAR_SCHEMA,
 )
 
 
@@ -141,6 +143,59 @@ def _resolve_g_family_artifact_bundle(bundle, *, kind, relation_bundle=None):
     return resolved
 
 
+def _resolve_star_rbf_v2_bundle(bundle):
+    if not isinstance(bundle, dict) or set(bundle) != set(G_FAMILY_COHORTS):
+        raise ValueError("Star-RBF v2 bundle must contain PI1M_v2 and downstream_union")
+    resolved = {}
+    semantic_hash = upper = None
+    for cohort in G_FAMILY_COHORTS:
+        entry = bundle[cohort]
+        if not isinstance(entry, dict) or set(entry) != {"root", "artifact_hash"}:
+            raise ValueError(f"star_rbf_v2_bundle.{cohort} requires root and artifact_hash")
+        root = Path(str(entry["root"]))
+        if not root.is_absolute(): root = PROJECT_ROOT / root
+        metadata_path = root / "metadata.json"
+        if not all((root / name).is_file() for name in ("metadata.json", ".done", ".frozen")):
+            raise ValueError(f"Star-RBF v2 artifact is incomplete: {root}")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        artifact = str(entry["artifact_hash"])
+        frozen = json.loads((root / ".frozen").read_text(encoding="utf-8"))
+        cohort_pointer = (
+            PROJECT_ROOT / "data/processed/mips_trimer_scage/cohorts"
+            / cohort / "current.json"
+        )
+        current = json.loads(cohort_pointer.read_text(encoding="utf-8"))
+        cohort_root = cohort_pointer.parent / str(current["cohort_hash"])
+        cohort_manifest = json.loads(
+            (cohort_root / "manifest.json").read_text(encoding="utf-8")
+        )
+        cohort_count = int(
+            np.load(cohort_root / "sample_keys.npy", mmap_mode="r", allow_pickle=False).shape[0]
+        )
+        if (
+            metadata.get("schema") != STAR_RBF_V2_SIDECAR_SCHEMA
+            or metadata.get("cohort") != cohort
+            or metadata.get("selection") != "full_cohort"
+            or int(metadata.get("record_count", -1)) != cohort_count
+            or metadata.get("cohort_hash") != current["cohort_hash"]
+            or metadata.get("ordered_sample_key_hash")
+            != cohort_manifest["ordered_sample_key_hash"]
+            or metadata.get("artifact_hash") != artifact
+            or (root / ".done").read_text(encoding="utf-8").strip() != artifact
+            or frozen.get("artifact_hash") != artifact
+            or digest({k: v for k, v in metadata.items() if k != "artifact_hash"}) != artifact
+        ):
+            raise ValueError(f"Star-RBF v2 immutable identity mismatch: {cohort}")
+        observed_semantic = str(metadata.get("model_semantic_hash", ""))
+        observed_upper = float(metadata.get("rbf", {}).get("upper", -1))
+        if semantic_hash is None:
+            semantic_hash, upper = observed_semantic, observed_upper
+        elif observed_semantic != semantic_hash or observed_upper != upper:
+            raise ValueError("Star-RBF v2 cohort model semantics mismatch")
+        resolved[cohort] = {"root": str(root.relative_to(PROJECT_ROOT)), "artifact_hash": artifact}
+    return resolved, semantic_hash, upper
+
+
 def g_family_bundle_identity_hash(arm, geometry_mode, relation_bundle, permutation_bundle):
     return digest({
         "g_family_arm": arm,
@@ -226,6 +281,8 @@ def main():
             "g_family_arm", "relation_geometry_bundle",
             "g3_permutation_bundle", "pretraining_objective",
             "angle_loss_weight", "shared_step0_id",
+            "star_rbf", "star_rbf_v2_bundle", "backbone_definition",
+            "attention_scale",
             "ablation",
         }
         unknown = sorted(set(config) - allowed)
@@ -289,6 +346,10 @@ def main():
             "pretraining_objective": str(config.get("pretraining_objective", "masked_atom_only")),
             "angle_loss_weight": float(config.get("angle_loss_weight", 0.0)),
             "shared_step0_id": config.get("shared_step0_id"),
+            "star_rbf": config.get("star_rbf"),
+            "star_rbf_v2_bundle": config.get("star_rbf_v2_bundle"),
+            "backbone_definition": config.get("backbone_definition"),
+            "attention_scale": str(config.get("attention_scale", "head_dim")),
         }
         ablation = config.get("ablation")
         # Historical non-ablation experiment configs remain valid as the
@@ -464,6 +525,36 @@ def main():
                 arm, experiment_values["geometry_mode"],
                 resolved_relation_bundle, resolved_permutation_bundle,
             )
+        star_contract = experiment_values.get("star_rbf")
+        if star_contract is not None:
+            if experiment_values.get("attention_scale") != "head_dim":
+                raise ValueError("R2 requires attention_scale=head_dim")
+            expected_star = {
+                "enabled": True,
+                "definition": "trimer_periodic_relation_rbf_v2",
+                "max_spd": 2,
+                "max_abs_shift": 2,
+                "shift0": "central_direct",
+                "shift1": "dual_observation_rbf_mean",
+                "shift2": "outer_trimer_direct",
+                "inversion": "canonical_pair_shared",
+                "trivial_self": "zero_bias",
+                "asymmetry": {"stored": True, "model_input": False, "hard_filter": False},
+            }
+            if star_contract != expected_star:
+                raise ValueError("invalid Star-RBF v2 scientific contract")
+            bundle, semantic_hash, upper = _resolve_star_rbf_v2_bundle(
+                experiment_values.get("star_rbf_v2_bundle")
+            )
+            if experiment_values.get("backbone_definition") != "legacy_g1_frozen":
+                raise ValueError("R2 requires backbone_definition=legacy_g1_frozen")
+            experiment_values["star_rbf_v2_bundle"] = bundle
+            experiment_values["star_rbf_v2_model_semantic_hash"] = semantic_hash
+            experiment_values["star_rbf_v2_upper"] = upper
+            experiment_values["use_star_rbf"] = True
+            experiment_values["use_mcl"] = False
+        elif experiment_values.get("star_rbf_v2_bundle") is not None:
+            raise ValueError("Star-RBF v2 bundle requires star_rbf contract")
         config_for_contract = reference
     elif config_schema == PRETRAIN_EXPERIMENT_CONFIG_SCHEMA:
         allowed = {
@@ -738,6 +829,25 @@ def main():
         "use_star_rbf": (
             experiment_values["use_star_rbf"] if experiment else True
         ),
+        "star_rbf_definition": (
+            "trimer_periodic_relation_rbf_v2"
+            if experiment and experiment_values.get("star_rbf") else
+            "legacy_sample_direct_link_v1"
+        ),
+        "star_rbf_v2_model_semantic_hash": (
+            experiment_values.get("star_rbf_v2_model_semantic_hash")
+            if experiment else None
+        ),
+        "star_rbf_v2_upper": (
+            experiment_values.get("star_rbf_v2_upper") if experiment else None
+        ),
+        "backbone_definition": (
+            experiment_values.get("backbone_definition") if experiment else None
+        ),
+        "attention_scale": (
+            experiment_values.get("attention_scale", "head_dim")
+            if experiment else "head_dim"
+        ),
         "use_mcl": experiment_values["use_mcl"] if experiment else True,
         "mcl_mask_mode": (
             "count_matched_random"
@@ -801,6 +911,39 @@ def main():
         ),
         "relation_geometry_bundle": (
             experiment_values.get("relation_geometry_bundle") if experiment else None
+        ),
+        "star_rbf_definition": (
+            "trimer_periodic_relation_rbf_v2"
+            if experiment and experiment_values.get("star_rbf") else
+            "legacy_sample_direct_link_v1"
+        ),
+        "star_rbf_v2_bundle": (
+            experiment_values.get("star_rbf_v2_bundle") if experiment else None
+        ),
+        "star_rbf_v2_model_semantic_hash": (
+            experiment_values.get("star_rbf_v2_model_semantic_hash") if experiment else None
+        ),
+        "star_rbf_v2_upper": (
+            experiment_values.get("star_rbf_v2_upper", 3.0) if experiment else 3.0
+        ),
+        "star_rbf_v2_sidecar_pi1m_v2": (
+            (experiment_values.get("star_rbf_v2_bundle") or {}).get("PI1M_v2", {}).get("root") if experiment else None
+        ),
+        "star_rbf_v2_artifact_pi1m_v2": (
+            (experiment_values.get("star_rbf_v2_bundle") or {}).get("PI1M_v2", {}).get("artifact_hash") if experiment else None
+        ),
+        "star_rbf_v2_sidecar_downstream_union": (
+            (experiment_values.get("star_rbf_v2_bundle") or {}).get("downstream_union", {}).get("root") if experiment else None
+        ),
+        "star_rbf_v2_artifact_downstream_union": (
+            (experiment_values.get("star_rbf_v2_bundle") or {}).get("downstream_union", {}).get("artifact_hash") if experiment else None
+        ),
+        "backbone_definition": (
+            experiment_values.get("backbone_definition") if experiment else None
+        ),
+        "attention_scale": (
+            experiment_values.get("attention_scale", "head_dim")
+            if experiment else "head_dim"
         ),
         "g3_permutation_bundle": (
             experiment_values.get("g3_permutation_bundle") if experiment else None
