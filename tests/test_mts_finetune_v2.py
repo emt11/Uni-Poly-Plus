@@ -13,6 +13,7 @@ from torch import nn
 from src.utils import (
     _build_downstream_optimizer,
     _configure_legacy_mts_trainability,
+    finetune_bf16_parity_gate,
 )
 
 
@@ -96,6 +97,14 @@ def test_mts_legacy_profile_trains_complete_graph_from_epoch_zero():
     )
 
 
+def test_bf16_gate_fails_closed_without_cuda():
+    passed, details = finetune_bf16_parity_gate(
+        nn.Linear(2, 1), None, nn.MSELoss(), torch.device('cpu')
+    )
+    assert not passed
+    assert details['reason'] == 'cuda_bf16_unavailable'
+
+
 def test_prediction_ensemble_and_three_decimal_sample_std(tmp_path):
     root = tmp_path / "results"
     best = tmp_path / "best.csv"
@@ -173,7 +182,7 @@ def test_prediction_ensemble_and_three_decimal_sample_std(tmp_path):
 # independent (task, fold) units inside run_mips_trimer_scage.sh: longest
 # task first per historical total_fold_wall_seconds, folds ascending within a
 # task, while preserving every fold's training identity, resume semantics and
-# the three dynamic GPU slots.
+# the four dynamic GPU slots.
 # ---------------------------------------------------------------------------
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -195,9 +204,9 @@ def _parse_lpt_array(name):
 
 
 class _DispatchSimulator:
-    """Reference 3-slot dispatch loop matching run_finetune_seeds.
+    """Reference 4-slot dispatch loop matching run_finetune_seeds.
 
-    The shell loop fills three dynamic GPU slots, `wait -n` on the earliest
+    The shell loop fills four dynamic GPU slots, `wait -n` on the earliest
     finishing child, refills the freed slot, skips shards whose identity
     already validates, and stops dispatching (keeping in-flight children for
     reaping) the moment a unit fails.  This is a pure reimplementation used to
@@ -216,7 +225,7 @@ class _DispatchSimulator:
 
     def run(self):
         pending = [u for u in self.queue if not self.resume(u)]
-        free = list(range(3))
+        free = list(range(4))
         active = {}  # pid -> [unit, gpu, remaining ticks]
         pid = 0
         next_idx = 0
@@ -287,7 +296,7 @@ def test_lpt_v1_does_not_change_training_identity():
         assert forbidden not in branch_text
 
 
-def test_lpt_v1_three_slots_refill_immediately():
+def test_lpt_v1_four_slots_refill_immediately():
     cost = {task: len(LPT_TASKS) - i for i, task in enumerate(LPT_TASKS)}
     sim = _DispatchSimulator(
         LPT_UNITS,
@@ -298,14 +307,14 @@ def test_lpt_v1_three_slots_refill_immediately():
     sim.run()
     assert sim.started_order() == LPT_UNITS
     assert len(sim.finished) == 40
-    # Concurrency never exceeds the three dynamic GPU slots.
+    # Concurrency never exceeds the four dynamic GPU slots.
     active = 0
     peak = 0
     for kind, _, _ in sim.events:
         active += 1 if kind == "start" else -1
         peak = max(peak, active)
-        assert 0 <= active <= 3, "more than three slots busy at once"
-    assert peak == 3
+        assert 0 <= active <= 4, "more than four slots busy at once"
+    assert peak == 4
     # Every freed slot is refilled from the queue head before more work waits.
     starts = 0
     for kind, unit, _ in sim.events:
@@ -313,7 +322,7 @@ def test_lpt_v1_three_slots_refill_immediately():
             starts += 1
         else:
             starts -= 1
-        assert 0 <= starts <= 3
+        assert 0 <= starts <= 4
     # All 40 units complete exactly once; completion order follows each
     # unit's own duration, only the dispatch order is pinned by lpt_v1.
     assert {unit for unit, _ in sim.finished} == set(LPT_UNITS)
@@ -354,4 +363,12 @@ def test_lpt_v1_failure_stops_dispatch_and_keeps_in_flight_children():
     assert not any(
         kind == "start" for kind, _, _ in sim.events[end_index + 1:]
     )
-    assert sim.in_flight_at_fail == 2  # egc/3 and egc/4 still running
+    assert sim.in_flight_at_fail == 2
+
+
+def test_gpu_policy_is_three_card_pretrain_and_four_slot_finetune():
+    text = _lpt_script_text()
+    assert 'MTS_PRETRAIN_GPU_IDS:-1,2,3' in text
+    assert 'MTS_FINETUNE_GPU_IDS:-0,1,2,3' in text
+    assert 'validate_gpu_ids "$PRETRAIN_GPU_IDS" 3' in text
+    assert 'validate_gpu_ids "$FINETUNE_GPU_IDS" 4' in text

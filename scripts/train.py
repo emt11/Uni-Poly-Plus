@@ -1,7 +1,6 @@
 import os
 import sys
 import argparse
-import ast
 import json
 import warnings
 import hashlib
@@ -10,10 +9,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import seaborn as sns
 from pathlib import Path
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
@@ -125,6 +120,7 @@ def _target_contract_mismatch(
     store_json_sha256,
     topology_frozen_payload_sha256,
     trimer_frozen_payload_sha256,
+    expected_graph_model_config_hash=None,
 ):
     """Return True when the checkpoint target_contract does not bind the
     current frozen production identity (Plan contract-finalization §4 / G0
@@ -182,7 +178,11 @@ def _target_contract_mismatch(
             PRETRAIN_CHECKPOINT_SCHEMA if pretrain_v2 else CHECKPOINT_SCHEMA
         ),
         "feature_config_hash": args.feature_config_hash,
-        "graph_model_config_hash": args.graph_model_config_hash,
+        "graph_model_config_hash": (
+            expected_graph_model_config_hash
+            if expected_graph_model_config_hash is not None
+            else args.graph_model_config_hash
+        ),
         "geometry_model_config_hash": args.source_geometry_model_config_hash,
         "source_cohort_hash": pretraining_cohort_hash,
         "topology_cache_artifact_hash": getattr(
@@ -200,7 +200,9 @@ def _target_contract_mismatch(
         "trimer_frozen_payload_sha256": trimer_frozen_payload_sha256,
         "optimizer_steps": 20000,
         "pretraining_objective": (
-            "masked_atom_plus_trimer_angle20_focal"
+            "masked_atom_only"
+            if getattr(args, "g_family_arm", None) is not None
+            else "masked_atom_plus_trimer_angle20_focal"
             if pretrain_v2 else "masked_atom_plus_trimer_bond_angle"
         ),
     }
@@ -240,6 +242,199 @@ def _source_contract_digest_mismatch(source_contract, declared_sha256) -> bool:
     if not isinstance(declared_sha256, str) or len(declared_sha256) != 64:
         return True
     return _canonical_json_hash(source_contract) != declared_sha256
+
+
+def validate_g_family_checkpoint_binding(checkpoint_meta, args, *, allow_smoke=False):
+    """Validate stable G identity while allowing cohort-specific active roots."""
+    arm = getattr(args, "g_family_arm", None)
+    if arm is None:
+        if checkpoint_meta.get("g_family_arm") is not None:
+            raise RuntimeError("G-family checkpoint cannot enter a T-family run")
+        return
+    expected = {
+        "g_family_arm": arm,
+        "topology_attention_variant": "msta_last2",
+        "shared_step0_id": getattr(args, "shared_step0_id", None),
+        "pretraining_objective": "masked_atom_only",
+        "g_family_bundle_hash": getattr(args, "g_family_bundle_hash", None),
+    }
+    mismatches = {
+        key: (checkpoint_meta.get(key), value)
+        for key, value in expected.items()
+        if checkpoint_meta.get(key) != value
+    }
+    steps = int(checkpoint_meta.get("optimizer_steps", -1))
+    smoke_ok = allow_smoke and bool(checkpoint_meta.get("smoke_only")) and steps in {1, 2}
+    if steps != 20000 and not smoke_ok:
+        mismatches["optimizer_steps"] = (steps, "20000 or explicit 1-2 step smoke")
+    relation_hash = checkpoint_meta.get("relation_geometry_artifact_hash")
+    if arm != "g0" and (not isinstance(relation_hash, str) or len(relation_hash) != 64):
+        mismatches["relation_geometry_artifact_hash"] = (relation_hash, "bound SHA256")
+    permutation_hash = checkpoint_meta.get("g3_permutation_artifact_hash")
+    if arm == "g3" and (not isinstance(permutation_hash, str) or len(permutation_hash) != 64):
+        mismatches["g3_permutation_artifact_hash"] = (permutation_hash, "bound SHA256")
+    if mismatches:
+        raise RuntimeError(f"G-family checkpoint identity mismatch: {mismatches}")
+
+
+def _is_mts_t1_function_preserving_init(meta) -> bool:
+    """Identify the explicit T0 -> T1 architecture-init artifact family."""
+
+    return bool(
+        isinstance(meta, dict)
+        and meta.get("init_artifact") is True
+        and meta.get("initialization") == "function_preserving"
+    )
+
+
+def _validate_mts_t1_function_preserving_init(
+    checkpoint,
+    checkpoint_path,
+    *,
+    args,
+    dataset,
+    pretraining_cohort_hash,
+    expected_angle_artifact,
+    store_json_sha256,
+    topology_frozen_payload_sha256,
+    trimer_frozen_payload_sha256,
+    model,
+):
+    """Validate the opt-in T1 init contract without weakening normal loading.
+
+    The artifact carries the immutable T0 target contract because that is the
+    parent pretraining fact.  The top-level metadata separately carries the
+    T1 graph hash and zero-step init identity.  This helper checks both sides
+    before the common strict state-dict transfer path is entered.
+    """
+
+    meta = checkpoint.get("meta") if isinstance(checkpoint, dict) else None
+    state = checkpoint.get("state_dict") if isinstance(checkpoint, dict) else None
+    if not isinstance(meta, dict) or not isinstance(state, dict):
+        raise RuntimeError("T1 function-preserving init must contain meta/state_dict")
+    if not bool(getattr(args, "allow_mts_t1_function_preserving_init", False)):
+        raise RuntimeError(
+            "T1 function-preserving init requires explicit "
+            "--allow_mts_t1_function_preserving_init"
+        )
+    if args.topology_attention_variant != "msta_last2":
+        raise RuntimeError("T1 function-preserving init requires topology_attention_variant=msta_last2")
+    required_identity = {
+        "init_artifact": True,
+        "initialization": "function_preserving",
+        "model_identity": "T1",
+        "source_model_identity": "T0",
+        "topology_attention_variant": "msta_last2",
+        "source_optimizer_steps": 20000,
+        "optimizer_steps": 0,
+    }
+    for key, expected in required_identity.items():
+        if meta.get(key) != expected:
+            raise RuntimeError(
+                f"T1 init metadata mismatch: {key}={meta.get(key)!r}, "
+                f"expected {expected!r}"
+            )
+    if meta.get("schema") != MTS_PRETRAIN_CHECKPOINT_SCHEMA:
+        raise RuntimeError("T1 init must use the immutable mts-model-v4 checkpoint schema")
+    if meta.get("stage") != MTS_STAGE1_ID:
+        raise RuntimeError("T1 init stage must be mts_joint_pretraining")
+    if meta.get("graph_model_config_hash") != args.graph_model_config_hash:
+        raise RuntimeError("T1 init top-level graph hash does not match the resolved T1 config")
+    if meta.get("target_config_hash") != args.resolved_config_hash:
+        raise RuntimeError("T1 init target config hash does not match the resolved experiment")
+    if list(meta.get("msta_layer_indices", [])) != list(args.msta_layer_indices):
+        raise RuntimeError("T1 init MSTA layer indices do not match the resolved config")
+    if list(meta.get("msta_local_spd", [])) != list(args.msta_local_spd):
+        raise RuntimeError("T1 init MSTA local SPD support does not match the resolved config")
+    if list(meta.get("msta_context_spd", [])) != list(args.msta_context_spd):
+        raise RuntimeError("T1 init MSTA context SPD support does not match the resolved config")
+    if bool(meta.get("msta_share_relation_dropout")) is not bool(
+        args.msta_share_relation_dropout
+    ) or bool(meta.get("msta_local_output_bias")) is not bool(
+        args.msta_local_output_bias
+    ) or meta.get("msta_local_output_init") != args.msta_local_output_init:
+        raise RuntimeError("T1 init MSTA identity fields do not match the resolved config")
+
+    parent = Path(str(meta.get("parent_checkpoint", ""))).expanduser()
+    if not parent.is_file():
+        raise RuntimeError(f"T1 init parent checkpoint is missing: {parent}")
+    parent_sha = meta.get("parent_checkpoint_sha256")
+    if not isinstance(parent_sha, str) or len(parent_sha) != 64:
+        raise RuntimeError("T1 init parent checkpoint SHA256 is missing")
+    if _sha256_file(parent) != parent_sha:
+        raise RuntimeError("T1 init parent checkpoint SHA256 mismatch")
+
+    source_graph_hash = meta.get("source_graph_model_config_hash")
+    source_contract = meta.get("source_contract")
+    target_contract = meta.get("target_contract")
+    if not isinstance(source_graph_hash, str) or len(source_graph_hash) != 64:
+        raise RuntimeError("T1 init source graph hash is missing")
+    if not isinstance(source_contract, dict) or not isinstance(target_contract, dict):
+        raise RuntimeError("T1 init must retain both parent source and target contracts")
+    if source_contract.get("graph_model_config_hash") != source_graph_hash:
+        raise RuntimeError("T1 init source contract graph hash mismatch")
+    if target_contract.get("graph_model_config_hash") != source_graph_hash:
+        raise RuntimeError("T1 init target contract must retain the T0 graph hash")
+    if _source_contract_digest_mismatch(
+        source_contract, meta.get("source_contract_sha256")
+    ):
+        raise RuntimeError("T1 init source contract digest mismatch")
+    if _target_contract_mismatch(
+        target_contract,
+        args=args,
+        dataset=dataset,
+        pretraining_cohort_hash=pretraining_cohort_hash,
+        expected_angle_artifact=expected_angle_artifact,
+        store_json_sha256=store_json_sha256,
+        topology_frozen_payload_sha256=topology_frozen_payload_sha256,
+        trimer_frozen_payload_sha256=trimer_frozen_payload_sha256,
+        expected_graph_model_config_hash=source_graph_hash,
+    ):
+        raise RuntimeError("T1 init parent target contract does not bind the current frozen cache")
+    pretrain_profile = meta.get("pretrain_profile")
+    if not isinstance(pretrain_profile, dict) or int(
+        pretrain_profile.get("optimizer_steps", -1)
+    ) != 20000:
+        raise RuntimeError("T1 init parent pretrain profile is not the completed 20k T0 source")
+    if pretrain_profile.get("dataset") != "PI1M_v2":
+        raise RuntimeError("T1 init parent pretrain dataset is not PI1M_v2")
+
+    graph_prefix = "encoders.graph.encoder."
+    graph_state = {
+        key[len(graph_prefix):]: value
+        for key, value in state.items()
+        if key.startswith(graph_prefix)
+    }
+    expected_graph_state = {
+        key[len(graph_prefix):]: value
+        for key, value in model.state_dict().items()
+        if key.startswith(graph_prefix)
+    }
+    if set(graph_state) != set(expected_graph_state):
+        missing = sorted(set(expected_graph_state) - set(graph_state))
+        unexpected = sorted(set(graph_state) - set(expected_graph_state))
+        raise RuntimeError(
+            "T1 init graph state is not transferable: "
+            f"missing={missing[:8]}, unexpected={unexpected[:8]}"
+        )
+    shape_mismatch = sorted(
+        key for key in graph_state
+        if tuple(graph_state[key].shape) != tuple(expected_graph_state[key].shape)
+    )
+    if shape_mismatch:
+        raise RuntimeError(
+            "T1 init graph state shape mismatch: " + ", ".join(shape_mismatch[:8])
+        )
+    for index in args.msta_layer_indices:
+        key = f"encoders.graph.encoder.layers.{int(index)}.attention.local_output.weight"
+        value = state.get(key)
+        if value is None or tuple(value.shape) != tuple(
+            expected_graph_state[f"layers.{int(index)}.attention.local_output.weight"].shape
+        ):
+            raise RuntimeError(f"T1 init local_output weight missing or malformed: {key}")
+        if torch.count_nonzero(value).item() != 0:
+            raise RuntimeError(f"T1 init local_output weight is not zero initialized: {key}")
+    return meta
 
 
 def _sha256_file(path) -> str:
@@ -360,142 +555,6 @@ def format_attention_weights(modalities, attention_weights):
     )
 
 
-def parse_modalities_for_plot(value):
-    if isinstance(value, (list, tuple)):
-        return [str(item) for item in value]
-    if pd.isna(value):
-        return None
-
-    raw_value = str(value).strip()
-    if not raw_value:
-        return None
-
-    for parser in (ast.literal_eval, json.loads):
-        try:
-            parsed = parser(raw_value)
-        except (ValueError, SyntaxError, json.JSONDecodeError):
-            continue
-        if isinstance(parsed, (list, tuple)):
-            return [str(item) for item in parsed]
-
-    return None
-
-
-def parse_attention_for_plot(value, modalities=None):
-    if pd.isna(value):
-        raise ValueError("Missing attention value.")
-
-    raw_value = str(value).strip()
-    if not raw_value:
-        raise ValueError("Empty attention value.")
-
-    for parser in (json.loads, ast.literal_eval):
-        try:
-            parsed = parser(raw_value)
-        except (ValueError, SyntaxError, json.JSONDecodeError):
-            continue
-
-        if isinstance(parsed, dict):
-            return {str(key): float(weight) for key, weight in parsed.items()}
-        if isinstance(parsed, (list, tuple)):
-            weights = np.asarray(parsed, dtype=float)
-            if weights.ndim == 2:
-                weights = weights.mean(axis=0)
-            if weights.ndim != 1:
-                raise ValueError(f"Unsupported attention array shape: {weights.shape}")
-            if modalities is None:
-                modalities = list(SUPPORTED_MODALITIES[:len(weights)])
-            if len(modalities) != len(weights):
-                raise ValueError(
-                    f"Modalities length ({len(modalities)}) does not match attention length "
-                    f"({len(weights)})."
-                )
-            return {modality: float(weight) for modality, weight in zip(modalities, weights)}
-
-    if ":" in raw_value:
-        parsed = {}
-        for item in raw_value.split(";"):
-            item = item.strip()
-            if not item:
-                continue
-            name, raw_weight = item.split(":", 1)
-            parsed[name.strip()] = float(raw_weight.strip())
-        return parsed
-
-    raise ValueError(f"Could not parse attention value: {raw_value}")
-
-
-def build_attention_matrix(results_df):
-    attention_column = "attention" if "attention" in results_df.columns else "attention_weights"
-    if attention_column not in results_df.columns:
-        raise ValueError("Results CSV must contain an 'attention' or 'attention_weights' column.")
-    if "task" not in results_df.columns:
-        raise ValueError("Results CSV must contain a 'task' column.")
-
-    rows = []
-    modality_order = []
-    for _, row in results_df.iterrows():
-        modalities = parse_modalities_for_plot(row.get("fusion_inputs"))
-        if modalities is None:
-            modalities = parse_modalities_for_plot(row.get("model_modality_list"))
-        attention = parse_attention_for_plot(row[attention_column], modalities=modalities)
-        rows.append((row["task"], attention))
-        for modality in attention:
-            if modality not in modality_order:
-                modality_order.append(modality)
-
-    matrix = pd.DataFrame(
-        [
-            [attention.get(modality, np.nan) for modality in modality_order]
-            for _, attention in rows
-        ],
-        index=[task for task, _ in rows],
-        columns=modality_order,
-    )
-    matrix.index.name = "task"
-    return matrix
-
-
-def default_attention_heatmap_path(results_csv_path):
-    results_path = Path(results_csv_path)
-    return results_path.with_name(f"{results_path.stem}_attention_heatmap.png")
-
-
-def plot_attention_heatmap_from_results(results_csv_path, output_path=None):
-    results_csv_path = Path(results_csv_path)
-    if output_path is None:
-        output_path = default_attention_heatmap_path(results_csv_path)
-    else:
-        output_path = Path(output_path)
-
-    results_df = pd.read_csv(results_csv_path)
-    matrix = build_attention_matrix(results_df)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    height = max(4.0, 0.45 * len(matrix.index) + 1.5)
-    width = max(5.0, 0.9 * len(matrix.columns) + 2.0)
-    plt.figure(figsize=(width, height))
-    sns.set_theme(style="white", font_scale=0.95)
-    ax = sns.heatmap(
-        matrix,
-        cmap="YlOrRd",
-        vmin=0.0,
-        vmax=1.0,
-        linewidths=0.5,
-        linecolor="white",
-        annot=True,
-        fmt=".2f",
-        cbar_kws={"label": "5-fold mean attention"},
-    )
-    ax.set_xlabel("modalities")
-    ax.set_ylabel("task")
-    ax.set_title("Attention Pooling Weights")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300)
-    plt.close()
-    return output_path
-
-
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Train UniEncoderAttention Model")
     parser.add_argument('--experiment_id', default='manual')
@@ -529,6 +588,11 @@ def parse_arguments():
     parser.add_argument(
         '--config_schema', default='mips-experiment-config-v2'
     )
+    # The shared MTS launcher passes the source schema to both pretraining
+    # and downstream entrypoints.  Downstream validation uses this metadata
+    # to distinguish an experiment input from the resolved production
+    # contract; it does not alter the fine-tuning objective.
+    parser.add_argument('--config_source_schema', default='')
     parser.add_argument(
         '--split_manifest_dir', default='data/splits/mips_shared5'
     )
@@ -595,6 +659,15 @@ def parse_arguments():
         help="Path to the pretrained model."
     )
     parser.add_argument(
+        '--allow_mts_t1_function_preserving_init',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            'Explicitly allow the isolated T0->T1 function-preserving init '
+            'artifact for downstream warm-start; never enables ordinary resume.'
+        ),
+    )
+    parser.add_argument(
         '--epochs',
         type=int,
         default=100,
@@ -625,6 +698,14 @@ def parse_arguments():
         help="Batch size for training."
     )
     parser.add_argument('--loader_workers', type=int, default=4)
+    parser.add_argument(
+        '--eval_batch_size', type=int, default=64,
+        help='Validation/test batch size; training batch size is unchanged.',
+    )
+    parser.add_argument(
+        '--amp_dtype', choices=['fp32', 'bf16'], default='fp32',
+        help='Fine-tuning precision. BF16 is enabled only after its parity gate.',
+    )
     parser.add_argument(
         '--max_grad_norm',
         type=float,
@@ -826,9 +907,35 @@ def parse_arguments():
         choices=[
             'trimer_scage_mcl', 'current_mcl', 'mcl_rbf', 'disabled',
             'coordinate_shuffled', 'mcl_rbf_coordinate_shuffled',
+            'g0', 'g1', 'g2', 'g3',
         ],
         default='trimer_scage_mcl',
     )
+    parser.add_argument(
+        '--topology_attention_variant',
+        choices=['o8', 'msta_last2'],
+        default='msta_last2',
+        help='T0 O8 attention or T1 MSTA in the final two layers.',
+    )
+    parser.add_argument('--msta_layer_indices', nargs=2, type=int, default=[4, 5])
+    parser.add_argument('--msta_local_spd', nargs='+', type=int, default=[0, 1])
+    parser.add_argument('--msta_context_spd', nargs='+', type=int, default=[0, 1, 2])
+    parser.add_argument(
+        '--msta_share_relation_dropout',
+        action=argparse.BooleanOptionalAction, default=True,
+    )
+    parser.add_argument(
+        '--msta_local_output_bias',
+        action=argparse.BooleanOptionalAction, default=False,
+    )
+    parser.add_argument('--msta_local_output_init', choices=['zero'], default='zero')
+    parser.add_argument('--g_family_arm', choices=['g0', 'g1', 'g2', 'g3'], default=None)
+    parser.add_argument('--relation_geometry_sidecar', default=None)
+    parser.add_argument('--relation_geometry_artifact_hash', default=None)
+    parser.add_argument('--g3_permutation_sidecar', default=None)
+    parser.add_argument('--g3_permutation_artifact_hash', default=None)
+    parser.add_argument('--g_family_bundle_hash', default=None)
+    parser.add_argument('--shared_step0_id', default=None)
     parser.add_argument(
         '--topology_representation',
         choices=['canonical_lifted', 'explicit_k_ru'],
@@ -966,18 +1073,9 @@ def parse_arguments():
         default='full',
         help='Conformer search budget. Must match the profile used to build the feature cache.'
     )
-    parser.add_argument(
-        '--attention_heatmap_path',
-        type=str,
-        default=None,
-        help="Optional output path for attention heatmap. Defaults to <results_dir stem>_attention_heatmap.png."
-    )
-    parser.add_argument(
-        '--disable_attention_heatmap',
-        action='store_true',
-        help="Disable automatic attention heatmap generation after writing training results."
-    )
     args = parser.parse_args()
+    if int(args.eval_batch_size) < int(args.batch_size):
+        raise ValueError("--eval_batch_size must be >= --batch_size")
     # These are fixed MTS topology values, not user-selectable route
     # parameters.  Retired geometry and legacy staged-finetuning controls are
     # intentionally absent from the runtime namespace.
@@ -1089,11 +1187,65 @@ def _scage_checkpoint_key_compatibility(
     return missing, retained_unexpected, incompatible
 
 
+def select_mts_checkpoint_transfer_keys(
+    model_keys, checkpoint_keys, *, allowed_missing=()
+):
+    """Return the exact learned MTS topology keys transferred to a fold.
+
+    Stage-3 fine-tuning deliberately reinitializes the MD200 residual,
+    graph projection/norm and regression head.  Every other common
+    ``encoders.graph.encoder`` tensor is part of the learned topology state,
+    including T1 MSTA and G-family relation-geometry parameters.  Keeping the
+    selection in one small, testable function prevents a descriptive log line
+    from becoming a weaker migration contract.
+    """
+
+    model_keys = set(model_keys)
+    checkpoint_keys = set(checkpoint_keys)
+    prefix = "encoders.graph.encoder."
+    candidates = tuple(sorted(
+        key for key in model_keys
+        if key.startswith(prefix) and ".md_residual." not in key
+    ))
+    allowed_missing = set(allowed_missing)
+    invalid_allowed = allowed_missing - set(candidates)
+    if invalid_allowed:
+        raise RuntimeError(
+            "MTS checkpoint allowed-missing set is not a topology tensor: "
+            + ", ".join(sorted(invalid_allowed)[:10])
+        )
+    missing = tuple(
+        key for key in candidates
+        if key not in checkpoint_keys and key not in allowed_missing
+    )
+    if missing:
+        raise RuntimeError(
+            "MTS checkpoint missing transferable topology tensors: "
+            + ", ".join(missing[:10])
+        )
+    return tuple(key for key in candidates if key in checkpoint_keys)
+
+
 def main():
     args = parse_arguments()
     validate_mips_trimer_runtime(args)
     if args.graph_encoder_type == "mips_trimer_scage":
         ablation_smoke = os.environ.get("MTS_ABLATION_SMOKE", "0") == "1"
+        g_family_smoke = os.environ.get("MTS_G_FAMILY_SMOKE", "0") == "1"
+        short_smoke = ablation_smoke or g_family_smoke
+        if getattr(args, "g_family_arm", None) is not None:
+            if not args.g_family_bundle_hash or not args.shared_step0_id:
+                raise ValueError("G-family fine-tuning requires bundle and shared step-0 identities")
+            if args.g_family_arm != "g0" and (
+                not args.relation_geometry_sidecar
+                or not args.relation_geometry_artifact_hash
+            ):
+                raise ValueError("G1/G2/G3 fine-tuning requires the active downstream artifact binding")
+            if args.g_family_arm == "g3" and (
+                not args.g3_permutation_sidecar
+                or not args.g3_permutation_artifact_hash
+            ):
+                raise ValueError("G3 fine-tuning requires the active permutation artifact binding")
         if args.finetune_profile != "legacy_mts_huber_v1":
             raise ValueError(
                 "MTS production fine-tuning uses legacy_mts_huber_v1; "
@@ -1104,8 +1256,8 @@ def main():
                 "MTS production fine-tuning is fixed to Huber(beta=0.5)"
             )
         fixed_finetune = {
-            "epochs": (int(args.epochs), 2 if ablation_smoke else 100),
-            "patience": (int(args.patience), 2 if ablation_smoke else 10),
+            "epochs": (int(args.epochs), 2 if short_smoke else 100),
+            "patience": (int(args.patience), 2 if short_smoke else 10),
             "batch_size": (int(args.batch_size), 32),
             "graph_lr": (float(args.graph_lr), 1e-5),
             "fusion_lr": (float(args.fusion_lr), 1e-4),
@@ -1284,6 +1436,11 @@ def main():
             experiment_id=args.experiment_id,
             feature_config_hash=args.feature_config_hash,
             modalities=args.modalities,
+            g_family_arm=args.g_family_arm,
+        relation_geometry_sidecar=args.relation_geometry_sidecar,
+        relation_geometry_artifact_hash=args.relation_geometry_artifact_hash,
+        g3_permutation_sidecar=args.g3_permutation_sidecar,
+        g3_permutation_artifact_hash=args.g3_permutation_artifact_hash,
             ablation_config=(
                 {
                     "id": _ablation["ablation_id"],
@@ -1467,6 +1624,8 @@ def main():
     pretrained_model_path = args.pretrained_model_path
     epochs = args.epochs
     patience = args.patience
+    t1_init_artifact = False
+    checkpoint_meta = {}
 
     for task in task_list:
         print(f"\nStarting task: {task}")
@@ -1624,7 +1783,7 @@ def main():
             test_loader = get_data_loader(
                 dataset,
                 indices=test_indices,
-                batch_size=args.batch_size,
+                batch_size=args.eval_batch_size,
                 shuffle=False,
                 drop_last=False,
                 num_workers=args.loader_workers,
@@ -1634,7 +1793,7 @@ def main():
             val_loader = get_data_loader(
                 dataset,
                 indices=val_indices,
-                batch_size=args.batch_size,
+                batch_size=args.eval_batch_size,
                 shuffle=False,
                 drop_last=False,
                 num_workers=args.loader_workers,
@@ -1702,6 +1861,16 @@ def main():
                 mips_mask_mode=args.mips_mask_mode,
                 mips_mask_policy=args.mips_mask_policy,
                 mips_masked_loss_reduction=args.mips_masked_loss_reduction,
+                topology_attention_variant=args.topology_attention_variant,
+                msta_layer_indices=args.msta_layer_indices,
+                msta_local_spd=args.msta_local_spd,
+                msta_context_spd=args.msta_context_spd,
+                msta_share_relation_dropout=args.msta_share_relation_dropout,
+                msta_local_output_bias=args.msta_local_output_bias,
+                msta_local_output_init=args.msta_local_output_init,
+                g_family_arm=args.g_family_arm,
+                relation_geometry_sidecar=args.relation_geometry_sidecar,
+                g3_permutation_sidecar=args.g3_permutation_sidecar,
                 use_star_rbf=_ablation["use_star_rbf"],
                 use_mcl=_ablation["use_mcl"],
                 mcl_mask_mode=_ablation["mcl_mask_mode"],
@@ -1740,6 +1909,13 @@ def main():
                             f"received stage={checkpoint_stage!r}."
                         )
                     checkpoint_meta = checkpoint.get("meta", {})
+                    original_checkpoint_meta = checkpoint_meta
+                    validate_g_family_checkpoint_binding(
+                        checkpoint_meta, args, allow_smoke=g_family_smoke
+                    )
+                    t1_init_artifact = _is_mts_t1_function_preserving_init(
+                        checkpoint_meta
+                    )
                     checkpoint_representation = checkpoint_meta.get(
                         "topology_representation", TOPOLOGY_CANONICAL
                     )
@@ -1773,6 +1949,58 @@ def main():
                     _tc_trimer_frozen = _sha256_file(
                         Path(cache_specs["trimer"]["root"]) / ".frozen"
                     )
+                    if t1_init_artifact:
+                        _validate_mts_t1_function_preserving_init(
+                            checkpoint,
+                            pretrained_model_path,
+                            args=args,
+                            dataset=dataset,
+                            pretraining_cohort_hash=pretraining_cohort_hash,
+                            expected_angle_artifact=expected_checkpoint_angle_artifact,
+                            store_json_sha256=_tc_store_sha,
+                            topology_frozen_payload_sha256=_tc_topo_frozen,
+                            trimer_frozen_payload_sha256=_tc_trimer_frozen,
+                            model=model,
+                        )
+                        # The common gate below describes a completed 20k
+                        # pretraining checkpoint.  Validate a local view only;
+                        # restore the original T1 init metadata before writing
+                        # any downstream result shard.
+                        from src.dataset.mips_trimer_contract import _canonical_json_hash
+
+                        validation_target = dict(
+                            original_checkpoint_meta["target_contract"]
+                        )
+                        validation_target["graph_model_config_hash"] = (
+                            args.graph_model_config_hash
+                        )
+                        validation_target["target_contract_sha256"] = _canonical_json_hash(
+                            {
+                                key: value
+                                for key, value in validation_target.items()
+                                if key != "target_contract_sha256"
+                            }
+                        )
+                        checkpoint_meta = dict(original_checkpoint_meta)
+                        checkpoint_meta["optimizer_steps"] = 20000
+                        checkpoint_meta["target_contract"] = validation_target
+                    # Fresh paired pretraining checkpoints carry the
+                    # authoritative source-geometry identity inside
+                    # source_contract.  Older checkpoint writers also emitted
+                    # the resolved geometry hash in the top-level field; use
+                    # the contract value when it is present and valid rather
+                    # than rejecting an otherwise strictly bound checkpoint.
+                    checkpoint_source_geometry_hash = checkpoint_meta.get(
+                        "source_geometry_model_config_hash",
+                        checkpoint_meta.get("geometry_model_config_hash"),
+                    )
+                    source_contract = checkpoint_meta.get("source_contract")
+                    if isinstance(source_contract, dict):
+                        contract_source_geometry_hash = source_contract.get(
+                            "source_geometry_model_config_hash"
+                        )
+                        if contract_source_geometry_hash:
+                            checkpoint_source_geometry_hash = contract_source_geometry_hash
                     if (
                         checkpoint_meta.get("baseline") != MTS_ROUTE_NAME
                         or checkpoint_representation
@@ -1812,10 +2040,8 @@ def main():
                         # geometry hash belongs to the shard identity rather
                         # than being compared to the source checkpoint hash.
                         # What must match here is the explicit source hash.
-                        or checkpoint_meta.get(
-                            "source_geometry_model_config_hash",
-                            checkpoint_meta.get("geometry_model_config_hash"),
-                        ) != args.source_geometry_model_config_hash
+                        or checkpoint_source_geometry_hash
+                        != args.source_geometry_model_config_hash
                         or (
                             args.graph_encoder_type == "mips_trimer_scage"
                             and not checkpoint_meta.get("trimer_cache_hash")
@@ -1831,6 +2057,26 @@ def main():
                         # the frozen contract (mirrors the doctor's binding).
                         or checkpoint_meta.get("mips_variant")
                         != args.mips_variant
+                        or checkpoint_meta.get("topology_attention_variant", "o8")
+                        != args.topology_attention_variant
+                        or checkpoint_meta.get("g_family_arm")
+                        != getattr(args, "g_family_arm", None)
+                        or checkpoint_meta.get("shared_step0_id")
+                        != getattr(args, "shared_step0_id", None)
+                        or (
+                            getattr(args, "g_family_arm", None) is not None
+                            and checkpoint_meta.get("g_family_bundle_hash")
+                            != getattr(args, "g_family_bundle_hash", None)
+                        )
+                        or list(checkpoint_meta.get(
+                            "msta_layer_indices", [4, 5]
+                        )) != list(args.msta_layer_indices)
+                        or list(checkpoint_meta.get(
+                            "msta_local_spd", [0, 1]
+                        )) != list(args.msta_local_spd)
+                        or list(checkpoint_meta.get(
+                            "msta_context_spd", [0, 1, 2]
+                        )) != list(args.msta_context_spd)
                         or (
                             expected_stage == "alignment"
                             and checkpoint_meta.get(
@@ -1894,7 +2140,15 @@ def main():
                                 args.checkpoint_pretraining_dataset,
                             )
                         )
-                        or int(checkpoint_meta.get("optimizer_steps", -1)) != 20000
+                        or (
+                            int(checkpoint_meta.get("optimizer_steps", -1)) != 20000
+                            and not (
+                                g_family_smoke
+                                and getattr(args, "g_family_arm", None) is not None
+                                and int(checkpoint_meta.get("optimizer_steps", -1)) in {1, 2}
+                                and bool(checkpoint_meta.get("smoke_only", False))
+                            )
+                        )
                         or checkpoint_angle_schema not in {
                             "mts-trimer-bond-angle-cache-v1",
                             "mts-trimer-bond-angle-cache-v2",
@@ -1914,7 +2168,11 @@ def main():
                         or checkpoint_meta.get("angle_cache_artifact_hash")
                         != expected_checkpoint_angle_artifact
                         or checkpoint_meta.get("pretraining_objective")
-                        != "masked_atom_plus_trimer_bond_angle"
+                        != (
+                            "masked_atom_only"
+                            if getattr(args, "g_family_arm", None) is not None
+                            else "masked_atom_plus_trimer_bond_angle"
+                        )
                         or checkpoint_meta.get("reference_commits", {}).get("mips")
                         != "26aafe52926a3f33bf2d3d382ae263360319812d"
                         or checkpoint_meta.get("reference_commits", {}).get("scage")
@@ -1936,21 +2194,30 @@ def main():
                             checkpoint_meta.get("source_contract"),
                             checkpoint_meta.get("source_contract_sha256"),
                         )
-                        or _target_contract_mismatch(
-                            checkpoint_meta.get("target_contract") or {},
-                            args=args,
-                            dataset=dataset,
-                            pretraining_cohort_hash=pretraining_cohort_hash,
-                            expected_angle_artifact=expected_checkpoint_angle_artifact,
-                            store_json_sha256=_tc_store_sha,
-                            topology_frozen_payload_sha256=_tc_topo_frozen,
-                            trimer_frozen_payload_sha256=_tc_trimer_frozen,
+                        or (
+                            not (
+                                g_family_smoke
+                                and getattr(args, "g_family_arm", None) is not None
+                                and bool(checkpoint_meta.get("smoke_only", False))
+                            )
+                            and _target_contract_mismatch(
+                                checkpoint_meta.get("target_contract") or {},
+                                args=args,
+                                dataset=dataset,
+                                pretraining_cohort_hash=pretraining_cohort_hash,
+                                expected_angle_artifact=expected_checkpoint_angle_artifact,
+                                store_json_sha256=_tc_store_sha,
+                                topology_frozen_payload_sha256=_tc_topo_frozen,
+                                trimer_frozen_payload_sha256=_tc_trimer_frozen,
+                            )
                         )
                     ):
                         raise RuntimeError(
                             "Alignment checkpoint MIPS configuration does not "
                             "match the requested core/hops/descriptor settings."
                         )
+                    if t1_init_artifact:
+                        checkpoint_meta = original_checkpoint_meta
                     checkpoint_fusion = checkpoint.get('meta', {}).get('fusion_type')
                     checkpoint_state = checkpoint['state_dict']
                 else:
@@ -1959,6 +2226,7 @@ def main():
                 checkpoint_keys = set(checkpoint_state)
                 missing = sorted(model_keys - checkpoint_keys)
                 unexpected = sorted(checkpoint_keys - model_keys)
+                allowed_transfer_missing = set()
                 if args.graph_encoder_type == 'mips_trimer_scage':
                     missing, unexpected, incompatible = (
                         _scage_checkpoint_key_compatibility(
@@ -1985,6 +2253,7 @@ def main():
                                     or key.endswith(".distance_centers")
                                 )
                             }
+                            allowed_transfer_missing = set(allowed_mcl_v2_missing)
                             incompatible = [
                                 key for key in incompatible
                                 if key not in allowed_mcl_v2_missing
@@ -2002,17 +2271,19 @@ def main():
                     # container, but Stage 3 migrates only learned structural
                     # modules.  MD200, graph norm/projection and regression
                     # head remain at their fold-seeded initialization.
-                    transferable_prefix = 'encoders.graph.encoder.'
+                    transfer_keys = select_mts_checkpoint_transfer_keys(
+                        merged_state,
+                        checkpoint_state,
+                        allowed_missing=allowed_transfer_missing,
+                    )
                     transferred = {
-                        key: value for key, value in checkpoint_state.items()
-                        if key in merged_state
-                        and key.startswith(transferable_prefix)
-                        and '.md_residual.' not in key
+                        key: checkpoint_state[key] for key in transfer_keys
                     }
                     merged_state.update(transferred)
                     print(
-                        'MTS checkpoint migration: loaded O8/Star-RBF/'
-                        f'Trimer-MCL only ({len(transferred)} tensors); '
+                        'MTS checkpoint migration: loaded topology encoder '
+                        '(including MSTA/G-family geometry parameters when present) '
+                        f'({len(transferred)} tensors); '
                         'MD200/projection/head reinitialized by fold seed.'
                     )
                 else:
@@ -2055,7 +2326,115 @@ def main():
                 mts_adapter_lr=args.mts_adapter_lr,
                 mts_finetune_profile=args.finetune_profile,
                 pcgrad=args.finetune_mode == 'multitask_pcgrad',
+                amp_dtype=args.amp_dtype,
             )
+            # The speed benchmark can request several evaluation batch sizes
+            # after training has selected the fold's best model.  All of these
+            # evaluations therefore use the exact same in-memory model state,
+            # validation split, scaler, and sample order; they are not
+            # independent training runs.  The feature is opt-in and has no
+            # effect on production launches.
+            benchmark_eval_batches = os.environ.get(
+                'MTS_BENCHMARK_EVAL_BATCHES', ''
+            ).strip()
+            if benchmark_eval_batches and args.predictions_dir:
+                try:
+                    requested_eval_batches = sorted({
+                        int(value.strip())
+                        for value in benchmark_eval_batches.split(',')
+                        if value.strip()
+                    })
+                except ValueError as exc:
+                    raise ValueError(
+                        'MTS_BENCHMARK_EVAL_BATCHES must be comma-separated '
+                        'positive integers'
+                    ) from exc
+                if not requested_eval_batches or any(
+                    value <= 0 for value in requested_eval_batches
+                ):
+                    raise ValueError(
+                        'MTS_BENCHMARK_EVAL_BATCHES must contain positive '
+                        'integers'
+                    )
+                benchmark_eval_root = Path(os.environ.get(
+                    'MTS_BENCHMARK_EVAL_OUTPUT_DIR',
+                    str(Path(args.predictions_dir).parent / 'benchmark_eval_predictions'),
+                ))
+                benchmark_eval_records = []
+                for eval_batch_size in requested_eval_batches:
+                    eval_started = time.perf_counter()
+                    benchmark_loader = get_data_loader(
+                        dataset,
+                        indices=test_indices,
+                        batch_size=eval_batch_size,
+                        shuffle=False,
+                        drop_last=False,
+                        num_workers=args.loader_workers,
+                        pin_memory=True,
+                        persistent_workers=args.loader_workers > 0,
+                    )
+                    benchmark_metrics = test_model(
+                        model,
+                        benchmark_loader,
+                        scaler,
+                        device,
+                        return_predictions=True,
+                        amp_dtype=args.amp_dtype,
+                    )
+                    benchmark_path = (
+                        benchmark_eval_root / f'batch_{eval_batch_size}'
+                        / task / f'fold_{fold}.npz'
+                    )
+                    benchmark_path.parent.mkdir(parents=True, exist_ok=True)
+                    benchmark_metadata = {
+                        'task': task,
+                        'fold': int(fold),
+                        'seed': int(args.seed),
+                        'fold_seed': int(fold_seed),
+                        'eval_batch_size': int(eval_batch_size),
+                        'amp_dtype': args.amp_dtype,
+                        'loader_workers': int(args.loader_workers),
+                        'sample_order': 'test_indices_in_source_order',
+                        'model_state_scope': (
+                            'same_train_and_evaluate_fold_best_model_state'
+                        ),
+                        'source_primary_eval_batch_size': int(args.eval_batch_size),
+                        'eval_seconds': float(time.perf_counter() - eval_started),
+                    }
+                    benchmark_tmp = benchmark_path.with_name(
+                        benchmark_path.name + f'.tmp.{os.getpid()}'
+                    )
+                    try:
+                        with benchmark_tmp.open('wb') as handle:
+                            np.savez(
+                                handle,
+                                y_true=np.asarray(
+                                    benchmark_metrics['_y_true'],
+                                    dtype=np.float64,
+                                ),
+                                y_pred=np.asarray(
+                                    benchmark_metrics['_y_pred'],
+                                    dtype=np.float64,
+                                ),
+                                sample_indices=np.asarray(
+                                    test_indices, dtype=np.int64
+                                ),
+                                metadata=np.asarray(json.dumps(
+                                    benchmark_metadata, sort_keys=True
+                                )),
+                            )
+                        os.replace(benchmark_tmp, benchmark_path)
+                    finally:
+                        if benchmark_tmp.exists():
+                            benchmark_tmp.unlink()
+                    benchmark_eval_records.append({
+                        **benchmark_metadata,
+                        'path': str(benchmark_path),
+                        'test_r2': float(benchmark_metrics['test_r2']),
+                        'test_mae': float(benchmark_metrics['test_mae']),
+                        'test_rmse': float(benchmark_metrics['test_rmse']),
+                    })
+                metrics['benchmark_eval_batch_records'] = benchmark_eval_records
             if args.refit_full_train:
                 refit_epochs = int(metrics.get('best_epoch', -1))
                 if refit_epochs <= 0:
@@ -2091,7 +2470,7 @@ def main():
                 test_loader = get_data_loader(
                     dataset,
                     indices=test_indices,
-                    batch_size=args.batch_size,
+                    batch_size=args.eval_batch_size,
                     shuffle=False,
                     drop_last=False,
                     num_workers=args.loader_workers,
@@ -2128,10 +2507,12 @@ def main():
                     mts_geometry_lr=args.mts_geometry_lr,
                     mts_adapter_lr=args.mts_adapter_lr,
                     mts_finetune_profile=args.finetune_profile,
+                    amp_dtype=args.amp_dtype,
                 )
                 refit_test_metrics = test_model(
                     model, test_loader, refit_scaler, device,
                     return_predictions=True,
+                    amp_dtype=args.amp_dtype,
                 )
                 metrics.update(refit_test_metrics)
                 metrics.update(refit_details)
@@ -2154,7 +2535,8 @@ def main():
                             refit_scaler if args.refit_full_train else scaler
                         )
                         controlled = test_model(
-                            model, test_loader, control_scaler, device
+                            model, test_loader, control_scaler, device,
+                            amp_dtype=args.amp_dtype,
                         )
                         for key, value in controlled.items():
                             metrics[
@@ -2195,6 +2577,10 @@ def main():
                         else 'shared_validation_test_fold'
                     ),
                     'independent_blind_test': args.evaluation_protocol == 'nested5',
+                    'amp_dtype': args.amp_dtype,
+                    'train_batch_size': int(args.batch_size),
+                    'eval_batch_size': int(args.eval_batch_size),
+                    'physical_gpu_id': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
                 }
                 try:
                     with prediction_tmp.open('wb') as handle:
@@ -2285,6 +2671,10 @@ def main():
             'finetune_config_hash': args.finetune_config_hash,
             'finetune_profile': args.finetune_profile,
             'finetune_profile_hash': args.finetune_profile_hash,
+            'amp_dtype': args.amp_dtype,
+            'train_batch_size': int(args.batch_size),
+            'eval_batch_size': int(args.eval_batch_size),
+            'physical_gpu_id': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
             'checkpoint_schema': (
                 checkpoint_meta.get('checkpoint_schema')
                 or checkpoint_meta.get('schema')
@@ -2292,6 +2682,25 @@ def main():
             ),
             'checkpoint_path': str(pretrained_model_path) if pretrained_model_path else None,
             'checkpoint_sha256': args.checkpoint_sha256 or None,
+            'checkpoint_model_identity': (
+                checkpoint_meta.get('model_identity')
+                if pretrained_model_path else None
+            ),
+            'checkpoint_initialization': (
+                checkpoint_meta.get('initialization')
+                if pretrained_model_path else None
+            ),
+            'checkpoint_init_opt_in': bool(
+                t1_init_artifact and args.allow_mts_t1_function_preserving_init
+            ) if pretrained_model_path else False,
+            'checkpoint_optimizer_steps': (
+                checkpoint_meta.get('optimizer_steps')
+                if pretrained_model_path else None
+            ),
+            'checkpoint_source_optimizer_steps': (
+                checkpoint_meta.get('source_optimizer_steps')
+                if pretrained_model_path else None
+            ),
             'cache_store_sha256': args.cache_store_sha256 or None,
             'checkpoint_cache_bundle_hash': (
                 checkpoint_meta.get('cache_bundle_hash')
@@ -2323,6 +2732,19 @@ def main():
                 args.graph_geometry_mode
                 if args.graph_encoder_type == 'mips_trimer_scage' else None
             ),
+            'topology_attention_variant': args.topology_attention_variant,
+            'g_family_arm': getattr(args, 'g_family_arm', None),
+            'g_family_bundle_hash': getattr(args, 'g_family_bundle_hash', None),
+            'checkpoint_g_family_bundle_hash': (
+                checkpoint_meta.get('g_family_bundle_hash')
+                if pretrained_model_path else None
+            ),
+            'relation_geometry_sidecar': getattr(args, 'relation_geometry_sidecar', None),
+            'relation_geometry_artifact_hash': getattr(args, 'relation_geometry_artifact_hash', None),
+            'g3_permutation_sidecar': getattr(args, 'g3_permutation_sidecar', None),
+            'g3_permutation_artifact_hash': getattr(args, 'g3_permutation_artifact_hash', None),
+            'smoke_only': bool(g_family_smoke),
+            'shared_step0_id': getattr(args, 'shared_step0_id', None),
             'trimer_cache_hash': (
                 getattr(dataset, 'trimer_cache_hash', None)
                 if args.graph_encoder_type == 'mips_trimer_scage'
@@ -2524,19 +2946,7 @@ def main():
                 index=False,
                 float_format="%.17g",
             )
-        task_result_file_initialized = True
         print(f"Results have been appended to '{task_result_output}'.")
-
-
-    if not args.disable_attention_heatmap and task_result_file_initialized:
-        try:
-            heatmap_path = plot_attention_heatmap_from_results(
-                task_result_output,
-                output_path=args.attention_heatmap_path,
-            )
-            print(f"Attention heatmap saved to '{heatmap_path}'.")
-        except Exception as exc:
-            print(f"Warning: failed to generate attention heatmap: {exc}")
 
 
 if __name__ == "__main__":

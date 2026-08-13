@@ -3,6 +3,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import global_mean_pool
 from torch_geometric.utils import softmax
 from torch_scatter import scatter
@@ -19,6 +20,62 @@ from src.dataset.mips_trimer_contract import (
     TOPOLOGY_EXPLICIT,
 )
 from .trimer_mcl import TrimerSCAGEMCLResidual
+
+
+MSTA_LAYER_INDICES = (4, 5)
+MSTA_LOCAL_SPD = (0, 1)
+MSTA_CONTEXT_SPD = (0, 1, 2)
+
+
+def topology_attention_identity(variant="o8"):
+    """Return the strict, serializable model identity for T0 or T1."""
+
+    variant = str(variant)
+    if variant not in {"o8", "msta_last2"}:
+        raise ValueError(f"unsupported topology attention variant: {variant!r}")
+    return {
+        "model_identity": "T1" if variant == "msta_last2" else "T0",
+        "topology_attention_variant": variant,
+        "msta_layer_indices": list(MSTA_LAYER_INDICES),
+        "msta_local_spd": list(MSTA_LOCAL_SPD),
+        "msta_context_spd": list(MSTA_CONTEXT_SPD),
+        "msta_share_relation_dropout": True,
+        "msta_local_output_bias": False,
+        "msta_local_output_init": "zero",
+    }
+
+
+def checkpoint_topology_attention_variant(meta):
+    """Read a checkpoint's variant while preserving legacy T0 metadata."""
+
+    return str((meta or {}).get("topology_attention_variant", "o8"))
+
+
+def add_function_preserving_t1_parameters(state_dict, *, prefix=""):
+    """Add only the zero local projections needed by a T1 state dict.
+
+    The caller still performs a strict ``load_state_dict`` after this
+    explicit conversion.  No generic ``strict=False`` loading is involved.
+    """
+
+    converted = dict(state_dict)
+    for index in MSTA_LAYER_INDICES:
+        output_key = (
+            f"{prefix}layers.{index}.attention.output.weight"
+            if prefix else f"layers.{index}.attention.output.weight"
+        )
+        local_key = (
+            f"{prefix}layers.{index}.attention.local_output.weight"
+            if prefix else f"layers.{index}.attention.local_output.weight"
+        )
+        if output_key not in converted:
+            raise KeyError(
+                f"T0 state dict is missing the final-layer output: {output_key}"
+            )
+        if local_key in converted:
+            raise ValueError(f"state dict already contains T1 parameter: {local_key}")
+        converted[local_key] = torch.zeros_like(converted[output_key])
+    return converted
 
 
 class MIPSLocalAtomEmbedding(nn.Module):
@@ -109,6 +166,113 @@ class SymmetricStarDistanceBias(nn.Module):
         return output
 
 
+class MTSRelationGeometryBias(nn.Module):
+    """Encode frozen SPD=2 relation/path geometry into per-head bias.
+
+    The final projection is zero initialized.  Thus G1/G2/G3 have exactly the
+    G0 forward at their shared step-0, while the encoder and projection remain
+    trainable for subsequent updates.
+    """
+
+    def __init__(self, dim=512, num_heads=8, mode="g1", num_distance_rbf=16):
+        super().__init__()
+        mode = str(mode).lower()
+        if mode not in {"g0", "g1", "g2", "g3"}:
+            raise ValueError("relation geometry bias requires G0/G1/G2/G3")
+        self.mode = mode
+        self.num_heads = int(num_heads)
+        self.num_distance_rbf = int(num_distance_rbf)
+        # All arms keep one identical geometry-only parameter layout.  G1 and
+        # G0 feed an explicit zero distance channel, so G1 cannot learn from
+        # endpoint distance while checkpoints remain shape-compatible.
+        input_dim = 1 + self.num_distance_rbf
+        hidden = max(32, min(128, int(dim) // 4))
+        self.path_mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.relation_projection = nn.Linear(hidden, self.num_heads, bias=False)
+        nn.init.zeros_(self.relation_projection.weight)
+        centers = torch.linspace(0.0, 8.0, self.num_distance_rbf)
+        self.register_buffer("distance_centers", centers)
+        spacing = 8.0 / max(1, self.num_distance_rbf - 1)
+        self.distance_gamma = 0.5 / max(spacing * spacing, 1e-12)
+
+    def _distance_rbf(self, distance):
+        delta = distance.unsqueeze(-1) - self.distance_centers.to(distance.device)
+        return torch.exp(-self.distance_gamma * delta.square())
+
+    def forward(self, data, *, edge_count, dtype):
+        output = data.lga_spd.new_zeros((int(edge_count), self.num_heads), dtype=dtype)
+        if self.mode == "g0":
+            return output
+        if not all(hasattr(data, name) for name in (
+            "mts_relation_geometry_relation_row",
+            "mts_relation_geometry_valid",
+            "mts_relation_geometry_path_offsets",
+            "mts_relation_geometry_path_valid",
+            "mts_relation_geometry_path_cos_angle",
+            "mts_relation_geometry_endpoint_distance",
+        )):
+            raise ValueError(f"{self.mode.upper()} requires a strict relation-geometry sidecar")
+        rows = data.mts_relation_geometry_relation_row.long().reshape(-1)
+        relation_valid = data.mts_relation_geometry_valid.bool().reshape(-1)
+        path_offsets = data.mts_relation_geometry_path_offsets.long().reshape(-1)
+        path_valid = data.mts_relation_geometry_path_valid.bool().reshape(-1)
+        cosine = data.mts_relation_geometry_path_cos_angle.float().reshape(-1)
+        endpoint = data.mts_relation_geometry_endpoint_distance.float().reshape(-1)
+        if path_offsets.numel() != rows.numel() + 1:
+            raise ValueError("relation-geometry path offsets are not relation-aligned")
+        if rows.numel() and (int(rows.min()) < 0 or int(rows.max()) >= int(edge_count)):
+            raise ValueError("relation-geometry row is outside the MSTA edge table")
+        if endpoint.numel() != rows.numel():
+            raise ValueError("relation-geometry endpoint distance is not relation-aligned")
+        # The original implementation launched one tiny MLP per relation.
+        # A PI1M batch contains tens of thousands of relations, so that Python
+        # loop turns the sidecar arm into a GPU-kernel launch bottleneck (and
+        # can reduce throughput by two orders of magnitude).  Flatten all
+        # paths once, run the MLP as one batch, then reduce back to relation
+        # rows.  The masks and per-relation denominator are unchanged.
+        relation_count = int(rows.numel())
+        path_lengths = path_offsets[1:] - path_offsets[:-1]
+        if relation_count and cosine.numel():
+            relation_ids = torch.repeat_interleave(
+                torch.arange(relation_count, device=rows.device, dtype=torch.long),
+                path_lengths,
+            )
+            features = [cosine.unsqueeze(-1)]
+            if self.mode in {"g2", "g3"}:
+                endpoint_per_path = torch.repeat_interleave(endpoint, path_lengths)
+                features.append(self._distance_rbf(endpoint_per_path))
+            else:
+                features.append(cosine.new_zeros((cosine.numel(), self.num_distance_rbf)))
+            path_embedding = self.path_mlp(
+                torch.cat(features, dim=-1).to(dtype=self.path_mlp[0].weight.dtype)
+            )
+            path_mask = path_valid.to(path_embedding.dtype)
+            relation_embeddings = scatter(
+                path_embedding * path_mask.unsqueeze(-1),
+                relation_ids,
+                dim=0,
+                dim_size=relation_count,
+                reduce="sum",
+            )
+            path_counts = scatter(
+                path_mask,
+                relation_ids,
+                dim=0,
+                dim_size=relation_count,
+                reduce="sum",
+            ).clamp_min(1.0).unsqueeze(-1)
+            relation_embeddings = relation_embeddings / path_counts
+            valid_relations = relation_valid & (path_counts.squeeze(-1) > 0)
+            if bool(valid_relations.any()):
+                projected = self.relation_projection(relation_embeddings).to(dtype=dtype)
+                output.index_copy_(0, rows[valid_relations], projected[valid_relations])
+        return output
+
+
 class MIPSLocalAttention(nn.Module):
     """K_source·Q_target attention with incoming-edge normalization."""
 
@@ -126,7 +290,7 @@ class MIPSLocalAttention(nn.Module):
         self.debug_attention = os.environ.get("MIPS_DEBUG_ATTENTION", "0") == "1"
         self.last_attention = None
 
-    def forward(self, x, edge_index, attention_bias):
+    def forward(self, x, edge_index, attention_bias, **_kwargs):
         qkv = self.qkv(x).view(x.size(0), 3, self.num_heads, self.head_dim)
         query, key, value = qkv.unbind(dim=1)
         source, target = edge_index.long()
@@ -156,6 +320,302 @@ class MIPSLocalAttention(nn.Module):
         )
 
 
+class MSTAMIPSLocalAttention(nn.Module):
+    """Final-layer multi-scale topology attention used by the T1 variant.
+
+    The module deliberately keeps the T0 ``qkv`` and ``output`` parameter
+    names.  ``output`` consumes the context (Z2) branch and the new
+    zero-initialized ``local_output`` consumes the local (Z1) branch.  This
+    makes the function-preserving T0 -> T1 conversion explicit while leaving
+    the ordinary T0 state-dict contract unchanged.
+    """
+
+    def __init__(
+        self,
+        dim=512,
+        num_heads=8,
+        dropout=0.1,
+        local_spd=(0, 1),
+        context_spd=(0, 1, 2),
+        share_relation_dropout=True,
+        local_output_bias=False,
+        local_output_init="zero",
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.dim // self.num_heads
+        if self.dim % self.num_heads:
+            raise ValueError("MSTA hidden dimension must divide num_heads")
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(self.dim, 3 * self.dim)
+        self.output = nn.Linear(self.dim, self.dim)
+        self.local_output = nn.Linear(
+            self.dim, self.dim, bias=bool(local_output_bias)
+        )
+        if str(local_output_init) != "zero":
+            raise ValueError("MSTA local_output_init must be 'zero'")
+        nn.init.zeros_(self.local_output.weight)
+        if self.local_output.bias is not None:
+            nn.init.zeros_(self.local_output.bias)
+        self.dropout = nn.Dropout(float(dropout))
+        self.attention_dropout = nn.Dropout(float(dropout))
+        self.output_norm = nn.LayerNorm(self.dim)
+        self.local_spd = tuple(sorted({int(value) for value in local_spd}))
+        self.context_spd = tuple(sorted({int(value) for value in context_spd}))
+        self.share_relation_dropout = bool(share_relation_dropout)
+        if self.local_spd != (0, 1):
+            raise ValueError("MSTA local SPD support must be exactly (0, 1)")
+        if self.context_spd != (0, 1, 2):
+            raise ValueError("MSTA context SPD support must be exactly (0, 1, 2)")
+        if not self.share_relation_dropout:
+            raise ValueError("MSTA requires shared relation dropout")
+        self.debug_attention = os.environ.get("MIPS_DEBUG_ATTENTION", "0") == "1"
+        self.last_attention = None
+        self.last_attention_branches = None
+        # Optional scalar-only branch diagnostics.  This is toggled by the
+        # pretraining loop only at declared milestone steps; it never retains
+        # the autograd graph or changes the forward values.
+        self.diagnostic_capture = False
+        self.diagnostic_local_off = False
+        self.last_diagnostic = None
+
+    @staticmethod
+    def _branch_mask(spd, allowed, target, relation_mask):
+        allowed_tensor = torch.zeros_like(spd, dtype=torch.bool)
+        for value in allowed:
+            allowed_tensor |= spd == int(value)
+        if relation_mask is not None:
+            allowed_tensor &= ~relation_mask.bool().reshape(-1)
+        if allowed_tensor.numel() != target.numel():
+            raise ValueError("MSTA relation mask and edge count mismatch")
+        # Both branches include SPD=0, but retain an explicit check so a
+        # malformed padded batch cannot silently create an all -inf softmax.
+        if target.numel():
+            counts = scatter(
+                allowed_tensor.to(torch.long), target.long(), dim=0,
+                dim_size=int(target.max().item()) + 1, reduce="sum",
+            )
+            if bool((counts == 0).any()):
+                raise ValueError(
+                    "MSTA branch has a target without a valid self relation"
+                )
+        return allowed_tensor
+
+    @staticmethod
+    def _normalize(logits, target, mask, num_nodes):
+        masked = logits.float().masked_fill(~mask.unsqueeze(-1), float("-inf"))
+        return softmax(masked, target.long(), num_nodes=num_nodes, dim=0)
+
+    def forward(
+        self, x, edge_index, attention_bias, spd, relation_mask=None,
+        geometry_bias=None,
+    ):
+        qkv = self.qkv(x).view(x.size(0), 3, self.num_heads, self.head_dim)
+        query, key, value = qkv.unbind(dim=1)
+        source, target = edge_index.long()
+        logits = (
+            (query[target] * key[source]).sum(dim=-1) * self.scale
+            + attention_bias
+        )
+        local_mask = self._branch_mask(
+            spd.long().reshape(-1), self.local_spd, target, relation_mask
+        )
+        context_mask = self._branch_mask(
+            spd.long().reshape(-1), self.context_spd, target, relation_mask
+        )
+        local_weights = self._normalize(
+            logits, target, local_mask, x.size(0)
+        ).to(value.dtype)
+        context_logits = logits
+        if geometry_bias is not None:
+            if geometry_bias.shape != logits.shape:
+                raise ValueError("MSTA geometry bias must match [edge, head]")
+            context_logits = logits + geometry_bias
+        context_weights = self._normalize(
+            context_logits, target, context_mask, x.size(0)
+        ).to(value.dtype)
+        if self.training and self.attention_dropout.p:
+            if self.share_relation_dropout:
+                relation_keep = (
+                    torch.rand_like(local_weights) >= self.attention_dropout.p
+                ).to(local_weights.dtype) / (1.0 - self.attention_dropout.p)
+                local_weights = local_weights * relation_keep
+                context_weights = context_weights * relation_keep
+            else:  # Defensive branch; constructor currently forbids this.
+                local_weights = self.attention_dropout(local_weights)
+                context_weights = self.attention_dropout(context_weights)
+        if self.debug_attention or not self.training:
+            self.last_attention = context_weights.detach()
+            self.last_attention_branches = {
+                "local": local_weights.detach(),
+                "context": context_weights.detach(),
+                "local_mask": local_mask.detach(),
+                "context_mask": context_mask.detach(),
+            }
+        else:
+            self.last_attention = None
+            self.last_attention_branches = None
+        local_messages = local_weights.unsqueeze(-1) * value[source]
+        context_messages = context_weights.unsqueeze(-1) * value[source]
+        local_aggregated = scatter(
+            local_messages, target, dim=0, dim_size=x.size(0), reduce="sum"
+        ).reshape(x.size(0), self.dim)
+        context_aggregated = scatter(
+            context_messages, target, dim=0, dim_size=x.size(0), reduce="sum"
+        ).reshape(x.size(0), self.dim)
+        local_projected = self.local_output(local_aggregated)
+        context_projected = self.output(context_aggregated)
+        projected = context_projected + (
+            local_projected if not self.diagnostic_local_off
+            else torch.zeros_like(local_projected)
+        )
+        if self.diagnostic_capture:
+            def _summary(values, *, expected_range=None):
+                """Summarize diagnostics without hiding invalid values.
+
+                The old implementation filtered NaNs before deciding whether a
+                row was finite.  That made an entirely invalid entropy vector
+                look like a valid row with ``count=0``.  Keep the finite and
+                range checks alongside the filtered statistics so the caller
+                can distinguish an empty/incomplete diagnostic from a finite
+                one.
+                """
+
+                raw = values.detach().float().reshape(-1)
+                finite_mask = torch.isfinite(raw)
+                finite_values = raw[finite_mask]
+                finite = bool(finite_mask.all())
+                range_valid = None
+                if expected_range is not None:
+                    lower, upper = expected_range
+                    range_valid = bool(
+                        finite_values.numel()
+                        and bool((finite_values >= lower - 1e-6).all())
+                        and bool((finite_values <= upper + 1e-6).all())
+                    )
+                summary = {
+                    "mean": None,
+                    "median": None,
+                    "p10": None,
+                    "p90": None,
+                    "count": int(finite_values.numel()),
+                    "finite": finite,
+                }
+                if expected_range is not None:
+                    summary["range_valid"] = range_valid
+                if finite_values.numel():
+                    summary.update({
+                        "mean": float(finite_values.mean().item()),
+                        "median": float(finite_values.median().item()),
+                        "p10": float(torch.quantile(finite_values, 0.10).item()),
+                        "p90": float(torch.quantile(finite_values, 0.90).item()),
+                    })
+                return summary
+
+            local_norm = local_aggregated.float().norm(dim=-1)
+            context_norm = context_aggregated.float().norm(dim=-1)
+            local_projected_norm = local_projected.float().norm(dim=-1)
+            context_projected_norm = context_projected.float().norm(dim=-1)
+            eps = torch.finfo(torch.float32).eps
+            raw_ratio = local_norm / context_norm.clamp_min(eps)
+            effective_ratio = local_projected_norm / context_projected_norm.clamp_min(eps)
+            raw_cos = F.cosine_similarity(
+                local_aggregated.float(), context_aggregated.float(), dim=-1
+            )
+            effective_cos = F.cosine_similarity(
+                local_projected.float(), context_projected.float(), dim=-1
+            )
+
+            def _entropy(weights, mask):
+                """Return per-target/per-head ``H(p) / log(n)``.
+
+                Masked relation rows must never participate in ``p*log(p)``.
+                Multiplying a zero probability by ``log(0)`` creates NaNs even
+                though the row is meant to be excluded.  We also keep heads
+                separate: summing entropy over heads changes the scale and can
+                produce values larger than one.
+                """
+
+                valid = mask.bool().unsqueeze(-1)
+                raw = weights.float()
+                # Relation dropout can make a whole target/head empty.  For
+                # the diagnostic, renormalize the surviving rows so entropy is
+                # always computed on a probability distribution.
+                mass = scatter(
+                    torch.where(valid, raw, torch.zeros_like(raw)),
+                    target.long(), dim=0, dim_size=x.size(0), reduce="sum",
+                )
+                denominator = mass[target.long()].clamp_min(eps)
+                probabilities = torch.where(
+                    valid,
+                    raw / denominator,
+                    torch.zeros_like(raw),
+                )
+                safe_probabilities = torch.where(
+                    valid,
+                    probabilities.clamp_min(eps),
+                    torch.ones_like(probabilities),
+                )
+                target_count = scatter(
+                    mask.to(torch.long), target.long(), dim=0,
+                    dim_size=x.size(0), reduce="sum",
+                ).float()
+                entropy_terms = torch.where(
+                    valid,
+                    -(safe_probabilities * safe_probabilities.log()),
+                    torch.zeros_like(safe_probabilities),
+                )
+                entropy = scatter(
+                    entropy_terms, target.long(), dim=0,
+                    dim_size=x.size(0), reduce="sum",
+                )
+                normalized = torch.where(
+                    target_count.unsqueeze(-1) > 1,
+                    entropy / target_count.unsqueeze(-1).clamp_min(2).log(),
+                    torch.zeros_like(entropy),
+                )
+                return normalized, target_count
+
+            local_entropy, local_degree = _entropy(local_weights, local_mask)
+            context_entropy, context_degree = _entropy(context_weights, context_mask)
+            self.last_diagnostic = {
+                "rho_raw": _summary(raw_ratio),
+                "rho_effective": _summary(effective_ratio),
+                "cosine_raw": _summary(raw_cos),
+                "cosine_effective": _summary(effective_cos),
+                "local_attention_entropy": _summary(
+                    local_entropy, expected_range=(0.0, 1.0)
+                ),
+                "context_attention_entropy": _summary(
+                    context_entropy, expected_range=(0.0, 1.0)
+                ),
+                "local_effective_incoming_degree": _summary(local_degree),
+                "context_effective_incoming_degree": _summary(context_degree),
+                "finite": bool(
+                    torch.isfinite(local_aggregated).all()
+                    and torch.isfinite(context_aggregated).all()
+                    and torch.isfinite(local_projected).all()
+                    and torch.isfinite(context_projected).all()
+                ),
+            }
+            # Do this after constructing the summaries so non-finite branch
+            # statistics cannot be hidden by the tensor-only check above.
+            required_summaries = (
+                self.last_diagnostic["local_attention_entropy"],
+                self.last_diagnostic["context_attention_entropy"],
+            )
+            self.last_diagnostic["finite"] = bool(
+                self.last_diagnostic["finite"]
+                and all(bool(item.get("finite")) for item in required_summaries)
+                and all(bool(item.get("range_valid")) for item in required_summaries)
+                and all(int(item.get("count", 0)) > 0 for item in required_summaries)
+            )
+        else:
+            self.last_diagnostic = None
+        return self.output_norm(x + self.dropout(projected))
+
+
 class MIPSLocalLayer(nn.Module):
     def __init__(self, dim=512, num_heads=8, dropout=0.1):
         super().__init__()
@@ -171,6 +631,51 @@ class MIPSLocalLayer(nn.Module):
 
     def forward(self, x, edge_index, attention_bias):
         x = self.attention(x, edge_index, attention_bias)
+        return self.output_norm(x + self.dropout(self.ffn(x)))
+
+
+class MSTAMIPSLocalLayer(nn.Module):
+    """T1 replacement for one O8 layer with two independent SPD branches."""
+
+    def __init__(
+        self,
+        dim=512,
+        num_heads=8,
+        dropout=0.1,
+        local_spd=(0, 1),
+        context_spd=(0, 1, 2),
+        share_relation_dropout=True,
+        local_output_bias=False,
+        local_output_init="zero",
+    ):
+        super().__init__()
+        self.attention = MSTAMIPSLocalAttention(
+            dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            local_spd=local_spd,
+            context_spd=context_spd,
+            share_relation_dropout=share_relation_dropout,
+            local_output_bias=local_output_bias,
+            local_output_init=local_output_init,
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(int(dim), 4 * int(dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(4 * int(dim), int(dim)),
+        )
+        self.dropout = nn.Dropout(float(dropout))
+        self.output_norm = nn.LayerNorm(int(dim))
+
+    def forward(
+        self, x, edge_index, attention_bias, spd, relation_mask=None,
+        geometry_bias=None,
+    ):
+        x = self.attention(
+            x, edge_index, attention_bias, spd=spd,
+            relation_mask=relation_mask, geometry_bias=geometry_bias,
+        )
         return self.output_norm(x + self.dropout(self.ffn(x)))
 
 
@@ -192,14 +697,21 @@ class MD200GraphResidual(nn.Module):
         valid = data.mips_md_valid.bool().flatten()
         residual = graph.new_zeros(graph.shape)
         if bool(valid.any()):
-            residual[valid] = self.adapter(data.mips_md.float()[valid])
+            # ``mips_md`` stays in float32 for stable LayerNorm/input
+            # handling, while CUDA autocast may produce a BF16 adapter
+            # output.  Indexed assignment does not promote the RHS, so make
+            # the conversion explicit before writing into the graph-typed
+            # residual buffer.
+            adapter_output = self.adapter(data.mips_md.float()[valid])
+            residual[valid] = adapter_output.to(dtype=residual.dtype)
         else:
             residual = residual + self.gate * 0.0
-        return graph + residual * torch.tanh(self.gate)
+        gate = torch.tanh(self.gate).to(dtype=graph.dtype)
+        return graph + residual * gate
 
 
 class MIPSLocalGraphEncoder(nn.Module):
-    """O8 + symmetric Star RBF + two-layer Trimer MCL + MD200."""
+    """O8/MSTA topology + symmetric Star RBF + Trimer MCL + MD200."""
 
     expects_data = True
     uses_geometry = True
@@ -241,6 +753,19 @@ class MIPSLocalGraphEncoder(nn.Module):
         use_star_rbf=True,
         use_mcl=True,
         mcl_mask_mode="real",
+        # Low-level constructor keeps the historical T0 default for explicit
+        # Python callers; new training entry points resolve T1 in config and
+        # UniEncoder defaults.
+        topology_attention_variant="o8",
+        msta_layer_indices=(4, 5),
+        msta_local_spd=(0, 1),
+        msta_context_spd=(0, 1, 2),
+        msta_share_relation_dropout=True,
+        msta_local_output_bias=False,
+        msta_local_output_init="zero",
+        g_family_arm=None,
+        relation_geometry_sidecar=None,
+        g3_permutation_sidecar=None,
         **retired,
     ):
         super().__init__()
@@ -251,11 +776,25 @@ class MIPSLocalGraphEncoder(nn.Module):
             "disabled": "disabled",
             "coordinate_shuffled": "coordinate_shuffled",
             "mcl_rbf_coordinate_shuffled": "mcl_rbf_coordinate_shuffled",
+            "g0": "g0",
+            "g1": "g1",
+            "g2": "g2",
+            "g3": "g3",
         }
         requested_geometry = str(graph_geometry_mode)
         if requested_geometry not in geometry_aliases:
             raise ValueError(f"unsupported MTS geometry mode: {requested_geometry}")
         resolved_geometry = geometry_aliases[requested_geometry]
+        resolved_g_arm = str(g_family_arm).lower() if g_family_arm is not None else None
+        if resolved_g_arm is None and requested_geometry in {"g0", "g1", "g2", "g3"}:
+            resolved_g_arm = requested_geometry
+        if resolved_g_arm is not None and resolved_g_arm not in {"g0", "g1", "g2", "g3"}:
+            raise ValueError("g_family_arm must be one of g0/g1/g2/g3")
+        if resolved_g_arm is not None and requested_geometry not in {resolved_g_arm, "trimer_scage_mcl", "current_mcl"}:
+            raise ValueError("g_family_arm and graph_geometry_mode are inconsistent")
+        if resolved_g_arm is not None:
+            requested_geometry = resolved_g_arm
+            resolved_geometry = resolved_g_arm
         contract = {
             "core": (str(core), "paper_corrected"),
             "num_layer": (int(num_layer), 6),
@@ -301,6 +840,28 @@ class MIPSLocalGraphEncoder(nn.Module):
             raise ValueError("MCL percentiles must be 0.20/0.50")
         if int(trimer_num_candidates) != 4 or int(trimer_max_heavy_atoms) != 384:
             raise ValueError("Trimer contract requires 4 candidates/384 atoms")
+        topology_attention_variant = str(topology_attention_variant)
+        if topology_attention_variant not in {"o8", "msta_last2"}:
+            raise ValueError(
+                "topology_attention_variant must be 'o8' or 'msta_last2'"
+            )
+        normalized_layers = tuple(int(value) for value in msta_layer_indices)
+        normalized_local_spd = tuple(sorted({int(value) for value in msta_local_spd}))
+        normalized_context_spd = tuple(sorted({int(value) for value in msta_context_spd}))
+        if topology_attention_variant == "msta_last2" and normalized_layers != (4, 5):
+            raise ValueError("MSTA currently supports only layer indices (4, 5)")
+        if topology_attention_variant == "o8" and normalized_layers != (4, 5):
+            raise ValueError("T0 msta_layer_indices must remain the default (4, 5)")
+        if normalized_local_spd != (0, 1):
+            raise ValueError("MSTA local SPD support must be exactly (0, 1)")
+        if normalized_context_spd != (0, 1, 2):
+            raise ValueError("MSTA context SPD support must be exactly (0, 1, 2)")
+        if not bool(msta_share_relation_dropout):
+            raise ValueError("MSTA requires shared relation dropout")
+        if bool(msta_local_output_bias):
+            raise ValueError("MSTA local_output must be bias-free")
+        if str(msta_local_output_init) != "zero":
+            raise ValueError("MSTA local_output_init must be 'zero'")
 
         self.core = "paper_corrected"
         self.variant = "O8"
@@ -311,14 +872,33 @@ class MIPSLocalGraphEncoder(nn.Module):
         self.spatial_mode = "trimer_scage"
         self.graph_geometry_mode = requested_geometry
         self.geometry_mode = resolved_geometry
+        self.g_family_arm = resolved_g_arm
+        self.relation_geometry_sidecar = relation_geometry_sidecar
+        self.g3_permutation_sidecar = g3_permutation_sidecar
+        self.topology_attention_variant = topology_attention_variant
+        self.model_identity = (
+            "T1" if topology_attention_variant == "msta_last2" else "T0"
+        )
+        self.msta_layer_indices = normalized_layers
+        self.msta_local_spd = normalized_local_spd
+        self.msta_context_spd = normalized_context_spd
+        self.msta_share_relation_dropout = bool(msta_share_relation_dropout)
+        self.msta_local_output_bias = bool(msta_local_output_bias)
+        self.msta_local_output_init = str(msta_local_output_init)
+        if self.g_family_arm is not None:
+            self.relation_geometry_bias = MTSRelationGeometryBias(
+                self.emb_dim, self.num_heads, mode=self.g_family_arm
+            )
+        else:
+            self.relation_geometry_bias = None
         self.use_descriptors = True
         self.descriptor_components = "md200"
         # Orthogonal causal-ablation axes (Plan mts_geometry_injection_ablation
         # A0-A4): star-RBF and MCL can be independently bypassed in forward and
         # excluded from the optimizer, while their parameters stay in the module
         # so a shared pretrained checkpoint still loads with strict=True.
-        self.use_star_rbf = bool(use_star_rbf)
-        self.use_mcl = bool(use_mcl)
+        self.use_star_rbf = False if self.g_family_arm is not None else bool(use_star_rbf)
+        self.use_mcl = False if self.g_family_arm is not None else bool(use_mcl)
         self.mcl_mask_mode = str(mcl_mask_mode)
         if self.mcl_mask_mode not in ("real", "count_matched_random"):
             raise ValueError(
@@ -342,10 +922,27 @@ class MIPSLocalGraphEncoder(nn.Module):
             self.emb_dim, self.num_heads, self.max_hops
         )
         self.star_distance_bias = SymmetricStarDistanceBias(self.num_heads)
-        self.layers = nn.ModuleList(
-            MIPSLocalLayer(self.emb_dim, self.num_heads, dropout)
-            for _ in range(6)
-        )
+        layers = []
+        for index in range(6):
+            if (
+                self.topology_attention_variant == "msta_last2"
+                and index in self.msta_layer_indices
+            ):
+                layers.append(
+                    MSTAMIPSLocalLayer(
+                        self.emb_dim,
+                        self.num_heads,
+                        dropout,
+                        local_spd=self.msta_local_spd,
+                        context_spd=self.msta_context_spd,
+                        share_relation_dropout=self.msta_share_relation_dropout,
+                        local_output_bias=self.msta_local_output_bias,
+                        local_output_init=self.msta_local_output_init,
+                    )
+                )
+            else:
+                layers.append(MIPSLocalLayer(self.emb_dim, self.num_heads, dropout))
+        self.layers = nn.ModuleList(layers)
         self.final_norm = nn.Identity()
         self.trimer_mcl = TrimerSCAGEMCLResidual(
             dim=self.emb_dim, num_heads=self.num_heads,
@@ -362,6 +959,9 @@ class MIPSLocalGraphEncoder(nn.Module):
                 _parameter.requires_grad_(False)
         if not self.use_mcl:
             for _parameter in self.trimer_mcl.parameters():
+                _parameter.requires_grad_(False)
+        if self.g_family_arm == "g0" and self.relation_geometry_bias is not None:
+            for _parameter in self.relation_geometry_bias.parameters():
                 _parameter.requires_grad_(False)
 
     def _validate(self, data, *, require_geometry, require_md):
@@ -420,6 +1020,15 @@ class MIPSLocalGraphEncoder(nn.Module):
                     "trimer_geometry_valid", "trimer_geometry_is_3d",
                     "trimer_2d_fallback", "trimer_batch",
                 )
+        if require_geometry and self.g_family_arm in {"g1", "g2", "g3"}:
+            required += (
+                "mts_relation_geometry_relation_row",
+                "mts_relation_geometry_valid",
+                "mts_relation_geometry_path_offsets",
+                "mts_relation_geometry_path_valid",
+                "mts_relation_geometry_path_cos_angle",
+                "mts_relation_geometry_endpoint_distance",
+            )
         if require_md:
             required += ("mips_md", "mips_md_valid")
         missing = [name for name in required if not hasattr(data, name)]
@@ -485,8 +1094,9 @@ class MIPSLocalGraphEncoder(nn.Module):
         self, data, atom_mask=None, *,
         use_star=True, use_geometry=True, use_md=True,
     ):
+        g_geometry = self.g_family_arm in {"g1", "g2", "g3"}
         self._validate(
-            data, require_geometry=(use_star or use_geometry),
+            data, require_geometry=(use_star or use_geometry or g_geometry),
             require_md=use_md,
         )
         initial = self.atom_embedding(data, atom_mask=atom_mask)
@@ -512,10 +1122,26 @@ class MIPSLocalGraphEncoder(nn.Module):
             path_bias = path_bias * keep
             star_bias = star_bias * keep
         attention_bias = spd_bias + path_bias + star_bias
+        geometry_bias = (
+            self.relation_geometry_bias(
+                data,
+                edge_count=int(data.lga_edge_index.size(1)),
+                dtype=initial.dtype,
+            )
+            if g_geometry else None
+        )
 
         x = initial
+        relation_mask = getattr(data, "lga_relation_mask", None)
         for layer in self.layers:
-            x = layer(x, data.lga_edge_index.long(), attention_bias)
+            if isinstance(layer, MSTAMIPSLocalLayer):
+                x = layer(
+                    x, data.lga_edge_index.long(), attention_bias,
+                    spd=data.lga_spd, relation_mask=relation_mask,
+                    geometry_bias=geometry_bias,
+                )
+            else:
+                x = layer(x, data.lga_edge_index.long(), attention_bias)
         if use_geometry and self.geometry_mode != "disabled":
             x = x + self.trimer_mcl(x, data)
 
@@ -565,11 +1191,15 @@ class MIPSLocalGraphEncoder(nn.Module):
         ).reshape(-1)
         if canonical_atom_mask.numel() != data.mips_x.size(0):
             raise ValueError("canonical_atom_mask length mismatch")
-        self._validate(data, require_geometry=True, require_md=False)
+        g_geometry = self.g_family_arm in {"g1", "g2", "g3"}
+        self._validate(data, require_geometry=(self.use_star_rbf or self.use_mcl or g_geometry), require_md=False)
         initial = self.atom_embedding(data, atom_mask=canonical_atom_mask)
         spd_bias = self.spd_embedding(data.lga_spd.long())
         path_bias = self.path_bias(initial, data)
-        star_bias = self.star_distance_bias(data, initial.dtype)
+        star_bias = (
+            self.star_distance_bias(data, initial.dtype)
+            if self.use_star_rbf else torch.zeros_like(spd_bias)
+        )
         relation_mask = getattr(data, "lga_relation_mask", None)
         if relation_mask is not None:
             keep = (~relation_mask.bool()).unsqueeze(-1).to(initial.dtype)
@@ -577,14 +1207,37 @@ class MIPSLocalGraphEncoder(nn.Module):
             path_bias = path_bias * keep
             star_bias = star_bias * keep
         attention_bias = spd_bias + path_bias + star_bias
+        geometry_bias = (
+            self.relation_geometry_bias(
+                data,
+                edge_count=int(data.lga_edge_index.size(1)),
+                dtype=initial.dtype,
+            )
+            if g_geometry else None
+        )
         topology_nodes = initial
         for layer in self.layers:
-            topology_nodes = layer(
-                topology_nodes, data.lga_edge_index.long(), attention_bias
+            if isinstance(layer, MSTAMIPSLocalLayer):
+                topology_nodes = layer(
+                    topology_nodes, data.lga_edge_index.long(), attention_bias,
+                    spd=data.lga_spd, relation_mask=relation_mask,
+                    geometry_bias=geometry_bias,
+                )
+            else:
+                topology_nodes = layer(
+                    topology_nodes, data.lga_edge_index.long(), attention_bias
+                )
+        if self.use_mcl:
+            geometry_delta, trimer_states, mcl_valid = (
+                self.trimer_mcl.forward_with_aux(topology_nodes, data)
             )
-        geometry_delta, trimer_states, mcl_valid = (
-            self.trimer_mcl.forward_with_aux(topology_nodes, data)
-        )
+        else:
+            geometry_delta = torch.zeros_like(topology_nodes)
+            trimer_states = topology_nodes.new_zeros((0, topology_nodes.size(-1)))
+            mcl_valid = torch.zeros(
+                (int(data.graph_available.numel()),), dtype=torch.bool,
+                device=topology_nodes.device,
+            )
         nodes = topology_nodes + geometry_delta
         graph_available = data.graph_available.bool().flatten()
         nodes = nodes * graph_available[data.batch.long()].unsqueeze(-1).to(nodes.dtype)

@@ -90,6 +90,7 @@ from .trimer_mcl import (
     attach_unavailable_trimer_mcl,
 )
 from .mips_cache_validation import validate_mcl_record
+from .mts_relation_geometry import RelationGeometryPermutation, RelationGeometrySidecar
 from .mts_target_contract import make_target_contract
 from transformers import AutoTokenizer
 from rdkit.Chem import rdFingerprintGenerator
@@ -2198,9 +2199,35 @@ class UniDataset(Dataset):
         transform=None,
         pre_transform=None,
         ablation_config=None,
+        g_family_arm=None,
+        relation_geometry_sidecar=None,
+        relation_geometry_artifact_hash=None,
+        g3_permutation_sidecar=None,
+        g3_permutation_artifact_hash=None,
     ):
         self.dataset = dataset
         self.ablation_config = ablation_config or {}
+        self.g_family_arm = (
+            str(g_family_arm).lower() if g_family_arm is not None else None
+        )
+        if self.g_family_arm is not None and self.g_family_arm not in {"g0", "g1", "g2", "g3"}:
+            raise ValueError("g_family_arm must be one of g0/g1/g2/g3")
+        self.relation_geometry_sidecar_root = (
+            str(relation_geometry_sidecar) if relation_geometry_sidecar else None
+        )
+        self.relation_geometry_artifact_hash = (
+            str(relation_geometry_artifact_hash)
+            if relation_geometry_artifact_hash else None
+        )
+        self.g3_permutation_sidecar_root = (
+            str(g3_permutation_sidecar) if g3_permutation_sidecar else None
+        )
+        self.g3_permutation_artifact_hash = (
+            str(g3_permutation_artifact_hash)
+            if g3_permutation_artifact_hash else None
+        )
+        self._relation_geometry_sidecar = None
+        self._g3_permutation = None
         self.ablation_id = self.ablation_config.get("id")
         if self.ablation_id is not None:
             self.ablation_id = str(self.ablation_id)
@@ -2288,6 +2315,10 @@ class UniDataset(Dataset):
         # but the Dataset contract is topology + MD200 only.
         if self.ablation_id == "A0_no3d_forward":
             cache_layers = tuple(name for name in cache_layers if name != "trimer")
+        if self.g_family_arm in {"g0", "g1", "g2", "g3"}:
+            # G-family geometry is read from the frozen relation sidecar; the
+            # retired full-Trimer MCL payload is deliberately not opened.
+            cache_layers = tuple(name for name in cache_layers if name != "trimer")
         self.requested_cache_layers = tuple(dict.fromkeys(cache_layers))
         requested_cache_layers = set(cache_layers)
         if "topology" in requested_cache_layers:
@@ -2368,10 +2399,17 @@ class UniDataset(Dataset):
         self.field_layout = "none"
         self.field_channels = "none"
         self.graph_geometry_mode = str(graph_geometry_mode)
+        if self.g_family_arm is None and self.graph_geometry_mode in {"g0", "g1", "g2", "g3"}:
+            self.g_family_arm = self.graph_geometry_mode
+        if self.g_family_arm is not None and self.graph_geometry_mode not in {"g0", "g1", "g2", "g3"}:
+            self.graph_geometry_mode = self.g_family_arm
+        if self.g_family_arm is not None and self.graph_geometry_mode != self.g_family_arm:
+            raise ValueError("G-family arm and graph_geometry_mode are inconsistent")
         if self.graph_geometry_mode not in {
             "none", "trimer_scage_mcl", "current_mcl", "mcl_rbf",
             "disabled", "coordinate_shuffled",
             "mcl_rbf_coordinate_shuffled",
+            "g0", "g1", "g2", "g3",
         }:
             raise ValueError(
                 "graph_geometry_mode must be none or trimer_scage_mcl"
@@ -2402,6 +2440,7 @@ class UniDataset(Dataset):
             if self.graph_geometry_mode not in {
                 "trimer_scage_mcl", "current_mcl", "mcl_rbf", "disabled",
                 "coordinate_shuffled", "mcl_rbf_coordinate_shuffled",
+                "g0", "g1", "g2", "g3",
             }:
                 raise ValueError(
                 "MTS requires graph_geometry_mode="
@@ -2483,6 +2522,8 @@ class UniDataset(Dataset):
             )
         else:
             self._init_legacy(processed_dir=processed_dir, graph_tag=f"{graph_tag}_{geom_tag}_{fp_tag}")
+        if self.g_family_arm is not None:
+            self._init_relation_geometry_sidecar()
 
     # ------------------------------------------------------------------
     # Legacy path (--disable_feature_cache)
@@ -3840,7 +3881,7 @@ class UniDataset(Dataset):
             graph_tag,
             geom_tag,
             fp_tag,
-            reuse_existing=False,
+            reuse_existing=not rebuild_feature_cache,
         )
         task_csv = os.path.join(
             self.root, "raw", f"{self.dataset}.csv"
@@ -5151,6 +5192,134 @@ class UniDataset(Dataset):
     def __len__(self):
         return len(self.data_list)
 
+    def _init_relation_geometry_sidecar(self):
+        """Bind the frozen relation-geometry artifact for G1/G2/G3.
+
+        G0 is intentionally a hard bypass: it does not even open sidecar
+        metadata.  For the geometry arms, startup is strict and a missing or
+        mismatched artifact is an error rather than a silent G0 fallback.
+        """
+        if self.g_family_arm == "g0":
+            return
+        if not isinstance(getattr(self, "_cohort", None), dict):
+            raise RuntimeError("G-family Dataset requires an immutable cohort manifest")
+        root = self.relation_geometry_sidecar_root
+        if root is None or self.relation_geometry_artifact_hash is None:
+            raise RuntimeError(
+                "G1/G2/G3 requires an explicit relation_geometry_sidecar "
+                "and expected artifact hash"
+            )
+        source_artifacts = {
+            "topology": {"done_artifact_hash": self.topology_cache_artifact_hash},
+            "trimer": {"done_artifact_hash": self.trimer_cache_artifact_hash},
+        }
+        self._relation_geometry_sidecar = RelationGeometrySidecar(
+            root,
+            expected_cohort=(
+                "downstream_union"
+                if str(self.feature_source_dataset) == "smi_all"
+                else str(self.feature_source_dataset)
+            ),
+            expected_cohort_hash=self._cohort["manifest"].get("cohort_hash"),
+            expected_artifact_hash=self.relation_geometry_artifact_hash,
+            expected_ordered_sample_key_hash=self._cohort["manifest"].get("ordered_sample_key_hash"),
+            expected_source_artifacts=source_artifacts,
+        )
+        if self.g_family_arm == "g3":
+            permutation_root = self.g3_permutation_sidecar_root
+            if permutation_root is None:
+                raise RuntimeError("G3 requires an explicit g3_permutation_sidecar")
+            if self.g3_permutation_artifact_hash is None:
+                raise RuntimeError("G3 requires an expected permutation artifact hash")
+            self._g3_permutation = RelationGeometryPermutation(
+                permutation_root,
+                source_sidecar=self._relation_geometry_sidecar.artifact_hash,
+                expected_cohort_hash=self._relation_geometry_sidecar.cohort_hash,
+                expected_artifact_hash=self.g3_permutation_artifact_hash,
+            )
+
+    def _attach_relation_geometry(self, data, key, *, row_hint=None):
+        """Attach one sidecar row aligned to the sample's local LGA rows."""
+        if self.g_family_arm is None or self.g_family_arm == "g0":
+            return data
+        if self._relation_geometry_sidecar is None:
+            raise RuntimeError("G-family sidecar was not initialized")
+        sidecar_index = self._relation_geometry_sidecar.index_for_key(
+            key, row_hint=row_hint
+        )
+        record = self._relation_geometry_sidecar.row(sidecar_index)
+        relations = record["relations"]
+        paths = record["paths"]
+        relation_rows = np.asarray(relations["relation_row"], dtype=np.int64)
+        if relation_rows.size and (
+            int(relation_rows.min()) < 0
+            or int(relation_rows.max()) >= int(data.lga_edge_index.size(1))
+        ):
+            raise RuntimeError("relation-geometry sidecar row is outside sample LGA topology")
+        path_offsets = np.asarray(relations["relation_path_offsets"], dtype=np.int64)
+        # The row reader returns relation-local offsets.  Keep the path slices
+        # compact; the collator adds a batch path offset without changing any
+        # topology relation order or multiplicity.
+        if path_offsets.size != relation_rows.size + 1:
+            raise RuntimeError("relation-geometry sidecar relation/path offset mismatch")
+        geometry_valid = np.asarray(relations["relation_geometry_valid"], dtype=bool)
+        path_valid = np.asarray(paths["path_geometry_valid"], dtype=bool)
+        cos_angle = np.asarray(paths["path_cos_angle"], dtype=np.float32).copy()
+        endpoint_distance = np.asarray(relations["relation_endpoint_distance"], dtype=np.float32).copy()
+        if self.g_family_arm == "g3":
+            # The permutation artifact is indexed by global sidecar relation
+            # row.  Obtain the global range from the key's row deterministically.
+            relation_start = int(self._relation_geometry_sidecar.arrays["sample_relation_offsets"][sidecar_index])
+            relation_end = int(self._relation_geometry_sidecar.arrays["sample_relation_offsets"][sidecar_index + 1])
+            source_indices = self._g3_permutation.permutation_for(np.arange(relation_start, relation_end, dtype=np.int64))
+            source_offsets = self._relation_geometry_sidecar.arrays["relation_path_offsets"]
+            source_cos = self._relation_geometry_sidecar.arrays["path_cos_angle"]
+            source_valid = self._relation_geometry_sidecar.arrays["path_geometry_valid"]
+            source_distance = self._relation_geometry_sidecar.arrays["relation_endpoint_distance"]
+            if source_indices.size != relation_rows.size:
+                raise RuntimeError("G3 permutation relation count mismatch")
+            shuffled_cos = np.zeros_like(cos_angle)
+            shuffled_distance = np.zeros_like(endpoint_distance)
+            for target_local, source_global in enumerate(source_indices.tolist()):
+                target_a, target_b = int(path_offsets[target_local]), int(path_offsets[target_local + 1])
+                source_a, source_b = int(source_offsets[int(source_global)]), int(source_offsets[int(source_global) + 1])
+                if target_b - target_a != source_b - source_a:
+                    raise RuntimeError("G3 permutation changed path multiplicity")
+                shuffled_cos[target_a:target_b] = np.asarray(source_cos[source_a:source_b], dtype=np.float32)
+                shuffled_distance[target_local] = float(source_distance[int(source_global)])
+            cos_angle = shuffled_cos
+            endpoint_distance = shuffled_distance
+            # Invalid target relations remain invalid/zero regardless of the
+            # source relation selected by the correspondence permutation.
+            cos_angle[~np.repeat(geometry_valid, np.diff(path_offsets))] = 0.0
+            endpoint_distance[~geometry_valid] = 0.0
+        cos_angle[~path_valid] = 0.0
+        endpoint_distance[~geometry_valid] = 0.0
+        data = copy.copy(data)
+        data.mts_relation_geometry_relation_row = torch.as_tensor(
+            np.array(relation_rows, dtype=np.int64, copy=True), dtype=torch.long
+        )
+        data.mts_relation_geometry_valid = torch.as_tensor(
+            np.array(geometry_valid, dtype=bool, copy=True), dtype=torch.bool
+        )
+        data.mts_relation_geometry_reason_code = torch.as_tensor(
+            np.array(relations["relation_invalid_reason_code"], dtype=np.int16, copy=True), dtype=torch.int16
+        )
+        data.mts_relation_geometry_path_offsets = torch.as_tensor(
+            np.array(path_offsets, dtype=np.int64, copy=True), dtype=torch.long
+        )
+        data.mts_relation_geometry_path_valid = torch.as_tensor(
+            np.array(path_valid, dtype=bool, copy=True), dtype=torch.bool
+        )
+        data.mts_relation_geometry_path_cos_angle = torch.as_tensor(cos_angle, dtype=torch.float32)
+        data.mts_relation_geometry_endpoint_distance = torch.as_tensor(endpoint_distance, dtype=torch.float32)
+        data.mts_relation_geometry_sidecar_artifact = self._relation_geometry_sidecar.artifact_hash
+        data.mts_relation_geometry_cohort_hash = self._relation_geometry_sidecar.cohort_hash
+        data.mts_relation_geometry_arm = self.g_family_arm
+        if self._g3_permutation is not None:
+            data.mts_relation_geometry_permutation_artifact = str(self._g3_permutation.metadata["artifact_hash"])
+        return data
+
     @property
     def raw_targets(self):
         """Return immutable raw labels aligned with ``data_list`` rows."""
@@ -5277,6 +5446,11 @@ class UniDataset(Dataset):
             & ((1 << 63) - 1),
             dtype=torch.long,
         )
+        if self.g_family_arm is not None and self.g_family_arm != "g0":
+            row_hint = int(idx) if self._cohort_row_mode else None
+            data = self._attach_relation_geometry(
+                data, lookup_key_for_hash, row_hint=row_hint
+            )
         # A4 random-mask sidecar (Plan mts_geometry_injection A4): attach the
         # sample-local compact visible key sets so the collator can expand them
         # into batch rows without dense [Q, K] storage on disk.

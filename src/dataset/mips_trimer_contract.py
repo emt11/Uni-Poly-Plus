@@ -33,6 +33,8 @@ CACHE_CONTINUOUS_ANGLE_SCHEMA = "mts-angle-continuous-cache-v1"
 CACHE_MCL_THRESHOLD_SCHEMA = "mts-mcl-threshold-array-v2"
 CACHE_BUNDLE_SCHEMA = "mts-canonical-cache-bundle-v3"
 CACHE_TOPOLOGY_COST_SCHEMA = "mts-topology-cost-v1"
+CACHE_RELATION_GEOMETRY_SCHEMA = "mts-relation-geometry-sidecar-v1"
+RELATION_GEOMETRY_BUILDER_VERSION = 1
 # Geometry-injection ablation (A0--A4).  These identifiers are part of the
 # experiment contract, not a free-form naming convention.
 ABLATION_IDS = (
@@ -318,6 +320,10 @@ def validate_runtime_args(args) -> None:
     if getattr(args, "graph_encoder_type", None) != "mips_trimer_scage":
         return
     experiment = getattr(args, "config_schema", None) == EXPERIMENT_CONFIG_SCHEMA
+    isolated_pretrain = (
+        getattr(args, "config_source_schema", None)
+        == "mts-pretrain-experiment-v1"
+    )
     fixed = {
         "config_schema": CONFIG_SCHEMA,
         "topology_representation": TOPOLOGY_CANONICAL,
@@ -339,8 +345,10 @@ def validate_runtime_args(args) -> None:
         "trimer_num_candidates": 4,
         "trimer_max_heavy_atoms": 384,
     }
-    if experiment:
-        fixed["config_schema"] = EXPERIMENT_CONFIG_SCHEMA
+    if experiment or isolated_pretrain:
+        fixed["config_schema"] = (
+            EXPERIMENT_CONFIG_SCHEMA if experiment else CONFIG_SCHEMA
+        )
         # Explicit k-RU is an isolated comparison representation, not a
         # mutation of the canonical feature contract.
         observed_representation = getattr(
@@ -358,17 +366,35 @@ def validate_runtime_args(args) -> None:
                 f"{ROUTE_NAME} fixed contract mismatch for {name}: "
                 f"expected {expected!r}, got {observed!r}"
             )
+    attention_variant = str(getattr(args, "topology_attention_variant", "o8"))
+    if attention_variant not in {"o8", "msta_last2"}:
+        raise ValueError("unsupported topology_attention_variant")
+    # T1/MSTA is the promoted default for new training.  Historical T0 remains
+    # available through an explicit o8 config/checkpoint identity.
+    if list(getattr(args, "msta_layer_indices", [4, 5])) != [4, 5]:
+        raise ValueError("MSTA layer indices must be [4, 5]")
+    if list(getattr(args, "msta_local_spd", [0, 1])) != [0, 1]:
+        raise ValueError("MSTA local SPD support must be [0, 1]")
+    if list(getattr(args, "msta_context_spd", [0, 1, 2])) != [0, 1, 2]:
+        raise ValueError("MSTA context SPD support must be [0, 1, 2]")
+    if not bool(getattr(args, "msta_share_relation_dropout", True)):
+        raise ValueError("MSTA requires shared relation dropout")
+    if bool(getattr(args, "msta_local_output_bias", False)):
+        raise ValueError("MSTA local_output must be bias-free")
+    if str(getattr(args, "msta_local_output_init", "zero")) != "zero":
+        raise ValueError("MSTA local_output must use zero initialization")
     if not bool(getattr(args, "mips_use_descriptors", False)):
         raise ValueError(f"{ROUTE_NAME} requires MD200")
     if list(getattr(args, "modalities", [])) != ["graph"]:
-        if not experiment:
+        if not (experiment or isolated_pretrain):
             raise ValueError(f"{ROUTE_NAME} production config is graph-only")
     if getattr(args, "fusion_type", None) != "none":
-        if not experiment:
+        if not (experiment or isolated_pretrain):
             raise ValueError(f"{ROUTE_NAME} production config requires fusion_type=none")
     geometry_modes = {
         "trimer_scage_mcl", "current_mcl", "mcl_rbf", "disabled",
         "coordinate_shuffled", "mcl_rbf_coordinate_shuffled",
+        "g0", "g1", "g2", "g3",
     }
     if getattr(args, "graph_geometry_mode", None) not in geometry_modes:
         raise ValueError("unsupported mts-experiment-v3 geometry_mode")

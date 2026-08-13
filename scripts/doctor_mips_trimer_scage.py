@@ -356,14 +356,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible != "0,1,2":
+    if visible != "1,2,3":
         raise RuntimeError(
-            f"{ROUTE_NAME} ({ROUTE_SHORT_NAME}) requires CUDA_VISIBLE_DEVICES=0,1,2; "
+            f"{ROUTE_NAME} ({ROUTE_SHORT_NAME}) requires CUDA_VISIBLE_DEVICES=1,2,3; "
             f"got {visible!r}"
         )
     if not torch.cuda.is_available() or torch.cuda.device_count() != 3:
         raise RuntimeError(
-            "doctor requires exactly three visible CUDA devices (0,1,2); "
+            "doctor requires exactly three visible physical devices (1,2,3); "
             f"available={torch.cuda.device_count()}"
         )
     _check_cli(args.python)

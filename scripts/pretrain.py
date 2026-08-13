@@ -8,7 +8,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 import numpy as np
-import matplotlib.pyplot as plt
 import json
 import hashlib
 import math
@@ -77,6 +76,17 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
+def _is_t1_function_preserving_init_payload(payload) -> bool:
+    """Identify an architecture-init artifact, never a resumable train state."""
+
+    meta = payload.get("meta") if isinstance(payload, dict) else None
+    return bool(
+        isinstance(meta, dict)
+        and meta.get("init_artifact") is True
+        and meta.get("initialization") == "function_preserving"
+    )
+
+
 def _path_tree_sha256(path):
     """Hash model/tokenizer bytes and relative filenames deterministically."""
     path = os.path.abspath(path)
@@ -95,6 +105,12 @@ def _path_tree_sha256(path):
 _PRETRAIN_CODE_FILES = (
     "configs/mts/default.json",
     "configs/mts/pretraining/canonical_ru_angle20_v1.json",
+    "configs/mts/experiments/T0_o8_pretrain20k_matched_v1.json",
+    "configs/mts/experiments/T1_msta_pretrain20k_matched_v1.json",
+    "configs/mts/experiments/T1_msta_readiness.json",
+    "scripts/initialize_mts_t_pretrain0.py",
+    "scripts/audit_mts_t_pretrain0.py",
+    "scripts/initialize_mts_t1.py",
     "scripts/pretrain.py",
     "scripts/run_mips_trimer_scage.sh",
     "src/dataset/dataloader.py",
@@ -337,6 +353,7 @@ def parse_arguments():
     parser.add_argument('--alignment_model_config_hash', default='manual')
     parser.add_argument('--training_config_hash', default='manual')
     parser.add_argument('--config_schema', default='manual')
+    parser.add_argument('--config_source_schema', default='')
     parser.add_argument(
         '--modalities',
         nargs='+',
@@ -421,6 +438,21 @@ def parse_arguments():
         help="Optional MTS joint-pretraining checkpoint to initialize or resume the fixed topology/Trimer stage."
     )
     parser.add_argument(
+        '--initialization_state',
+        type=str,
+        default='',
+        help=(
+            "Fresh-paired step-0 model state. This is distinct from a "
+            "pretrained checkpoint and never carries optimizer/sampler state."
+        ),
+    )
+    parser.add_argument(
+        '--paired_init_id',
+        type=str,
+        default='',
+        help='Expected fresh-paired initialization identity.',
+    )
+    parser.add_argument(
         '--root',
         type=str,
         default='./data',
@@ -492,6 +524,15 @@ def parse_arguments():
     parser.add_argument(
         '--checkpoint_interval_steps', type=int, default=250,
         help='Optimizer steps between resumable train-state checkpoints.'
+    )
+    parser.add_argument(
+        '--diagnostics_dir', type=str, default='',
+        help='Optional non-intrusive MSTA milestone diagnostics directory.',
+    )
+    parser.add_argument(
+        '--diagnostic_steps', type=str,
+        default='0,500,2000,5000,10000,20000',
+        help='Comma-separated optimizer milestones for optional diagnostics.',
     )
     parser.add_argument(
         '--mts_num_layers',
@@ -604,9 +645,36 @@ def parse_arguments():
     )
     parser.add_argument(
         '--graph_geometry_mode',
-        choices=['trimer_scage_mcl', 'current_mcl'],
+        choices=['trimer_scage_mcl', 'current_mcl', 'g0', 'g1', 'g2', 'g3'],
         default='trimer_scage_mcl',
     )
+    parser.add_argument(
+        '--topology_attention_variant',
+        choices=['o8', 'msta_last2'],
+        default='msta_last2',
+        help='T0 O8 attention or T1 MSTA in the final two layers.',
+    )
+    parser.add_argument('--msta_layer_indices', nargs=2, type=int, default=[4, 5])
+    parser.add_argument('--msta_local_spd', nargs='+', type=int, default=[0, 1])
+    parser.add_argument('--msta_context_spd', nargs='+', type=int, default=[0, 1, 2])
+    parser.add_argument(
+        '--msta_share_relation_dropout',
+        action=argparse.BooleanOptionalAction, default=True,
+    )
+    parser.add_argument(
+        '--msta_local_output_bias',
+        action=argparse.BooleanOptionalAction, default=False,
+    )
+    parser.add_argument('--msta_local_output_init', choices=['zero'], default='zero')
+    parser.add_argument('--g_family_arm', choices=['g0', 'g1', 'g2', 'g3'], default=None)
+    parser.add_argument('--relation_geometry_sidecar', default=None)
+    parser.add_argument('--relation_geometry_artifact_hash', default=None)
+    parser.add_argument('--g3_permutation_sidecar', default=None)
+    parser.add_argument('--g3_permutation_artifact_hash', default=None)
+    parser.add_argument('--g_family_bundle_hash', default=None)
+    parser.add_argument('--pretraining_objective', choices=['joint', 'masked_atom_only'], default='joint')
+    parser.add_argument('--angle_loss_weight', type=float, default=0.25)
+    parser.add_argument('--shared_step0_id', default=None)
     parser.add_argument(
         '--topology_representation',
         choices=['canonical_lifted', 'explicit_k_ru'],
@@ -1021,6 +1089,210 @@ def _base_model(model):
     if isinstance(model, MIPSPretrainContainer):
         return model.model
     return model
+
+
+def _load_fresh_paired_initialization(model, args):
+    """Strictly load an optimizer-free fresh-paired step-0 model state."""
+
+    path = Path(str(args.initialization_state)).resolve()
+    if not path.is_file():
+        raise RuntimeError(f"fresh-paired initialization state is missing: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or not isinstance(payload.get("state_dict"), dict):
+        raise RuntimeError("fresh-paired initialization must contain state_dict")
+    meta = dict(payload.get("meta") or {})
+    expected_identity = (
+        "T1" if str(args.topology_attention_variant) == "msta_last2" else "T0"
+    )
+    required = {
+        "schema": "mts-pretrain-init-v1",
+        "initialization": "fresh_paired",
+        "model_identity": expected_identity,
+        "optimizer_steps": 0,
+        "paired_init_id": str(args.paired_init_id or "mts_t_pretrain0_matched_v1"),
+    }
+    for key, expected in required.items():
+        if meta.get(key) != expected:
+            raise RuntimeError(
+                f"fresh-paired initialization metadata mismatch for {key}: "
+                f"expected={expected!r}, observed={meta.get(key)!r}"
+            )
+    # G-family step-0 artifacts are full UniEncoder states, but their
+    # scientific identity is distinct from the historical T-Pretrain-0 pair.
+    # Bind every requested arm to its own shared step-0 id before loading any
+    # tensor, so a T-family or wrong-arm initialization cannot be reused.
+    if getattr(args, "g_family_arm", None) is not None:
+        g_arm = str(args.g_family_arm)
+        g_required = {
+            "g_family_arm": g_arm,
+            "geometry_mode": g_arm,
+            "pretraining_objective": "masked_atom_only",
+            "angle_loss_weight": 0.0,
+            "shared_step0_id": str(args.shared_step0_id or args.paired_init_id or ""),
+            "g_family_bundle_hash": str(args.g_family_bundle_hash or ""),
+        }
+        if not g_required["shared_step0_id"]:
+            raise RuntimeError("G-family initialization requires --shared_step0_id")
+        for key, expected in g_required.items():
+            observed = meta.get(key)
+            if key == "angle_loss_weight":
+                try:
+                    matches = float(observed) == float(expected)
+                except (TypeError, ValueError):
+                    matches = False
+            else:
+                matches = observed == expected
+            if not matches:
+                raise RuntimeError(
+                    "G-family step-0 initialization metadata mismatch for "
+                    f"{key}: expected={expected!r}, observed={observed!r}"
+                )
+    state = payload["state_dict"]
+    expected_state = model.state_dict()
+    missing = sorted(set(expected_state) - set(state))
+    unexpected = sorted(set(state) - set(expected_state))
+    if missing or unexpected:
+        raise RuntimeError(
+            "fresh-paired initialization architecture mismatch: "
+            f"missing={missing[:8]}, unexpected={unexpected[:8]}"
+        )
+    shape_mismatch = sorted(
+        key for key in expected_state
+        if tuple(state[key].shape) != tuple(expected_state[key].shape)
+        or state[key].dtype != expected_state[key].dtype
+    )
+    if shape_mismatch:
+        raise RuntimeError(
+            "fresh-paired initialization shape/dtype mismatch: "
+            + ", ".join(shape_mismatch[:8])
+        )
+    model.load_state_dict(state, strict=True)
+    if expected_identity == "T1":
+        for index in (4, 5):
+            key = f"encoders.graph.encoder.layers.{index}.attention.local_output.weight"
+            value = state[key]
+            if not torch.isfinite(value).all() or torch.count_nonzero(value).item() != 0:
+                raise RuntimeError(f"T1 fresh local_output is not finite zero: {key}")
+    return {
+        "schema": str(meta["schema"]),
+        "initialization": str(meta["initialization"]),
+        "model_identity": expected_identity,
+        "paired_init_id": str(meta["paired_init_id"]),
+        "path": str(path),
+        "sha256": _file_sha256(path),
+        "target_config_hash": meta.get("target_config_hash"),
+        "target_graph_model_config_hash": meta.get("target_graph_model_config_hash"),
+        "optimizer_steps": int(meta["optimizer_steps"]),
+        "g_family_arm": meta.get("g_family_arm"),
+        "shared_step0_id": meta.get("shared_step0_id"),
+        "pretraining_objective": meta.get("pretraining_objective"),
+        "g_family_bundle_hash": meta.get("g_family_bundle_hash"),
+    }
+
+
+def _msta_attention_modules(model):
+    """Return the declared T1 local/context attention modules."""
+
+    base = _base_model(model)
+    encoder = base.encoders["graph"].encoder
+    output = []
+    for index in (4, 5):
+        layer = encoder.layers[index]
+        attention = getattr(layer, "attention", None)
+        if hasattr(attention, "local_output"):
+            output.append((index, attention))
+    return output
+
+
+def _set_msta_diagnostic_mode(model, *, capture=False, local_off=False):
+    for _, attention in _msta_attention_modules(model):
+        attention.diagnostic_capture = bool(capture)
+        attention.diagnostic_local_off = bool(local_off)
+        if not capture:
+            attention.last_diagnostic = None
+
+
+def _make_fixed_probe(data):
+    """Keep a deterministic CPU snapshot without touching the loader."""
+
+    # The project collator intentionally returns a custom DataBatch that is
+    # not reconstructible through PyG's ``to_data_list``.  A detached CPU
+    # snapshot is still a fixed probe: it preserves the first batch's sample
+    # keys and never advances the train iterator or RNG.
+    try:
+        return data.detach().cpu()
+    except Exception:
+        return data.cpu()
+
+
+@torch.no_grad()
+def _fixed_probe_losses(owner, probe_cpu, args, step, device):
+    if probe_cpu is None:
+        return None
+    previous_training = owner.training
+    previous_flags = [
+        (attention, bool(attention.diagnostic_capture), bool(attention.diagnostic_local_off))
+        for _, attention in _msta_attention_modules(owner)
+    ]
+    rng_state = _capture_rng_state()
+    owner.eval()
+    probe = probe_cpu.to(device)
+
+    def evaluate(local_off):
+        _set_msta_diagnostic_mode(owner, capture=False, local_off=local_off)
+        payload = owner(MTS_STAGE1_ID, probe, args, int(step))
+        counts = payload["counts"]
+        atom = payload["loss_terms"]["masked_atom_sum"] / max(1, int(counts["masked_atoms"]))
+        angle = payload["loss_terms"]["angle_sum"] / max(1, int(counts["angle_graphs"]))
+        return float(atom.float().item()), float(angle.float().item())
+
+    normal_mask, normal_angle = evaluate(False)
+    off_mask, off_angle = evaluate(True)
+    for attention, capture, local_off in previous_flags:
+        attention.diagnostic_capture = capture
+        attention.diagnostic_local_off = local_off
+    if previous_training:
+        owner.train()
+    _restore_rng_state(rng_state)
+    return {
+        "delta_L_mask": off_mask - normal_mask,
+        "delta_L_angle": off_angle - normal_angle,
+        "normal_mask": normal_mask,
+        "normal_angle": normal_angle,
+        "probe_graph_count": int(len(probe.smiles)) if hasattr(probe, "smiles") else None,
+    }
+
+
+def _diagnostic_record(model, optimizer_step, probe, args, device, owner):
+    """Collect scalar-only training/probe diagnostics at one declared step."""
+
+    layers = {}
+    for index, attention in _msta_attention_modules(model):
+        row = dict(attention.last_diagnostic or {})
+        parameter = attention.local_output.weight
+        gradient = parameter.grad
+        row.update({
+            "weight_norm": float(parameter.detach().float().norm().item()),
+            "grad_norm": (
+                float(gradient.detach().float().norm().item())
+                if gradient is not None else None
+            ),
+            "grad_present": gradient is not None,
+            "grad_finite": bool(gradient is not None and torch.isfinite(gradient).all()),
+            "weight_finite": bool(torch.isfinite(parameter).all()),
+        })
+        layers[str(index)] = row
+    probe_result = _fixed_probe_losses(owner, probe, args, optimizer_step, device)
+    return {
+        "optimizer_step": int(optimizer_step),
+        "layers": layers,
+        "probe": probe_result,
+        "finite": bool(
+            all(bool(row.get("finite", True)) for row in layers.values())
+            and all(bool(row.get("weight_finite", False)) for row in layers.values())
+            and all(bool(row.get("grad_finite", False)) for row in layers.values())
+        ),
+    }
 
 
 def _distributed_enabled():
@@ -3211,10 +3483,14 @@ def _bf16_joint_parity_gate(base_model, data, atom_head, angle_head, args):
             atom_sum, _, atom_count, _ = _joint_masked_atom_terms(
                 data, nodes, atom_head, mask
             )
-            angle_sum, _, angle_count, _, _, _ = _joint_angle_terms(
-                data, aux["final_trimer_states"], angle_head,
-                gamma=float(args.scage_focal_gamma),
-            )
+            if str(getattr(args, "pretraining_objective", "joint")) == "masked_atom_only":
+                angle_sum = atom_sum.new_zeros(())
+                angle_count = 0
+            else:
+                angle_sum, _, angle_count, _, _, _ = _joint_angle_terms(
+                    data, aux["final_trimer_states"], angle_head,
+                    gamma=float(args.scage_focal_gamma),
+                )
             atom_loss = atom_sum / max(1, atom_count)
             angle_loss = angle_sum / max(1, angle_count)
             loss = atom_loss + float(args.graph_angle_weight) * angle_loss
@@ -3360,12 +3636,24 @@ class MIPSPretrainContainer(nn.Module):
         atom_sum, atom_detached, atom_count, atom_correct = _joint_masked_atom_terms(
             data, node_states, self.heads["mips_atom"], mask
         )
-        angle_sum, angle_detached, angle_graph_count, angle_correct, angle_targets, angle_mae_sum = _joint_angle_terms(
-            data,
-            aux["final_trimer_states"],
-            self.heads["angle"],
-            gamma=float(args.scage_focal_gamma),
-        )
+        if str(getattr(args, "pretraining_objective", "joint")) == "masked_atom_only":
+            # G-family input geometry is deliberately not reused as an
+            # Angle-20 target.  Keep the angle head in the strict checkpoint
+            # layout and zero-anchor it for DDP, but never inspect angle
+            # labels or invoke the angle loss helper in this objective.
+            angle_sum = atom_sum.new_zeros(())
+            angle_detached = angle_sum.detach()
+            angle_graph_count = 0
+            angle_correct = 0
+            angle_targets = 0
+            angle_mae_sum = angle_detached
+        else:
+            angle_sum, angle_detached, angle_graph_count, angle_correct, angle_targets, angle_mae_sum = _joint_angle_terms(
+                data,
+                aux["final_trimer_states"],
+                self.heads["angle"],
+                gamma=float(args.scage_focal_gamma),
+            )
         # The zero anchors are only for the rare rank-local empty target case;
         # they do not alter any numerical loss value or gradient of active
         # parameters.
@@ -3785,8 +4073,31 @@ def _dataset_kwargs_from_args(args):
         field_channels=args.field_channels,
         experiment_id=args.experiment_id,
         feature_config_hash=args.feature_config_hash,
+        g_family_arm=args.g_family_arm,
+        relation_geometry_sidecar=args.relation_geometry_sidecar,
+        relation_geometry_artifact_hash=args.relation_geometry_artifact_hash,
+        g3_permutation_sidecar=args.g3_permutation_sidecar,
+        g3_permutation_artifact_hash=args.g3_permutation_artifact_hash,
         angle_cache_root_override=getattr(args, 'angle_cache_root_override', None),
     )
+
+
+def validate_mts_pretrain_execution(profile, batch_size, accumulation, world_size):
+    """Validate the execution-only batch decomposition of an MTS profile."""
+    expected_world_size = int(profile.get("world_size", 3))
+    if int(world_size) != expected_world_size:
+        raise ValueError(
+            "pretrain profile/world-size mismatch: "
+            f"profile={expected_world_size}, runtime={world_size}"
+        )
+    effective = int(batch_size) * int(world_size) * int(accumulation)
+    target = int(profile["global_batch"])
+    if effective != target:
+        raise ValueError(
+            "canonical_ru_angle20_v1 requires batch_size * world_size * "
+            f"gradient_accumulation_steps = {target}; got {effective}"
+        )
+    return effective
 
 
 def main():
@@ -3829,17 +4140,42 @@ def main():
         args.amp_dtype = "bf16"
         args.max_grad_norm = -1.0
         args.angle_objective = "categorical"
-        if int(args.batch_size) * 3 * int(args.gradient_accumulation_steps) != int(
-            pretrain_profile["global_batch"]
-        ):
-            raise ValueError(
-                "canonical_ru_angle20_v1 requires batch_size * 3 * "
-                "gradient_accumulation_steps = 1008"
-            )
+        if getattr(args, "g_family_arm", None) is not None:
+            if args.pretraining_objective != "masked_atom_only" or float(args.angle_loss_weight) != 0.0:
+                raise RuntimeError("G-family pretraining requires masked_atom_only and angle_loss_weight=0")
+            if not args.g_family_bundle_hash:
+                raise RuntimeError("G-family pretraining requires --g_family_bundle_hash")
+            if args.g_family_arm != "g0" and (
+                not args.relation_geometry_sidecar
+                or not args.relation_geometry_artifact_hash
+            ):
+                raise RuntimeError("G1/G2/G3 pretraining requires the active PI1M_v2 artifact binding")
+            if args.g_family_arm == "g3" and (
+                not args.g3_permutation_sidecar
+                or not args.g3_permutation_artifact_hash
+            ):
+                raise RuntimeError("G3 pretraining requires the active permutation artifact binding")
+            # G-family readiness deliberately does not open or optimize the
+            # legacy Angle-20 target.  The formal profile remains unchanged
+            # for T-family runs.
+            args.graph_angle_weight = 0.0
+            args.pretraining_objective = "masked_atom_only"
+        # torchrun exports WORLD_SIZE before the process group is initialized.
+        # Validate the execution contract early without referring to the
+        # post-init local ``world_size`` defined later in this function.
+        requested_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        validate_mts_pretrain_execution(
+            pretrain_profile, args.batch_size,
+            args.gradient_accumulation_steps, requested_world_size,
+        )
         if args.pretrained_model_path:
             raise RuntimeError(
                 "canonical_ru_angle20_v1 must start from random initialization; "
                 "parent checkpoints are forbidden"
+            )
+        if args.initialization_state and args.resume_state:
+            raise RuntimeError(
+                "fresh-paired initialization cannot be combined with resume_state"
             )
         if not args.cache_only and not args.benchmark_only and not args.resume_smoke:
             output_path = Path(args.save_path).resolve()
@@ -3906,11 +4242,27 @@ def main():
         raise ValueError(
             f"{MTS_STAGE1_ID} is fixed to exactly 20000 optimizer steps"
         )
+    # Ordinary ``mts-experiment-v3`` descriptors remain fine-tune-only.  The
+    # matched G-family cycle is the one explicitly authorized exception: its
+    # resolver has already bound the arm, MSTA identity, masked-atom-only
+    # objective, zero angle weight, shared step-0 and (for G1) immutable
+    # relation sidecar.  Keep the exception narrow so a random experiment
+    # descriptor cannot silently become a formal pretraining entry point.
+    g_family_formal = (
+        args.config_schema == MIPS_EXPERIMENT_CONFIG_SCHEMA
+        and getattr(args, "g_family_arm", None) in {"g0", "g1"}
+        and not args.cache_only
+        and not args.resume_smoke
+        and getattr(args, "pretraining_objective", None) == "masked_atom_only"
+        and float(getattr(args, "angle_loss_weight", 1.0)) == 0.0
+        and getattr(args, "shared_step0_id", None)
+        == "mts_g_family_step0_v2_seed42"
+    )
     allowed_config_schema = (
         args.config_schema == MIPS_TRIMER_CONFIG_SCHEMA
         or (
             args.config_schema == MIPS_EXPERIMENT_CONFIG_SCHEMA
-            and (args.cache_only or args.resume_smoke)
+            and (args.cache_only or args.resume_smoke or g_family_formal)
         )
     )
     if (
@@ -3920,7 +4272,8 @@ def main():
         raise ValueError(
             f"{MTS_ROUTE_NAME} formal training accepts only "
             f"{MIPS_TRIMER_CONFIG_SCHEMA}; experiment configs are limited "
-            "to cache-only and short resume-smoke runs"
+            "to cache-only, short resume-smoke, or the strict G0/G1 matched "
+            "pretraining contract"
         )
     stage1_weights = (
         args.scage_mips_mask_weight,
@@ -4005,7 +4358,7 @@ def main():
         if distributed and world_size != 3:
             raise ValueError(
                 "The non-PBC MIPS campaign requires exactly three DDP ranks "
-                f"(GPU 0,1,2); received world_size={world_size}."
+                f"(physical GPUs 1,2,3); received world_size={world_size}."
             )
         if args.mips_max_hops is None:
             args.mips_max_hops = (
@@ -4148,12 +4501,15 @@ def main():
                 f"{MTS_ROUTE_NAME} cache artifacts are not frozen: "
                 + ", ".join(unfrozen)
             )
-        if getattr(getattr(dataset, "_lazy_feature_store", None), "angle_offsets", None) is None:
+        if (
+            getattr(args, "g_family_arm", None) is None
+            and getattr(getattr(dataset, "_lazy_feature_store", None), "angle_offsets", None) is None
+        ):
             raise RuntimeError(
                 "MTS joint pretraining requires the frozen Trimer bond-angle "
                 "cache; run scripts/prepare_mts_angle_cache.py first"
             )
-        if pretrain_profile is not None:
+        if pretrain_profile is not None and getattr(args, "g_family_arm", None) is None:
             angle_meta = getattr(dataset, "angle_cache_metadata", None) or {}
             if (
                 angle_meta.get("schema") != pretrain_profile["angle_cache_schema"]
@@ -4164,7 +4520,7 @@ def main():
                     "canonical_ru_angle20_v1 requires the frozen categorical "
                     "Angle-20 v2 sidecar; continuous or stale sidecars are rejected"
                 )
-        if args.angle_objective == 'categorical':
+        if args.angle_objective == 'categorical' and getattr(args, "g_family_arm", None) is None:
             angle_counts = np.asarray(
                 getattr(dataset, "angle_class_counts", np.zeros(20, dtype=np.int64)),
                 dtype=np.int64,
@@ -4412,11 +4768,31 @@ def main():
             mips_mask_mode=args.mips_mask_mode,
             mips_mask_policy=args.mips_mask_policy,
             mips_masked_loss_reduction=args.mips_masked_loss_reduction,
+        topology_attention_variant=args.topology_attention_variant,
+        msta_layer_indices=args.msta_layer_indices,
+        msta_local_spd=args.msta_local_spd,
+        msta_context_spd=args.msta_context_spd,
+        msta_share_relation_dropout=args.msta_share_relation_dropout,
+        msta_local_output_bias=args.msta_local_output_bias,
+        msta_local_output_init=args.msta_local_output_init,
+        g_family_arm=args.g_family_arm,
+        relation_geometry_sidecar=args.relation_geometry_sidecar,
+        g3_permutation_sidecar=args.g3_permutation_sidecar,
         fusion_type=args.fusion_type,
         fp_mode=args.fp_mode,
         fusion_dropout=args.fusion_dropout,
         alignment_projection_dim=args.alignment_projection_dim,
     )
+
+    initialization_info = None
+    if args.initialization_state:
+        initialization_info = _load_fresh_paired_initialization(model, args)
+        if rank == 0:
+            print(
+                "Loaded fresh-paired step-0 initialization: "
+                f"identity={initialization_info['model_identity']} "
+                f"sha256={initialization_info['sha256']}"
+            )
 
     if args.pretrained_model_path:
         checkpoint = torch.load(args.pretrained_model_path, map_location='cpu')
@@ -4471,6 +4847,14 @@ def main():
                 != bool(args.mips_use_descriptors)
                 or meta.get("spatial_mode", "none") != args.spatial_mode
                 or meta.get("mips_variant") != args.mips_variant
+                or meta.get("topology_attention_variant", "o8")
+                != args.topology_attention_variant
+                or list(meta.get("msta_layer_indices", [4, 5]))
+                != list(args.msta_layer_indices)
+                or list(meta.get("msta_local_spd", [0, 1]))
+                != list(args.msta_local_spd)
+                or list(meta.get("msta_context_spd", [0, 1, 2]))
+                != list(args.msta_context_spd)
                 or meta.get("o8_feature_config_hash")
                 != args.o8_feature_config_hash
                 or meta.get("graph_model_config_hash")
@@ -4600,7 +4984,11 @@ def main():
                 hidden=256,
                 bins=int(args.scage_angle_bins),
                 alpha=(
-                    _angle_alpha_from_dataset(dataset, args.scage_angle_bins)
+                    (
+                        torch.ones(int(args.scage_angle_bins), device=device)
+                        if getattr(args, "g_family_arm", None) is not None
+                        else _angle_alpha_from_dataset(dataset, args.scage_angle_bins)
+                    )
                     if args.angle_objective == 'categorical' else None
                 ),
                 dropout=0.10,
@@ -4695,9 +5083,14 @@ def main():
             graph_encoder.spd_embedding,
             graph_encoder.path_bias,
             graph_encoder.layers,
-            graph_encoder.star_distance_bias,
-            graph_encoder.trimer_mcl,
         )
+        if getattr(graph_encoder, "g_family_arm", None) is None:
+            active_modules = active_modules + (
+                graph_encoder.star_distance_bias,
+                graph_encoder.trimer_mcl,
+            )
+        elif str(graph_encoder.g_family_arm) in {"g1", "g2", "g3"}:
+            active_modules = active_modules + (graph_encoder.relation_geometry_bias,)
         for module in active_modules:
             for parameter in module.parameters():
                 parameter.requires_grad = True
@@ -4795,6 +5188,22 @@ def main():
         "feature_config_hash": args.feature_config_hash,
         "o8_feature_config_hash": args.o8_feature_config_hash,
         "graph_model_config_hash": args.graph_model_config_hash,
+        "topology_attention_variant": args.topology_attention_variant,
+        "msta_layer_indices": list(args.msta_layer_indices),
+        "msta_local_spd": list(args.msta_local_spd),
+        "msta_context_spd": list(args.msta_context_spd),
+        "msta_share_relation_dropout": bool(args.msta_share_relation_dropout),
+        "msta_local_output_bias": bool(args.msta_local_output_bias),
+        "msta_local_output_init": args.msta_local_output_init,
+        "g_family_arm": getattr(args, "g_family_arm", None),
+        "g_family_bundle_hash": getattr(args, "g_family_bundle_hash", None),
+        "relation_geometry_sidecar": getattr(args, "relation_geometry_sidecar", None),
+        "relation_geometry_artifact_hash": getattr(args, "relation_geometry_artifact_hash", None),
+        "g3_permutation_sidecar": getattr(args, "g3_permutation_sidecar", None),
+        "g3_permutation_artifact_hash": getattr(args, "g3_permutation_artifact_hash", None),
+        "pretraining_objective": getattr(args, "pretraining_objective", "joint"),
+        "angle_loss_weight": float(getattr(args, "angle_loss_weight", 0.25)),
+        "shared_step0_id": getattr(args, "shared_step0_id", None),
         "geometry_model_config_hash": args.geometry_model_config_hash,
         "source_geometry_model_config_hash": args.source_geometry_model_config_hash,
         "training_config_hash": args.training_config_hash,
@@ -4854,8 +5263,14 @@ def main():
         "masked_atom_weight": float(args.scage_mips_mask_weight),
         "trimer_bond_angle_weight": float(args.graph_angle_weight),
         "pretraining_objective": (
-            "masked_atom_plus_trimer_bond_angle"
+            getattr(args, "pretraining_objective", "joint")
             if args.pretrain_stage == MTS_STAGE1_ID else None
+        ),
+        "initialization_state": (
+            initialization_info["sha256"] if initialization_info is not None else None
+        ),
+        "paired_init_id": (
+            initialization_info["paired_init_id"] if initialization_info is not None else None
         ),
     })
     resume_epoch = 0
@@ -4880,6 +5295,11 @@ def main():
         resume_payload = torch.load(
             resume_path, map_location="cpu", weights_only=False
         )
+        if _is_t1_function_preserving_init_payload(resume_payload):
+            raise RuntimeError(
+                "T1 function-preserving init is an architecture warm start and "
+                "cannot be used as --resume_state"
+            )
         if resume_payload.get("schema") != PRETRAIN_TRAIN_STATE_SCHEMA:
             raise RuntimeError(
                 "resume state uses an obsolete checkpoint schema; rerun from "
@@ -4903,6 +5323,20 @@ def main():
                 != args.o8_feature_config_hash
             or resume_meta.get("graph_model_config_hash")
                 != args.graph_model_config_hash
+            or resume_meta.get("g_family_bundle_hash")
+                != resume_contract["g_family_bundle_hash"]
+            or resume_meta.get("relation_geometry_artifact_hash")
+                != resume_contract["relation_geometry_artifact_hash"]
+            or resume_meta.get("g3_permutation_artifact_hash")
+                != resume_contract["g3_permutation_artifact_hash"]
+            or resume_meta.get("topology_attention_variant", "o8")
+                != args.topology_attention_variant
+            or list(resume_meta.get("msta_layer_indices", [4, 5]))
+                != list(args.msta_layer_indices)
+            or list(resume_meta.get("msta_local_spd", [0, 1]))
+                != list(args.msta_local_spd)
+            or list(resume_meta.get("msta_context_spd", [0, 1, 2]))
+                != list(args.msta_context_spd)
             or resume_meta.get("geometry_model_config_hash", "manual")
                 != args.geometry_model_config_hash
             or resume_meta.get(
@@ -5057,26 +5491,34 @@ def main():
         total_batches = warmup_batches + benchmark_batches
         timings = []
         data_timings = []
+        h2d_timings = []
         forward_timings = []
         backward_timings = []
+        optimizer_timings = []
         sample_count = 0
         optimizer_steps = 0
         accumulation = max(1, int(args.gradient_accumulation_steps))
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         optimizer.zero_grad(set_to_none=True)
+        finite_loss = True
+        finite_gradient = True
+        finite_parameters = True
         for batch_index in range(total_batches):
             data_started = time.monotonic()
             try:
-                data = next(iterator).to(device)
+                data = next(iterator)
             except StopIteration:
                 if sampler is not None:
                     sampler.set_epoch(getattr(sampler, "epoch", 0) + 1)
                 iterator = iter(dataloader)
-                data = next(iterator).to(device)
+                data = next(iterator)
             data_elapsed = time.monotonic() - data_started
+            transfer_started = time.monotonic()
+            data = data.to(device, non_blocking=True)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
+            transfer_elapsed = time.monotonic() - transfer_started
             started = time.monotonic()
             should_step = (batch_index + 1) % accumulation == 0
             sync_context = (
@@ -5103,31 +5545,57 @@ def main():
                         / max(1, payload["counts"]["angle_graphs"])
                     )
                     loss = loss + payload["zero_reference"]
+                finite_loss = finite_loss and bool(torch.isfinite(loss.detach()))
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 forward_elapsed = time.monotonic() - forward_started
                 backward_started = time.monotonic()
                 (loss / accumulation).backward()
+                if batch_index + 1 == total_batches:
+                    finite_gradient = all(
+                        parameter.grad is None
+                        or bool(torch.isfinite(parameter.grad).all())
+                        for parameter in train_module.parameters()
+                    )
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 backward_elapsed = time.monotonic() - backward_started
             if should_step:
+                optimizer_started = time.monotonic()
                 if float(args.max_grad_norm) > 0:
                     torch.nn.utils.clip_grad_norm_(train_module.parameters(), args.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                optimizer_elapsed = time.monotonic() - optimizer_started
+                if batch_index + 1 == total_batches:
+                    finite_parameters = all(
+                        bool(torch.isfinite(parameter).all())
+                        for parameter in train_module.parameters()
+                    )
                 optimizer_steps += int(batch_index >= warmup_batches)
+            else:
+                optimizer_elapsed = 0.0
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             elapsed = time.monotonic() - started
             if batch_index >= warmup_batches:
-                timings.append(elapsed + data_elapsed)
+                timings.append(elapsed + data_elapsed + transfer_elapsed)
                 data_timings.append(data_elapsed)
+                h2d_timings.append(transfer_elapsed)
                 forward_timings.append(forward_elapsed)
                 backward_timings.append(backward_elapsed)
+                optimizer_timings.append(optimizer_elapsed)
                 sample_count += int(data.graph_available.numel())
         local_elapsed = float(sum(timings))
+        finite_tensor = torch.tensor(
+            [finite_loss, finite_gradient, finite_parameters],
+            device=device, dtype=torch.int32,
+        )
+        if distributed:
+            dist.all_reduce(finite_tensor, op=dist.ReduceOp.MIN)
         local_compute = torch.tensor(
             [local_elapsed, local_elapsed], device=device, dtype=torch.float64
         )
@@ -5160,9 +5628,14 @@ def main():
                 "samples_per_second": effective_samples / max(elapsed, 1e-9),
                 "optimizer_steps_per_second": optimizer_steps / max(elapsed, 1e-9),
                 "mean_data_seconds": float(np.mean(data_timings)),
+                "mean_h2d_seconds": float(np.mean(h2d_timings)),
                 "mean_forward_seconds": float(np.mean(forward_timings)),
                 "mean_backward_ddp_seconds": float(np.mean(backward_timings)),
+                "mean_optimizer_seconds": float(np.mean(optimizer_timings)),
                 "rank_wait_fraction": rank_wait_fraction,
+                "loss_finite": bool(finite_tensor[0].item()),
+                "gradient_finite": bool(finite_tensor[1].item()),
+                "parameters_finite": bool(finite_tensor[2].item()),
                 "peak_memory_allocated_bytes": peak_allocated,
                 "peak_memory_reserved_bytes": peak_reserved,
                 "peak_memory_fraction": (
@@ -5333,19 +5806,42 @@ def main():
         )
         print(f"Dynamic pretraining loss terms: {active_loss_names}")
 
-
-    # Create directory for saving loss curves and data
-    os.makedirs('./plots/pretrain', exist_ok=True)
-
-    # Record loss and periodic augmentation health for each epoch
-    losses = []
-    periodic_aug_epoch_stats = []
-    dynamic_loss_epoch_weights = []
-    dynamic_loss_epoch_stats = []
-    m4p_epoch_target_stats = []
-    m4p_geometry_epoch_stats = []
-    gradient_norms = []
-    alignment_epoch_stats = []
+    diagnostics_enabled = bool(args.diagnostics_dir)
+    diagnostic_steps = set()
+    diagnostic_rows = []
+    diagnostic_probe = None
+    diagnostic_jsonl = None
+    if diagnostics_enabled:
+        try:
+            diagnostic_steps = {
+                int(value.strip()) for value in str(args.diagnostic_steps).split(",")
+                if value.strip()
+            }
+        except ValueError as exc:
+            raise ValueError("--diagnostic_steps must be comma-separated integers") from exc
+        if min(diagnostic_steps, default=0) < 0:
+            raise ValueError("diagnostic steps must be non-negative")
+        diagnostic_root = Path(args.diagnostics_dir).resolve()
+        diagnostic_root.mkdir(parents=True, exist_ok=True)
+        diagnostic_jsonl = diagnostic_root / "milestones.jsonl"
+        if rank == 0 and diagnostic_jsonl.exists():
+            raise RuntimeError(
+                f"diagnostics output already exists; refusing overwrite: {diagnostic_jsonl}"
+            )
+        _set_msta_diagnostic_mode(model, capture=False, local_off=False)
+        if rank == 0:
+            (diagnostic_root / "contract.json").write_text(
+                json.dumps({
+                    "schema": "mts-msta-branch-diagnostics-v1",
+                    "model_identity": (
+                        "T1" if args.topology_attention_variant == "msta_last2" else "T0"
+                    ),
+                    "steps": sorted(diagnostic_steps),
+                    "no_extra_backward": True,
+                    "probe_mode": "eval_no_grad_fixed_first_two_graphs",
+                }, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
 
     model.train()
     angle_v2_validation_history = []
@@ -5372,22 +5868,6 @@ def main():
         first_step_idx = resume_step_idx if epoch == resume_epoch else 0
         epoch_loss = 0.0
         epoch_periodic_aug_stats = _empty_periodic_aug_stats()
-        epoch_raw_terms = {}
-        epoch_raw_term_counts = {}
-        epoch_normalized_terms = {}
-        epoch_dynamic_weights = {}
-        epoch_effective_weights = {}
-        epoch_baselines = {}
-        epoch_target_counts = {}
-        epoch_geometry_components = {}
-        epoch_geometry_component_steps = {}
-        epoch_alignment_stats = {
-            'steps': 0,
-            'fusion_gradient_norm': 0.0,
-            'pooling_entropy': 0.0,
-            'missing_rates': {},
-            'pooling_weights': {},
-        }
         epoch_term_steps = 0
         show_progress = (
             rank == 0
@@ -5435,7 +5915,7 @@ def main():
             ):
                 break
             global_step += 1
-            data = data.to(device)
+            data = data.to(device, non_blocking=True)
             trace_record = None
             if (
                 args.pretrain_stage == MTS_STAGE1_ID
@@ -5461,6 +5941,17 @@ def main():
                 (step_idx + 1) % accumulation_steps == 0
                 or (step_idx + 1) == len(dataloader)
                 or (args.max_steps > 0 and global_step >= args.max_steps)
+            )
+            diagnostic_step = None
+            if diagnostics_enabled:
+                if optimizer_steps_completed in diagnostic_steps:
+                    diagnostic_step = int(optimizer_steps_completed)
+                elif should_step and optimizer_steps_completed + 1 in diagnostic_steps:
+                    diagnostic_step = int(optimizer_steps_completed + 1)
+            _set_msta_diagnostic_mode(
+                model,
+                capture=bool(diagnostics_enabled and diagnostic_step is not None),
+                local_off=False,
             )
             base_model = _base_model(model)
             loss_terms = {}
@@ -5506,6 +5997,25 @@ def main():
                             f"Non-finite MTS joint loss for batch smiles={data.smiles}"
                         )
                     (loss / accumulation_steps).backward()
+                if diagnostics_enabled and rank == 0 and diagnostic_step is not None:
+                    if diagnostic_probe is None:
+                        diagnostic_probe = _make_fixed_probe(data)
+                    owner = (
+                        train_module.module
+                        if isinstance(train_module, torch.nn.parallel.DistributedDataParallel)
+                        else train_module
+                    )
+                    record = _diagnostic_record(
+                        base_model,
+                        diagnostic_step,
+                        diagnostic_probe,
+                        args,
+                        device,
+                        owner,
+                    )
+                    diagnostic_rows.append(record)
+                    with diagnostic_jsonl.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(record, sort_keys=True) + "\n")
                 if trace_record is not None:
                     trace_record.update({
                         "loss": float(loss.detach().float().item()),
@@ -5678,32 +6188,7 @@ def main():
                                     for key, value in _base_model(model).state_dict().items()
                                 }
                 epoch_loss += float(loss.detach().item())
-                if should_step:
-                    gradient_norms.append(float(gradient_norm.detach().cpu().item()))
                 epoch_term_steps += 1
-                epoch_target_counts["masked_atoms"] = (
-                    epoch_target_counts.get("masked_atoms", 0) + global_atom_count
-                )
-                epoch_target_counts["angle_graphs"] = (
-                    epoch_target_counts.get("angle_graphs", 0) + global_angle_count
-                )
-                epoch_target_counts["angle_targets"] = (
-                    epoch_target_counts.get("angle_targets", 0) + global_angle_targets
-                )
-                epoch_raw_terms["masked_atom"] = (
-                    epoch_raw_terms.get("masked_atom", 0.0)
-                    + float(atom_mean.detach().float().item())
-                )
-                epoch_raw_terms["trimer_bond_angle"] = (
-                    epoch_raw_terms.get("trimer_bond_angle", 0.0)
-                    + float(angle_mean.detach().float().item())
-                )
-                epoch_raw_term_counts["masked_atom"] = (
-                    epoch_raw_term_counts.get("masked_atom", 0) + 1
-                )
-                epoch_raw_term_counts["trimer_bond_angle"] = (
-                    epoch_raw_term_counts.get("trimer_bond_angle", 0) + 1
-                )
                 if show_progress:
                     progress_bar.set_postfix(
                         step=f"{optimizer_steps_completed}/{args.max_optimizer_steps}",
@@ -5731,10 +6216,6 @@ def main():
                             data, args, epoch,
                         )
                     loss_terms = payload["loss_terms"]
-                    for name, count in payload["counts"].items():
-                        epoch_target_counts[name] = (
-                            epoch_target_counts.get(name, 0) + count
-                        )
                     zero_reference = payload["zero_reference"]
                     if dynamic_loss_weighter is not None:
                         loss = dynamic_loss_weighter(
@@ -5829,21 +6310,7 @@ def main():
                         next_step = 0 if next_epoch > epoch else step_idx + 1
                         save_train_state(next_epoch, next_step)
                 epoch_loss += float(loss.item())
-                gradient_norms.append(float(gradient_norm.detach().cpu().item()))
                 epoch_term_steps += 1
-                for name, value in loss_terms.items():
-                    epoch_raw_terms[name] = epoch_raw_terms.get(name, 0.0) + float(value.detach().cpu().item())
-                    epoch_raw_term_counts[name] = epoch_raw_term_counts.get(name, 0) + 1
-                if dynamic_loss_weighter is not None:
-                    for name, value in dynamic_loss_weighter.last_normalized.items():
-                        epoch_normalized_terms[name] = epoch_normalized_terms.get(name, 0.0) + float(value)
-                    for name, value in dynamic_loss_weighter.last_weights.items():
-                        epoch_dynamic_weights[name] = epoch_dynamic_weights.get(name, 0.0) + float(value)
-                    for name, value in dynamic_loss_weighter.last_effective.items():
-                        epoch_effective_weights[name] = epoch_effective_weights.get(name, 0.0) + float(value)
-                    for name, value in dynamic_loss_weighter.last_baselines.items():
-                        if value is not None:
-                            epoch_baselines[name] = float(value)
                 if show_progress and (
                     should_step or optimizer_steps_completed % 50 == 0
                 ):
@@ -5869,7 +6336,6 @@ def main():
                             "alignment", data, args, epoch
                         )
                         alignment_losses = payload["losses"]
-                        alignment_stats = payload["stats"]
                         loss = _alignment_total(alignment_losses, args)
                     if not torch.isfinite(loss):
                         raise ValueError(
@@ -5877,9 +6343,6 @@ def main():
                             f"smiles={data.smiles}"
                         )
                     (loss / accumulation_steps).backward()
-                fusion_gradient = _module_gradient_norm(
-                    getattr(base_model, "parallel_attention_fusion", None)
-                )
                 gradient_norm = loss.new_tensor(0.0)
                 if should_step:
                     gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -5899,17 +6362,7 @@ def main():
                         )
                     optimizer.zero_grad(set_to_none=True)
                 epoch_loss += float(loss.item())
-                gradient_norms.append(float(gradient_norm.detach().cpu().item()))
                 epoch_term_steps += 1
-                for name, value in alignment_losses.items():
-                    epoch_raw_terms[name] = epoch_raw_terms.get(name, 0.0) + float(value.item())
-                epoch_alignment_stats['steps'] += 1
-                epoch_alignment_stats['fusion_gradient_norm'] += fusion_gradient
-                epoch_alignment_stats['pooling_entropy'] += alignment_stats['pooling_entropy']
-                for group in ('missing_rates', 'pooling_weights'):
-                    for name, value in alignment_stats[group].items():
-                        target = epoch_alignment_stats[group]
-                        target[name] = target.get(name, 0.0) + float(value)
                 progress_bar.set_postfix(
                     loss=f"{loss.item():.4f}",
                     fusion=f"{alignment_losses['fused_view'].item():.3f}",
@@ -6041,16 +6494,7 @@ def main():
                     next_step = 0 if next_epoch > epoch else step_idx + 1
                     save_train_state(next_epoch, next_step)
             epoch_loss += loss.item()
-            gradient_norms.append(float(gradient_norm.detach().cpu().item()))
             epoch_term_steps += 1
-            for name, value in weighted_loss_terms.items():
-                epoch_raw_terms[name] = epoch_raw_terms.get(name, 0.0) + float(value.detach().cpu().item())
-                epoch_raw_term_counts[name] = epoch_raw_term_counts.get(name, 0) + 1
-            if dynamic_loss_weighter is not None:
-                for name, value in dynamic_loss_weighter.last_normalized.items():
-                    epoch_normalized_terms[name] = epoch_normalized_terms.get(name, 0.0) + float(value)
-                for name, value in dynamic_weights.items():
-                    epoch_dynamic_weights[name] = epoch_dynamic_weights.get(name, 0.0) + float(value)
             paug_attempted = int(graph_paug_stats.get('attempted', 0))
             paug_success = int(graph_paug_stats.get('success', 0))
             paug_rate = (paug_success / paug_attempted) if paug_attempted else 0.0
@@ -6076,95 +6520,10 @@ def main():
             dist.all_reduce(epoch_summary, op=dist.ReduceOp.SUM)
         global_epoch_steps = max(1, int(round(epoch_summary[1].item())))
         avg_loss = float(epoch_summary[0].item()) / global_epoch_steps
-        epoch_raw_terms = _distributed_sum_mapping(epoch_raw_terms, device)
-        epoch_raw_term_counts = _distributed_sum_mapping(epoch_raw_term_counts, device)
-        epoch_normalized_terms = _distributed_sum_mapping(epoch_normalized_terms, device)
-        epoch_dynamic_weights = _distributed_sum_mapping(epoch_dynamic_weights, device)
-        epoch_effective_weights = _distributed_sum_mapping(epoch_effective_weights, device)
-        epoch_target_counts = _distributed_sum_mapping(epoch_target_counts, device)
-        epoch_geometry_components = _distributed_sum_mapping(epoch_geometry_components, device)
-        epoch_geometry_component_steps = _distributed_sum_mapping(
-            epoch_geometry_component_steps, device
-        )
         epoch_periodic_aug_stats = _distributed_sum_mapping(
             epoch_periodic_aug_stats, device
         )
-        alignment_summary = torch.tensor([
-            float(epoch_alignment_stats['steps']),
-            float(epoch_alignment_stats['fusion_gradient_norm']),
-            float(epoch_alignment_stats['pooling_entropy']),
-        ], dtype=torch.float64, device=device)
-        if distributed:
-            dist.all_reduce(alignment_summary, op=dist.ReduceOp.SUM)
-        epoch_alignment_stats['steps'] = int(round(alignment_summary[0].item()))
-        epoch_alignment_stats['fusion_gradient_norm'] = float(alignment_summary[1].item())
-        epoch_alignment_stats['pooling_entropy'] = float(alignment_summary[2].item())
-        epoch_alignment_stats['missing_rates'] = _distributed_sum_mapping(
-            epoch_alignment_stats['missing_rates'], device
-        )
-        epoch_alignment_stats['pooling_weights'] = _distributed_sum_mapping(
-            epoch_alignment_stats['pooling_weights'], device
-        )
-        losses.append(avg_loss)
         paug_summary = _finalize_periodic_aug_stats(epoch + 1, epoch_periodic_aug_stats)
-        periodic_aug_epoch_stats.append(paug_summary)
-        if dynamic_loss_weighter is not None:
-            dynamic_loss_epoch_weights.append({
-                'epoch': int(epoch + 1),
-                'weights': dict(dynamic_loss_weighter.last_weights),
-            })
-        if global_epoch_steps:
-            dynamic_loss_epoch_stats.append({
-                'epoch': int(epoch + 1),
-                'raw_weighted_losses': {
-                    name: value / max(epoch_raw_term_counts.get(name, 1.0), 1.0)
-                    for name, value in epoch_raw_terms.items()
-                },
-                'normalized_losses': {
-                    name: value / global_epoch_steps for name, value in epoch_normalized_terms.items()
-                },
-                'dynamic_weights': {
-                    name: value / global_epoch_steps for name, value in epoch_dynamic_weights.items()
-                },
-                'task_priors': (
-                    dict(dynamic_loss_weighter.task_priors)
-                    if dynamic_loss_weighter is not None else {}
-                ),
-                'effective_coefficients': {
-                    name: value / global_epoch_steps for name, value in epoch_effective_weights.items()
-                },
-                'frozen_baselines': dict(epoch_baselines),
-            })
-        if args.pretrain_stage == 'scage_m4p':
-            valid_ids = epoch_target_counts.get('paug_valid_identities', 0)
-            epoch_target_counts['paug_average_positives_per_polymer'] = (
-                epoch_target_counts.get('paug_positive_count_sum', 0) / valid_ids
-                if valid_ids else 0.0
-            )
-            m4p_epoch_target_stats.append({'epoch': epoch + 1, **epoch_target_counts})
-            m4p_geometry_epoch_stats.append({
-                'epoch': epoch + 1,
-                'component_losses': {
-                    name: value / max(epoch_geometry_component_steps.get(name, 1), 1)
-                    for name, value in epoch_geometry_components.items()
-                },
-                'component_steps': dict(epoch_geometry_component_steps),
-            })
-        if epoch_alignment_stats['steps']:
-            steps = epoch_alignment_stats['steps']
-            alignment_epoch_stats.append({
-                'epoch': epoch + 1,
-                'fusion_gradient_norm': epoch_alignment_stats['fusion_gradient_norm'] / steps,
-                'pooling_entropy': epoch_alignment_stats['pooling_entropy'] / steps,
-                'missing_rates': {
-                    name: value / steps
-                    for name, value in epoch_alignment_stats['missing_rates'].items()
-                },
-                'pooling_weights': {
-                    name: value / steps
-                    for name, value in epoch_alignment_stats['pooling_weights'].items()
-                },
-            })
         if rank == 0 and paug_summary['attempted'] > 0:
             print(
                 f"Epoch [{epoch+1}/{args.epochs}] Total Loss: {avg_loss:.4f} | "
@@ -6187,10 +6546,29 @@ def main():
         joint_progress.close()
 
     if args.resume_smoke:
-        if distributed:
-            dist.barrier()
-            dist.destroy_process_group()
-        return
+        if diagnostics_enabled and rank == 0:
+            diagnostic_root = Path(args.diagnostics_dir).resolve()
+            (diagnostic_root / "report.json").write_text(
+                json.dumps({
+                    "schema": "mts-msta-branch-diagnostics-v1",
+                    "model_identity": (
+                        "T1" if args.topology_attention_variant == "msta_last2" else "T0"
+                    ),
+                    "requested_steps": sorted(diagnostic_steps),
+                    "observed_steps": [int(row["optimizer_step"]) for row in diagnostic_rows],
+                    "rows": diagnostic_rows,
+                    "all_rows_finite": all(bool(row.get("finite")) for row in diagnostic_rows),
+                    "probe_no_extra_backward": True,
+                    "probe_rng_restored": True,
+                    "smoke_only": True,
+                }, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        if getattr(args, "g_family_arm", None) is None:
+            if distributed:
+                dist.barrier()
+                dist.destroy_process_group()
+            return
 
     if distributed and rank != 0:
         dist.barrier()
@@ -6206,149 +6584,24 @@ def main():
             f'{angle_v2_best_composite:.6f}'
         )
 
-    # Save original loss data
-    loss_data = {
-        'pretrain_stage': args.checkpoint_stage,
-        'fusion_type': args.fusion_type,
-        'fp_mode': args.fp_mode,
-        'pretraining_rows': int(len(indices)),
-        'pretraining_unique_smiles': bool(args.pretrain_unique_smiles),
-        'graph_encoder_type': args.graph_encoder_type,
-        'scage_dist_bar': args.scage_dist_bar,
-        'scage_backbone': (
-            'sparse_mips_non_pbc_spd_single_path_node'
-            if args.graph_encoder_type == 'mips_trimer_scage' else None
-        ),
-        'scage_input': (
-            'mips137_independent_backbone_embedding'
-            if args.graph_encoder_type == 'mips_trimer_scage' else None
-        ),
-        'scage_checkpoint_schema': (
-            MIPS_TRIMER_CHECKPOINT_SCHEMA
-            if args.graph_encoder_type == 'mips_trimer_scage' else None
-        ),
-        'scage_ffn_hidden_dim': args.scage_ffn_hidden_dim,
-        'scage_num_kernels': args.scage_num_kernels,
-        'scage_use_descriptors': bool(args.scage_use_descriptors),
-        'scage_distance_mode': args.scage_distance_mode,
-        'scage_distance_rbf': args.scage_distance_rbf,
-        'scage_distance_cutoff': args.scage_distance_cutoff,
-        'scage_distance_scales': args.scage_distance_scales,
-        'scage_distance_taus': args.scage_distance_taus,
-        'scage_topology_bias': bool(args.scage_topology_bias),
-        'scage_topology_max_distance': args.scage_topology_max_distance,
-        'scage_topology_locality_mode': args.scage_topology_locality_mode,
-        'scage_topology_locality_threshold': args.scage_topology_locality_threshold,
-        'scage_topology_locality_tau': args.scage_topology_locality_tau,
-        'scage_periodic_image_mode': args.scage_periodic_image_mode,
-        'scage_periodic_image_cap': args.scage_periodic_image_cap,
-        'scage_periodic_image_temperature': args.scage_periodic_image_temperature,
-        'scage_force_topology_only': bool(args.scage_force_topology_only),
-        'scage_num_heads': args.scage_num_heads,
-        'optimizer_schedule': {
-            'type': f'linear_warmup_{args.mips_scheduler}_decay',
-            'batch_size_per_rank': int(args.batch_size),
-            'world_size': int(world_size),
-            'effective_batch_size': int(args.batch_size) * int(world_size) * accumulation_steps,
-            'total_optimizer_steps': total_optimizer_steps,
-            'warmup_steps': warmup_steps,
-            'warmup_ratio': float(args.warmup_ratio),
-            'gradient_accumulation_steps': accumulation_steps,
-        },
-        'epochs': list(range(1, len(losses) + 1)),
-        'losses': losses,
-        'periodic_aug_stats': periodic_aug_epoch_stats,
-        'dynamic_pretrain_loss': bool(args.dynamic_pretrain_loss),
-        'dynamic_loss_config': ({
-            'distributed_statistics': 'all_reduce_mean_over_valid_ranks',
-            'warmup_steps': int(args.dynamic_loss_warmup_steps),
-            'recent_window': int(args.dynamic_loss_recent_window),
-            'temperature': float(args.dynamic_loss_temperature),
-        } if args.dynamic_pretrain_loss else None),
-        'dynamic_loss_weights': dynamic_loss_epoch_weights,
-        'dynamic_loss_epoch_stats': dynamic_loss_epoch_stats,
-        'm4p_target_stats': m4p_epoch_target_stats,
-        'm4p_geometry_stats': m4p_geometry_epoch_stats,
-        'm4p_geometry_objective': None,
-        'joint_pretraining_objective': (
-            {
-                'masked_atom_weight': float(args.scage_mips_mask_weight),
-                'trimer_bond_angle_weight': float(args.graph_angle_weight),
-                'angle_objective': str(args.angle_objective),
-                'angle_bins': int(args.scage_angle_bins),
-                'focal_gamma': float(args.scage_focal_gamma),
-                'spd_weight': 0.0,
-                'path_bond_weight': 0.0,
-            }
-            if args.pretrain_stage == MTS_STAGE1_ID else None
-        ),
-        'angle_v2_validation': angle_v2_validation_history,
-        'angle_v2_selected_composite': (
-            angle_v2_best_composite
-            if args.angle_objective == 'cosine' else None
-        ),
-        'm4p_ecfp_pos_weight': ({
-            'valid_samples': int(m4p_ecfp_valid_count),
-            'min': float(m4p_ecfp_pos_weight.min().item()),
-            'mean': float(m4p_ecfp_pos_weight.mean().item()),
-            'max': float(m4p_ecfp_pos_weight.max().item()),
-        } if m4p_ecfp_pos_weight is not None else None),
-        'alignment_epoch_stats': alignment_epoch_stats,
-        'alignment_objective': ({
-            'version': 'fusion-view-lomo-v1',
-            'weights': {
-                'fused_view': args.alignment_fused_weight,
-                'graph_smiles': args.alignment_graph_smiles_weight,
-                'graph_fp': args.alignment_graph_fp_weight,
-                'lomo': args.alignment_lomo_weight,
-                'pooling_kl': args.alignment_pooling_kl_weight,
-                'fused_mask': args.alignment_fused_mask_weight,
-                'shared_private': args.alignment_shared_private_weight,
-            },
-            'dropout': {
-                'fp': args.alignment_fp_drop,
-                'smiles': args.alignment_smiles_drop,
-                'graph': args.alignment_graph_drop,
-            },
-        } if args.pretrain_stage == 'alignment' and args.graph_encoder_type == 'mips_trimer_scage' else None),
-        'gradient_norm': {
-            'mean': float(np.mean(gradient_norms)) if gradient_norms else None,
-            'max': float(np.max(gradient_norms)) if gradient_norms else None,
-        },
-    }
-    if args.graph_encoder_type == "mips_trimer_scage":
-        loss_data["repeat_cut_stats"] = loss_data.pop(
-            "periodic_aug_stats", []
+    if diagnostics_enabled and rank == 0:
+        diagnostic_root = Path(args.diagnostics_dir).resolve()
+        diagnostic_report = {
+            "schema": "mts-msta-branch-diagnostics-v1",
+            "model_identity": (
+                "T1" if args.topology_attention_variant == "msta_last2" else "T0"
+            ),
+            "requested_steps": sorted(diagnostic_steps),
+            "observed_steps": [int(row["optimizer_step"]) for row in diagnostic_rows],
+            "rows": diagnostic_rows,
+            "all_rows_finite": all(bool(row.get("finite")) for row in diagnostic_rows),
+            "probe_no_extra_backward": True,
+            "probe_rng_restored": True,
+        }
+        (diagnostic_root / "report.json").write_text(
+            json.dumps(diagnostic_report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
-        for legacy_key in (
-            "scage_dist_bar", "scage_use_descriptors",
-            "scage_distance_mode", "scage_distance_rbf",
-            "scage_distance_cutoff", "scage_distance_scales",
-            "scage_distance_taus", "scage_topology_bias",
-            "scage_topology_max_distance", "scage_topology_locality_mode",
-            "scage_topology_locality_threshold",
-            "scage_topology_locality_tau", "scage_periodic_image_mode",
-            "scage_periodic_image_cap", "scage_periodic_image_temperature",
-            "scage_force_topology_only",
-        ):
-            loss_data.pop(legacy_key, None)
-    artifact_tag = os.path.splitext(os.path.basename(args.save_path))[0]
-    loss_json_path = os.path.join('./plots/pretrain', f'{artifact_tag}_loss_data.json')
-    loss_curve_path = os.path.join('./plots/pretrain', f'{artifact_tag}_loss_curve.png')
-    with open(loss_json_path, 'w') as f:
-        json.dump(loss_data, f, indent=4)
-    print(f"Loss data saved at {loss_json_path}")
-
-    # Plot loss curve
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(losses) + 1), losses, marker='o')
-    plt.title('Pretraining Loss Curve')
-    plt.xlabel('Epoch')
-    plt.ylabel('Total Pretraining Loss')
-    plt.grid(True)
-    plt.savefig(loss_curve_path)
-    plt.close()
-    print(f"Loss curve saved at {loss_curve_path}")
 
     state_dict = model.state_dict()
     if args.graph_encoder_type == 'mips_trimer_scage':
@@ -6409,6 +6662,14 @@ def main():
         trimer_geometry_active = args.graph_geometry_mode in {
             "trimer_scage_mcl", "current_mcl"
         }
+        # G-family does not read the full Trimer payload at forward time, but
+        # its frozen relation sidecar is derived from and strictly bound to
+        # the same Trimer artifact. Keep that source identity in the
+        # checkpoint/cache bundle without re-enabling legacy MCL.
+        trimer_identity_bound = (
+            trimer_geometry_active
+            or getattr(args, "g_family_arm", None) is not None
+        )
         cache_bundle_hash = cache_bundle_binding_hash(
             cohort_hash=getattr(dataset, "feature_cohort_hash", None),
             topology_artifact_hash=getattr(
@@ -6416,7 +6677,7 @@ def main():
             ),
             trimer_artifact_hash=(
                 getattr(dataset, "trimer_cache_artifact_hash", None)
-                if trimer_geometry_active
+                if trimer_identity_bound
                 else None
             ),
         )
@@ -6435,8 +6696,33 @@ def main():
             "source_cohort_hash": getattr(dataset, "feature_cohort_hash", None),
             "topology_artifact_hash": getattr(dataset, "topology_cache_artifact_hash", None),
             "trimer_artifact_hash": getattr(dataset, "trimer_cache_artifact_hash", None),
-            "angle_cache_schema": getattr(dataset, "angle_cache_metadata", {}).get("schema"),
-            "angle_cache_artifact_hash": getattr(dataset, "angle_cache_artifact_hash", None),
+            "angle_cache_schema": (
+                (getattr(dataset, "angle_cache_metadata", None) or {}).get("schema")
+                or (
+                    pretrain_profile.get("angle_cache_schema")
+                    if pretrain_profile is not None
+                    and getattr(args, "g_family_arm", None) is not None
+                    else None
+                )
+            ),
+            "angle_cache_artifact_hash": (
+                getattr(dataset, "angle_cache_artifact_hash", None)
+                or (
+                    pretrain_profile.get("angle_cache_artifact")
+                    if pretrain_profile is not None
+                    and getattr(args, "g_family_arm", None) is not None
+                    else None
+                )
+            ),
+            "g_family_arm": getattr(args, "g_family_arm", None),
+            "g_family_bundle_hash": getattr(args, "g_family_bundle_hash", None),
+            "relation_geometry_sidecar": getattr(args, "relation_geometry_sidecar", None),
+            "relation_geometry_artifact_hash": getattr(args, "relation_geometry_artifact_hash", None),
+            "g3_permutation_sidecar": getattr(args, "g3_permutation_sidecar", None),
+            "g3_permutation_artifact_hash": getattr(args, "g3_permutation_artifact_hash", None),
+            "pretraining_objective": getattr(args, "pretraining_objective", "joint"),
+            "angle_loss_weight": float(getattr(args, "angle_loss_weight", 0.25)),
+            "shared_step0_id": getattr(args, "shared_step0_id", None),
             "cache_store_sha256": final_cache_binding["store_sha256"],
             "topology_frozen_sha256": final_cache_binding["frozen_file_sha256"]["topology"],
             "trimer_frozen_sha256": final_cache_binding["frozen_file_sha256"]["trimer"],
@@ -6454,6 +6740,16 @@ def main():
             "optimizer_steps": int(optimizer_steps_completed),
             "random_initialization": True,
             "parent_checkpoint": None,
+            "initialization": (
+                "fresh_paired" if initialization_info is not None else "random"
+            ),
+            "initialization_state": (
+                dict(initialization_info) if initialization_info is not None else None
+            ),
+            "paired_init_id": (
+                initialization_info["paired_init_id"]
+                if initialization_info is not None else None
+            ),
         }
         source_contract_sha256 = _canonical_json_hash(source_contract)
         target_contract = None
@@ -6481,7 +6777,11 @@ def main():
                     "frozen_file_sha256"
                 ]["trimer"],
                 optimizer_steps=optimizer_steps_completed,
-                pretraining_objective="masked_atom_plus_trimer_angle20_focal",
+                pretraining_objective=(
+                    "masked_atom_only"
+                    if getattr(args, "g_family_arm", None) is not None
+                    else "masked_atom_plus_trimer_angle20_focal"
+                ),
                 topology_representation=args.topology_representation,
             )
         _atomic_torch_save({
@@ -6556,12 +6856,12 @@ def main():
                 'graph_geometry_mode': args.graph_geometry_mode,
                 'trimer_cache_hash': (
                     getattr(dataset, 'trimer_cache_hash', None)
-                    if trimer_geometry_active
+                    if trimer_identity_bound
                     else None
                 ),
                 'trimer_cache_artifact_hash': (
                     getattr(dataset, 'trimer_cache_artifact_hash', None)
-                    if trimer_geometry_active
+                    if trimer_identity_bound
                     else None
                 ),
                 'topology_cache_hash': getattr(
@@ -6581,42 +6881,42 @@ def main():
                 ),
                 'trimer_conformer_protocol': (
                     MIPS_TRIMER_PROTOCOL
-                    if trimer_geometry_active
+                    if trimer_identity_bound
                     else 'none'
                 ),
                 'trimer_content_schema': (
                     MIPS_TRIMER_CONTENT_SCHEMA
-                    if trimer_geometry_active
+                    if trimer_identity_bound
                     else None
                 ),
                 'trimer_lmdb_schema': (
                     MIPS_TRIMER_LMDB_SCHEMA
-                    if trimer_geometry_active
+                    if trimer_identity_bound
                     else None
                 ),
                 'trimer_builder_version': (
                     MIPS_TRIMER_BUILDER_VERSION
-                    if trimer_geometry_active
+                    if trimer_identity_bound
                     else None
                 ),
                 'trimer_mmff_relax_steps': (
                     MIPS_TRIMER_MMFF_RELAX_STEPS
-                    if trimer_geometry_active
+                    if trimer_identity_bound
                     else None
                 ),
                 'trimer_require_mmff_convergence': (
                     MIPS_TRIMER_REQUIRE_MMFF_CONVERGENCE
-                    if trimer_geometry_active
+                    if trimer_identity_bound
                     else None
                 ),
                 'trimer_acceptance': (
                     MIPS_TRIMER_ACCEPTANCE
-                    if trimer_geometry_active
+                    if trimer_identity_bound
                     else None
                 ),
                 'trimer_selection': (
                     MIPS_TRIMER_SELECTION
-                    if trimer_geometry_active
+                    if trimer_identity_bound
                     else None
                 ),
                 'trimer_num_candidates': int(args.trimer_num_candidates),
@@ -6625,26 +6925,77 @@ def main():
                     args.mcl_distance_percentiles
                 ),
                 'angle_cache_schema': (
-                    'mts-angle-continuous-cache-v1'
-                    if args.angle_objective == 'cosine'
-                    else 'mts-trimer-bond-angle-cache-v2'
+                    (
+                        pretrain_profile.get('angle_cache_schema')
+                        if pretrain_profile is not None
+                        and getattr(args, 'g_family_arm', None) is not None
+                        else None
+                    )
+                    or (
+                        'mts-angle-continuous-cache-v1'
+                        if args.angle_objective == 'cosine'
+                        else 'mts-trimer-bond-angle-cache-v2'
+                    )
                 ),
                 'angle_objective': str(args.angle_objective),
-                'angle_cache_artifact_hash': getattr(
-                    getattr(dataset, '_lazy_feature_store', None),
-                    'angle_cache_artifact_hash', None
+                'angle_cache_artifact_hash': (
+                    (
+                        pretrain_profile.get('angle_cache_artifact')
+                        if pretrain_profile is not None
+                        and getattr(args, 'g_family_arm', None) is not None
+                        else None
+                    )
+                    or getattr(
+                        getattr(dataset, '_lazy_feature_store', None),
+                        'angle_cache_artifact_hash', None
+                    )
                 ),
                 'angle_bins': int(args.scage_angle_bins),
                 'angle_focal_gamma': float(args.scage_focal_gamma),
                 'pretraining_objective': (
-                    'masked_atom_plus_trimer_bond_angle'
-                    if args.pretrain_stage == MTS_STAGE1_ID else None
+                    getattr(args, 'pretraining_objective', 'joint')
+                    if getattr(args, 'g_family_arm', None) is not None
+                    else (
+                        'masked_atom_plus_trimer_bond_angle'
+                        if args.pretrain_stage == MTS_STAGE1_ID else None
+                    )
+                ),
+                'angle_loss_weight': float(getattr(args, 'angle_loss_weight', 0.25)),
+                'g_family_arm': getattr(args, 'g_family_arm', None),
+                'g_family_bundle_hash': getattr(args, 'g_family_bundle_hash', None),
+                'relation_geometry_sidecar': getattr(args, 'relation_geometry_sidecar', None),
+                'relation_geometry_artifact_hash': getattr(args, 'relation_geometry_artifact_hash', None),
+                'g3_permutation_sidecar': getattr(args, 'g3_permutation_sidecar', None),
+                'g3_permutation_artifact_hash': getattr(args, 'g3_permutation_artifact_hash', None),
+                'shared_step0_id': getattr(args, 'shared_step0_id', None),
+                'initialization': (
+                    'fresh_paired' if initialization_info is not None else 'random'
+                ),
+                'initialization_state': (
+                    dict(initialization_info) if initialization_info is not None else None
+                ),
+                'paired_init_id': (
+                    initialization_info['paired_init_id']
+                    if initialization_info is not None else None
                 ),
                 'reference_commits': {
                     'mips': '26aafe52926a3f33bf2d3d382ae263360319812d',
                     'scage': '82bcbb4647e31bf0d413a317e69a2526df75ce01',
                 },
                 'mips_variant': args.mips_variant,
+                'model_identity': (
+                    'T1' if args.topology_attention_variant == 'msta_last2'
+                    else 'T0'
+                ),
+                'topology_attention_variant': args.topology_attention_variant,
+                'msta_layer_indices': list(args.msta_layer_indices),
+                'msta_local_spd': list(args.msta_local_spd),
+                'msta_context_spd': list(args.msta_context_spd),
+                'msta_share_relation_dropout': bool(
+                    args.msta_share_relation_dropout
+                ),
+                'msta_local_output_bias': bool(args.msta_local_output_bias),
+                'msta_local_output_init': args.msta_local_output_init,
                 'experiment_id': args.experiment_id,
                 'feature_config_hash': args.feature_config_hash,
                 'o8_feature_config_hash': args.o8_feature_config_hash,
@@ -6665,6 +7016,7 @@ def main():
                 ),
                 'random_seed': int(args.seed),
                 'optimizer_steps': int(optimizer_steps_completed),
+                'smoke_only': bool(args.resume_smoke),
                 'training_wall_seconds': float(
                     time.monotonic() - pretrain_started
                 ),
@@ -6721,7 +7073,7 @@ def main():
                 'fusion_dropout': args.fusion_dropout,
             },
         }, args.save_path)
-        if pretrain_profile is not None:
+        if pretrain_profile is not None and not args.resume_smoke:
             if optimizer_steps_completed != int(pretrain_profile["optimizer_steps"]):
                 raise RuntimeError(
                     "formal pretraining ended before the fixed optimizer-step budget"

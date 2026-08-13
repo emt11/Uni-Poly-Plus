@@ -52,6 +52,14 @@ DEFAULT = (
     / "configs/mts/default.json"
 )
 
+# Isolated, pretraining-only experiment descriptors.  They inherit the
+# immutable production route contract but carry a distinct experiment/config
+# identity for the matched T0/T1 pretraining cycle.  The resolved runtime
+# schema remains ``mts-config-v3`` so existing checkpoint consumers continue
+# to enforce the production contract.
+PRETRAIN_EXPERIMENT_CONFIG_SCHEMA = "mts-pretrain-experiment-v1"
+G_FAMILY_COHORTS = ("PI1M_v2", "downstream_union")
+
 
 def digest(value):
     return hashlib.sha256(
@@ -65,6 +73,87 @@ def _sha256_file(path):
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             value.update(block)
     return value.hexdigest()
+
+
+def _resolve_g_family_artifact_bundle(bundle, *, kind, relation_bundle=None):
+    """Validate an immutable two-cohort bundle without reading payload arrays."""
+    if not isinstance(bundle, dict) or set(bundle) != set(G_FAMILY_COHORTS):
+        raise ValueError(
+            f"{kind} bundle must contain exactly {list(G_FAMILY_COHORTS)}"
+        )
+    resolved = {}
+    expected_schema = {
+        "relation_geometry": "mts-relation-geometry-sidecar-v1",
+        "g3_permutation": "mts-relation-geometry-permutation-v1",
+    }[kind]
+    for cohort in G_FAMILY_COHORTS:
+        entry = bundle[cohort]
+        if not isinstance(entry, dict) or set(entry) != {"root", "artifact_hash"}:
+            raise ValueError(f"{kind}.{cohort} requires only root and artifact_hash")
+        expected_hash = str(entry["artifact_hash"])
+        if len(expected_hash) != 64:
+            raise ValueError(f"{kind}.{cohort} artifact_hash must be SHA256")
+        root = Path(str(entry["root"]))
+        if not root.is_absolute():
+            root = PROJECT_ROOT / root
+        root = root.resolve()
+        metadata_path = root / "metadata.json"
+        done_path = root / ".done"
+        frozen_path = root / ".frozen"
+        if not (metadata_path.is_file() and done_path.is_file() and frozen_path.is_file()):
+            raise ValueError(f"{kind}.{cohort} artifact is incomplete: {root}")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+        artifact_hash = str(metadata.get("artifact_hash", ""))
+        metadata_hash = digest({
+            key: value for key, value in metadata.items() if key != "artifact_hash"
+        })
+        if (
+            metadata.get("schema") != expected_schema
+            or frozen.get("schema") != expected_schema
+            or metadata.get("cohort") != cohort
+            or artifact_hash != expected_hash
+            or done_path.read_text(encoding="utf-8").strip() != expected_hash
+            or frozen.get("artifact_hash") != expected_hash
+            or metadata_hash != expected_hash
+        ):
+            raise ValueError(f"{kind}.{cohort} immutable identity mismatch")
+        if kind == "relation_geometry":
+            source = metadata.get("source_identity")
+            if not isinstance(source, dict) or set(source) != {"topology", "trimer"}:
+                raise ValueError(f"{kind}.{cohort} source binding is incomplete")
+            for name in ("topology", "trimer"):
+                if len(str(source[name].get("done_artifact_hash", ""))) != 64:
+                    raise ValueError(f"{kind}.{cohort} source {name} is unbound")
+        else:
+            relation_entry = relation_bundle[cohort]
+            if (
+                metadata.get("source_sidecar_artifact")
+                != relation_entry["artifact_hash"]
+                or int(metadata.get("seed", -1)) != 42
+            ):
+                raise ValueError(f"{kind}.{cohort} source sidecar binding mismatch")
+        resolved[cohort] = {
+            "root": str(root.relative_to(PROJECT_ROOT)),
+            "artifact_hash": artifact_hash,
+            "cohort_hash": str(metadata.get("cohort_hash", "")),
+        }
+    return resolved
+
+
+def g_family_bundle_identity_hash(arm, geometry_mode, relation_bundle, permutation_bundle):
+    return digest({
+        "g_family_arm": arm,
+        "geometry_mode": geometry_mode,
+        "relation_geometry_artifacts": (
+            {cohort: relation_bundle[cohort]["artifact_hash"] for cohort in G_FAMILY_COHORTS}
+            if relation_bundle is not None else None
+        ),
+        "g3_permutation_artifacts": (
+            {cohort: permutation_bundle[cohort]["artifact_hash"] for cohort in G_FAMILY_COHORTS}
+            if permutation_bundle is not None else None
+        ),
+    })
 
 
 def _random_mask_sidecar_path():
@@ -113,9 +202,14 @@ def main():
     path = Path(args.config).resolve()
     config = json.loads(path.read_text(encoding="utf-8"))
     reference = json.loads(DEFAULT.read_text(encoding="utf-8"))
-    experiment = config.get("schema_version") == EXPERIMENT_CONFIG_SCHEMA
+    config_schema = config.get("schema_version")
+    pretrain_experiment = config_schema == PRETRAIN_EXPERIMENT_CONFIG_SCHEMA
+    experiment = config_schema in {
+        EXPERIMENT_CONFIG_SCHEMA,
+        PRETRAIN_EXPERIMENT_CONFIG_SCHEMA,
+    }
     experiment_values = None
-    if experiment:
+    if config_schema == EXPERIMENT_CONFIG_SCHEMA:
         allowed = {
             "schema_version", "experiment_id", "parent_config",
             "geometry_mode", "modalities", "fusion_mode", "finetune_mode",
@@ -125,6 +219,13 @@ def main():
             "legacy_graph_trainable_from_epoch0",
             "modality_control", "controlled_modality",
             "topology_representation",
+            "topology_attention_variant", "msta_layer_indices",
+            "msta_local_spd", "msta_context_spd",
+            "msta_share_relation_dropout", "msta_local_output_bias",
+            "msta_local_output_init",
+            "g_family_arm", "relation_geometry_bundle",
+            "g3_permutation_bundle", "pretraining_objective",
+            "angle_loss_weight", "shared_step0_id",
             "ablation",
         }
         unknown = sorted(set(config) - allowed)
@@ -159,6 +260,35 @@ def main():
             "topology_representation": str(config.get(
                 "topology_representation", TOPOLOGY_CANONICAL
             )),
+            "topology_attention_variant": str(config.get(
+                "topology_attention_variant", "msta_last2"
+            )),
+            "msta_layer_indices": [
+                int(value) for value in config.get("msta_layer_indices", [4, 5])
+            ],
+            "msta_local_spd": [
+                int(value) for value in config.get("msta_local_spd", [0, 1])
+            ],
+            "msta_context_spd": [
+                int(value) for value in config.get(
+                    "msta_context_spd", [0, 1, 2]
+                )
+            ],
+            "msta_share_relation_dropout": bool(config.get(
+                "msta_share_relation_dropout", True
+            )),
+            "msta_local_output_bias": bool(config.get(
+                "msta_local_output_bias", False
+            )),
+            "msta_local_output_init": str(config.get(
+                "msta_local_output_init", "zero"
+            )),
+            "g_family_arm": config.get("g_family_arm"),
+            "relation_geometry_bundle": config.get("relation_geometry_bundle"),
+            "g3_permutation_bundle": config.get("g3_permutation_bundle"),
+            "pretraining_objective": str(config.get("pretraining_objective", "masked_atom_only")),
+            "angle_loss_weight": float(config.get("angle_loss_weight", 0.0)),
+            "shared_step0_id": config.get("shared_step0_id"),
         }
         ablation = config.get("ablation")
         # Historical non-ablation experiment configs remain valid as the
@@ -239,6 +369,7 @@ def main():
         if experiment_values["geometry_mode"] not in {
             "current_mcl", "mcl_rbf", "disabled", "coordinate_shuffled",
             "mcl_rbf_coordinate_shuffled",
+            "g0", "g1", "g2", "g3",
         }:
             raise ValueError("unsupported geometry_mode")
         if experiment_values["modalities"] not in (
@@ -276,6 +407,154 @@ def main():
             raise ValueError("controlled_modality must be smiles or fp")
         if experiment_values["topology_representation"] not in TOPOLOGY_REPRESENTATIONS:
             raise ValueError("unsupported topology_representation")
+        if experiment_values["topology_attention_variant"] not in {
+            "o8", "msta_last2"
+        }:
+            raise ValueError("unsupported topology_attention_variant")
+        if experiment_values["msta_layer_indices"] != [4, 5]:
+            raise ValueError("MSTA layer indices must be [4, 5]")
+        if experiment_values["msta_local_spd"] != [0, 1]:
+            raise ValueError("MSTA local SPD support must be [0, 1]")
+        if experiment_values["msta_context_spd"] != [0, 1, 2]:
+            raise ValueError("MSTA context SPD support must be [0, 1, 2]")
+        if not experiment_values["msta_share_relation_dropout"]:
+            raise ValueError("MSTA requires shared relation dropout")
+        if experiment_values["msta_local_output_bias"]:
+            raise ValueError("MSTA local_output must be bias-free")
+        if experiment_values["msta_local_output_init"] != "zero":
+            raise ValueError("MSTA local_output must use zero initialization")
+        if experiment_values["g_family_arm"] is not None:
+            if experiment_values["g_family_arm"] not in {"g0", "g1", "g2", "g3"}:
+                raise ValueError("unsupported g_family_arm")
+            if experiment_values["geometry_mode"] != experiment_values["g_family_arm"]:
+                raise ValueError("G-family arm and geometry_mode must match")
+            if experiment_values["angle_loss_weight"] != 0.0 or experiment_values["pretraining_objective"] != "masked_atom_only":
+                raise ValueError("G-family readiness requires masked_atom_only and angle_loss_weight=0")
+            if config.get("ablation") is not None:
+                raise ValueError("G-family configs cannot use the historical A0-A4 ablation object")
+            experiment_values["use_star_rbf"] = False
+            experiment_values["use_mcl"] = False
+            if experiment_values["shared_step0_id"] is None:
+                raise ValueError("G-family config requires shared_step0_id")
+            arm = experiment_values["g_family_arm"]
+            relation_bundle = experiment_values["relation_geometry_bundle"]
+            permutation_bundle = experiment_values["g3_permutation_bundle"]
+            if arm == "g0":
+                if relation_bundle is not None or permutation_bundle is not None:
+                    raise ValueError("G0 must not bind relation geometry artifacts")
+                resolved_relation_bundle = None
+                resolved_permutation_bundle = None
+            else:
+                resolved_relation_bundle = _resolve_g_family_artifact_bundle(
+                    relation_bundle, kind="relation_geometry"
+                )
+                if arm == "g3":
+                    resolved_permutation_bundle = _resolve_g_family_artifact_bundle(
+                        permutation_bundle,
+                        kind="g3_permutation",
+                        relation_bundle=resolved_relation_bundle,
+                    )
+                else:
+                    if permutation_bundle is not None:
+                        raise ValueError(f"{arm.upper()} must not bind a G3 permutation")
+                    resolved_permutation_bundle = None
+            experiment_values["relation_geometry_bundle"] = resolved_relation_bundle
+            experiment_values["g3_permutation_bundle"] = resolved_permutation_bundle
+            experiment_values["g_family_bundle_hash"] = g_family_bundle_identity_hash(
+                arm, experiment_values["geometry_mode"],
+                resolved_relation_bundle, resolved_permutation_bundle,
+            )
+        config_for_contract = reference
+    elif config_schema == PRETRAIN_EXPERIMENT_CONFIG_SCHEMA:
+        allowed = {
+            "schema_version", "experiment_id", "parent_config",
+            "topology_representation", "topology_attention_variant",
+            "msta_layer_indices", "msta_local_spd", "msta_context_spd",
+            "msta_share_relation_dropout", "msta_local_output_bias",
+            "msta_local_output_init", "pretrain_profile", "paired_init_id",
+        }
+        unknown = sorted(set(config) - allowed)
+        missing = sorted({"schema_version", "experiment_id", "parent_config"} - set(config))
+        if unknown or missing:
+            raise ValueError(
+                f"invalid {PRETRAIN_EXPERIMENT_CONFIG_SCHEMA}: "
+                f"unknown={unknown}, missing={missing}"
+            )
+        if Path(config["parent_config"]).name != "default.json":
+            raise ValueError(
+                "MTS pretraining experiments must inherit configs/mts/default.json"
+            )
+        if str(config.get("pretrain_profile", "canonical_ru_angle20_v1")) != "canonical_ru_angle20_v1":
+            raise ValueError(
+                "matched MTS pretraining experiments must use canonical_ru_angle20_v1"
+            )
+        if str(config.get("paired_init_id", "")) != "mts_t_pretrain0_matched_v1":
+            raise ValueError(
+                "matched MTS pretraining experiments must use the paired-init identity"
+            )
+        experiment_values = {
+            "experiment_id": str(config["experiment_id"]),
+            "geometry_mode": "trimer_scage_mcl",
+            "modalities": ["graph"],
+            "fusion_mode": "none",
+            "finetune_mode": "single_task",
+            "evaluation_protocol": "historical_shared5",
+            "regression_loss": "huber",
+            "huber_beta": 0.5,
+            "finetune_profile": "legacy_mts_huber_v1",
+            "patience": 10,
+            "warmup_epochs": 5,
+            "weight_decay": 0.02,
+            "swa_start_epoch": -1,
+            "legacy_graph_trainable_from_epoch0": True,
+            "modality_control": "real",
+            "controlled_modality": None,
+            "topology_representation": str(config.get(
+                "topology_representation", TOPOLOGY_CANONICAL
+            )),
+            "topology_attention_variant": str(config.get(
+                "topology_attention_variant", "msta_last2"
+            )),
+            "msta_layer_indices": [int(value) for value in config.get(
+                "msta_layer_indices", [4, 5]
+            )],
+            "msta_local_spd": [int(value) for value in config.get(
+                "msta_local_spd", [0, 1]
+            )],
+            "msta_context_spd": [int(value) for value in config.get(
+                "msta_context_spd", [0, 1, 2]
+            )],
+            "msta_share_relation_dropout": bool(config.get(
+                "msta_share_relation_dropout", True
+            )),
+            "msta_local_output_bias": bool(config.get(
+                "msta_local_output_bias", False
+            )),
+            "msta_local_output_init": str(config.get(
+                "msta_local_output_init", "zero"
+            )),
+            "ablation_id": None,
+            "use_star_rbf": True,
+            "use_mcl": True,
+            "mcl_random_mask": False,
+            "shared_checkpoint": None,
+        }
+        if experiment_values["topology_representation"] not in TOPOLOGY_REPRESENTATIONS:
+            raise ValueError("unsupported topology_representation")
+        if experiment_values["topology_attention_variant"] not in {"o8", "msta_last2"}:
+            raise ValueError("unsupported topology_attention_variant")
+        if experiment_values["msta_layer_indices"] != [4, 5]:
+            raise ValueError("MSTA layer indices must be [4, 5]")
+        if experiment_values["msta_local_spd"] != [0, 1]:
+            raise ValueError("MSTA local SPD support must be [0, 1]")
+        if experiment_values["msta_context_spd"] != [0, 1, 2]:
+            raise ValueError("MSTA context SPD support must be [0, 1, 2]")
+        if not experiment_values["msta_share_relation_dropout"]:
+            raise ValueError("MSTA requires shared relation dropout")
+        if experiment_values["msta_local_output_bias"]:
+            raise ValueError("MSTA local_output must be bias-free")
+        if experiment_values["msta_local_output_init"] != "zero":
+            raise ValueError("MSTA local_output must use zero initialization")
         config_for_contract = reference
     else:
         config_for_contract = config
@@ -332,6 +611,56 @@ def main():
     )
     if topology_representation not in TOPOLOGY_REPRESENTATIONS:
         raise ValueError("unsupported topology_representation")
+    topology_attention_variant = (
+        experiment_values["topology_attention_variant"]
+        if experiment else str(config_for_contract.get(
+            "topology_attention_variant", "msta_last2"
+        ))
+    )
+    msta_layer_indices = (
+        experiment_values["msta_layer_indices"]
+        if experiment else [int(value) for value in config_for_contract.get(
+            "msta_layer_indices", [4, 5]
+        )]
+    )
+    msta_local_spd = (
+        experiment_values["msta_local_spd"]
+        if experiment else [int(value) for value in config_for_contract.get(
+            "msta_local_spd", [0, 1]
+        )]
+    )
+    msta_context_spd = (
+        experiment_values["msta_context_spd"]
+        if experiment else [int(value) for value in config_for_contract.get(
+            "msta_context_spd", [0, 1, 2]
+        )]
+    )
+    msta_share_relation_dropout = (
+        experiment_values["msta_share_relation_dropout"]
+        if experiment else bool(config_for_contract.get(
+            "msta_share_relation_dropout", True
+        ))
+    )
+    msta_local_output_bias = (
+        experiment_values["msta_local_output_bias"]
+        if experiment else bool(config_for_contract.get(
+            "msta_local_output_bias", False
+        ))
+    )
+    msta_local_output_init = (
+        experiment_values["msta_local_output_init"]
+        if experiment else str(config_for_contract.get(
+            "msta_local_output_init", "zero"
+        ))
+    )
+    if topology_attention_variant not in {"o8", "msta_last2"}:
+        raise ValueError("unsupported topology_attention_variant")
+    if msta_layer_indices != [4, 5] or msta_local_spd != [0, 1] \
+            or msta_context_spd != [0, 1, 2]:
+        raise ValueError("invalid MSTA topology attention support")
+    if not msta_share_relation_dropout or msta_local_output_bias \
+            or msta_local_output_init != "zero":
+        raise ValueError("invalid MSTA local-output contract")
     serialized_hash = digest(config)
     graph_contract = {
         key: config_for_contract[key] for key in (
@@ -346,6 +675,19 @@ def main():
         )
     }
     graph_contract["topology_representation"] = topology_representation
+    # Keep the historical T0 graph hash stable so existing O8 checkpoints
+    # remain strictly loadable.  The T1 identity is a new graph contract and
+    # therefore carries the explicit MSTA fields in its hash.
+    if topology_attention_variant != "o8":
+        graph_contract.update({
+            "topology_attention_variant": topology_attention_variant,
+            "msta_layer_indices": msta_layer_indices,
+            "msta_local_spd": msta_local_spd,
+            "msta_context_spd": msta_context_spd,
+            "msta_share_relation_dropout": msta_share_relation_dropout,
+            "msta_local_output_bias": msta_local_output_bias,
+            "msta_local_output_init": msta_local_output_init,
+        })
     graph_hash = digest(graph_contract)
     resolved_feature_schema = (
         EXPLICIT_FEATURE_SCHEMA
@@ -402,10 +744,17 @@ def main():
             if experiment and experiment_values["mcl_random_mask"]
             else "real"
         ),
-        "random_mask_schema": ABLATION_RANDOM_MASK_SCHEMA if experiment else None,
-        "random_mask_seed": ABLATION_RANDOM_MASK_SEED if experiment else None,
+        "random_mask_schema": (
+            ABLATION_RANDOM_MASK_SCHEMA
+            if config_schema == EXPERIMENT_CONFIG_SCHEMA else None
+        ),
+        "random_mask_seed": (
+            ABLATION_RANDOM_MASK_SEED
+            if config_schema == EXPERIMENT_CONFIG_SCHEMA else None
+        ),
         "random_mask_payload_version": (
-            ABLATION_RANDOM_MASK_PAYLOAD_VERSION if experiment else None
+            ABLATION_RANDOM_MASK_PAYLOAD_VERSION
+            if config_schema == EXPERIMENT_CONFIG_SCHEMA else None
         ),
     })
     payload = {
@@ -429,13 +778,78 @@ def main():
         "feature_config_hash": feature_hash,
         "topology_representation": topology_representation,
         "resolved_config_schema": (
-            EXPERIMENT_CONFIG_SCHEMA if experiment else CONFIG_SCHEMA
+            CONFIG_SCHEMA
+            if config_schema == PRETRAIN_EXPERIMENT_CONFIG_SCHEMA
+            else (EXPERIMENT_CONFIG_SCHEMA if experiment else CONFIG_SCHEMA)
         ),
+        "config_source_schema": config_schema,
         "experiment_id": (
             experiment_values["experiment_id"] if experiment else ROUTE_NAME
         ),
         "graph_geometry_mode": (
             resolved_geometry_mode
+        ),
+        "topology_attention_variant": topology_attention_variant,
+        "msta_layer_indices": msta_layer_indices,
+        "msta_local_spd": msta_local_spd,
+        "msta_context_spd": msta_context_spd,
+        "msta_share_relation_dropout": msta_share_relation_dropout,
+        "msta_local_output_bias": msta_local_output_bias,
+        "msta_local_output_init": msta_local_output_init,
+        "g_family_arm": (
+            experiment_values.get("g_family_arm") if experiment else None
+        ),
+        "relation_geometry_bundle": (
+            experiment_values.get("relation_geometry_bundle") if experiment else None
+        ),
+        "g3_permutation_bundle": (
+            experiment_values.get("g3_permutation_bundle") if experiment else None
+        ),
+        "g_family_bundle_hash": (
+            experiment_values.get("g_family_bundle_hash") if experiment else None
+        ),
+        "relation_geometry_sidecar_pi1m_v2": (
+            (experiment_values.get("relation_geometry_bundle") or {}).get("PI1M_v2", {}).get("root")
+            if experiment else None
+        ),
+        "relation_geometry_artifact_pi1m_v2": (
+            (experiment_values.get("relation_geometry_bundle") or {}).get("PI1M_v2", {}).get("artifact_hash")
+            if experiment else None
+        ),
+        "relation_geometry_sidecar_downstream_union": (
+            (experiment_values.get("relation_geometry_bundle") or {}).get("downstream_union", {}).get("root")
+            if experiment else None
+        ),
+        "relation_geometry_artifact_downstream_union": (
+            (experiment_values.get("relation_geometry_bundle") or {}).get("downstream_union", {}).get("artifact_hash")
+            if experiment else None
+        ),
+        "g3_permutation_sidecar_pi1m_v2": (
+            (experiment_values.get("g3_permutation_bundle") or {}).get("PI1M_v2", {}).get("root")
+            if experiment else None
+        ),
+        "g3_permutation_artifact_pi1m_v2": (
+            (experiment_values.get("g3_permutation_bundle") or {}).get("PI1M_v2", {}).get("artifact_hash")
+            if experiment else None
+        ),
+        "g3_permutation_sidecar_downstream_union": (
+            (experiment_values.get("g3_permutation_bundle") or {}).get("downstream_union", {}).get("root")
+            if experiment else None
+        ),
+        "g3_permutation_artifact_downstream_union": (
+            (experiment_values.get("g3_permutation_bundle") or {}).get("downstream_union", {}).get("artifact_hash")
+            if experiment else None
+        ),
+        "pretraining_objective": (
+            experiment_values.get("pretraining_objective", "joint")
+            if experiment else "joint"
+        ),
+        "angle_loss_weight": (
+            experiment_values.get("angle_loss_weight", 0.25)
+            if experiment else 0.25
+        ),
+        "shared_step0_id": (
+            experiment_values.get("shared_step0_id") if experiment else None
         ),
         "modalities": (
             experiment_values["modalities"] if experiment else ["graph"]
@@ -481,17 +895,25 @@ def main():
             experiment_values["shared_checkpoint"] if experiment else None
         ),
         "shared_checkpoint_sha256": (
-            MTS_SHARED_CHECKPOINT_SHA256 if experiment else None
+            MTS_SHARED_CHECKPOINT_SHA256
+            if config_schema == EXPERIMENT_CONFIG_SCHEMA else None
         ),
         "mcl_mask_mode": (
             "count_matched_random"
             if experiment and experiment_values["mcl_random_mask"]
             else "real"
         ),
-        "random_mask_schema": ABLATION_RANDOM_MASK_SCHEMA if experiment else None,
-        "random_mask_seed": ABLATION_RANDOM_MASK_SEED if experiment else None,
-        "random_mask_payload_version": (
-            ABLATION_RANDOM_MASK_PAYLOAD_VERSION if experiment else None
+            "random_mask_schema": (
+                ABLATION_RANDOM_MASK_SCHEMA
+                if config_schema == EXPERIMENT_CONFIG_SCHEMA else None
+            ),
+            "random_mask_seed": (
+                ABLATION_RANDOM_MASK_SEED
+                if config_schema == EXPERIMENT_CONFIG_SCHEMA else None
+            ),
+            "random_mask_payload_version": (
+            ABLATION_RANDOM_MASK_PAYLOAD_VERSION
+            if config_schema == EXPERIMENT_CONFIG_SCHEMA else None
         ),
         "random_mask_sidecar": (
             str(_random_mask_sidecar_path().relative_to(PROJECT_ROOT))

@@ -270,7 +270,8 @@ def run_config(name, folds, seed, dry_run=False, tasks=TASKS, output_root=None):
     )
     env = os.environ.copy()
     env.update({
-        "CUDA_VISIBLE_DEVICES": "0,1,2",
+        "MTS_PRETRAIN_GPU_IDS": "1,2,3",
+        "MTS_FINETUNE_GPU_IDS": "0,1,2,3",
         "EXPERIMENT_CONFIG": str(materialize_config(name)),
         "FINETUNE_ONLY": "1",
         # The immutable joint-pretraining artifact is seed 42.  Downstream
@@ -782,7 +783,8 @@ def main(argv=None):
             resolved = materialize_config(name)
             environment = os.environ.copy()
             environment.update({
-                "CUDA_VISIBLE_DEVICES": "0,1,2",
+                "MTS_PRETRAIN_GPU_IDS": "1,2,3",
+                "MTS_FINETUNE_GPU_IDS": "0,1,2,3",
                 "EXPERIMENT_CONFIG": str(resolved),
                 "VALIDATE_ONLY": "1",
                 "FINETUNE_ONLY": "1",

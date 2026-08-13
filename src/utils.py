@@ -1,7 +1,9 @@
 import copy
 import os
 import random
+import time
 import torch
+from contextlib import nullcontext
 from functools import partial
 from torch.utils.data import Subset
 import torch.nn as nn
@@ -154,14 +156,85 @@ def get_data_loader(
     print(f"Created dataloader with {len(subset_dataset)} samples")
     return loader
 
+
+def _autocast_context(device, amp_dtype):
+    enabled = str(amp_dtype) == 'bf16' and torch.device(device).type == 'cuda'
+    return (
+        torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+        if enabled else nullcontext()
+    )
+
+
+def finetune_bf16_parity_gate(model, batch, criterion, device):
+    """Gate downstream BF16 on the complete graph forward and gradients."""
+    if torch.device(device).type != 'cuda' or not torch.cuda.is_bf16_supported():
+        return False, {
+            'relative_loss_delta': float('inf'),
+            'gradient_cosine': float('nan'),
+            'finite': False,
+            'reason': 'cuda_bf16_unavailable',
+        }
+    batch = batch.to(device, non_blocking=True)
+    was_training = model.training
+    model.eval()
+
+    def evaluate(amp_dtype):
+        model.zero_grad(set_to_none=True)
+        with _autocast_context(device, amp_dtype):
+            outputs, _ = model(batch)
+            loss = criterion(outputs, batch.y)
+        loss.backward()
+        values = [
+            parameter.grad.detach().float().reshape(-1)
+            for parameter in model.parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+        gradient = torch.cat(values) if values else loss.new_zeros(1).float()
+        return loss.detach().float(), gradient
+
+    fp32_loss, fp32_gradient = evaluate('fp32')
+    bf16_loss, bf16_gradient = evaluate('bf16')
+    delta = float(
+        (bf16_loss - fp32_loss).abs()
+        / fp32_loss.abs().clamp_min(1e-8)
+    )
+    cosine = float(torch.nn.functional.cosine_similarity(
+        fp32_gradient, bf16_gradient, dim=0
+    ).item())
+    fp32_finite = bool(
+        torch.isfinite(fp32_loss) and torch.isfinite(fp32_gradient).all()
+    )
+    bf16_finite = bool(
+        torch.isfinite(bf16_loss) and torch.isfinite(bf16_gradient).all()
+    )
+    finite = fp32_finite and bf16_finite
+    model.zero_grad(set_to_none=True)
+    model.train(was_training)
+    result = {
+        'relative_loss_delta': delta,
+        'gradient_cosine': cosine,
+        'finite': finite,
+        'fp32_finite': fp32_finite,
+        'bf16_finite': bf16_finite,
+    }
+    # The fine-tuning handoff gates BF16 on finite loss/gradients and a small
+    # loss delta only.  Gradient cosine remains a useful diagnostic, but it is
+    # not a required full-gradient parity claim for this speed experiment.
+    return bool(finite and delta <= 0.02), result
+
 def train_epoch(
     model, train_loader, criterion, optimizer, scheduler, device, epoch=None,
     max_grad_norm=1.0, unimodal_aux_weight=0.0,
     fusion_prior_kl_weight=0.0, fusion_prior=(0.30, 0.40, 0.30),
     cross_task_aux_weight=0.0,
     pcgrad=False,
+    amp_dtype='fp32',
+    return_timing=False,
 ):
     model.train()
+    epoch_started = time.perf_counter()
+    optimizer_steps = 0
+    legacy_sync = os.environ.get('MTS_BENCHMARK_LEGACY_SYNC', '0') == '1'
     train_losses = []
     fused_losses = []
     auxiliary_losses = []
@@ -172,10 +245,11 @@ def train_epoch(
 
     progress_bar = tqdm(train_loader, desc="Training")
     for batch in progress_bar:
-        batch = batch.to(device)
-        optimizer.zero_grad()
+        batch = batch.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
 
-        outputs, embeddings = model(batch)
+        with _autocast_context(device, amp_dtype):
+            outputs, embeddings = model(batch)
         multitask_component_losses = []
         if hasattr(batch, 'mts_task_index'):
             task_index = batch.mts_task_index.long().reshape(-1)
@@ -326,42 +400,96 @@ def train_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
         scheduler.step()
-        train_losses.append(loss.item())
-        fused_losses.append(fused_loss.item())
-        auxiliary_losses.append(auxiliary_loss.item())
-        fusion_prior_losses.append(fusion_prior_loss.item())
-        cross_task_aux_losses.append(cross_task_aux_loss.item())
-        train_preds.extend(outputs.detach().cpu().numpy())
-        train_targets.extend(batch.y.detach().cpu().numpy())
+        optimizer_steps += 1
+        if legacy_sync:
+            train_losses.append(loss.item())
+            fused_losses.append(fused_loss.item())
+            auxiliary_losses.append(auxiliary_loss.item())
+            fusion_prior_losses.append(fusion_prior_loss.item())
+            cross_task_aux_losses.append(cross_task_aux_loss.item())
+            train_preds.extend(outputs.detach().float().cpu().numpy())
+            train_targets.extend(batch.y.detach().float().cpu().numpy())
+        else:
+            train_losses.append(loss.detach())
+            fused_losses.append(fused_loss.detach())
+            auxiliary_losses.append(auxiliary_loss.detach())
+            fusion_prior_losses.append(fusion_prior_loss.detach())
+            cross_task_aux_losses.append(cross_task_aux_loss.detach())
+            train_preds.append(outputs.detach().float())
+            train_targets.append(batch.y.detach().float())
 
-    avg_train_loss = sum(train_losses) / len(train_losses)
-    train_r2 = r2_score(train_targets, train_preds)
-    avg_fused_loss = sum(fused_losses) / len(fused_losses)
-    avg_auxiliary_loss = sum(auxiliary_losses) / len(auxiliary_losses)
-    avg_fusion_prior_loss = sum(fusion_prior_losses) / len(fusion_prior_losses)
-    avg_cross_task_aux_loss = sum(cross_task_aux_losses) / len(cross_task_aux_losses)
+    if legacy_sync:
+        avg_train_loss = float(np.mean(train_losses))
+        avg_fused_loss = float(np.mean(fused_losses))
+        avg_auxiliary_loss = float(np.mean(auxiliary_losses))
+        avg_fusion_prior_loss = float(np.mean(fusion_prior_losses))
+        avg_cross_task_aux_loss = float(np.mean(cross_task_aux_losses))
+        train_predictions = np.asarray(train_preds)
+        train_target_values = np.asarray(train_targets)
+    else:
+        metric_tensors = torch.stack([
+            torch.stack(train_losses).mean(),
+            torch.stack(fused_losses).mean(),
+            torch.stack(auxiliary_losses).mean(),
+            torch.stack(fusion_prior_losses).mean(),
+            torch.stack(cross_task_aux_losses).mean(),
+        ]).float().cpu().numpy()
+        train_predictions = torch.cat(train_preds).cpu().numpy()
+        train_target_values = torch.cat(train_targets).cpu().numpy()
+        avg_train_loss, avg_fused_loss, avg_auxiliary_loss, avg_fusion_prior_loss, avg_cross_task_aux_loss = (
+            float(value) for value in metric_tensors
+        )
+    train_r2 = r2_score(train_target_values, train_predictions)
 
-    return (
+    result = (
         avg_train_loss, train_r2, avg_fused_loss,
         avg_auxiliary_loss, avg_fusion_prior_loss, avg_cross_task_aux_loss,
     )
+    if not return_timing:
+        return result
+    elapsed = time.perf_counter() - epoch_started
+    timing = {
+        'training_steps': int(optimizer_steps),
+        'training_seconds': float(elapsed),
+        'optimizer_steps_per_second': (
+            float(optimizer_steps / elapsed) if elapsed > 0 else 0.0
+        ),
+    }
+    return result + (timing,)
 
-def evaluate(model, data_loader, criterion, device, scaler=None):
+def evaluate(model, data_loader, criterion, device, scaler=None, amp_dtype='fp32'):
     model.eval()
+    legacy_sync = os.environ.get('MTS_BENCHMARK_LEGACY_SYNC', '0') == '1'
     losses = []
     preds = []
     targets = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in tqdm(data_loader, desc="Evaluating"):
-            batch = batch.to(device)
-            outputs,_ = model(batch)
-            loss = criterion(outputs, batch.y)
-            losses.append(loss.item())
-            preds.extend(outputs.cpu().numpy())
-            targets.extend(batch.y.cpu().numpy())
+            batch = batch.to(device, non_blocking=True)
+            with _autocast_context(device, amp_dtype):
+                outputs,_ = model(batch)
+                loss = criterion(outputs, batch.y)
+            if legacy_sync:
+                losses.append(loss.item())
+                preds.extend(outputs.detach().float().cpu().numpy())
+                targets.extend(batch.y.detach().float().cpu().numpy())
+            else:
+                losses.append(loss.detach().float())
+                preds.append(outputs.detach().float())
+                targets.append(batch.y.detach().float())
 
-    avg_loss = sum(losses) / len(losses)
+    # A single host transfer at loader end avoids three CUDA synchronizations
+    # per validation batch while preserving the historical unweighted mean of
+    # per-batch losses.
+    if legacy_sync:
+        avg_loss = float(np.mean(losses))
+        targets = np.asarray(targets)
+        preds = np.asarray(preds)
+    else:
+        avg_loss = float(torch.stack(losses).mean().cpu())
+        targets = torch.cat(targets).cpu().numpy()
+        preds = torch.cat(preds).cpu().numpy()
     if scaler is not None:
         r2 = r2_score(
             scaler.inverse_transform(np.asarray(targets)),
@@ -372,20 +500,35 @@ def evaluate(model, data_loader, criterion, device, scaler=None):
     
     return avg_loss, r2, targets, preds
 
-def test_model(model, test_loader, scaler, device, return_predictions=False):
+def test_model(
+    model, test_loader, scaler, device, return_predictions=False,
+    amp_dtype='fp32',
+):
     model.eval()
+    legacy_sync = os.environ.get('MTS_BENCHMARK_LEGACY_SYNC', '0') == '1'
     test_preds = []
     test_targets = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in tqdm(test_loader, desc="Testing"):
-            batch = batch.to(device)
-            outputs,_ = model(batch)
-            test_preds.extend(outputs.cpu().numpy())
-            test_targets.extend(batch.y.cpu().numpy())
+            batch = batch.to(device, non_blocking=True)
+            with _autocast_context(device, amp_dtype):
+                outputs,_ = model(batch)
+            if legacy_sync:
+                test_preds.extend(outputs.detach().float().cpu().numpy())
+                test_targets.extend(batch.y.detach().float().cpu().numpy())
+            else:
+                test_preds.append(outputs.detach().float())
+                test_targets.append(batch.y.detach().float())
 
-    y_true = np.array(test_targets)
-    y_pred = np.array(test_preds)
+    # Keep prediction collection asynchronous until the complete loader has
+    # finished, then synchronize once for metric computation and artifacts.
+    if legacy_sync:
+        y_true = np.asarray(test_targets)
+        y_pred = np.asarray(test_preds)
+    else:
+        y_true = torch.cat(test_targets).cpu().numpy()
+        y_pred = torch.cat(test_preds).cpu().numpy()
     y_true_unscaled = scaler.inverse_transform(y_true)
     y_pred_unscaled = scaler.inverse_transform(y_pred)
     test_r2 = r2_score(y_true_unscaled, y_pred_unscaled)
@@ -699,6 +842,7 @@ def fit_fixed_epochs(
     mts_geometry_lr=1e-5,
     mts_adapter_lr=5e-5,
     mts_finetune_profile='default',
+    amp_dtype='fp32',
 ):
     """Fit a fresh downstream model for a validation-selected epoch count."""
     num_epochs = int(num_epochs)
@@ -760,6 +904,7 @@ def fit_fixed_epochs(
             fusion_prior_kl_weight=fusion_prior_kl_weight,
             fusion_prior=fusion_prior,
             cross_task_aux_weight=cross_task_aux_weight,
+            amp_dtype=amp_dtype,
         )
         print(
             f'Refit epoch {epoch + 1}/{num_epochs}: '
@@ -805,6 +950,7 @@ def train_and_evaluate(
     mts_adapter_lr=5e-5,
     mts_finetune_profile='default',
     pcgrad=False,
+    amp_dtype='fp32',
 ):
     # Define loss function and optimizer
     criterion = nn.SmoothL1Loss(beta=float(huber_beta)) if regression_loss == 'huber' else nn.MSELoss()
@@ -822,6 +968,16 @@ def train_and_evaluate(
     if int(swa_start_epoch) >= 0:
         raise ValueError('legacy_mts_huber_v1 requires swa_start_epoch=-1')
     _configure_legacy_mts_trainability(model)
+    if str(amp_dtype) not in {'fp32', 'bf16'}:
+        raise ValueError("amp_dtype must be fp32 or bf16")
+    if str(amp_dtype) == 'bf16':
+        parity_batch = next(iter(train_loader))
+        passed, parity = finetune_bf16_parity_gate(
+            model, parity_batch, criterion, device
+        )
+        print(f"Fine-tune BF16 parity gate: {parity}, pass={passed}")
+        if not passed:
+            raise RuntimeError("Fine-tune BF16 parity gate failed")
     optimizer = _build_downstream_optimizer(
         model, smiles_lr, graph_lr, geom_lr, fp_lr, fusion_lr, head_lr,
         weight_decay, mts_o8_lr=mts_o8_lr,
@@ -845,12 +1001,14 @@ def train_and_evaluate(
     epochs_no_improve = 0
     swa_start_epoch = int(swa_start_epoch)
     state_averager = _CpuStateAverager() if swa_start_epoch >= 0 else None
+    training_timing = []
 
     for epoch in range(num_epochs):
         # Training phase
         (
             avg_train_loss, train_r2, avg_fused_loss,
             avg_auxiliary_loss, avg_fusion_prior_loss, avg_cross_task_aux_loss,
+            epoch_timing,
         ) = train_epoch(
             model,
             train_loader,
@@ -865,14 +1023,18 @@ def train_and_evaluate(
             fusion_prior=fusion_prior,
             cross_task_aux_weight=cross_task_aux_weight,
             pcgrad=pcgrad,
+            amp_dtype=amp_dtype,
+            return_timing=True,
         )
+        training_timing.append(epoch_timing)
 
         if state_averager is not None and epoch >= swa_start_epoch:
             state_averager.update(model)
 
         # Validation phase
         avg_val_loss, val_r2, val_targets, val_predictions = evaluate(
-            model, val_loader, criterion, device, scaler=scaler
+            model, val_loader, criterion, device, scaler=scaler,
+            amp_dtype=amp_dtype,
         )
         val_true_raw = scaler.inverse_transform(np.asarray(val_targets))
         val_pred_raw = scaler.inverse_transform(np.asarray(val_predictions))
@@ -921,7 +1083,8 @@ def train_and_evaluate(
     if state_averager is not None and swa_snapshots >= 2:
         model.load_state_dict(state_averager.state_dict())
         _, swa_val_r2, swa_targets, swa_predictions = evaluate(
-            model, val_loader, criterion, device, scaler=scaler
+            model, val_loader, criterion, device, scaler=scaler,
+            amp_dtype=amp_dtype,
         )
         swa_val_rmse = float(np.sqrt(metrics.mean_squared_error(
             scaler.inverse_transform(np.asarray(swa_targets)),
@@ -955,6 +1118,7 @@ def train_and_evaluate(
         test_model(
             model, test_loader, scaler, device,
             return_predictions=return_predictions,
+            amp_dtype=amp_dtype,
         )
         if evaluate_test else {}
     )
@@ -965,6 +1129,17 @@ def train_and_evaluate(
         'swa_selected': swa_selected,
         'swa_snapshots': swa_snapshots,
         'swa_val_r2': swa_val_r2,
+        'training_steps': int(sum(
+            item['training_steps'] for item in training_timing
+        )),
+        'training_seconds': float(sum(
+            item['training_seconds'] for item in training_timing
+        )),
+        'optimizer_steps_per_second': (
+            float(sum(item['training_steps'] for item in training_timing))
+            / max(float(sum(item['training_seconds'] for item in training_timing)), 1e-12)
+        ),
+        'training_epoch_timing': training_timing,
     })
     return test_metrics
 

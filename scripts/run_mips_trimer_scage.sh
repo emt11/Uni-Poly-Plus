@@ -2,14 +2,102 @@
 set -euo pipefail
 
 export PYTHONPATH="$(pwd)"
-export CUDA_VISIBLE_DEVICES=0,1,2
+PRETRAIN_GPU_IDS=${MTS_PRETRAIN_GPU_IDS:-1,2,3}
+FINETUNE_GPU_IDS=${MTS_FINETUNE_GPU_IDS:-0,1,2,3}
+
+validate_gpu_ids() {
+  local value=$1 expected=$2 label=$3
+  if [[ ! "$value" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "$label must be a comma-separated GPU list; got '$value'" >&2
+    exit 2
+  fi
+  local -a ids=()
+  IFS=',' read -r -a ids <<< "$value"
+  if (( ${#ids[@]} != expected )); then
+    echo "$label requires exactly $expected GPUs; got '$value'" >&2
+    exit 2
+  fi
+  if (( $(printf '%s\n' "${ids[@]}" | sort -u | wc -l) != expected )); then
+    echo "$label contains duplicate GPU ids: '$value'" >&2
+    exit 2
+  fi
+}
+
+validate_gpu_ids "$PRETRAIN_GPU_IDS" 3 MTS_PRETRAIN_GPU_IDS
+validate_gpu_ids "$FINETUNE_GPU_IDS" 4 MTS_FINETUNE_GPU_IDS
+if [[ "$PRETRAIN_GPU_IDS" != "1,2,3" ]]; then
+  echo "MTS_PRETRAIN_GPU_IDS is fixed to physical GPUs 1,2,3; got '$PRETRAIN_GPU_IDS'" >&2
+  exit 2
+fi
+export CUDA_VISIBLE_DEVICES="$PRETRAIN_GPU_IDS"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
 export MIPS_DEBUG_ATTENTION=${MIPS_DEBUG_ATTENTION:-0}
 
-PYTHON_BIN=${PYTHON_BIN:-/root/anaconda3/envs/Uni-Poly/bin/python}
+PYTHON_BIN=${PYTHON_BIN:-/opt/conda/envs/MTS/bin/python}
 CONFIG=${EXPERIMENT_CONFIG:-configs/mts/default.json}
 eval "$("$PYTHON_BIN" scripts/resolve_mips_trimer_scage.py "$CONFIG" --shell)"
+
+read -r -a MSTA_LAYER_INDICES_VALUES < <(
+  "$PYTHON_BIN" - "$MSTA_LAYER_INDICES" <<'PY'
+import json, sys
+print(*json.loads(sys.argv[1]))
+PY
+)
+read -r -a MSTA_LOCAL_SPD_VALUES < <(
+  "$PYTHON_BIN" - "$MSTA_LOCAL_SPD" <<'PY'
+import json, sys
+print(*json.loads(sys.argv[1]))
+PY
+)
+read -r -a MSTA_CONTEXT_SPD_VALUES < <(
+  "$PYTHON_BIN" - "$MSTA_CONTEXT_SPD" <<'PY'
+import json, sys
+print(*json.loads(sys.argv[1]))
+PY
+)
+MSTA_DROPOUT_ARGS=(--msta_share_relation_dropout)
+if [[ "$MSTA_SHARE_RELATION_DROPOUT" != "true" ]]; then
+  MSTA_DROPOUT_ARGS=(--no-msta_share_relation_dropout)
+fi
+MSTA_LOCAL_BIAS_ARGS=(--no-msta_local_output_bias)
+if [[ "$MSTA_LOCAL_OUTPUT_BIAS" == "true" ]]; then
+  MSTA_LOCAL_BIAS_ARGS=(--msta_local_output_bias)
+fi
+PRETRAIN_G_FAMILY_ARGS=()
+TRAIN_G_FAMILY_ARGS=()
+if [[ -n "${G_FAMILY_ARM:-}" ]]; then
+  PRETRAIN_G_FAMILY_ARGS=(--g_family_arm "$G_FAMILY_ARM" --g_family_bundle_hash "$G_FAMILY_BUNDLE_HASH")
+  TRAIN_G_FAMILY_ARGS=(--g_family_arm "$G_FAMILY_ARM" --g_family_bundle_hash "$G_FAMILY_BUNDLE_HASH")
+  if [[ "$G_FAMILY_ARM" != "g0" ]]; then
+    PRETRAIN_G_FAMILY_ARGS+=(
+      --relation_geometry_sidecar "$RELATION_GEOMETRY_SIDECAR_PI1M_V2"
+      --relation_geometry_artifact_hash "$RELATION_GEOMETRY_ARTIFACT_PI1M_V2"
+    )
+    TRAIN_G_FAMILY_ARGS+=(
+      --relation_geometry_sidecar "$RELATION_GEOMETRY_SIDECAR_DOWNSTREAM_UNION"
+      --relation_geometry_artifact_hash "$RELATION_GEOMETRY_ARTIFACT_DOWNSTREAM_UNION"
+    )
+  fi
+  if [[ "$G_FAMILY_ARM" == "g3" ]]; then
+    PRETRAIN_G_FAMILY_ARGS+=(
+      --g3_permutation_sidecar "$G3_PERMUTATION_SIDECAR_PI1M_V2"
+      --g3_permutation_artifact_hash "$G3_PERMUTATION_ARTIFACT_PI1M_V2"
+    )
+    TRAIN_G_FAMILY_ARGS+=(
+      --g3_permutation_sidecar "$G3_PERMUTATION_SIDECAR_DOWNSTREAM_UNION"
+      --g3_permutation_artifact_hash "$G3_PERMUTATION_ARTIFACT_DOWNSTREAM_UNION"
+    )
+  fi
+fi
+MTS_T1_INIT_ARGS=()
+if [[ "${MTS_ALLOW_T1_FUNCTION_PRESERVING_INIT:-0}" == "1" ]]; then
+  if [[ "$TOPOLOGY_ATTENTION_VARIANT" != "msta_last2" ]]; then
+    echo "MTS_ALLOW_T1_FUNCTION_PRESERVING_INIT=1 requires topology_attention_variant=msta_last2" >&2
+    exit 2
+  fi
+  MTS_T1_INIT_ARGS=(--allow_mts_t1_function_preserving_init)
+fi
 
 # Causal geometry-ablation switches (Plan mts_geometry_injection A0-A4).  The
 # finetune subprocess reads these env vars; absent values default to the full
@@ -30,7 +118,8 @@ SEED=${RANDOM_SEED:-42}
 NPROC=3
 CACHE_WORKERS=${CACHE_WORKERS:-48}
 CACHE_VALIDATE=${CACHE_VALIDATE:-full}
-LOADER_WORKERS=${DATALOADER_WORKERS:-0}
+PRETRAIN_LOADER_WORKERS=${PRETRAIN_DATALOADER_WORKERS:-${DATALOADER_WORKERS:-6}}
+FINETUNE_LOADER_WORKERS=${FINETUNE_DATALOADER_WORKERS:-${DATALOADER_WORKERS:-2}}
 LOADER_PREFETCH_FACTOR=${DATALOADER_PREFETCH_FACTOR:-2}
 SAMPLER_VERSION=${MIPS_SAMPLER_VERSION:-cost_v1}
 BATCH_BALANCE=${MIPS_BATCH_BALANCE:-cost}
@@ -44,21 +133,39 @@ PRETRAIN_BENCHMARK_STAGE=${PRETRAIN_BENCHMARK_STAGE:-joint}
 PRETRAIN_PROFILE=${PRETRAIN_PROFILE:-canonical_ru_angle20_v1}
 PRETRAIN_BENCHMARK_JSON=${PRETRAIN_BENCHMARK_JSON:-}
 PRETRAIN_SMOKE_STEPS=${PRETRAIN_SMOKE_STEPS:-0}
-# MIPS uses a global batch close to 1024.  With three ranks the production
-# target is exactly 1008; the default candidate is 168 samples/rank with two
-# accumulation steps.  The other benchmark candidates are 42/8, 84/4 and
-# 336/1; all preserve global batch 1008 on three ranks.
-# Keep workers at zero until the deterministic loader benchmark selects a
-# reproducible alternative.
-PRETRAIN_BATCH_SIZE=${PRETRAIN_BATCH_SIZE:-168}
-PRETRAIN_ACCUMULATION=${PRETRAIN_ACCUMULATION:-2}
+PRETRAIN_CHECKPOINT_INTERVAL_STEPS=${PRETRAIN_CHECKPOINT_INTERVAL_STEPS:-0}
+MTS_INITIALIZATION_STATE=${MTS_INITIALIZATION_STATE:-}
+MTS_PAIRED_INIT_ID=${MTS_PAIRED_INIT_ID:-}
+SHARED_STEP0_ID=${SHARED_STEP0_ID:-}
+if [[ -n "${G_FAMILY_ARM:-}" ]]; then
+  # G-family training has its own full-UniEncoder shared step-0 identity.  A
+  # caller may still provide an explicit path, but an unset path must not
+  # silently fall back to the historical T-Pretrain-0 pair.
+  SHARED_STEP0_ID=${SHARED_STEP0_ID:-mts_g_family_step0_v2_seed42}
+  MTS_PAIRED_INIT_ID=${MTS_PAIRED_INIT_ID:-$SHARED_STEP0_ID}
+  MTS_INITIALIZATION_STATE=${MTS_INITIALIZATION_STATE:-pretrained_models/mts_multiscale_topology/g_family_step0_full_v2/${G_FAMILY_ARM}_step0.pth}
+fi
+MTS_DIAGNOSTICS_DIR=${MTS_DIAGNOSTICS_DIR:-}
+MTS_DIAGNOSTIC_STEPS=${MTS_DIAGNOSTIC_STEPS:-0,500,2000,5000,10000,20000}
+# The accepted three-rank production profile keeps global batch 1008 with
+# 336 samples/rank, one optimizer accumulation step, six loader workers/rank,
+# and prefetch factor two.  Explicit environment overrides remain available.
+PRETRAIN_BATCH_SIZE=${PRETRAIN_BATCH_SIZE:-336}
+PRETRAIN_ACCUMULATION=${PRETRAIN_ACCUMULATION:-1}
 if [[ -n "$PRETRAIN_BENCHMARK_JSON" && "$PRETRAIN_BENCHMARK_ONLY" != 1 ]]; then
-  read -r PRETRAIN_BATCH_SIZE PRETRAIN_ACCUMULATION < <(
+  read -r PRETRAIN_BATCH_SIZE PRETRAIN_ACCUMULATION PRETRAIN_LOADER_WORKERS LOADER_PREFETCH_FACTOR < <(
     "$PYTHON_BIN" - "$PRETRAIN_BENCHMARK_JSON" <<'PY'
 import json, sys
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 selected = payload.get("selected") or {}
-print(int(selected["batch_size_per_rank"]), int(selected["gradient_accumulation_steps"]))
+if not selected:
+    raise SystemExit("benchmark promotion gate did not select a production profile")
+print(
+    int(selected["batch_size_per_rank"]),
+    int(selected["gradient_accumulation_steps"]),
+    int(selected.get("loader_workers", 0)),
+    int(selected.get("loader_prefetch_factor", 2)),
+)
 PY
   )
 fi
@@ -72,14 +179,25 @@ TRAIN_EPOCHS=${TRAIN_EPOCHS:-100}
 FINETUNE_EPOCHS=${MTS_FINETUNE_EPOCHS:-$TRAIN_EPOCHS}
 FINETUNE_PATIENCE=${MTS_FINETUNE_PATIENCE:-10}
 FINETUNE_BATCH_SIZE=${MTS_FINETUNE_BATCH_SIZE:-32}
+FINETUNE_EVAL_BATCH_SIZE=${MTS_FINETUNE_EVAL_BATCH_SIZE:-64}
+FINETUNE_AMP_DTYPE=${MTS_FINETUNE_AMP_DTYPE:-fp32}
 FINETUNE_SEEDS=${FINETUNE_SEEDS:-42}
 MTS_RUN_MULTI_SEED=${MTS_RUN_MULTI_SEED:-0}
+G_FAMILY_FORMAL_PRETRAIN=0
+if [[ ( "${G_FAMILY_ARM:-}" == "g0" || "${G_FAMILY_ARM:-}" == "g1" ) \
+      && "$PRETRAIN_ONLY" == 1 \
+      && "${PRETRAINING_OBJECTIVE:-}" == "masked_atom_only" \
+      && ( "${ANGLE_LOSS_WEIGHT:-1}" == "0" || "${ANGLE_LOSS_WEIGHT:-1}" == "0.0" ) \
+      && "${SHARED_STEP0_ID:-}" == "mts_g_family_step0_v2_seed42" ]]; then
+  G_FAMILY_FORMAL_PRETRAIN=1
+fi
 if [[ "$RESOLVED_CONFIG_SCHEMA" == "mts-experiment-v3" \
       && "$FINETUNE_ONLY" != 1 \
       && "$PRETRAIN_CACHE_ONLY" != 1 \
       && "$PRETRAIN_BENCHMARK_ONLY" != 1 \
       && "$PRETRAIN_SMOKE_STEPS" -le 0 \
-      && "${VALIDATE_ONLY:-0}" != 1 ]]; then
+      && "${VALIDATE_ONLY:-0}" != 1 \
+      && "$G_FAMILY_FORMAL_PRETRAIN" != 1 ]]; then
   echo "mts-experiment-v3 is fine-tune-only except for explicit benchmark/smoke validation; set FINETUNE_ONLY=1." >&2
   exit 2
 fi
@@ -110,7 +228,7 @@ MTS_FINETUNE_SCHEDULE=${MTS_FINETUNE_SCHEDULE:-}
 # lpt_v1 reorders only the dispatch sequence of the 40 independent (task, fold)
 # finetune units, longest-predicted-task first per the historical
 # total_fold_wall_seconds.  It changes no seed, identity hash, command-line
-# argument, resume decision, or the three dynamic GPU slots; the schedule name
+# argument, resume decision, or the four dynamic GPU slots; the schedule name
 # is never written into a fold's training_config_hash.
 LPT_V1_TASK_ORDER=(egc egb eat xc ei eps nc eea)
 LPT_V1_FOLD_ORDER=(0 1 2 3 4)
@@ -121,14 +239,31 @@ if [[ "$PRETRAIN_DATASET" != "PI1M_v2" ]]; then
 fi
 JOINT_STEPS=20000
 MTS_ANGLE_OBJECTIVE=${MTS_ANGLE_OBJECTIVE:-categorical}
-MTS_ANGLE_WEIGHT=${MTS_ANGLE_WEIGHT:-0.25}
+MTS_ANGLE_WEIGHT=${ANGLE_LOSS_WEIGHT:-${MTS_ANGLE_WEIGHT:-0.25}}
 if [[ "$PRETRAIN_PROFILE" == "canonical_ru_angle20_v1" || "$PRETRAIN_PROFILE" == *"canonical_ru_angle20_v1.json" ]]; then
   MTS_ANGLE_OBJECTIVE=categorical
-  MTS_ANGLE_WEIGHT=0.25
+  if [[ -z "${G_FAMILY_ARM:-}" ]]; then
+    MTS_ANGLE_WEIGHT=0.25
+  fi
+fi
+if [[ -n "${G_FAMILY_ARM:-}" ]]; then
+  if [[ "${PRETRAINING_OBJECTIVE:-}" != "masked_atom_only" || ( "${ANGLE_LOSS_WEIGHT:-1}" != "0" && "${ANGLE_LOSS_WEIGHT:-1}" != "0.0" ) ]]; then
+    echo "G-family requires pretraining_objective=masked_atom_only and angle_loss_weight=0." >&2
+    exit 2
+  fi
+  MTS_ANGLE_WEIGHT=0
 fi
 FINETUNE_PROFILE=${FINETUNE_PROFILE:-legacy_mts_huber_v1}
 if [[ "$FINETUNE_PROFILE" != "legacy_mts_huber_v1" ]]; then
   echo "MTS only supports finetune_profile=legacy_mts_huber_v1; F/Phase-A-B-C logic is retired." >&2
+  exit 2
+fi
+if [[ "$FINETUNE_AMP_DTYPE" != "fp32" && "$FINETUNE_AMP_DTYPE" != "bf16" ]]; then
+  echo "MTS_FINETUNE_AMP_DTYPE must be fp32 or bf16." >&2
+  exit 2
+fi
+if (( FINETUNE_EVAL_BATCH_SIZE < FINETUNE_BATCH_SIZE )); then
+  echo "MTS_FINETUNE_EVAL_BATCH_SIZE must be >= MTS_FINETUNE_BATCH_SIZE." >&2
   exit 2
 fi
 if [[ "$MTS_ANGLE_OBJECTIVE" != "categorical" && "$MTS_ANGLE_OBJECTIVE" != "cosine" ]]; then
@@ -156,19 +291,19 @@ PY
 }
 
 JOINT_TRAINING_HASH=$(hash_training_spec "$(cat <<JSON
-{"config_hash":"$CONFIG_HASH","feature_hash":"$FEATURE_CONFIG_HASH","graph_hash":"$GRAPH_MODEL_CONFIG_HASH","geometry_hash":"$GEOMETRY_MODEL_CONFIG_HASH","stage":"mts_joint_pretraining","dataset":"PI1M_v2","steps":20000,"epoch_cap":30,"batch_size":$PRETRAIN_BATCH_SIZE,"accumulation":$PRETRAIN_ACCUMULATION,"lr":0.0002,"weight_decay":0.0,"optimizer_impl":"adam","adam_betas":[0.9,0.98],"eps":1e-8,"warmup_steps":2000,"scheduler":"polynomial","scheduler_power":1,"end_lr":1e-9,"amp":"bf16","mask_ratio":0.30,"angle_objective":"$MTS_ANGLE_OBJECTIVE","angle_weight":$MTS_ANGLE_WEIGHT,"angle_bins":20,"angle_gamma":2.0,"max_grad_norm":-1.0,"checkpoint_interval_steps":0,"seed":$SEED,"loader_workers":$LOADER_WORKERS,"loader_prefetch_factor":$LOADER_PREFETCH_FACTOR,"sampler_version":"$SAMPLER_VERSION","batch_balance":"$BATCH_BALANCE"}
+{"config_hash":"$CONFIG_HASH","feature_hash":"$FEATURE_CONFIG_HASH","graph_hash":"$GRAPH_MODEL_CONFIG_HASH","geometry_hash":"$GEOMETRY_MODEL_CONFIG_HASH","stage":"mts_joint_pretraining","dataset":"PI1M_v2","steps":20000,"epoch_cap":30,"batch_size":$PRETRAIN_BATCH_SIZE,"accumulation":$PRETRAIN_ACCUMULATION,"lr":0.0002,"weight_decay":0.0,"optimizer_impl":"adam","adam_betas":[0.9,0.98],"eps":1e-8,"warmup_steps":2000,"scheduler":"polynomial","scheduler_power":1,"end_lr":1e-9,"amp":"bf16","mask_ratio":0.30,"angle_objective":"$MTS_ANGLE_OBJECTIVE","angle_weight":$MTS_ANGLE_WEIGHT,"angle_bins":20,"angle_gamma":2.0,"max_grad_norm":-1.0,"checkpoint_interval_steps":$PRETRAIN_CHECKPOINT_INTERVAL_STEPS,"seed":$SEED,"loader_workers":$PRETRAIN_LOADER_WORKERS,"loader_prefetch_factor":$LOADER_PREFETCH_FACTOR,"sampler_version":"$SAMPLER_VERSION","batch_balance":"$BATCH_BALANCE"}
 JSON
 )")
 FINETUNE_PROFILE_HASH=$(hash_training_spec '{"profile":"legacy_mts_huber_v1","graph_wrapper_trainable_from_epoch":0,"loss":"huber","huber_beta":0.5,"epochs":100,"patience":10,"batch_size":32,"graph_wrapper_lr":1e-5,"smiles_lora_lr":5e-6,"adapter_lr":1e-4,"head_lr":1e-4,"weight_decay":0.02,"warmup_epochs":5,"scheduler":"cosine","swa_start_epoch":-1,"gradient_clip":1.0}')
 FINETUNE_CONFIG_HASH=$(hash_training_spec "$(cat <<JSON
-{"config_hash":"$CONFIG_HASH","feature_hash":"$FEATURE_CONFIG_HASH","graph_hash":"$GRAPH_MODEL_CONFIG_HASH","geometry_hash":"$GEOMETRY_MODEL_CONFIG_HASH","source_geometry_hash":"$SOURCE_GEOMETRY_MODEL_CONFIG_HASH","geometry_mode":"$GRAPH_GEOMETRY_MODE","modalities":$MODALITIES,"fusion_mode":"$FUSION_MODE","finetune_mode":"$FINETUNE_MODE","evaluation_protocol":"$EVALUATION_PROTOCOL","modality_control":"$MODALITY_CONTROL","controlled_modality":"$CONTROLLED_MODALITY","stage":"mts_property_finetune_legacy_v1","dataset":"downstream_union","epochs":100,"batch_size":32,"patience":10,"graph_wrapper_lr":0.00001,"smiles_lora_lr":0.000005,"adapter_lr":0.0001,"head_lr":0.0001,"weight_decay":0.02,"warmup_epochs":5,"scheduler":"cosine","finetune_profile":"$FINETUNE_PROFILE","finetune_profile_hash":"$FINETUNE_PROFILE_HASH","target_transform":"recommended","loss":"huber","huber_beta":0.5,"gradient_clip":1.0,"head_dropout":0.25,"swa_start_epoch":-1}
+{"config_hash":"$CONFIG_HASH","feature_hash":"$FEATURE_CONFIG_HASH","graph_hash":"$GRAPH_MODEL_CONFIG_HASH","geometry_hash":"$GEOMETRY_MODEL_CONFIG_HASH","source_geometry_hash":"$SOURCE_GEOMETRY_MODEL_CONFIG_HASH","geometry_mode":"$GRAPH_GEOMETRY_MODE","modalities":$MODALITIES,"fusion_mode":"$FUSION_MODE","finetune_mode":"$FINETUNE_MODE","evaluation_protocol":"$EVALUATION_PROTOCOL","modality_control":"$MODALITY_CONTROL","controlled_modality":"$CONTROLLED_MODALITY","stage":"mts_property_finetune_legacy_v1","dataset":"downstream_union","epochs":100,"batch_size":32,"eval_batch_size":$FINETUNE_EVAL_BATCH_SIZE,"amp_dtype":"$FINETUNE_AMP_DTYPE","patience":10,"graph_wrapper_lr":0.00001,"smiles_lora_lr":0.000005,"adapter_lr":0.0001,"head_lr":0.0001,"weight_decay":0.02,"warmup_epochs":5,"scheduler":"cosine","finetune_profile":"$FINETUNE_PROFILE","finetune_profile_hash":"$FINETUNE_PROFILE_HASH","target_transform":"recommended","loss":"huber","huber_beta":0.5,"gradient_clip":1.0,"head_dropout":0.25,"swa_start_epoch":-1}
 JSON
 )")
 
 stage3_training_hash() {
   local fine_seed=$1
   hash_training_spec "$(cat <<JSON
-{"finetune_config_hash":"$FINETUNE_CONFIG_HASH","seed":$fine_seed,"loader_workers":$LOADER_WORKERS}
+{"finetune_config_hash":"$FINETUNE_CONFIG_HASH","seed":$fine_seed,"loader_workers":$FINETUNE_LOADER_WORKERS}
 JSON
 )"
 }
@@ -177,7 +312,6 @@ JSON
 # deliberately runs after hash construction so malformed shell/JSON quoting is
 # caught before a cache or training process is started.
 if [[ "${VALIDATE_ONLY:-0}" == 1 ]]; then
-  [[ "$CUDA_VISIBLE_DEVICES" == "0,1,2" ]]
   [[ "$JOINT_TRAINING_HASH" =~ ^[0-9a-f]{64}$ ]]
   [[ "$FINETUNE_PROFILE_HASH" =~ ^[0-9a-f]{64}$ ]]
   [[ "$FINETUNE_CONFIG_HASH" =~ ^[0-9a-f]{64}$ ]]
@@ -198,7 +332,7 @@ if [[ -z "${RESULTS_DIR:-}" ]]; then
   fi
 fi
 mkdir -p "$ARTIFACT_DIR" "$LOG_DIR" "$RESULTS_DIR"
-if [[ "$RESOLVED_CONFIG_SCHEMA" == "mts-experiment-v3" ]]; then
+if [[ "$RESOLVED_CONFIG_SCHEMA" == "mts-experiment-v3" || -n "${CONFIG_SOURCE_SCHEMA:-}" ]]; then
   mkdir -p "$RESULTS_DIR/configs"
   cp -f "$CONFIG" "$RESULTS_DIR/configs/resolved_input.json"
 fi
@@ -228,6 +362,7 @@ fi
 COMMON=(
   --seed "$SEED"
   --config_schema "$RESOLVED_CONFIG_SCHEMA"
+  --config_source_schema "${CONFIG_SOURCE_SCHEMA:-}"
   --experiment_id "$EXPERIMENT_ID"
   --feature_config_hash "$FEATURE_CONFIG_HASH"
   --o8_feature_config_hash "$FEATURE_CONFIG_HASH"
@@ -268,6 +403,13 @@ COMMON=(
   --mips_descriptor_disturbance 0
   --mips_mask_policy canonical_exact
   --mips_use_descriptors
+  --topology_attention_variant "$TOPOLOGY_ATTENTION_VARIANT"
+  --msta_layer_indices "${MSTA_LAYER_INDICES_VALUES[@]}"
+  --msta_local_spd "${MSTA_LOCAL_SPD_VALUES[@]}"
+  --msta_context_spd "${MSTA_CONTEXT_SPD_VALUES[@]}"
+  "${MSTA_DROPOUT_ARGS[@]}"
+  "${MSTA_LOCAL_BIAS_ARGS[@]}"
+  --msta_local_output_init "$MSTA_LOCAL_OUTPUT_INIT"
   --spatial_mode trimer_scage
   --graph_geometry_mode "$GRAPH_GEOMETRY_MODE"
   --mcl_distance_percentiles 0.20 0.50
@@ -292,6 +434,31 @@ fi
 SMOKE_ARGS=()
 if [[ "$PRETRAIN_SMOKE_STEPS" -gt 0 ]]; then
   SMOKE_ARGS=(--resume_smoke --max_optimizer_steps "$PRETRAIN_SMOKE_STEPS")
+fi
+INITIALIZATION_ARGS=()
+if [[ -n "$MTS_INITIALIZATION_STATE" ]]; then
+  INITIALIZATION_ARGS=(
+    --initialization_state "$MTS_INITIALIZATION_STATE"
+    --paired_init_id "${MTS_PAIRED_INIT_ID:-mts_t_pretrain0_matched_v1}"
+  )
+fi
+DIAGNOSTIC_ARGS=()
+if [[ -n "$MTS_DIAGNOSTICS_DIR" ]]; then
+  DIAGNOSTIC_ARGS=(
+    --diagnostics_dir "$MTS_DIAGNOSTICS_DIR"
+    --diagnostic_steps "$MTS_DIAGNOSTIC_STEPS"
+  )
+fi
+PRETRAIN_IDENTITY_ARGS=(
+  --pretraining_objective "$PRETRAINING_OBJECTIVE"
+  --angle_loss_weight "$ANGLE_LOSS_WEIGHT"
+)
+if [[ -n "${SHARED_STEP0_ID:-}" ]]; then
+  PRETRAIN_IDENTITY_ARGS+=(--shared_step0_id "$SHARED_STEP0_ID")
+fi
+TRAIN_IDENTITY_ARGS=()
+if [[ -n "${SHARED_STEP0_ID:-}" ]]; then
+  TRAIN_IDENTITY_ARGS+=(--shared_step0_id "$SHARED_STEP0_ID")
 fi
 
 run_cache() {
@@ -328,7 +495,8 @@ PY
   fi
   env CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" scripts/pretrain.py \
     --dataset_name "$dataset" --pretrain_stage mts_joint_pretraining \
-    "${COMMON[@]}" "${CACHE[@]}" "$@" \
+    "${COMMON[@]}" "${CACHE[@]}" "${PRETRAIN_G_FAMILY_ARGS[@]}" \
+    "${PRETRAIN_IDENTITY_ARGS[@]}" "$@" \
     --cache_layers "$layers" --cache_only
 }
 
@@ -379,7 +547,7 @@ fi
 # is never used as a Stage 1/1.5 sampling cohort.
 if [[ "$FINETUNE_ONLY" != 1 && "$PRETRAIN_ONLY" != 1 && "$PRETRAIN_BENCHMARK_ONLY" != 1 || "$PRETRAIN_CACHE_ONLY" == 1 ]]; then
   env CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" scripts/train.py \
-    "${COMMON[@]}" "${CACHE[@]}" \
+    "${COMMON[@]}" "${CACHE[@]}" "${TRAIN_G_FAMILY_ARGS[@]}" \
     --feature_source_dataset smi_all \
     --cache_layers "$MTS_TRAIN_CACHE_LAYERS" \
     --tasks "${TASK_LIST[@]}" --fold_ids "${FOLD_LIST[@]}" --cache_only
@@ -443,17 +611,21 @@ if [[ "$FINETUNE_ONLY" != 1 ]]; then
     --dataset_name "$PRETRAIN_DATASET" \
     --feature_source_dataset "$PRETRAIN_DATASET" \
     --pretrain_stage mts_joint_pretraining \
-    "${COMMON[@]}" "${CACHE[@]}" \
+    "${COMMON[@]}" "${CACHE[@]}" "${PRETRAIN_G_FAMILY_ARGS[@]}" \
+    "${PRETRAIN_IDENTITY_ARGS[@]}" \
     --cache_layers topology,trimer \
     --pretrain_profile "$PRETRAIN_PROFILE" \
     --training_config_hash "$JOINT_TRAINING_HASH" \
     --epochs 30 --max_optimizer_steps "$JOINT_STEPS" \
     --batch_size "$PRETRAIN_BATCH_SIZE" --gradient_accumulation_steps "$PRETRAIN_ACCUMULATION" \
-    --loader_workers "$LOADER_WORKERS" --loader_prefetch_factor "$LOADER_PREFETCH_FACTOR" --batch_balance "$BATCH_BALANCE" --amp_dtype bf16 \
+    --loader_workers "$PRETRAIN_LOADER_WORKERS" --loader_prefetch_factor "$LOADER_PREFETCH_FACTOR" --batch_balance "$BATCH_BALANCE" --amp_dtype bf16 \
     --lr 2e-4 --warmup_steps 2000 --mips_scheduler polynomial --scheduler_power 1 --end_lr 1e-9 \
     --graph_mask_ratio 0.30 --angle_objective "$MTS_ANGLE_OBJECTIVE" \
     --graph_angle_weight "$MTS_ANGLE_WEIGHT" --mips_spd_weight 0 --mips_path_bond_weight 0 \
-    --no-dynamic_pretrain_loss --max_grad_norm -1 --checkpoint_interval_steps 0 \
+    --no-dynamic_pretrain_loss --max_grad_norm -1 \
+    --checkpoint_interval_steps "$PRETRAIN_CHECKPOINT_INTERVAL_STEPS" \
+    "${INITIALIZATION_ARGS[@]}" \
+    "${DIAGNOSTIC_ARGS[@]}" \
     "${SMOKE_ARGS[@]}" \
     "${BENCHMARK_ARGS[@]}" \
     "${JOINT_RESUME_ARGS[@]}" \
@@ -626,7 +798,7 @@ launch_stage3_unit() {
     export CUDA_VISIBLE_DEVICES=$gpu
     if [[ "${MTS_FAKE_TRAIN:-0}" == "1" ]]; then
       # Test-only injection (Plan §7): a fake training command drives the real
-      # three-slot dispatcher without GPU/Dataset.  It receives the unit and
+      # four-slot dispatcher without GPU/Dataset.  It receives the unit and
       # output paths; the real train.py path is untouched when unset.
       "$PYTHON_BIN" "${MTS_FAKE_TRAIN_CMD}" \
         --task "$task" --fold "$fold" \
@@ -634,7 +806,9 @@ launch_stage3_unit() {
         >> "$LOG_DIR/finetune_seed${fine_seed}_${task}_fold${fold}.log" 2>&1
     else
       "$PYTHON_BIN" scripts/train.py \
-        "${COMMON[@]}" "${CACHE[@]}" \
+        "${COMMON[@]}" "${CACHE[@]}" "${TRAIN_G_FAMILY_ARGS[@]}" \
+        "${TRAIN_IDENTITY_ARGS[@]}" \
+        "${MTS_T1_INIT_ARGS[@]}" \
         "${MTS_FINETUNE_MODE_ARGS[@]}" \
         --cache_layers "$MTS_TRAIN_CACHE_LAYERS" \
         --tasks "$task" --fold_ids "$fold" \
@@ -651,7 +825,8 @@ launch_stage3_unit() {
         --checkpoint_pretraining_dataset "$PRETRAIN_DATASET" \
         --checkpoint_tier 1m \
         --epochs "$FINETUNE_EPOCHS" --patience "$FINETUNE_PATIENCE" --batch_size "$FINETUNE_BATCH_SIZE" \
-        --loader_workers "$LOADER_WORKERS" \
+        --eval_batch_size "$FINETUNE_EVAL_BATCH_SIZE" --amp_dtype "$FINETUNE_AMP_DTYPE" \
+        --loader_workers "$FINETUNE_LOADER_WORKERS" \
         --evaluation_protocol "$EVALUATION_PROTOCOL" \
         --target_transform recommended \
         --regression_loss huber --huber_beta 0.5 --max_grad_norm 1.0 \
@@ -668,7 +843,8 @@ launch_stage3_unit() {
 }
 
 run_finetune_seeds() {
-  local -a requested=("$@") queue=() free_gpus=(0 1 2)
+  local -a requested=("$@") queue=() free_gpus=()
+  IFS=',' read -r -a free_gpus <<< "$FINETUNE_GPU_IDS"
   local fine_seed task fold shard prediction training_hash
   local -a dispatch_tasks=("${TASK_LIST[@]}") dispatch_folds=("${FOLD_LIST[@]}")
   if [[ "$MTS_FINETUNE_SCHEDULE" == "lpt_v1" ]]; then

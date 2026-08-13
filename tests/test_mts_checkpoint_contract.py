@@ -441,7 +441,7 @@ def test_shell_dispatcher_failure_stops_and_cleans_up(tmp_path):
     assert (results / "shards/42/eat/fold_0.csv").is_file(), out
     # 5. The failed unit has no complete shard.
     assert not (results / "shards/42/egb/fold_2.csv").exists(), out
-    # 6. Monotonic event order: three concurrent slots were filled, and after
+    # 6. Monotonic event order: four concurrent slots were filled, and after
     # the dispatcher observed FAIL no further unit is STARTed (queued units
     # stay unstarted) and the failing unit itself reached FAIL.
     events = []
@@ -451,7 +451,7 @@ def test_shell_dispatcher_failure_stops_and_cleans_up(tmp_path):
             if len(parts) == 3:
                 events.append(tuple(parts))
     assert len(events) >= 4, out
-    assert sum(1 for e in events if e[0] == "START") >= 3, out
+    assert sum(1 for e in events if e[0] == "START") >= 4, out
     assert ("FAIL", "egb", "2") in events, out
     fail_index = next(
         i for i, e in enumerate(events) if e[0] == "FAIL"

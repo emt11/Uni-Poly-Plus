@@ -2,6 +2,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +34,7 @@ EXPERIMENTS = (
 
 def _resolved(path):
     return json.loads(subprocess.check_output([
-        "/root/anaconda3/envs/Uni-Poly/bin/python", str(RESOLVER), str(path)
+        sys.executable, str(RESOLVER), str(path)
     ], cwd=ROOT, text=True))
 
 
@@ -53,7 +54,7 @@ def test_resolver_rejects_unknown_ablation_field(tmp_path):
     path = tmp_path / "bad.json"
     path.write_text(json.dumps(config))
     result = subprocess.run([
-        "/root/anaconda3/envs/Uni-Poly/bin/python", str(RESOLVER), str(path)
+        sys.executable, str(RESOLVER), str(path)
     ], cwd=ROOT, text=True, capture_output=True)
     assert result.returncode != 0
     assert "ablation" in (result.stderr + result.stdout)

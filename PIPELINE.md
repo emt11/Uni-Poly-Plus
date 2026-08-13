@@ -15,7 +15,7 @@ MIPS-Trimer-SCAGE
 ```text
 P-SMILES
 → canonical 单 RU 周期拓扑
-→ O8 MIPS Graph Transformer
+→ T1 MSTA（前四层 O8、最后两层 MSTA）MIPS Graph Transformer
 → Trimer Star-RBF + SCAGE-MCL
 → canonical atom mean pooling
 → MD200低容量图级残差
@@ -407,6 +407,70 @@ $$
 
 MD200无效时残差精确为零。
 
+### 5.7 T0/T1 拓扑注意力身份
+
+新训练生产默认已晋级为 T1（`topology_attention_variant=msta_last2`）：前四层保持
+O8，最后两层
+使用两个独立 incoming-edge softmax 分支：
+
+```text
+Z1: SPD ∈ {0, 1}
+Z2: SPD ∈ {0, 1, 2}
+output = old_output(Z2) + local_output(Z1)
+```
+
+两分支共享 Q/K/V、拓扑/path/Star bias 和 relation/head dropout mask；canonical
+relation row 不按 `(source, target)` 去重，SPD=0 自关系同时保留在两支。每个
+T1 层的显式关系支持仍是 `SPD ≤ 2`；六层堆叠后的有效传播范围可能超过两跳。
+`local_output` 是无 bias 的 `512→512` 线性层并零初始化，因此只能通过显式
+初始化器从 T0 warm start，不能把 T0 checkpoint 当作普通 T1 resume。
+
+T1 配置和入口：
+
+```text
+configs/mts/experiments/T1_msta_readiness.json
+scripts/initialize_mts_t1.py
+```
+
+初始化产物必须写入新的 `pretrained_models/mts_multiscale_topology/t1_init/`
+目录，并记录 `parent_checkpoint`、`initialization=function_preserving`、
+`source_model_identity=T0` 和 `model_identity=T1`。T1 smoke/benchmark 证据位于
+`results/mts_multiscale_topology/t1_readiness/`，均标记为 screening-only；它们
+不改变冻结 cache、`best_result.csv`、历史正式 checkpoint，也不构成 T1 优于 T0
+的科学结论。
+
+历史 T0（`topology_attention_variant=o8`）仍保留为显式对照配置；新训练不能隐式
+回退到 T0。现有正式 T1 checkpoint 可作为普通 T1 下游微调来源，但 G-family
+必须从独立 shared step-0 开始，不能从 T1 20k checkpoint 分叉。
+
+T1 初始化产物用于生产微调时必须显式 opt-in，且仍按架构 warm start 处理：
+
+```bash
+MTS_ALLOW_T1_FUNCTION_PRESERVING_INIT=1 \
+JOINT_CKPT=pretrained_models/mts_multiscale_topology/t1_init/mts_t1_function_preserving_init.pth \
+```
+
+launcher 将该环境变量转换为
+`--allow_mts_t1_function_preserving_init`，仅接受 `init_artifact=true`、
+`initialization=function_preserving`、T0 parent `source_optimizer_steps=20000`、
+T1 `optimizer_steps=0`、parent SHA/source contract、当前 T1 graph hash 和零
+`local_output` 权重全部一致的 checkpoint。未显式 opt-in、普通 T0/T1 resume 或
+将该 init 传给 `pretrain.py --resume_state` 均会拒绝；该特例不会继承 optimizer、
+scheduler 或 sampler 状态。
+
+### 5.8 G-family readiness identity
+
+G0/G1/G2/G3 统一使用 T1 拓扑、MD200，关闭旧 Star-RBF 与 full-Trimer MCL；G1
+只读冻结 relation-geometry sidecar 的 path cosine，G2/G3 额外读取 endpoint distance，
+G3 使用独立的 seed-42 条件分层置乱 artifact。四臂共享同一 T1 common step-0，
+G0 geometry residual 恒为零且不进 optimizer；invalid relation/path 精确回退为零。
+本周期仅做 sidecar/collate、forward/backward、DDP 和 2-epoch load/train smoke，
+不启动正式 20k 或 8×5。
+
+本修复周期的生产入口 smoke 证据独立写入
+`results/mts_multiscale_topology/t1_repair/`，不得覆盖上一周期
+`t1_readiness/` 证据。
+
 随后：
 
 ```text
@@ -499,7 +563,10 @@ MD200不参与预训练。固定训练参数：
 ```text
 optimizer steps  20,000
 global batch     1008
-GPU              0,1,2
+per-rank batch   336
+accumulation     1
+DataLoader       workers=6, prefetch=2（每个rank）
+GPU              1,2,3
 Adam betas       (0.9,0.98)
 peak LR          2e-4
 warmup           2,000 steps
@@ -536,6 +603,26 @@ head dropout       0.25
 SWA                disabled
 target transform   recommended
 ```
+
+本机有限速度 smoke（4 GPU、四任务、fold0、2 epochs）已验证微调默认：
+
+```text
+train batch        32
+DataLoader workers 2 / slot
+prefetch           2
+eval batch         64
+AMP                FP32
+GPU slots          0,1,2,3
+```
+
+该选择来自 `results/mts_speed_optimization/finetune/worker_eval_amp_20260811/benchmark.json`：
+workers=2 在“最高吞吐 2% 内优先较少 worker”规则下胜出；eval batch 64/128/256
+均在同一 fold-best 模型状态上通过 `y_true` 精确一致和预测
+`allclose(rtol=0, atol=1e-5)`，四任务 eval 总时间分别为
+`3.024543/3.773683/3.871604s`，因此按最快安全候选选择 64。这是有限速度 smoke，不是正式模型质量或 8×5
+训练结论。修复 `mips_md` residual 的 BF16/Float indexed-assignment 后，BF16
+finite/loss parity gate 已通过，但聚合吞吐仅为 FP32 的 `1.019x`，低于 10%
+晋级门，因此仍保留 FP32。
 
 `recommended` 对 eps/nc 使用 `log + 训练折标准化`，其余任务使用训练折标准化；指标在逆变换后的原始标签空间计算。
 
