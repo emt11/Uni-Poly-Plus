@@ -10,7 +10,6 @@ import hashlib
 import json
 
 CONFIG_SCHEMA = "mts-config-v3"
-EXPERIMENT_CONFIG_SCHEMA = "mts-experiment-v3"
 FEATURE_SCHEMA = "mts-canonical-periodic-feature-v3"
 LEGACY_FEATURE_SCHEMA = "mips-trimer-scage-feature-v4"
 EXPLICIT_FEATURE_SCHEMA = "mts-explicit-kru-feature-v1"
@@ -33,37 +32,12 @@ CACHE_CONTINUOUS_ANGLE_SCHEMA = "mts-angle-continuous-cache-v1"
 CACHE_MCL_THRESHOLD_SCHEMA = "mts-mcl-threshold-array-v2"
 CACHE_BUNDLE_SCHEMA = "mts-canonical-cache-bundle-v3"
 CACHE_TOPOLOGY_COST_SCHEMA = "mts-topology-cost-v1"
-CACHE_RELATION_GEOMETRY_SCHEMA = "mts-relation-geometry-sidecar-v1"
-RELATION_GEOMETRY_BUILDER_VERSION = 1
 STAR_RBF_V2_SIDECAR_SCHEMA = "mts-star-rbf-v2-sidecar-v1"
 STAR_RBF_V2_BUILDER_VERSION = 1
-# Geometry-injection ablation (A0--A4).  These identifiers are part of the
-# experiment contract, not a free-form naming convention.
-ABLATION_IDS = (
-    "A0_no3d_forward",
-    "A1_star_only",
-    "A2_mcl_real",
-    "A3_star_mcl_real",
-    "A4_star_mcl_random_mask",
-)
-# v2 adds the ordered 32-byte sample-key payload and a manifest-bound .done
-# marker.  The frozen Trimer/threshold artifacts remain unchanged.
-ABLATION_RANDOM_MASK_SCHEMA = "mts-mcl-count-matched-random-mask-v2"
-ABLATION_RANDOM_MASK_SEED = 42
-ABLATION_RANDOM_MASK_PAYLOAD_VERSION = 2
-MTS_SHARED_CHECKPOINT = (
-    "pretrained_models/mts/"
-    "mts_joint_pretraining_pi1m_v2_seed42_canonical_angle20_v1.pth"
-)
-MTS_SHARED_CHECKPOINT_SHA256 = (
-    "56c8a0ba148280fef22ecb953705a14259fb5e87258c0cae67799d7484375e77"
-)
 TOPOLOGY_LMDB_SCHEMA = "mts-canonical-periodic-topology-lmdb-v3"
 MIGRATION_SCHEMA = "mts-canonical-cache-migration-v3"
 TARGET_CONTRACT_SCHEMA = "mts-canonical-target-contract-v1"
 PRETRAIN_TARGET_CONTRACT_SCHEMA = "mts-canonical-target-contract-v2"
-PRETRAIN_PROFILE_SCHEMA = "mts-pretrain-profile-v1"
-PRETRAIN_PROFILE_ID = "canonical_ru_angle20_v1"
 BUILDER_VERSION = 12
 CANONICAL_LGA_SCHEMA_VERSION = 2
 EXPLICIT_LGA_SCHEMA_VERSION = 3
@@ -218,7 +192,6 @@ def build_target_contract(
     contract = {
         "schema": TARGET_CONTRACT_SCHEMA,
         "config_schema": CONFIG_SCHEMA,
-        "experiment_config_schema": EXPERIMENT_CONFIG_SCHEMA,
         "feature_schema": FEATURE_SCHEMA,
         "topology_representation": TOPOLOGY_CANONICAL,
         "cache_layout_schema": CACHE_LAYOUT_SCHEMA,
@@ -257,7 +230,6 @@ def build_target_contract(
 
 def build_pretrain_target_contract(
     *,
-    profile_id,
     source_cohort_hash,
     feature_config_hash,
     graph_model_config_hash,
@@ -283,10 +255,8 @@ def build_pretrain_target_contract(
     """
     contract = {
         "schema": PRETRAIN_TARGET_CONTRACT_SCHEMA,
-        "profile_id": str(profile_id),
         "topology_representation": str(topology_representation),
         "config_schema": CONFIG_SCHEMA,
-        "experiment_config_schema": EXPERIMENT_CONFIG_SCHEMA,
         "feature_schema": FEATURE_SCHEMA,
         "cache_layout_schema": CACHE_LAYOUT_SCHEMA,
         "cache_bundle_schema": CACHE_BUNDLE_SCHEMA,
@@ -321,11 +291,6 @@ def validate_runtime_args(args) -> None:
 
     if getattr(args, "graph_encoder_type", None) != "mips_trimer_scage":
         return
-    experiment = getattr(args, "config_schema", None) == EXPERIMENT_CONFIG_SCHEMA
-    isolated_pretrain = (
-        getattr(args, "config_source_schema", None)
-        == "mts-pretrain-experiment-v1"
-    )
     fixed = {
         "config_schema": CONFIG_SCHEMA,
         "topology_representation": TOPOLOGY_CANONICAL,
@@ -347,20 +312,7 @@ def validate_runtime_args(args) -> None:
         "trimer_num_candidates": 4,
         "trimer_max_heavy_atoms": 384,
     }
-    if experiment or isolated_pretrain:
-        fixed["config_schema"] = (
-            EXPERIMENT_CONFIG_SCHEMA if experiment else CONFIG_SCHEMA
-        )
-        # Explicit k-RU is an isolated comparison representation, not a
-        # mutation of the canonical feature contract.
-        observed_representation = getattr(
-            args, "topology_representation", TOPOLOGY_CANONICAL
-        )
-        if observed_representation not in TOPOLOGY_REPRESENTATIONS:
-            raise ValueError("unsupported MTS topology representation")
-        fixed.pop("topology_representation", None)
-    else:
-        fixed["graph_geometry_mode"] = "trimer_scage_mcl"
+    fixed["graph_geometry_mode"] = "trimer_scage_mcl"
     for name, expected in fixed.items():
         observed = getattr(args, name, None)
         if observed != expected:
@@ -371,8 +323,6 @@ def validate_runtime_args(args) -> None:
     attention_variant = str(getattr(args, "topology_attention_variant", "o8"))
     if attention_variant not in {"o8", "msta_last2"}:
         raise ValueError("unsupported topology_attention_variant")
-    # T1/MSTA is the promoted default for new training.  Historical T0 remains
-    # available through an explicit o8 config/checkpoint identity.
     if list(getattr(args, "msta_layer_indices", [4, 5])) != [4, 5]:
         raise ValueError("MSTA layer indices must be [4, 5]")
     if list(getattr(args, "msta_local_spd", [0, 1])) != [0, 1]:
@@ -388,18 +338,11 @@ def validate_runtime_args(args) -> None:
     if not bool(getattr(args, "mips_use_descriptors", False)):
         raise ValueError(f"{ROUTE_NAME} requires MD200")
     if list(getattr(args, "modalities", [])) != ["graph"]:
-        if not (experiment or isolated_pretrain):
-            raise ValueError(f"{ROUTE_NAME} production config is graph-only")
+        raise ValueError(f"{ROUTE_NAME} production config is graph-only")
     if getattr(args, "fusion_type", None) != "none":
-        if not (experiment or isolated_pretrain):
-            raise ValueError(f"{ROUTE_NAME} production config requires fusion_type=none")
-    geometry_modes = {
-        "trimer_scage_mcl", "current_mcl", "mcl_rbf", "disabled",
-        "coordinate_shuffled", "mcl_rbf_coordinate_shuffled",
-        "g0", "g1", "g2", "g3",
-    }
-    if getattr(args, "graph_geometry_mode", None) not in geometry_modes:
-        raise ValueError("unsupported mts-experiment-v3 geometry_mode")
+        raise ValueError(f"{ROUTE_NAME} production config requires fusion_type=none")
+    if getattr(args, "graph_geometry_mode", None) != "trimer_scage_mcl":
+        raise ValueError("unsupported MTS geometry mode")
     percentiles = tuple(float(value) for value in getattr(
         args, "mcl_distance_percentiles", (0.20, 0.50)
     ))

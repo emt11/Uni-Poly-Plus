@@ -1,5 +1,4 @@
 import copy
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,7 +14,6 @@ from src.dataset.mts_star_rbf_v2 import (
 )
 from src.dataset.trimer_mcl import attach_finite_trimer_mcl
 from src.modules.mips_local_graph import MIPSLocalGraphEncoder
-from scripts.train import validate_g_family_checkpoint_binding
 
 
 def _sample(smiles="*CCO*"):
@@ -38,24 +36,7 @@ def _attach(topology, record, upper=6.0):
     topology.mts_star_v2_rbf_upper = upper
     topology.mips_md = torch.zeros(200)
     topology.mips_md_valid = torch.tensor(False)
-    topology.mts_relation_geometry_arm = "g0"
-    topology.mts_relation_geometry_relation_row = torch.empty(0, dtype=torch.long)
-    topology.mts_relation_geometry_valid = torch.empty(0, dtype=torch.bool)
-    topology.mts_relation_geometry_reason_code = torch.empty(0, dtype=torch.int16)
-    topology.mts_relation_geometry_path_offsets = torch.zeros(1, dtype=torch.long)
-    topology.mts_relation_geometry_path_valid = torch.empty(0, dtype=torch.bool)
-    topology.mts_relation_geometry_path_cos_angle = torch.empty(0)
-    topology.mts_relation_geometry_endpoint_distance = torch.empty(0)
     return topology
-
-
-def _attach_empty_g1_batch_fields(batch):
-    batch.mts_relation_geometry_relation_row = torch.empty(0, dtype=torch.long)
-    batch.mts_relation_geometry_valid = torch.empty(0, dtype=torch.bool)
-    batch.mts_relation_geometry_path_offsets = torch.zeros(1, dtype=torch.long)
-    batch.mts_relation_geometry_path_valid = torch.empty(0, dtype=torch.bool)
-    batch.mts_relation_geometry_path_cos_angle = torch.empty(0)
-    batch.mts_relation_geometry_endpoint_distance = torch.empty(0)
 
 
 def test_periodic_pair_key_is_inversion_symmetric():
@@ -130,9 +111,8 @@ def test_encode_first_average_and_inverse_bitwise_identity():
     topology = _sample()
     record = build_star_rbf_v2_sample(b"k" * 32, topology, topology)
     batch = mips_trimer_collate([_attach(topology, record)])
-    _attach_empty_g1_batch_fields(batch)
     model = MIPSLocalGraphEncoder(
-        graph_geometry_mode="g1", g_family_arm="g1", use_star_rbf=True,
+        graph_geometry_mode="trimer_scage_mcl", use_star_rbf=True,
         use_mcl=False, topology_attention_variant="msta_last2",
         star_rbf_definition="trimer_periodic_relation_rbf_v2", star_rbf_upper=6.0,
     )
@@ -155,7 +135,7 @@ def test_encode_first_average_and_inverse_bitwise_identity():
 def test_rbf_upper_margin_and_valid_tail_nonzero():
     assert rbf_upper_from_distances([5.61] * 1000) == 6.0
     model = MIPSLocalGraphEncoder(
-        graph_geometry_mode="g1", g_family_arm="g1", use_star_rbf=True,
+        graph_geometry_mode="trimer_scage_mcl", use_star_rbf=True,
         use_mcl=False, topology_attention_variant="msta_last2",
         star_rbf_definition="trimer_periodic_relation_rbf_v2", star_rbf_upper=3.0,
     )
@@ -167,13 +147,12 @@ def test_asymmetry_is_qc_only_and_step0_forward_matches_g1():
     topology = _sample()
     record = build_star_rbf_v2_sample(b"k" * 32, topology, topology)
     batch = mips_trimer_collate([_attach(topology, record)])
-    _attach_empty_g1_batch_fields(batch)
     legacy = MIPSLocalGraphEncoder(
-        graph_geometry_mode="g1", g_family_arm="g1", use_star_rbf=False,
+        graph_geometry_mode="trimer_scage_mcl", use_star_rbf=False,
         use_mcl=False, topology_attention_variant="msta_last2",
     ).eval()
     candidate = MIPSLocalGraphEncoder(
-        graph_geometry_mode="g1", g_family_arm="g1", use_star_rbf=True,
+        graph_geometry_mode="trimer_scage_mcl", use_star_rbf=True,
         use_mcl=False, topology_attention_variant="msta_last2",
         star_rbf_definition="trimer_periodic_relation_rbf_v2", star_rbf_upper=6.0,
     ).eval()
@@ -182,37 +161,3 @@ def test_asymmetry_is_qc_only_and_step0_forward_matches_g1():
         expected = legacy._forward_impl(batch, use_star=False, use_geometry=False, use_md=False)[0]
         observed = candidate._forward_impl(batch, use_geometry=False, use_md=False)[0]
     assert torch.equal(expected, observed)
-
-
-def test_r2_checkpoint_uses_pi_source_artifact_not_downstream_artifact():
-    args = SimpleNamespace(
-        g_family_arm="g1",
-        shared_step0_id="mts_star_rbf_v2_r2_step0_seed42",
-        g_family_bundle_hash="a" * 64,
-        star_rbf_definition="trimer_periodic_relation_rbf_v2",
-        star_rbf_upper=3.75,
-        star_rbf_v2_artifact_hash="b" * 64,
-        star_rbf_v2_source_artifact_hash="c" * 64,
-        star_rbf_v2_model_semantic_hash="d" * 64,
-    )
-    meta = {
-        "g_family_arm": "g1",
-        "topology_attention_variant": "msta_last2",
-        "shared_step0_id": args.shared_step0_id,
-        "pretraining_objective": "masked_atom_only",
-        "g_family_bundle_hash": args.g_family_bundle_hash,
-        "relation_geometry_artifact_hash": "e" * 64,
-        "optimizer_steps": 20000,
-        "smoke_only": False,
-        "star_rbf_definition": args.star_rbf_definition,
-        "star_rbf_upper": args.star_rbf_upper,
-        "star_rbf_v2_artifact_hash": args.star_rbf_v2_source_artifact_hash,
-        "star_rbf_v2_model_semantic_hash": args.star_rbf_v2_model_semantic_hash,
-        "backbone_definition": "legacy_g1_frozen",
-    }
-    validate_g_family_checkpoint_binding(meta, args)
-    with pytest.raises(RuntimeError, match="star_rbf_v2_artifact_hash"):
-        validate_g_family_checkpoint_binding(
-            {**meta, "star_rbf_v2_artifact_hash": args.star_rbf_v2_artifact_hash},
-            args,
-        )

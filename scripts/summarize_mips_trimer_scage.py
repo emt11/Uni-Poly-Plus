@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,14 +14,6 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 TASKS = ("eat", "eea", "egb", "egc", "ei", "eps", "nc", "xc")
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _read_shard(root: Path, seed: int, task: str, fold: int,
@@ -53,6 +44,9 @@ def _read_shard(root: Path, seed: int, task: str, fold: int,
     metrics = json.loads(str(row.get("per_fold_metrics", "[]")))
     if len(metrics) != 1 or int(metrics[0].get("fold", -1)) != fold:
         raise RuntimeError(f"invalid per_fold_metrics: {path}")
+    for key in ("test_r2", "test_mae", "test_rmse", "best_val_r2"):
+        if key in metrics[0] and not np.isfinite(float(metrics[0][key])):
+            raise RuntimeError(f"non-finite metric {key}: {path}")
     return row
 
 
@@ -60,9 +54,6 @@ def _read_prediction(root: Path, seed: int, task: str, fold: int, row: dict):
     path = root / "predictions" / str(seed) / task / f"fold_{fold}.npz"
     if not path.is_file():
         raise RuntimeError(f"missing prediction shard: {path}")
-    expected_sha = str(row.get("prediction_sha256", ""))
-    if not expected_sha or _sha256(path) != expected_sha:
-        raise RuntimeError(f"prediction hash mismatch: {path}")
     with np.load(path, allow_pickle=False) as payload:
         y_true = np.asarray(payload["y_true"], dtype=np.float64).reshape(-1)
         y_pred = np.asarray(payload["y_pred"], dtype=np.float64).reshape(-1)
@@ -70,25 +61,17 @@ def _read_prediction(root: Path, seed: int, task: str, fold: int, row: dict):
         metadata = json.loads(str(np.asarray(payload["metadata"]).item()))
     if y_true.shape != y_pred.shape or y_true.shape != indices.shape:
         raise RuntimeError(f"prediction array shape mismatch: {path}")
-    profile_key = "finetune_profile_hash"
-    profile_hash = str(row.get(profile_key, ""))
-    if not profile_hash:
-        # Read-only compatibility for historical pre-F MTS shards.
-        profile_key = "phase_schedule_hash"
-        profile_hash = str(row.get(profile_key, ""))
-    expected = {
-        "task": task,
-        "fold": fold,
-        "seed": seed,
-        "finetune_config_hash": str(row.get("finetune_config_hash")),
-        profile_key: profile_hash,
-        "checkpoint_sha256": str(row.get("checkpoint_sha256")),
-        "cache_store_sha256": str(row.get("cache_store_sha256")),
-        "split_manifest_hash": str(row.get("split_manifest_hash")),
-    }
+    expected = {"task": task, "fold": fold, "seed": seed}
     for key, value in expected.items():
         if metadata.get(key) != value:
             raise RuntimeError(f"prediction metadata mismatch ({key}): {path}")
+    expected_protocol = (
+        "nested_outer5_inner_hash10"
+        if row.get("fold_validation_protocol") == "nested_outer5_inner_hash10"
+        else "shared_validation_test_fold"
+    )
+    if metadata.get("fold_validation_protocol", expected_protocol) != expected_protocol:
+        raise RuntimeError(f"prediction protocol mismatch: {path}")
     if not np.isfinite(y_true).all() or not np.isfinite(y_pred).all():
         raise RuntimeError(f"non-finite prediction data: {path}")
     return y_true, y_pred, indices
@@ -150,27 +133,10 @@ def main():
             truths = []
             predictions = []
             reference_indices = None
-            identity = None
             for seed in args.seeds:
                 row = _read_shard(
                     root, seed, task, fold, args.evaluation_protocol
                 )
-                profile_hash = str(row.get("finetune_profile_hash", ""))
-                if not profile_hash:
-                    profile_hash = str(row.get("phase_schedule_hash", ""))
-                current_identity = (
-                    str(row.get("finetune_config_hash")),
-                    profile_hash,
-                    str(row.get("checkpoint_sha256")),
-                    str(row.get("cache_store_sha256")),
-                    str(row.get("split_manifest_hash")),
-                )
-                if identity is None:
-                    identity = current_identity
-                elif current_identity != identity:
-                    raise RuntimeError(
-                        f"seed shards use different training identities: {task}/fold_{fold}"
-                    )
                 y_true, y_pred, indices = _read_prediction(root, seed, task, fold, row)
                 if reference_indices is None:
                     reference_indices = indices

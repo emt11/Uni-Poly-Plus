@@ -48,7 +48,6 @@ from .canonical_periodic import (
 )
 from .explicit_k_ru import build_explicit_k_ru_topology
 from .mips_trimer_contract import (
-    ABLATION_IDS,
     EXPLICIT_FEATURE_SCHEMA,
     EXPLICIT_TOPOLOGY_LMDB_SCHEMA,
     TOPOLOGY_CANONICAL,
@@ -90,7 +89,6 @@ from .trimer_mcl import (
     attach_unavailable_trimer_mcl,
 )
 from .mips_cache_validation import validate_mcl_record
-from .mts_relation_geometry import RelationGeometryPermutation, RelationGeometrySidecar
 from .mts_star_rbf_v2 import StarRBFV2Sidecar
 from .mts_target_contract import make_target_contract
 from transformers import AutoTokenizer
@@ -128,15 +126,14 @@ class ShardedFeatureStore:
             raise RuntimeError(f"incomplete immutable feature cache: {self.root}")
         with open(manifest_path, encoding="utf-8") as handle:
             self.manifest = json.load(handle)
-        expected_done = hashlib.sha256(
-            json.dumps(self.manifest, sort_keys=True).encode()
-        ).hexdigest()
-        with open(done_path, encoding="utf-8") as handle:
-            observed_done = handle.read().strip()
-        if observed_done != expected_done:
-            raise RuntimeError(f"feature-cache manifest hash mismatch: {self.root}")
-        self._shard_sha256 = dict(self.manifest.get("shard_sha256", {}))
-        self._verified_shards = set()
+        if self.manifest.get("schema") != self.schema:
+            raise RuntimeError(f"feature-cache schema mismatch: {self.root}")
+        shard_count = int(self.manifest.get("shard_count", -1))
+        if shard_count < 0 or int(self.manifest.get("count", -1)) < 0:
+            raise RuntimeError(f"feature-cache manifest shape mismatch: {self.root}")
+        # ``.done`` is a writer-completion signal.  Its historical digest is
+        # intentionally not recomputed on the training read path.
+        self._shard_count = shard_count
         self._connection = None
         self._pid = None
         self._cache_size = max(
@@ -183,21 +180,8 @@ class ShardedFeatureStore:
         if shard_id not in self._cached_shards:
             shard_name = f"shard_{shard_id:06d}.pt"
             shard_path = os.path.join(self.root, shard_name)
-            if shard_name not in self._verified_shards:
-                expected = self._shard_sha256.get(shard_name)
-                if not expected:
-                    raise RuntimeError(
-                        f"immutable shard checksum missing: {shard_name}"
-                    )
-                checksum = hashlib.sha256()
-                with open(shard_path, "rb") as handle:
-                    for block in iter(lambda: handle.read(1024 * 1024), b""):
-                        checksum.update(block)
-                if checksum.hexdigest() != expected:
-                    raise RuntimeError(
-                        f"immutable shard checksum mismatch: {shard_name}"
-                    )
-                self._verified_shards.add(shard_name)
+            if not os.path.isfile(shard_path):
+                raise RuntimeError(f"immutable shard is missing: {shard_path}")
             payload = torch.load(
                 shard_path,
                 weights_only=False, mmap=True,
@@ -2199,76 +2183,13 @@ class UniDataset(Dataset):
         feature_config_hash='manual',
         transform=None,
         pre_transform=None,
-        ablation_config=None,
-        g_family_arm=None,
-        relation_geometry_sidecar=None,
-        relation_geometry_artifact_hash=None,
-        g3_permutation_sidecar=None,
-        g3_permutation_artifact_hash=None,
         star_rbf_v2_sidecar=None,
-        star_rbf_v2_artifact_hash=None,
     ):
         self.dataset = dataset
-        self.ablation_config = ablation_config or {}
-        self.g_family_arm = (
-            str(g_family_arm).lower() if g_family_arm is not None else None
-        )
-        if self.g_family_arm is not None and self.g_family_arm not in {"g0", "g1", "g2", "g3"}:
-            raise ValueError("g_family_arm must be one of g0/g1/g2/g3")
-        self.relation_geometry_sidecar_root = (
-            str(relation_geometry_sidecar) if relation_geometry_sidecar else None
-        )
-        self.relation_geometry_artifact_hash = (
-            str(relation_geometry_artifact_hash)
-            if relation_geometry_artifact_hash else None
-        )
-        self.g3_permutation_sidecar_root = (
-            str(g3_permutation_sidecar) if g3_permutation_sidecar else None
-        )
-        self.g3_permutation_artifact_hash = (
-            str(g3_permutation_artifact_hash)
-            if g3_permutation_artifact_hash else None
-        )
-        self._relation_geometry_sidecar = None
-        self._g3_permutation = None
         self.star_rbf_v2_sidecar_root = (
             str(star_rbf_v2_sidecar) if star_rbf_v2_sidecar else None
         )
-        self.star_rbf_v2_artifact_hash = (
-            str(star_rbf_v2_artifact_hash) if star_rbf_v2_artifact_hash else None
-        )
         self._star_rbf_v2_sidecar = None
-        self.ablation_id = self.ablation_config.get("id")
-        if self.ablation_id is not None:
-            self.ablation_id = str(self.ablation_id)
-            if self.ablation_id not in ABLATION_IDS:
-                raise ValueError(f"unsupported MTS ablation id: {self.ablation_id!r}")
-        self.ablation_use_star = bool(self.ablation_config.get(
-            "use_star_rbf", self.ablation_config.get("star", True)
-        ))
-        self.ablation_use_mcl = bool(self.ablation_config.get(
-            "use_mcl", self.ablation_config.get("mcl", True)
-        ))
-        self.ablation_mcl_mask_mode = str(self.ablation_config.get(
-            "mcl_mask_mode",
-            "count_matched_random"
-            if self.ablation_config.get("mcl_random_mask", False)
-            else "real",
-        ))
-        if self.ablation_mcl_mask_mode not in {"real", "count_matched_random"}:
-            raise ValueError("unsupported MTS ablation MCL mask mode")
-        if self.ablation_mcl_mask_mode == "count_matched_random" and not self.ablation_use_mcl:
-            raise ValueError("random MCL masking requires an enabled MCL branch")
-        self._ablation_random_mask = None
-        if self.ablation_config.get("id") == "A4_star_mcl_random_mask":
-            sidecar_root = self.ablation_config.get("random_mask_sidecar")
-            if sidecar_root:
-                from src.dataset.mts_ablation_random_mask import (
-                    AblationRandomMaskSidecar,
-                )
-                self._ablation_random_mask = AblationRandomMaskSidecar(
-                    sidecar_root
-                )
         self.root = root
         self.transform = transform
         self.pre_transform = pre_transform
@@ -2320,15 +2241,6 @@ class UniDataset(Dataset):
             raise ValueError(
                 f"unknown MIPS cache layers: {sorted(unknown_cache_layers)}"
             )
-        # A0 is a forward-only 2D control.  Do not even open the frozen
-        # Trimer LMDB for this branch; the shared checkpoint remains identical
-        # but the Dataset contract is topology + MD200 only.
-        if self.ablation_id == "A0_no3d_forward":
-            cache_layers = tuple(name for name in cache_layers if name != "trimer")
-        if self.g_family_arm in {"g0", "g1", "g2", "g3"}:
-            # G-family geometry is read from the frozen relation sidecar; the
-            # retired full-Trimer MCL payload is deliberately not opened.
-            cache_layers = tuple(name for name in cache_layers if name != "trimer")
         self.requested_cache_layers = tuple(dict.fromkeys(cache_layers))
         requested_cache_layers = set(cache_layers)
         if "topology" in requested_cache_layers:
@@ -2409,20 +2321,10 @@ class UniDataset(Dataset):
         self.field_layout = "none"
         self.field_channels = "none"
         self.graph_geometry_mode = str(graph_geometry_mode)
-        if self.g_family_arm is None and self.graph_geometry_mode in {"g0", "g1", "g2", "g3"}:
-            self.g_family_arm = self.graph_geometry_mode
-        if self.g_family_arm is not None and self.graph_geometry_mode not in {"g0", "g1", "g2", "g3"}:
-            self.graph_geometry_mode = self.g_family_arm
-        if self.g_family_arm is not None and self.graph_geometry_mode != self.g_family_arm:
-            raise ValueError("G-family arm and graph_geometry_mode are inconsistent")
-        if self.graph_geometry_mode not in {
-            "none", "trimer_scage_mcl", "current_mcl", "mcl_rbf",
-            "disabled", "coordinate_shuffled",
-            "mcl_rbf_coordinate_shuffled",
-            "g0", "g1", "g2", "g3",
-        }:
+        if self.graph_geometry_mode not in {"none", "trimer_scage_mcl"}:
             raise ValueError(
-                "graph_geometry_mode must be none or trimer_scage_mcl"
+                "graph_geometry_mode must be none or trimer_scage_mcl; "
+                "retired experiment modes are unavailable"
             )
         self.trimer_num_candidates = int(trimer_num_candidates)
         self.trimer_max_heavy_atoms = int(trimer_max_heavy_atoms)
@@ -2433,10 +2335,7 @@ class UniDataset(Dataset):
             str(angle_cache_root_override)
             if angle_cache_root_override is not None else None
         )
-        if self.graph_geometry_mode in {
-            "trimer_scage_mcl", "current_mcl", "mcl_rbf", "disabled",
-            "coordinate_shuffled", "mcl_rbf_coordinate_shuffled",
-        }:
+        if self.graph_geometry_mode == "trimer_scage_mcl":
             if self.graph_encoder_type != "mips_trimer_scage":
                 raise ValueError("Trimer-MCL is only valid for the selected O8 route")
             if self.trimer_num_candidates != 4:
@@ -2447,11 +2346,7 @@ class UniDataset(Dataset):
                 raise ValueError("selected Trimer-MCL requires percentiles 0.20/0.50")
         self.mips_variant = "O8"
         if self.graph_encoder_type == "mips_trimer_scage":
-            if self.graph_geometry_mode not in {
-                "trimer_scage_mcl", "current_mcl", "mcl_rbf", "disabled",
-                "coordinate_shuffled", "mcl_rbf_coordinate_shuffled",
-                "g0", "g1", "g2", "g3",
-            }:
+            if self.graph_geometry_mode != "trimer_scage_mcl":
                 raise ValueError(
                 "MTS requires graph_geometry_mode="
                     "trimer_scage_mcl"
@@ -2532,13 +2427,12 @@ class UniDataset(Dataset):
             )
         else:
             self._init_legacy(processed_dir=processed_dir, graph_tag=f"{graph_tag}_{geom_tag}_{fp_tag}")
-        if self.g_family_arm is not None:
-            self._init_relation_geometry_sidecar()
         if self.star_rbf_v2_sidecar_root is not None:
             self._star_rbf_v2_sidecar = StarRBFV2Sidecar(
                 self.star_rbf_v2_sidecar_root,
-                expected_artifact_hash=self.star_rbf_v2_artifact_hash,
             )
+            if len(self._star_rbf_v2_sidecar) != len(self.data_list):
+                raise RuntimeError("Star-RBF v2 sidecar record count does not match Dataset")
 
     # ------------------------------------------------------------------
     # Legacy path (--disable_feature_cache)
@@ -3780,9 +3674,9 @@ class UniDataset(Dataset):
             self.feature_source_dataset,
             source_csv,
             load_text=not bool(self.is_graph_only_mips_route),
-            # Frozen training verifies the full manifest once; graph-only
-            # workers should not hash/read million-row text files at startup.
-            verify_integrity=not bool(self.is_graph_only_mips_route),
+            # Training readers use the lightweight shape/key mode.  Full
+            # cohort integrity is an explicit offline QC operation.
+            verify_integrity=False,
         )
         meta = self._feature_cache_meta()
         specs = self._lmdb_cache_specs(meta)
@@ -3852,12 +3746,9 @@ class UniDataset(Dataset):
         self.trimer_cache_hash = None
         self.trimer_cache_artifact_hash = None
         self.feature_cohort_hash = cohort["manifest"]["cohort_hash"]
-        # A0 deliberately does not open or read Trimer records, but its
-        # downstream model still loads the single shared MTS checkpoint.  The
-        # checkpoint alignment contract therefore needs the immutable Trimer
-        # identity as metadata even on this topology+MD200 data path.  Resolve
-        # the content-addressed binding spec without adding a Trimer store or
-        # materialising any geometry payloads.
+        # A topology-only cache path can still bind the immutable Trimer
+        # artifact identity as metadata without opening or materialising the
+        # Trimer geometry payloads.
         trimer_binding_spec = specs.get("trimer")
         if trimer_binding_spec is None:
             original_layers = self.cache_layers
@@ -3869,16 +3760,20 @@ class UniDataset(Dataset):
             finally:
                 self.cache_layers = original_layers
         if trimer_binding_spec is not None:
-            with open(
-                os.path.join(trimer_binding_spec["root"], ".done"),
-                encoding="utf-8",
-            ) as handle:
-                self.trimer_cache_artifact_hash = handle.read().strip()
-            if len(self.trimer_cache_artifact_hash) != 64:
-                raise RuntimeError("invalid Trimer cache manifest hash")
-            self.trimer_cache_hash = trimer_binding_spec["meta"][
-                "feature_config_hash"
-            ]
+            # Topology-only readers are valid before the optional Trimer layer
+            # is materialised.  Bind its immutable identity when the artifact
+            # exists, but do not turn a topology-only cache read into an
+            # implicit Trimer build requirement.
+            trimer_done_path = Path(trimer_binding_spec["root"]) / ".done"
+            if trimer_done_path.is_file():
+                self.trimer_cache_artifact_hash = trimer_done_path.read_text(
+                    encoding="utf-8"
+                ).strip()
+                if len(self.trimer_cache_artifact_hash) != 64:
+                    raise RuntimeError("invalid Trimer cache manifest hash")
+                self.trimer_cache_hash = trimer_binding_spec["meta"][
+                    "feature_config_hash"
+                ]
         feature_cache = {
             "meta": {
                 **meta,
@@ -5086,11 +4981,7 @@ class UniDataset(Dataset):
         )
         if reusable:
             observed = json.loads(metadata_path.read_text(encoding="utf-8"))
-            reusable = observed.get("specification") == specification and all(
-                observed.get("files", {}).get(path.name, {}).get("sha256")
-                == _sha256_file(path)
-                for path in required
-            )
+            reusable = observed.get("specification") == specification
         if not reusable:
             if self.mts_use_smiles:
                 views = []
@@ -5154,7 +5045,11 @@ class UniDataset(Dataset):
             metadata = {
                 "specification": specification,
                 "files": {
-                    path.name: {"sha256": _sha256_file(path), "bytes": path.stat().st_size}
+                    path.name: {
+                        "bytes": path.stat().st_size,
+                        "shape": list(np.load(path, mmap_mode="r").shape),
+                        "dtype": str(np.load(path, mmap_mode="r").dtype),
+                    }
                     for path in required
                 },
             }
@@ -5165,7 +5060,7 @@ class UniDataset(Dataset):
             )
             os.replace(temporary, metadata_path)
             done_tmp = root / f".done.tmp.{os.getpid()}"
-            done_tmp.write_text(_sha256_file(metadata_path) + "\n", encoding="utf-8")
+            done_tmp.write_text("complete\n", encoding="utf-8")
             os.replace(done_tmp, done_path)
         self.mts_sidecar_hash = sidecar_hash
         self._mts_input_ids = (
@@ -5206,134 +5101,6 @@ class UniDataset(Dataset):
     # ------------------------------------------------------------------
     def __len__(self):
         return len(self.data_list)
-
-    def _init_relation_geometry_sidecar(self):
-        """Bind the frozen relation-geometry artifact for G1/G2/G3.
-
-        G0 is intentionally a hard bypass: it does not even open sidecar
-        metadata.  For the geometry arms, startup is strict and a missing or
-        mismatched artifact is an error rather than a silent G0 fallback.
-        """
-        if self.g_family_arm == "g0":
-            return
-        if not isinstance(getattr(self, "_cohort", None), dict):
-            raise RuntimeError("G-family Dataset requires an immutable cohort manifest")
-        root = self.relation_geometry_sidecar_root
-        if root is None or self.relation_geometry_artifact_hash is None:
-            raise RuntimeError(
-                "G1/G2/G3 requires an explicit relation_geometry_sidecar "
-                "and expected artifact hash"
-            )
-        source_artifacts = {
-            "topology": {"done_artifact_hash": self.topology_cache_artifact_hash},
-            "trimer": {"done_artifact_hash": self.trimer_cache_artifact_hash},
-        }
-        self._relation_geometry_sidecar = RelationGeometrySidecar(
-            root,
-            expected_cohort=(
-                "downstream_union"
-                if str(self.feature_source_dataset) == "smi_all"
-                else str(self.feature_source_dataset)
-            ),
-            expected_cohort_hash=self._cohort["manifest"].get("cohort_hash"),
-            expected_artifact_hash=self.relation_geometry_artifact_hash,
-            expected_ordered_sample_key_hash=self._cohort["manifest"].get("ordered_sample_key_hash"),
-            expected_source_artifacts=source_artifacts,
-        )
-        if self.g_family_arm == "g3":
-            permutation_root = self.g3_permutation_sidecar_root
-            if permutation_root is None:
-                raise RuntimeError("G3 requires an explicit g3_permutation_sidecar")
-            if self.g3_permutation_artifact_hash is None:
-                raise RuntimeError("G3 requires an expected permutation artifact hash")
-            self._g3_permutation = RelationGeometryPermutation(
-                permutation_root,
-                source_sidecar=self._relation_geometry_sidecar.artifact_hash,
-                expected_cohort_hash=self._relation_geometry_sidecar.cohort_hash,
-                expected_artifact_hash=self.g3_permutation_artifact_hash,
-            )
-
-    def _attach_relation_geometry(self, data, key, *, row_hint=None):
-        """Attach one sidecar row aligned to the sample's local LGA rows."""
-        if self.g_family_arm is None or self.g_family_arm == "g0":
-            return data
-        if self._relation_geometry_sidecar is None:
-            raise RuntimeError("G-family sidecar was not initialized")
-        sidecar_index = self._relation_geometry_sidecar.index_for_key(
-            key, row_hint=row_hint
-        )
-        record = self._relation_geometry_sidecar.row(sidecar_index)
-        relations = record["relations"]
-        paths = record["paths"]
-        relation_rows = np.asarray(relations["relation_row"], dtype=np.int64)
-        if relation_rows.size and (
-            int(relation_rows.min()) < 0
-            or int(relation_rows.max()) >= int(data.lga_edge_index.size(1))
-        ):
-            raise RuntimeError("relation-geometry sidecar row is outside sample LGA topology")
-        path_offsets = np.asarray(relations["relation_path_offsets"], dtype=np.int64)
-        # The row reader returns relation-local offsets.  Keep the path slices
-        # compact; the collator adds a batch path offset without changing any
-        # topology relation order or multiplicity.
-        if path_offsets.size != relation_rows.size + 1:
-            raise RuntimeError("relation-geometry sidecar relation/path offset mismatch")
-        geometry_valid = np.asarray(relations["relation_geometry_valid"], dtype=bool)
-        path_valid = np.asarray(paths["path_geometry_valid"], dtype=bool)
-        cos_angle = np.asarray(paths["path_cos_angle"], dtype=np.float32).copy()
-        endpoint_distance = np.asarray(relations["relation_endpoint_distance"], dtype=np.float32).copy()
-        if self.g_family_arm == "g3":
-            # The permutation artifact is indexed by global sidecar relation
-            # row.  Obtain the global range from the key's row deterministically.
-            relation_start = int(self._relation_geometry_sidecar.arrays["sample_relation_offsets"][sidecar_index])
-            relation_end = int(self._relation_geometry_sidecar.arrays["sample_relation_offsets"][sidecar_index + 1])
-            source_indices = self._g3_permutation.permutation_for(np.arange(relation_start, relation_end, dtype=np.int64))
-            source_offsets = self._relation_geometry_sidecar.arrays["relation_path_offsets"]
-            source_cos = self._relation_geometry_sidecar.arrays["path_cos_angle"]
-            source_valid = self._relation_geometry_sidecar.arrays["path_geometry_valid"]
-            source_distance = self._relation_geometry_sidecar.arrays["relation_endpoint_distance"]
-            if source_indices.size != relation_rows.size:
-                raise RuntimeError("G3 permutation relation count mismatch")
-            shuffled_cos = np.zeros_like(cos_angle)
-            shuffled_distance = np.zeros_like(endpoint_distance)
-            for target_local, source_global in enumerate(source_indices.tolist()):
-                target_a, target_b = int(path_offsets[target_local]), int(path_offsets[target_local + 1])
-                source_a, source_b = int(source_offsets[int(source_global)]), int(source_offsets[int(source_global) + 1])
-                if target_b - target_a != source_b - source_a:
-                    raise RuntimeError("G3 permutation changed path multiplicity")
-                shuffled_cos[target_a:target_b] = np.asarray(source_cos[source_a:source_b], dtype=np.float32)
-                shuffled_distance[target_local] = float(source_distance[int(source_global)])
-            cos_angle = shuffled_cos
-            endpoint_distance = shuffled_distance
-            # Invalid target relations remain invalid/zero regardless of the
-            # source relation selected by the correspondence permutation.
-            cos_angle[~np.repeat(geometry_valid, np.diff(path_offsets))] = 0.0
-            endpoint_distance[~geometry_valid] = 0.0
-        cos_angle[~path_valid] = 0.0
-        endpoint_distance[~geometry_valid] = 0.0
-        data = copy.copy(data)
-        data.mts_relation_geometry_relation_row = torch.as_tensor(
-            np.array(relation_rows, dtype=np.int64, copy=True), dtype=torch.long
-        )
-        data.mts_relation_geometry_valid = torch.as_tensor(
-            np.array(geometry_valid, dtype=bool, copy=True), dtype=torch.bool
-        )
-        data.mts_relation_geometry_reason_code = torch.as_tensor(
-            np.array(relations["relation_invalid_reason_code"], dtype=np.int16, copy=True), dtype=torch.int16
-        )
-        data.mts_relation_geometry_path_offsets = torch.as_tensor(
-            np.array(path_offsets, dtype=np.int64, copy=True), dtype=torch.long
-        )
-        data.mts_relation_geometry_path_valid = torch.as_tensor(
-            np.array(path_valid, dtype=bool, copy=True), dtype=torch.bool
-        )
-        data.mts_relation_geometry_path_cos_angle = torch.as_tensor(cos_angle, dtype=torch.float32)
-        data.mts_relation_geometry_endpoint_distance = torch.as_tensor(endpoint_distance, dtype=torch.float32)
-        data.mts_relation_geometry_sidecar_artifact = self._relation_geometry_sidecar.artifact_hash
-        data.mts_relation_geometry_cohort_hash = self._relation_geometry_sidecar.cohort_hash
-        data.mts_relation_geometry_arm = self.g_family_arm
-        if self._g3_permutation is not None:
-            data.mts_relation_geometry_permutation_artifact = str(self._g3_permutation.metadata["artifact_hash"])
-        return data
 
     @property
     def raw_targets(self):
@@ -5419,41 +5186,6 @@ class UniDataset(Dataset):
             )
         if lookup_key_for_hash is None:
             lookup_key_for_hash = sample_key_from_smiles(str(data.smiles))
-        if self.ablation_id is not None:
-            data = copy.copy(data)
-            data.mts_ablation_id = self.ablation_id
-            data.mts_use_star_rbf = bool(self.ablation_use_star)
-            data.mts_use_mcl = bool(self.ablation_use_mcl)
-            data.mts_mcl_mask_mode = self.ablation_mcl_mask_mode
-            # A0 and A1/A2 intentionally expose only the fields their forward
-            # path consumes.  The underlying frozen layer is never modified;
-            # this is a per-sample read-side projection.
-            if self.ablation_id == "A0_no3d_forward":
-                for name in (
-                    "trimer_pos", "trimer_atomic_number", "trimer_edge_index",
-                    "trimer_bond_type", "trimer_base_ru_atom_index",
-                    "trimer_base_ru_atom_id", "trimer_ru_offset",
-                    "trimer_central_ru_mask", "trimer_central_atom_index",
-                    "trimer_central_ru_atom_index",
-                    "mips_to_trimer_central_index", "trimer_mcl_thresholds",
-                    "star_3d_distance", "star_3d_asymmetry", "star_3d_valid",
-                    "trimer_geometry_valid", "trimer_geometry_is_3d",
-                    "trimer_2d_fallback", "mcl_valid",
-                ):
-                    if hasattr(data, name):
-                        delattr(data, name)
-            elif self.ablation_id == "A1_star_only":
-                for name in (
-                    "trimer_mcl_thresholds", "mcl_valid",
-                ):
-                    if hasattr(data, name):
-                        delattr(data, name)
-            elif self.ablation_id == "A2_mcl_real":
-                for name in (
-                    "star_3d_distance", "star_3d_asymmetry", "star_3d_valid",
-                ):
-                    if hasattr(data, name):
-                        delattr(data, name)
         # A compact stable identity supports vectorised stateless augmentation
         # without carrying or hashing SMILES strings on the GPU hot path.
         data.mts_sample_hash64 = torch.tensor(
@@ -5461,14 +5193,9 @@ class UniDataset(Dataset):
             & ((1 << 63) - 1),
             dtype=torch.long,
         )
-        if self.g_family_arm is not None and self.g_family_arm != "g0":
-            row_hint = int(idx) if self._cohort_row_mode else None
-            data = self._attach_relation_geometry(
-                data, lookup_key_for_hash, row_hint=row_hint
-            )
         if self._star_rbf_v2_sidecar is not None:
             row_hint = int(idx) if self._cohort_row_mode else None
-            sidecar_row = self._star_rbf_v2_sidecar.row(
+            sidecar_row = self._star_rbf_v2_sidecar.model_row(
                 self._star_rbf_v2_sidecar.index_for_key(
                     lookup_key_for_hash, row_hint=row_hint
                 )
@@ -5481,29 +5208,7 @@ class UniDataset(Dataset):
             data.mts_star_v2_pair_observation_count = torch.as_tensor(pairs["pair_observation_count"], dtype=torch.long)
             data.mts_star_v2_pair_valid = torch.as_tensor(pairs["pair_valid"], dtype=torch.bool)
             data.mts_star_v2_pair_geometry_source = torch.as_tensor(pairs["pair_geometry_source"], dtype=torch.long)
-            data.mts_star_v2_sidecar_artifact = self._star_rbf_v2_sidecar.artifact_hash
-            data.mts_star_v2_model_semantic_hash = self._star_rbf_v2_sidecar.model_semantic_hash
             data.mts_star_v2_rbf_upper = float(self._star_rbf_v2_sidecar.rbf_upper)
-        # A4 random-mask sidecar (Plan mts_geometry_injection A4): attach the
-        # sample-local compact visible key sets so the collator can expand them
-        # into batch rows without dense [Q, K] storage on disk.
-        if self._ablation_random_mask is not None:
-            _record = self._ablation_random_mask.record_for(lookup_key_for_hash)
-            if _record is not None:
-                data.mcl_random_ptr20 = _record["ptr20"]
-                data.mcl_random_ptr50 = _record["ptr50"]
-                data.mcl_random_keys20 = _record["keys20"]
-                data.mcl_random_keys50 = _record["keys50"]
-                data.mcl_random_mask_valid = True
-            else:
-                # Keep an explicit per-sample placeholder.  The collator uses
-                # this row even for geometry-invalid samples, so graph IDs and
-                # random visibility rows never become compressed.
-                data.mcl_random_ptr20 = np.zeros(1, dtype=np.int64)
-                data.mcl_random_ptr50 = np.zeros(1, dtype=np.int64)
-                data.mcl_random_keys20 = np.zeros(0, dtype=np.int32)
-                data.mcl_random_keys50 = np.zeros(0, dtype=np.int32)
-                data.mcl_random_mask_valid = False
         if getattr(self, "_mts_input_ids", None) is not None:
             data.input_ids_smiles = torch.from_numpy(
                 np.array(self._mts_input_ids[int(idx)], dtype=np.int64, copy=True)

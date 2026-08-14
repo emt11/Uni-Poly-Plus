@@ -71,21 +71,10 @@ def mips_trimer_collate(data_list):
     smiles, ys = [], []
     graph_available, boundary, condition = [], [], []
     md_parts, md_valid = [], []
-    geometry_relation_rows = []
-    geometry_relation_valid = []
-    geometry_relation_reasons = []
-    geometry_path_offsets = []
-    geometry_path_valid = []
-    geometry_path_cos = []
-    geometry_relation_distance = []
-    geometry_sidecar_artifacts = set()
-    geometry_cohort_hashes = set()
-    geometry_arms = set()
-    geometry_items = 0
     star_v2_relation_rows, star_v2_relation_pairs = [], []
     star_v2_pair_distances, star_v2_pair_counts = [], []
     star_v2_pair_valid, star_v2_pair_sources = [], []
-    star_v2_artifacts, star_v2_semantics, star_v2_uppers = set(), set(), set()
+    star_v2_uppers = set()
     smiles_ids, smiles_masks, fp_parts = [], [], []
     smiles_available, fp_available = [], []
     smiles_fields_present = all(
@@ -97,19 +86,10 @@ def mips_trimer_collate(data_list):
         hasattr(item, "mts_task_index") for item in data_list
     )
     trimer_fields_present = all(hasattr(item, "trimer_pos") for item in data_list)
-    ablation_ids = {
-        getattr(item, "mts_ablation_id", None) for item in data_list
-    }
-    if len(ablation_ids) > 1:
-        raise ValueError("cannot mix MTS geometry ablations in one batch")
-    ablation_id = next(iter(ablation_ids))
-    mcl_enabled = all(
-        bool(getattr(item, "mts_use_mcl", True)) for item in data_list
-    )
-    star_enabled = all(
-        bool(getattr(item, "mts_use_star_rbf", True)) for item in data_list
-    )
-    random_mask_enabled = ablation_id == "A4_star_mcl_random_mask"
+    # MCL and Star-RBF are ordinary model capabilities.  Experiment-specific
+    # ablation descriptors are retired and are not carried in Dataset items.
+    mcl_enabled = True
+    star_enabled = True
     trimer_pos, trimer_z, trimer_edges, trimer_bonds = [], [], [], []
     trimer_base, trimer_offset, trimer_central = [], [], []
     trimer_central_index, trimer_mapping, trimer_batch = [], [], []
@@ -137,16 +117,7 @@ def mips_trimer_collate(data_list):
     pair_offset = 0
     trimer_offset_global = 0
     trimer_ptr = [0]
-    # A4 count-matched random MCL sidecar rows (Plan mts_geometry_injection
-    # A4): per-graph visible-key tables and graph query/trimer start offsets.
-    mcl_random_visible20_rows = []
-    mcl_random_visible50_rows = []
-    mcl_query_start = []
-    mcl_trimer_start = []
-    mcl_random_mask_valid = []
-    query_row_offset = 0
     lga_relation_offset = 0
-    geometry_path_offset = 0
     star_v2_pair_offset = 0
 
     for graph_id, item in enumerate(data_list):
@@ -222,52 +193,9 @@ def mips_trimer_collate(data_list):
             star_v2_pair_counts.append(item.mts_star_v2_pair_observation_count.long())
             star_v2_pair_valid.append(item.mts_star_v2_pair_valid.bool())
             star_v2_pair_sources.append(item.mts_star_v2_pair_geometry_source.long())
-            star_v2_artifacts.add(str(item.mts_star_v2_sidecar_artifact))
-            star_v2_semantics.add(str(item.mts_star_v2_model_semantic_hash))
             star_v2_uppers.add(float(item.mts_star_v2_rbf_upper))
             star_v2_pair_offset += pair_count
 
-        item_arm = getattr(item, "mts_relation_geometry_arm", None)
-        if item_arm is not None:
-            geometry_items += 1
-            geometry_arms.add(str(item_arm))
-            if str(item_arm) == "g0":
-                # G0 is a hard sidecar bypass by design.
-                item.mts_relation_geometry_relation_row = torch.empty(0, dtype=torch.long)
-                item.mts_relation_geometry_valid = torch.empty(0, dtype=torch.bool)
-                item.mts_relation_geometry_reason_code = torch.empty(0, dtype=torch.int16)
-                item.mts_relation_geometry_path_offsets = torch.zeros(1, dtype=torch.long)
-                item.mts_relation_geometry_path_valid = torch.empty(0, dtype=torch.bool)
-                item.mts_relation_geometry_path_cos_angle = torch.empty(0, dtype=torch.float32)
-                item.mts_relation_geometry_endpoint_distance = torch.empty(0, dtype=torch.float32)
-            required_geometry_fields = (
-                "mts_relation_geometry_relation_row",
-                "mts_relation_geometry_valid",
-                "mts_relation_geometry_reason_code",
-                "mts_relation_geometry_path_offsets",
-                "mts_relation_geometry_path_valid",
-                "mts_relation_geometry_path_cos_angle",
-                "mts_relation_geometry_endpoint_distance",
-            )
-            if not all(hasattr(item, name) for name in required_geometry_fields):
-                raise ValueError("G-family item is missing relation-geometry fields")
-            local_rows = item.mts_relation_geometry_relation_row.long()
-            local_offsets = item.mts_relation_geometry_path_offsets.long()
-            if local_offsets.numel() != local_rows.numel() + 1:
-                raise ValueError("G-family relation/path offsets are not aligned")
-            geometry_relation_rows.append(local_rows + lga_relation_offset)
-            geometry_relation_valid.append(item.mts_relation_geometry_valid.bool())
-            geometry_relation_reasons.append(item.mts_relation_geometry_reason_code.short())
-            geometry_relation_distance.append(item.mts_relation_geometry_endpoint_distance.float())
-            geometry_path_valid.append(item.mts_relation_geometry_path_valid.bool())
-            geometry_path_cos.append(item.mts_relation_geometry_path_cos_angle.float())
-            shifted_offsets = local_offsets + geometry_path_offset
-            geometry_path_offsets.append(
-                shifted_offsets if not geometry_path_offsets else shifted_offsets[1:]
-            )
-            geometry_path_offset += int(item.mts_relation_geometry_path_valid.numel())
-            geometry_sidecar_artifacts.add(str(getattr(item, "mts_relation_geometry_sidecar_artifact", "")))
-            geometry_cohort_hashes.add(str(getattr(item, "mts_relation_geometry_cohort_hash", "")))
         lga_relation_offset += int(item.lga_edge_index.size(1))
 
         if canonical_periodic_batch:
@@ -446,49 +374,6 @@ def mips_trimer_collate(data_list):
                     raise ValueError(
                         "MCL central-RU local index exceeds Trimer atom count"
                     )
-            # A4 random-mask sidecar rows (Plan mts_geometry_injection A4):
-            # expand the compact per-query visible key sets into [Q, 384] bool
-            # tables aligned to the batched query index, and record this
-            # graph's query/trimer start offsets.
-            if random_mask_enabled:
-                if not all(hasattr(item, name) for name in (
-                    "mcl_random_ptr20", "mcl_random_ptr50",
-                    "mcl_random_keys20", "mcl_random_keys50",
-                    "mcl_random_mask_valid",
-                )):
-                    raise ValueError("A4 item is missing random-mask placeholder fields")
-                n_q = int(central_count)
-                vis20 = torch.zeros((n_q, 384), dtype=torch.bool)
-                vis50 = torch.zeros((n_q, 384), dtype=torch.bool)
-                random_valid = bool(getattr(item, "mcl_random_mask_valid", False))
-                if random_valid and item_mcl_valid and bucket_size and n_q:
-                    p20 = item.mcl_random_ptr20
-                    p50 = item.mcl_random_ptr50
-                    if len(p20) != n_q + 1 or len(p50) != n_q + 1:
-                        raise ValueError("A4 compact mask pointer/query mismatch")
-                    k20 = torch.as_tensor(
-                        item.mcl_random_keys20, dtype=torch.long
-                    )
-                    k50 = torch.as_tensor(
-                        item.mcl_random_keys50, dtype=torch.long
-                    )
-                    for q in range(n_q):
-                        a, b = int(p20[q]), int(p20[q + 1])
-                        a5, b5 = int(p50[q]), int(p50[q + 1])
-                        if not (0 <= a <= b <= k20.numel() and 0 <= a5 <= b5 <= k50.numel()):
-                            raise ValueError("A4 compact mask pointer is out of bounds")
-                        if k20[a:b].numel() and bool(((k20[a:b] < 0) | (k20[a:b] >= n_trimer)).any()):
-                            raise ValueError("A4 random 20% mask selects invalid Trimer atom")
-                        if k50[a5:b5].numel() and bool(((k50[a5:b5] < 0) | (k50[a5:b5] >= n_trimer)).any()):
-                            raise ValueError("A4 random 50% mask selects invalid Trimer atom")
-                        vis20[q, k20[a:b]] = True
-                        vis50[q, k50[a5:b5]] = True
-                mcl_random_visible20_rows.append(vis20)
-                mcl_random_visible50_rows.append(vis50)
-                mcl_query_start.append(query_row_offset)
-                mcl_trimer_start.append(trimer_offset_global)
-                mcl_random_mask_valid.append(random_valid and item_mcl_valid and bool(bucket_size))
-                query_row_offset += n_q
             mcl_bucket_sizes.append(bucket_size)
             mcl_key_rows.append(key_row)
             mcl_query_rows.append(query_row)
@@ -496,9 +381,6 @@ def mips_trimer_collate(data_list):
             mcl_query_canonical_rows.append(query_canonical_row)
             trimer_offset_global += n_trimer
             trimer_ptr.append(trimer_offset_global)
-
-    if geometry_arms and geometry_items != len(data_list):
-        raise ValueError("cannot mix G-family and non-G-family records in one batch")
 
     batch.x = torch.cat(x_parts, dim=0)
     batch.edge_index = torch.cat(edge_parts, dim=1)
@@ -520,35 +402,15 @@ def mips_trimer_collate(data_list):
     batch.lga_path_bond_hist = torch.cat(lga_hist, dim=0)
     batch.lga_star_edge_mask = torch.cat(lga_star, dim=0)
     if star_v2_relation_rows:
-        if not (len(star_v2_artifacts) == len(star_v2_semantics) == len(star_v2_uppers) == 1):
-            raise ValueError("Star-RBF v2 batch identity mismatch")
+        if len(star_v2_uppers) != 1:
+            raise ValueError("Star-RBF v2 batch RBF upper mismatch")
         batch.mts_star_v2_relation_row = torch.cat(star_v2_relation_rows)
         batch.mts_star_v2_relation_pair_index = torch.cat(star_v2_relation_pairs)
         batch.mts_star_v2_pair_observation_distances = torch.cat(star_v2_pair_distances)
         batch.mts_star_v2_pair_observation_count = torch.cat(star_v2_pair_counts)
         batch.mts_star_v2_pair_valid = torch.cat(star_v2_pair_valid)
         batch.mts_star_v2_pair_geometry_source = torch.cat(star_v2_pair_sources)
-        batch.mts_star_v2_sidecar_artifact = next(iter(star_v2_artifacts))
-        batch.mts_star_v2_model_semantic_hash = next(iter(star_v2_semantics))
         batch.mts_star_v2_rbf_upper = next(iter(star_v2_uppers))
-    if geometry_arms:
-        if len(geometry_arms) != 1:
-            raise ValueError("cannot mix G-family arms in one batch")
-        if next(iter(geometry_arms)) == "g0":
-            batch.mts_relation_geometry_arm = "g0"
-        else:
-            batch.mts_relation_geometry_relation_row = torch.cat(geometry_relation_rows, dim=0)
-            batch.mts_relation_geometry_valid = torch.cat(geometry_relation_valid, dim=0)
-            batch.mts_relation_geometry_reason_code = torch.cat(geometry_relation_reasons, dim=0)
-            batch.mts_relation_geometry_path_offsets = torch.cat(geometry_path_offsets, dim=0)
-            batch.mts_relation_geometry_path_valid = torch.cat(geometry_path_valid, dim=0)
-            batch.mts_relation_geometry_path_cos_angle = torch.cat(geometry_path_cos, dim=0)
-            batch.mts_relation_geometry_endpoint_distance = torch.cat(geometry_relation_distance, dim=0)
-            batch.mts_relation_geometry_arm = next(iter(geometry_arms))
-            if len(geometry_sidecar_artifacts) != 1 or len(geometry_cohort_hashes) != 1:
-                raise ValueError("G-family batch sidecar identity mismatch")
-            batch.mts_relation_geometry_sidecar_artifact = next(iter(geometry_sidecar_artifacts))
-            batch.mts_relation_geometry_cohort_hash = next(iter(geometry_cohort_hashes))
     batch.canonical_ru_atom_index = torch.cat(canonical_parts, dim=0)
     if canonical_periodic_batch:
         batch.canonical_atom_id = torch.cat(canonical_id_parts, dim=0)
@@ -650,19 +512,18 @@ def mips_trimer_collate(data_list):
             batch.star_3d_valid = torch.tensor(star_valid, dtype=torch.bool)
         if mcl_enabled:
             batch.trimer_mcl_thresholds = torch.stack(mcl_thresholds, dim=0)
-        if ablation_id is None:
-            batch.trimer_angle_index = torch.cat(angle_indices, dim=0)
-            batch.trimer_angle_bins = torch.cat(angle_bins, dim=0)
-            batch.trimer_angle_cos = torch.cat(angle_cos, dim=0)
-            batch.trimer_angle_ptr = torch.tensor(angle_ptr, dtype=torch.long)
-            batch.trimer_angle_valid = torch.tensor(angle_valid, dtype=torch.bool)
-            schemas = {
-                str(getattr(item, "trimer_angle_cache_schema", ""))
-                for item in data_list if hasattr(item, "trimer_angle_cache_schema")
-            }
-            batch.trimer_angle_cache_schema = (
-                next(iter(schemas)) if len(schemas) == 1 else "mixed-or-missing"
-            )
+        batch.trimer_angle_index = torch.cat(angle_indices, dim=0)
+        batch.trimer_angle_bins = torch.cat(angle_bins, dim=0)
+        batch.trimer_angle_cos = torch.cat(angle_cos, dim=0)
+        batch.trimer_angle_ptr = torch.tensor(angle_ptr, dtype=torch.long)
+        batch.trimer_angle_valid = torch.tensor(angle_valid, dtype=torch.bool)
+        schemas = {
+            str(getattr(item, "trimer_angle_cache_schema", ""))
+            for item in data_list if hasattr(item, "trimer_angle_cache_schema")
+        }
+        batch.trimer_angle_cache_schema = (
+            next(iter(schemas)) if len(schemas) == 1 else "mixed-or-missing"
+        )
         if mcl_enabled:
             batch.mcl_bucket_size = torch.tensor(mcl_bucket_sizes, dtype=torch.int16)
             batch.mcl_key_index_padded = torch.stack(mcl_key_rows, dim=0)
@@ -672,24 +533,6 @@ def mips_trimer_collate(data_list):
             )
             batch.mcl_query_canonical_index_padded = torch.stack(
                 mcl_query_canonical_rows, dim=0
-            )
-        if random_mask_enabled:
-            if len(mcl_random_visible20_rows) != len(data_list):
-                raise ValueError("A4 random visibility rows are not graph-aligned")
-            batch.mcl_random_visible20 = torch.cat(
-                mcl_random_visible20_rows, dim=0
-            )
-            batch.mcl_random_visible50 = torch.cat(
-                mcl_random_visible50_rows, dim=0
-            )
-            batch.mcl_query_start = torch.tensor(
-                mcl_query_start, dtype=torch.int32
-            )
-            batch.mcl_trimer_start = torch.tensor(
-                mcl_trimer_start, dtype=torch.int32
-            )
-            batch.mcl_random_mask_valid = torch.tensor(
-                mcl_random_mask_valid, dtype=torch.bool
             )
         if mcl_enabled:
             batch.trimer_mcl_schema = TRIMER_CONTENT_SCHEMA

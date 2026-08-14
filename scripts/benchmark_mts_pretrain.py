@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Select the reproducible three-GPU MTS pretraining batch profile.
+"""Select a reproducible three-GPU MTS pretraining batch configuration.
 
 The production objective is a global batch of 1008. This cycle confirms only
 the two authorized finalists: (168, 2) and (336, 1)
 samples/rank and gradient
 accumulation steps.  This wrapper runs the existing finite DDP benchmark for
-each candidate, records the raw result, and writes the selected profile only
+each candidate, records the raw result, and writes the selected configuration only
 after all candidates pass the memory/finite checks.  It deliberately does not
 start a 20k-step training job.
 """
@@ -85,7 +85,7 @@ def _run_candidate(
         "PRETRAIN_BENCHMARK_ONLY": "1",
         "PRETRAIN_BENCHMARK_STAGE": "joint",
         "PRETRAIN_BENCHMARK_BATCHES": str(int(batches)),
-        "PRETRAIN_PROFILE": "canonical_ru_angle20_v1",
+        "EXPERIMENT_CONFIG": os.environ.get("EXPERIMENT_CONFIG", ""),
         "PRETRAIN_BATCH_SIZE": str(int(batch_size)),
         "PRETRAIN_ACCUMULATION": str(int(accumulation)),
         "DATALOADER_WORKERS": str(int(workers)),
@@ -143,14 +143,14 @@ def _run_candidate(
 
 
 def _reusable_worker_result(
-    benchmark_path: Path, profile: str, batches: int, gpu_ids: str,
+    benchmark_path: Path, config: str, batches: int, gpu_ids: str,
 ):
     """Return the compatible workers=4 result from the existing benchmark."""
     if not benchmark_path.is_file():
         return None
     try:
         payload = json.loads(benchmark_path.read_text(encoding="utf-8"))
-        current_meta = _profile_metadata(profile)
+        current_meta = _config_metadata(config)
     except (OSError, json.JSONDecodeError):
         return None
     if (
@@ -162,13 +162,12 @@ def _reusable_worker_result(
         or int(payload.get("target_global_batch", -1)) != 1008
         or int(payload.get("batches", -1)) != int(batches)
         or int(payload.get("warmup_batches", -1)) != 50
-        or payload.get("profile") != profile
+        or payload.get("config") != config
     ):
         return None
-    prior_meta = payload.get("profile_metadata", {})
+    prior_meta = payload.get("config_metadata", {})
     if (
-        prior_meta.get("profile_id") != current_meta.get("profile_id")
-        or prior_meta.get("profile_sha256") != current_meta.get("profile_sha256")
+        prior_meta.get("config_sha256") != current_meta.get("config_sha256")
         or prior_meta.get("gpu_visibility") != current_meta.get("gpu_visibility")
     ):
         return None
@@ -215,7 +214,7 @@ def _run_worker_sweep(args, output: Path, shm_bytes: int, workers):
     benchmark_path = ROOT / "results/mts_speed_optimization/pretrain/benchmark.json"
     results = []
     reused = _reusable_worker_result(
-        benchmark_path, args.profile, args.batches, args.gpu_ids
+        benchmark_path, args.config, args.batches, args.gpu_ids
     )
     for worker in workers:
         if worker == 4 and reused is not None:
@@ -259,8 +258,8 @@ def _run_worker_sweep(args, output: Path, shm_bytes: int, workers):
         "prefetch_factor": 2,
         "workers": list(workers),
         "shared_memory_bytes": int(shm_bytes),
-        "profile": str(args.profile),
-        "profile_metadata": _profile_metadata(args.profile),
+        "config": str(args.config),
+        "config_metadata": _config_metadata(args.config),
         "warmup_batches": 50,
         "measurement_batches": int(args.batches),
         "results": results,
@@ -313,14 +312,14 @@ def _select_candidate(items):
     )
 
 
-def _profile_metadata(path):
-    profile_path = ROOT / path
-    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+def _config_metadata(path):
+    config_path = ROOT / path
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     digest = __import__("hashlib").sha256(
-        json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     code_files = [
-        "configs/mts/default.json", "configs/mts/pretraining/canonical_ru_angle20_v1.json",
+        "scripts/resolve_mips_trimer_scage.py",
         "scripts/benchmark_mts_pretrain.py", "scripts/pretrain.py",
         "scripts/run_mips_trimer_scage.sh", "src/dataset/dataloader.py",
         "src/dataset/dataset.py", "src/dataset/lmdb_cache.py",
@@ -351,9 +350,8 @@ def _profile_metadata(path):
         cuda_version = None
         gpu_names = []
     return {
-        "profile_id": profile.get("profile_id"),
-        "profile_sha256": digest,
-        "profile": profile,
+        "config_sha256": digest,
+        "config": config,
         "pretrain_code_sha256": code_digest.hexdigest(),
         "pretrain_code_files": file_hashes,
         "torch_version": torch_version,
@@ -371,8 +369,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batches", type=int, default=500)
     parser.add_argument(
-        "--profile",
-        default="configs/mts/pretraining/canonical_ru_angle20_v1.json",
+        "--config",
+        default="",
     )
     parser.add_argument("--loader-workers", type=int, default=0)
     parser.add_argument("--prefetch-factor", type=int, default=2)
@@ -395,6 +393,14 @@ def main(argv=None):
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if not args.config:
+        raise SystemExit(
+            "No active MTS configuration; pass --config after defining the next schema."
+        )
+    config_path = ROOT / args.config
+    if not config_path.is_file():
+        raise SystemExit(f"MTS configuration does not exist: {config_path}")
+    os.environ["EXPERIMENT_CONFIG"] = str(config_path)
     if args.batches <= 0:
         raise SystemExit("--batches must be positive")
     gpu_ids = [value.strip() for value in args.gpu_ids.split(",") if value.strip()]
@@ -430,7 +436,7 @@ def main(argv=None):
                 "prefetch_factor": 2,
                 "workers": list(worker_sweep),
                 "selected": None,
-                "profile": str(args.profile),
+                "config": str(args.config),
             }
             output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
             print(json.dumps(payload, indent=2))
@@ -448,7 +454,7 @@ def main(argv=None):
                 for b, a in CANDIDATES
             ],
             "selected": None,
-            "profile": str(args.profile),
+            "config": str(args.config),
         }
         output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(payload, indent=2))
@@ -556,8 +562,8 @@ def main(argv=None):
         "target_global_batch": 1008,
         "physical_gpu_ids": args.gpu_ids,
         "shared_memory_bytes": int(shm_bytes),
-        "profile": str(args.profile),
-        "profile_metadata": _profile_metadata(args.profile),
+        "config": str(args.config),
+        "config_metadata": _config_metadata(args.config),
         "batches": int(args.batches),
         "warmup_batches": 50,
         "results": results,

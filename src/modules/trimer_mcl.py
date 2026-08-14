@@ -13,10 +13,7 @@ from src.dataset.mips_cache_validation import trimer_can_enter_mcl
 class _TrimerMCLLayer(nn.Module):
     """Central-RU cross-attention over full-Trimer tokens at two scales."""
 
-    def __init__(
-        self, dim=512, num_heads=8, dropout=0.10,
-        use_distance_bias=False, num_rbf=64, rbf_upper=8.0,
-    ):
+    def __init__(self, dim=512, num_heads=8, dropout=0.10):
         super().__init__()
         if int(dim) % int(num_heads):
             raise ValueError("MCL dimension must divide num_heads")
@@ -41,26 +38,6 @@ class _TrimerMCLLayer(nn.Module):
             nn.Linear(4 * self.dim, self.dim),
         )
         self.ffn_norm = nn.LayerNorm(self.dim)
-        self.use_distance_bias = bool(use_distance_bias)
-        # Register optional MCL-v2 tensors only for the explicit RBF mode.
-        # The legacy/current hard-mask path must remain exactly isomorphic to
-        # the completed joint checkpoint; unconditional registration would
-        # incorrectly report missing parameters during G0 transfer.
-        if self.use_distance_bias:
-            centers = torch.linspace(0.0, float(rbf_upper), int(num_rbf))
-            self.register_buffer("distance_centers", centers)
-            spacing = float(rbf_upper) / max(1, int(num_rbf) - 1)
-            self.distance_gamma = 0.5 / max(spacing * spacing, 1e-12)
-            self.distance_projection = nn.Linear(
-                int(num_rbf), self.num_heads, bias=False
-            )
-            # MCL-v2 is an exact functional no-op at construction time.  This
-            # is essential for transferring the immutable MTS-v2 checkpoint.
-            nn.init.zeros_(self.distance_projection.weight)
-        else:
-            self.distance_centers = None
-            self.distance_gamma = None
-            self.distance_projection = None
         self.debug_attention = os.environ.get("MIPS_DEBUG_ATTENTION", "0") == "1"
         self.last_attention = None
 
@@ -103,35 +80,11 @@ class _TrimerMCLLayer(nn.Module):
             state + self.residual_dropout(self.ffn(state))
         )
 
-    def _project_distance(self, distances):
-        if not self.use_distance_bias:
-            return distances.new_zeros((*distances.shape, self.num_heads))
-        flat = distances.float().reshape(-1)
-        outputs = []
-        # Avoid materialising [B,Q,K,64] for large 384-atom buckets.
-        for start in range(0, int(flat.numel()), 65536):
-            values = flat[start:start + 65536].unsqueeze(-1)
-            rbf = torch.exp(
-                -self.distance_gamma
-                * (values - self.distance_centers.float()) ** 2
-            )
-            outputs.append(self.distance_projection(
-                rbf.to(self.distance_projection.weight.dtype)
-            ).to(distances.dtype))
-        return torch.cat(outputs, dim=0).reshape(
-            *distances.shape, self.num_heads
-        )
-
     def forward_batched(
         self, central_state, memory, distances, thresholds,
-        key_mask=None, query_mask=None, precomputed_visible=None,
+        key_mask=None, query_mask=None,
     ):
-        """Padded batched MCL with exact masks for ragged Trimer records.
-
-        ``precomputed_visible`` (A4 random-mask mode) is an optional fixed
-        [B, Q, K] bool set that replaces the distance-threshold visibility so
-        the only difference vs A3 is the key identity, never the sparsity.
-        """
+        """Padded batched MCL with exact masks for ragged Trimer records."""
         query = self.query(central_state).view(
             central_state.size(0), central_state.size(1),
             self.num_heads, self.head_dim
@@ -152,27 +105,18 @@ class _TrimerMCLLayer(nn.Module):
                 central_state.shape[:2], dtype=torch.bool,
                 device=central_state.device,
             )
-        distance_bias = self._project_distance(distances)
         if self.debug_attention:
             self.last_attention = []
-        num_scales = (
-            2 if precomputed_visible is not None
-            else thresholds.size(1)
-        )
+        num_scales = thresholds.size(1)
         for scale_index in range(num_scales):
-            if precomputed_visible is not None:
-                visible = precomputed_visible[:, :, :, scale_index].bool()
-                visible = visible & key_mask.unsqueeze(1) & query_mask.unsqueeze(-1)
-            else:
-                visible = (
-                    distances <= thresholds[:, scale_index].view(-1, 1, 1)
-                ) & key_mask.unsqueeze(1) & query_mask.unsqueeze(-1)
+            visible = (
+                distances <= thresholds[:, scale_index].view(-1, 1, 1)
+            ) & key_mask.unsqueeze(1) & query_mask.unsqueeze(-1)
             # Padded query rows need one finite logit to keep softmax finite;
             # their output is zeroed immediately afterwards.
             if visible.size(-1):
                 visible[:, :, 0] |= ~query_mask
             logits = torch.einsum("bqhd,bkhd->bqkh", query, key) * self.scale
-            logits = logits + distance_bias
             logits = logits.float().masked_fill(
                 ~visible.unsqueeze(-1), float("-inf")
             )
@@ -210,31 +154,18 @@ class TrimerSCAGEMCLResidual(nn.Module):
         num_heads: int = 8,
         percentiles=(0.20, 0.50),
         dropout: float = 0.10,
-        use_distance_bias: bool = False,
-        coordinate_shuffle: bool = False,
-        mask_mode: str = "real",
     ):
         super().__init__()
         if tuple(float(value) for value in percentiles) != (0.20, 0.50):
             raise ValueError("MIPS-Trimer-SCAGE requires percentiles 0.20/0.50")
-        if mask_mode not in ("real", "count_matched_random"):
-            raise ValueError(
-                f"unsupported MCL mask mode: {mask_mode!r}"
-            )
         self.dim = int(dim)
         self.percentiles = (0.20, 0.50)
-        self.mask_mode = str(mask_mode)
         self.input_norm = nn.LayerNorm(self.dim)
         self.layers = nn.ModuleList(
             _TrimerMCLLayer(
                 dim, num_heads, dropout,
-                use_distance_bias=use_distance_bias,
-                num_rbf=64,
-                rbf_upper=8.0,
             ) for _ in range(2)
         )
-        self.use_distance_bias = bool(use_distance_bias)
-        self.coordinate_shuffle = bool(coordinate_shuffle)
         self.geometry_gate = nn.Parameter(torch.zeros(self.dim))
         self.debug_attention = os.environ.get("MIPS_DEBUG_ATTENTION", "0") == "1"
         self.last_thresholds = [] if self.debug_attention else None
@@ -253,19 +184,6 @@ class TrimerSCAGEMCLResidual(nn.Module):
         )
         thresholds_all = data.trimer_mcl_thresholds.float()
         valid = valid.clone()
-        if self.mask_mode == "count_matched_random":
-            random_valid = getattr(data, "mcl_random_mask_valid", None)
-            if random_valid is None:
-                raise ValueError(
-                    "count_matched_random MCL requires mcl_random_mask_valid"
-                )
-            random_valid = torch.as_tensor(
-                random_valid, dtype=torch.bool, device=valid.device
-            ).flatten()
-            if random_valid.numel() != valid.numel():
-                raise ValueError("random-mask validity length mismatch")
-            valid &= random_valid
-
         for key_capacity in (24, 48, 96, 192, 384):
             graph_ids = torch.nonzero(
                 valid & (bucket_sizes == key_capacity), as_tuple=False
@@ -288,71 +206,13 @@ class TrimerSCAGEMCLResidual(nn.Module):
             memory = tokens[safe_keys]
             central_state = tokens[safe_queries]
             memory_positions = data.trimer_pos[safe_keys].float()
-            if self.coordinate_shuffle:
-                counts = key_mask.sum(dim=1, keepdim=True)
-                local = torch.arange(
-                    key_capacity, device=memory_positions.device
-                ).view(1, -1)
-                reverse = (counts - 1 - local).clamp_min(0)
-                memory_positions = memory_positions.gather(
-                    1, reverse.unsqueeze(-1).expand(-1, -1, 3)
-                )
-                central_positions = memory_positions.gather(
-                    1,
-                    safe_query_local.unsqueeze(-1).expand(-1, -1, 3),
-                )
-            else:
-                central_positions = data.trimer_pos[safe_queries].float()
+            central_positions = data.trimer_pos[safe_queries].float()
             distances = torch.cdist(central_positions, memory_positions)
             thresholds = thresholds_all[graph_ids]
             threshold_valid = torch.isfinite(thresholds).all(dim=1)
             invalid_graphs = graph_ids[~threshold_valid]
             valid[invalid_graphs] = False
             query_mask = query_mask & threshold_valid.unsqueeze(1)
-
-            precomputed_visible = None
-            if self.mask_mode == "count_matched_random":
-                # A4: replace distance-threshold visibility with the fixed
-                # count-matched random sets from the sidecar (Plan §4).  Same
-                # per-query sparsity as A3, different key identity.
-                if not hasattr(data, "mcl_random_visible20") or not hasattr(
-                    data, "mcl_random_visible50"
-                ):
-                    raise ValueError("random-mask visible tables are missing")
-                trimer_start = data.mcl_trimer_start[graph_ids]
-                query_start = data.mcl_query_start[graph_ids]
-                # The sidecar rows are ordered by the central-query column
-                # (0..Q-1), whereas ``safe_query_local`` is the Trimer atom
-                # position used to replace the central token in ``memory``.
-                # Mixing those two coordinate systems sends padded MCL
-                # batches to arbitrary/out-of-range sidecar rows.  Index the
-                # sidecar with the query column and clamp only padded columns
-                # to a harmless real row; ``query_mask`` below prevents them
-                # from contributing to the update.
-                query_columns = torch.arange(
-                    query_capacity, device=query_start.device
-                ).view(1, -1).expand(graph_ids.numel(), -1)
-                q_global = query_start.unsqueeze(1) + query_columns
-                sidecar_rows = int(data.mcl_random_visible20.size(0))
-                if sidecar_rows <= 0:
-                    raise ValueError("A4 random sidecar has no query rows")
-                q_global = q_global.clamp(0, sidecar_rows - 1)
-                vis20 = data.mcl_random_visible20[q_global]
-                vis50 = data.mcl_random_visible50[q_global]
-                keys_local = keys.unsqueeze(1) - trimer_start[:, None, None]
-                valid_key = (keys_local >= 0) & (keys_local < 384)
-                kl = keys_local.clamp(0, 383).expand(
-                    -1, q_global.size(1), -1
-                )
-                v20 = (
-                    vis20.gather(-1, kl)
-                    & valid_key & key_mask.unsqueeze(1)
-                )
-                v50 = (
-                    vis50.gather(-1, kl)
-                    & valid_key & key_mask.unsqueeze(1)
-                )
-                precomputed_visible = torch.stack([v20, v50], dim=-1)
 
             for layer in self.layers:
                 memory_current = memory.clone()
@@ -369,7 +229,6 @@ class TrimerSCAGEMCLResidual(nn.Module):
                     thresholds,
                     key_mask=key_mask,
                     query_mask=query_mask,
-                    precomputed_visible=precomputed_visible,
                 )
 
             final_memory = memory.clone()
@@ -530,11 +389,6 @@ class TrimerSCAGEMCLResidual(nn.Module):
                 topology_nodes, data, canonical, tokens,
                 final_trimer_states, delta_canonical, valid,
             )
-        if self.mask_mode == "count_matched_random":
-            raise ValueError(
-                "count_matched_random MCL requires the padded production collator"
-            )
-
         # Validate records once, then group equal (Trimer atom count, central
         # atom count) records so their two-scale MCL can run as one padded
         # batched attention operation.  Invalid records remain exact O8

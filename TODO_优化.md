@@ -1,13 +1,16 @@
+> 状态说明：本文的 R2/T1/G-family 数值和建议均为历史审查材料。R2 已由 R6 退役，
+> 不得继续运行、profiling、补齐 milestone 或派生新实验；未来实验必须等待新的活动配置。
+
 结论：当前项目最大的优化空间已经不在 DataLoader，而在“预训练目标是否真正迫使模型学习 3D”以及“3D 信息如何进入消息更新”。继续增加 workers、单独修改 Attention scale，优先级都较低。
 
 ## 当前审查结论
 
 | 优先级 | 优化方向 | 当前问题 | 建议 |
 |---|---|---|---|
-| P0 | 实验状态与源码身份 | R2 未完成正式 20k/8×5，工作树存在大量未提交修改 | 先明确 R2 是继续还是归档，并冻结源码身份 |
+| P0 | 实验状态与源码身份 | R2 未完成正式 20k/8×5，工作树存在大量未提交修改 | 历史归档；不得恢复 R2，等待未来新配置 |
 | P1 | 预训练目标 | `masked_atom_only` 很快饱和，3D 只得到间接梯度 | 增加与 Trimer 几何直接相关的去噪/重建目标 |
 | P1 | 3D 注入方式 | 主要作为标量 Attention bias，没有方向和几何消息 | 增加 shift-conditioned 几何消息或等变向量头 |
-| P2 | 前向性能 | 约 79% 时间在 forward，存在 CUDA 同步和稀疏算子开销 | profiler 后消除热路径同步、优化 MSTA/Star-RBF |
+| P2 | 前向性能 | 约 79% 时间在 forward，存在 CUDA 同步和稀疏算子开销 | 历史 profiler 建议；R6.5 不执行 |
 | P2 | 构象表达 | 每个聚合物只保留一个最低能 Trimer 构象 | 后续加入小规模构象系综和可信度门控 |
 | P3 | 下游质量 | XC、EI、EEA 仍是主要短板 | 多任务学习和图/SMILES融合比继续微调 workers 更有价值 |
 | P3 | 工程维护 | 超大训练脚本、sidecar 启动审计重复、文档身份较复杂 | 当前实验结束后再模块化整理 |
@@ -22,7 +25,7 @@ R2 的实际配置是：
 - Star-RBF v2 + G1 path-cosine
 - 不使用 full-Trimer MCL
 
-证据见 [R2 配置](/root/workspace/Uni-Poly-Plus-master/configs/mts/experiments/R2_g1_periodic_relation_rbf_v2_legacy_backbone_formal_v1.json:44)。
+该 R2 配置已在 R6 退役清理；这里仅保留历史审查结论，不再指向活动配置。
 
 这个任务很快饱和：
 
@@ -31,7 +34,7 @@ R2 的实际配置是：
 - step 3,000：约 `99.3%`
 - step 6,000：约 `99.5%`
 
-见 [R2 预训练日志](/root/workspace/Uni-Poly-Plus-master/logs/mts_star_rbf_v2/legacy_backbone_formal_v1/R2/formal20k_v3/mts_joint_pretraining_pi1m_v2.log:107)。
+原 R2 预训练日志属于本周期授权清理的历史实验产物，R6 后不再保留活动路径。
 
 这说明后续大量训练主要是在继续压低一个已经接近解决的分类损失。模型并没有被直接要求理解：
 
@@ -82,7 +85,7 @@ Star-RBF v2 已经比旧版本合理：它在 unique periodic pairs 上编码真
 - G2−G1 宏平均 `-0.002992`
 - 只有 `3/8` 个任务为正
 
-见 [G1/G2 正式报告](/root/workspace/Uni-Poly-Plus-master/results/mts_multiscale_topology/g_family_matched_v1/G1_vs_G2/final_report.md:21)。
+原 G1/G2 正式报告属于本周期授权清理的历史实验产物，R6 后不再保留活动路径。
 
 这不能证明“3D 距离无效”，更准确的结论是：仅把单一距离加进 Attention bias 不足以形成有效几何表征。
 
@@ -127,14 +130,15 @@ workers 6 仍然最快。其单步阶段时间中：
 - data wait：约 `0.37 ms`
 - rank wait：约 `0.011%`
 
-见 [workers=6 benchmark](/root/workspace/Uni-Poly-Plus-master/logs/mts_speed_optimization/r2_worker_sweep_20260813/w6/launcher.log:21)。
+原 workers=6 benchmark 属于本周期授权清理的 R2 历史产物；该段结论仅作为历史审查记录保留。
 
 因此：
 
 - 保持 `workers=6, prefetch=2`；
 - 不再测试更高 workers；
 - 不要增加 activation checkpointing，显存还有大量余量，而且会变慢；
-- 应用 `torch.profiler` 定位 `scatter/softmax/RBF/repeat_interleave` 的真实占比。
+- 历史上建议应用 `torch.profiler` 定位 `scatter/softmax/RBF/repeat_interleave` 的真实
+  占比；R6.5 不执行该 profiler，未来须等待活动配置后重新授权。
 
 代码层可优先检查两个同步热点：
 
@@ -142,7 +146,8 @@ workers 6 仍然最快。其单步阶段时间中：
 - MSTA 每次 forward 执行 `target.max().item()` 和 GPU `any()`：[mips_local_graph.py](/root/workspace/Uni-Poly-Plus-master/src/modules/mips_local_graph.py:427)
 - Star-RBF v2 forward 中的 `min/max/any` 严格检查也会触发同步：[mips_local_graph.py](/root/workspace/Uni-Poly-Plus-master/src/modules/mips_local_graph.py:183)
 
-建议把不变量检查前移到 collate/首批验证，正式热路径只保留必要检查；指标使用 GPU 累加器，到日志间隔再同步。是否真正提速必须用同一 benchmark 复测。
+历史上曾建议把不变量检查前移到 collate/首批验证，正式热路径只保留必要检查；该
+profiler/benchmark 建议不属于 R6.5 执行范围，是否提速须等待未来活动配置后重新验证。
 
 ## 6. Sidecar 启动和存储也可以优化
 
@@ -165,7 +170,7 @@ workers 6 仍然最快。其单步阶段时间中：
 
 ## 7. 下游质量优化应优先覆盖 XC
 
-当前 T1 的宏平均约 `0.840`，而 XC 约 `0.425`，与项目记录的 `0.579` 相差约 `0.154`。EI、EEA 也还有明显差距。报告见 [T1 下游结果](/root/workspace/Uni-Poly-Plus-master/results/mts_multiscale_topology/t0_t1_formal_v1/T1_msta/final_report.md:1) 和 [best_result.csv](/root/workspace/Uni-Poly-Plus-master/results/best_result.csv:1)。
+当前 T1 的宏平均约 `0.840`，而 XC 约 `0.425`，与项目记录的 `0.579` 相差约 `0.154`。EI、EEA 也还有明显差距。原 T1 下游报告属于本周期授权清理的历史实验产物；保留的汇总表仍见 [best_result.csv](/root/workspace/Uni-Poly-Plus-master/results/best_result.csv:1)。
 
 因此建议在几何预训练之后开展：
 
@@ -177,15 +182,11 @@ workers 6 仍然最快。其单步阶段时间中：
 
 微调速度本身已经较成熟：4 GPU 单卡 slots、workers 2、eval batch 64、FP32；BF16 只有 `1.019x`，暂时没有继续优化价值。
 
-## 建议的实际顺序
+## 历史研究顺序（不执行）
 
-1. 先更新实验状态：当前 handoff 仍是 `ready_for_claude`，但正式训练已经停止；另一个对话可能误启动 R2。
-2. 保存当前源码 hash/diff 快照，避免再次出现无法复原实验代码的问题。
-3. 对现有 R2 做 20-step profiler，只优化 forward 热点。
-4. 决定是完整跑完 R2，还是把它归档为未完成实验；不要在未完成 R2 上叠加新目标。
-5. 新建 matched 预训练目标实验：`R2 masked-atom-only` 对比 `R2 + invariant geometry denoising`。
-6. 先用 2k/5k/10k milestones 做明确标记的 screening，再决定是否执行正式 20k。
-7. 若几何去噪有效，再加入 shift-conditioned message gate；最后才考虑等变坐标头和多构象。
-8. 之后单独开展多任务/多模态微调，重点改善 XC、EI、EEA。
+以下顺序只记录当时的研究思路，不是当前任务清单：曾考虑 profiler、R2 milestone、
+R2 masked-atom-only 对照和几何去噪路线，但 R2 已在 R6 退役，不能继续、恢复、
+profiling、补齐 20k/8×5，不能据此新建 matched 实验。新的预训练目标、配置和运行
+顺序必须在未来独立配置周期中重新审查。
 
-本轮是只读静态审查和已有实验证据核对；没有修改文件、运行测试或启动训练。
+本文件保留历史审查与已有数值，不构成当前生产训练或性能结论。

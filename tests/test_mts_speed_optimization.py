@@ -1,5 +1,3 @@
-import json
-import os
 import subprocess
 import sys
 import runpy
@@ -16,7 +14,6 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.pretrain import validate_mts_pretrain_execution
 from scripts.benchmark_mts_pretrain import (
     _passes_gate as pretrain_candidate_passes,
     _parse_worker_sweep,
@@ -61,35 +58,15 @@ class _IdentityScaler:
         return np.asarray(values)
 
 
-def test_three_rank_global_batch_decompositions_and_world_size_gate():
-    profile = {"world_size": 3, "global_batch": 1008}
-    assert validate_mts_pretrain_execution(profile, 168, 2, 3) == 1008
-    assert validate_mts_pretrain_execution(profile, 336, 1, 3) == 1008
-    with pytest.raises(ValueError, match="world-size mismatch"):
-        validate_mts_pretrain_execution(profile, 126, 2, 4)
-    with pytest.raises(ValueError, match="got 504"):
-        validate_mts_pretrain_execution(profile, 84, 2, 3)
-
-
-def test_launcher_uses_accepted_pretrain_defaults_without_changing_finetune():
+def test_launcher_is_explicitly_fail_closed_without_configuration():
     text = (ROOT / "scripts/run_mips_trimer_scage.sh").read_text(
         encoding="utf-8"
     )
-    assert "PRETRAIN_BATCH_SIZE=${PRETRAIN_BATCH_SIZE:-336}" in text
-    assert "PRETRAIN_ACCUMULATION=${PRETRAIN_ACCUMULATION:-1}" in text
-    assert (
-        "PRETRAIN_LOADER_WORKERS=${PRETRAIN_DATALOADER_WORKERS:-"
-        "${DATALOADER_WORKERS:-6}}" in text
-    )
-    assert (
-        "FINETUNE_LOADER_WORKERS=${FINETUNE_DATALOADER_WORKERS:-"
-        "${DATALOADER_WORKERS:-2}}" in text
-    )
-    assert '--loader_workers "$PRETRAIN_LOADER_WORKERS"' in text
-    assert '--loader_workers "$FINETUNE_LOADER_WORKERS"' in text
+    assert "EXPERIMENT_CONFIG" in text
+    assert "resolve_mips_trimer_scage.py" in text
 
 
-def test_pretrain_benchmark_dry_run_is_bound_to_physical_gpus_123(tmp_path):
+def test_pretrain_benchmark_requires_new_configuration(tmp_path):
     output = tmp_path / "benchmark.json"
     completed = subprocess.run(
         [
@@ -107,15 +84,9 @@ def test_pretrain_benchmark_dry_run_is_bound_to_physical_gpus_123(tmp_path):
         stderr=subprocess.STDOUT,
         check=False,
     )
-    assert completed.returncode == 0, completed.stdout
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["schema"] == "mts-pretrain-benchmark-v2"
-    assert payload["physical_gpu_ids"] == "1,2,3"
-    assert payload["world_size"] == 3
-    assert payload["target_global_batch"] == 1008
-    assert payload["warmup_batches"] == 50
-    assert payload["measurement_batches"] == 500
-    assert {item["global_batch_size"] for item in payload["candidates"]} == {1008}
+    assert completed.returncode != 0, completed.stdout
+    assert "No active MTS configuration" in completed.stdout
+    assert not output.exists()
 
 
 def test_worker_sweep_parser_rejects_negative_and_duplicate_values():
@@ -126,7 +97,7 @@ def test_worker_sweep_parser_rejects_negative_and_duplicate_values():
         _parse_worker_sweep("4,6,4")
 
 
-def test_worker_sweep_dry_run_is_fixed_to_batch_336(tmp_path):
+def test_worker_sweep_requires_new_configuration(tmp_path):
     output = tmp_path / "worker_sweep.json"
     completed = subprocess.run(
         [
@@ -144,15 +115,9 @@ def test_worker_sweep_dry_run_is_fixed_to_batch_336(tmp_path):
         stderr=subprocess.STDOUT,
         check=False,
     )
-    assert completed.returncode == 0, completed.stdout
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["schema"] == "mts-pretrain-worker-sweep-v1"
-    assert payload["workers"] == [4, 6, 8]
-    assert payload["batch_size_per_rank"] == 336
-    assert payload["gradient_accumulation_steps"] == 1
-    assert payload["global_batch_size"] == 1008
-    assert payload["prefetch_factor"] == 2
-    assert payload["measurement_batches"] == 500
+    assert completed.returncode != 0, completed.stdout
+    assert "No active MTS configuration" in completed.stdout
+    assert not output.exists()
 
 
 def test_pretrain_candidate_gate_requires_finite_memory_wait_and_shm():
@@ -221,12 +186,11 @@ def test_eval_batch_size_and_epoch_sync_do_not_change_fp32_predictions(monkeypat
     )
 
 
-def test_finetune_identity_payload_includes_precision_and_eval_batch():
-    text = (ROOT / "scripts" / "run_mips_trimer_scage.sh").read_text(
-        encoding="utf-8"
-    )
-    assert '"eval_batch_size":$FINETUNE_EVAL_BATCH_SIZE' in text
-    assert '"amp_dtype":"$FINETUNE_AMP_DTYPE"' in text
+def test_finetune_payload_includes_precision_and_eval_batch_without_hash_identity():
+    train_text = (ROOT / "scripts" / "train.py").read_text(encoding="utf-8")
+    assert "'eval_batch_size': int(args.eval_batch_size)" in train_text
+    assert "'amp_dtype': args.amp_dtype" in train_text
+    assert "prediction_sha256" not in train_text
 
 
 def test_mts_collate_fields_and_sample_order_match_with_two_workers():
@@ -319,28 +283,3 @@ def test_eval_batch_selector_chooses_fastest_safe_batch_not_largest():
     assert selected == 64
     assert evidence["candidate_totals"]["256"] > evidence["candidate_totals"]["64"]
     assert evidence["tie_policy"].startswith("none")
-
-
-@pytest.mark.parametrize(
-    ("variable", "value", "message"),
-    [
-        ("MTS_PRETRAIN_GPU_IDS", "0,1,2", "fixed to physical GPUs 1,2,3"),
-        ("MTS_PRETRAIN_GPU_IDS", "1,1,3", "duplicate GPU ids"),
-        ("MTS_FINETUNE_GPU_IDS", "0,1,2", "requires exactly 4 GPUs"),
-        ("MTS_FINETUNE_GPU_IDS", "0,1,x,3", "comma-separated GPU list"),
-    ],
-)
-def test_launcher_rejects_invalid_or_wrong_gpu_policy(variable, value, message):
-    environment = os.environ.copy()
-    environment.update({"VALIDATE_ONLY": "1", variable: value})
-    completed = subprocess.run(
-        ["bash", "scripts/run_mts.sh"],
-        cwd=ROOT,
-        env=environment,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    assert completed.returncode == 2
-    assert message in completed.stdout

@@ -21,7 +21,7 @@ MolGT 最有价值的地方，是同时使用 node-level、graph-level、2D、3D
 
 ## 最值得借鉴：3D 去噪
 
-当前 R2 预训练是 `masked_atom_only`，angle loss 为 0，见 [R2 配置](/root/workspace/Uni-Poly-Plus-master/configs/mts/experiments/R2_g1_periodic_relation_rbf_v2_legacy_backbone_formal_v1.json:44)。原子分类约在 3,000 step 就达到 `99.3%`，说明任务很快饱和。
+历史 R2 预训练是 `masked_atom_only`，angle loss 为 0；其配置已在 R6 退役清理。原子分类约在 3,000 step 就达到 `99.3%`，说明任务很快饱和。
 
 MolGT 的关键启示是：
 
@@ -168,12 +168,16 @@ KGPC 使用 fingerprint 聚类作为图级伪标签。它可能改善小数据�
 
 因此应借鉴公式和实验拆分，不建议把官方模块整体复制进当前代码。
 
-## 推荐的实验顺序
+## 历史研究草案（不执行）
+
+下面的 M0–M5 仅保留为历史研究讨论。R2 已由 R6 退役，不是当前 baseline、配置或
+可运行入口；不得继续 R2、恢复 R2、执行 milestone 或按此顺序启动新实验。未来新
+预训练路线必须等待新的活动配置并重新审查。
 
 不建议一次加入 MolGT 全套任务。最干净的因果拆分是：
 
 ```text
-M0：当前 R2
+M0：历史 R2（已退役，不得执行）
     masked atom only
     Star-RBF v2
 

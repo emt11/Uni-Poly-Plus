@@ -1,671 +1,875 @@
-# Uni-Poly-Plus 工程维护执行计划
+# R6：旧 MTS 配置与 T/G/R/A 实验体系彻底退役计划
 
-> 状态：计划已冻结，可直接进入实施；不再增加 Identity、Manifest、Contract、Gate、Registry、BaseTrainer 或统一 Trainer。
->
-> 核心原则：**删掉重复防御逻辑，只保留会直接影响正确运行的检查；用最小重构和真实运行验证替代复杂工程机制。**
-
-## 0. 当前仓库事实与实施起点
-
-本计划以 `/root/workspace/Uni-Poly-Plus-master` 当前工作树为唯一依据。实施前已确认的真实情况如下：
-
-- `scripts/pretrain.py` 同时承担参数解析、数据集构造、DDP、采样器、全部预训练 objective、训练循环、resume、milestone、final checkpoint 和 completion marker。
-- `scripts/train.py` 同时承担参数解析、数据集/折划分、checkpoint 迁移、单折训练、预测与 shard 写入；epoch 级训练函数主要位于 `src/utils.py`。
-- 8×5 展开、四 GPU slot、LPT、失败停止派发及 shard 跳过目前实际写在 `scripts/run_mips_trimer_scage.sh` 的 Bash 函数中，而不在 `scripts/train.py`。
-- launcher 当前调用 `scripts/resolve_mips_trimer_scage.py --shell`，但随后只是把原 experiment JSON 复制为 `results/.../configs/resolved_input.json`；它并不是实际 resolved 参数。
-- launcher 的 `PRETRAIN_CHECKPOINT_INTERVAL_STEPS` 当前默认是 `0`，而直接运行 `scripts/pretrain.py` 时 `--checkpoint_interval_steps` 默认是 `250`；两者不一致。
-- `scripts/pretrain.py::save_train_state()` 已通过 `_atomic_torch_save()` 使用临时文件和 `os.replace()`；但 formal profile 还会每 2000 optimizer steps调用 `save_categorical_milestone()` 生成 `step_XXXXX.pth`。
-- final checkpoint 当前是 `state_dict + 大量 meta`，completion marker 当前复制 checkpoint/profile/code hash 等信息。
-- `src/dataset/mts_star_rbf_v2.py::StarRBFV2Sidecar` 启动时会重算 metadata/hash、扫描每个 NPY SHA，并对整列数组执行 `all/any/min/max`。
-- `src/dataset/dataset.py::_init_relation_geometry_sidecar()`、`RelationGeometrySidecar` 和 `RelationGeometryPermutation` 仍按 artifact/cohort/source hash 绑定；`mips_trimer_collate()` 还把这些身份字符串带进 batch。
-- `scripts/run_mips_trimer_scage.sh::validate_shard()` 会重算 checkpoint、cache、prediction 和 split SHA；多个 watcher 在 completion marker 后还会调用独立 audit。
-
-用户已明确放弃当前 R2 实验。因此实施无需等待 R2 final，也不得尝试从 R2 milestone 恢复或续训。第一项执行动作是确认并停止所有仍指向 R2 输出路径的训练、watcher 和下游触发进程；现有 R2 checkpoint、`.last.pt`、milestone、日志和结果均保持原状，不在本维护周期删除。任何历史产物清理必须另行授权。
-
-## 1. 固定范围与不变量
-
-### 1.1 科学语义完全冻结
-
-本周期不得改变：
-
-- 3D 构象数量及 Trimer 构象生成规则；
-- Star-RBF v2 的 relation/pair 几何、RBF upper、projection 和无效回退；
-- MSTA 层、local/context SPD、Attention 方向及缩放；
-- Backbone annotation；
-- 模型结构、hidden size、层数、head 数、norm、激活和 readout；
-- PI1M_v2/downstream 数据定义、sample 顺序、fold 定义和任务集合；
-- masked-atom/angle 等训练目标、loss 权重和科学超参数；
-- 现有冻结 cache、cohort、relation-geometry sidecar 和 Star-RBF v2 sidecar 内容。
-
-工程重构不得以重建 cache/sidecar 的方式绕过兼容问题，也不得运行正式 20k 预训练或完整 8×5 微调来证明重构正确。
-
-### 1.2 允许修改的工程范围
-
-- 删除活动训练/恢复/调度/监控路径中的 integrity、identity、compatibility hash 计算与比对；
-- 简化 checkpoint、completion marker 和 watcher 生命周期；
-- 把 sidecar 启动检查从全量审计降为轻量结构检查；
-- 按职责渐进提取 Pretrain/Finetune 模块；
-- 简化 resolver、launcher、结果 metadata 和相关文档；
-- 添加直接数值和短运行测试。
-
-### 1.3 明确不做
-
-- 不新增四类 Identity、`run_manifest.json`、audit receipt 或持久 baseline；
-- 不新增统一 Trainer、BaseTrainer、Registry、插件式 objective 框架；
-- 不迁移、不重写历史 checkpoint/metadata；旧 hash 字段由新代码忽略；
-- 不重命名历史 hash 目录；目录名只作为现有路径片段使用；
-- 不删除与本计划无关的原子写、只读打开、shape/dtype、索引边界、finite、进程清理或防覆盖措施；
-- 不修改当前 R2 产物；只停止仍在运行的 R2 writer/watcher。
-
-## 2. 哈希分类：删除检测链，保留算法行为
-
-### 2.1 必须删除的哈希
-
-活动生产路径不再生成、传递或比较以下身份字段：
-
-- `checkpoint_sha256`、`pretrain_code_sha256`、dirty diff/code tree SHA；
-- `config_hash`、`resolved_config_hash`、`training_config_hash`、`finetune_config_hash`、`finetune_profile_hash`；
-- `feature_config_hash`、`graph_model_config_hash`、`geometry_model_config_hash`、`source_geometry_model_config_hash` 作为运行兼容判定；
-- cache bundle、Topology、Trimer、angle、relation geometry、Star-RBF v2、G3 permutation 的 `artifact_hash` 启动比对；
-- `.done/.frozen` 内容与 metadata/artifact hash 的交叉绑定；
-- NPY、LMDB/feature shard、CSV、prediction、result shard 的全文件 SHA；
-- checkpoint/source/target/final cache contract 的 digest 与逐字段身份检查；
-- launcher、scheduler、watcher、monitor、doctor 和 summarizer 中为上述字段服务的参数和审计。
-
-历史 JSON/CSV/checkpoint 中已有字段不迁移、不改写。读取旧产物时允许字段存在，但不得据此拒绝加载。
-
-### 2.2 必须保留的算法性哈希
-
-以下哈希会直接决定数据或算法行为，不属于本轮删除范围：
-
-- `src/dataset/lmdb_cache.py::sample_key_from_smiles()` 与 `sample_key_from_normalized()`：内容寻址和 LMDB key；
-- cohort 的 sample-key/row-key 顺序及其现有 hash 目录定位：不能改变 key 映射和数据顺序；
-- `scripts/pretrain.py::_graph_periodic_aug_loss()` 内由 seed/epoch/SMILES 决定选择的 hash；
-- `src/dataset/dataset.py` 写入 `mts_sample_hash64` 的确定性样本标识；
-- `scripts/train.py` nested5 内层验证集的 sample-key SHA 排序；
-- `src/dataset/mts_star_rbf_v2.py::_signature()` 生成的 path-signature bytes；它只属于既有 QC 数据语义，不进入 forward；
-- deterministic sampling、partition、排序、随机 mask 或 key 映射中实际参与选择的哈希；
-- `LmdbFeatureStore.replace_raw_verified()` 的 compare-and-replace 检查：这是显式数据修复写操作的并发保护，不在训练读取热路径，且不得因本计划移除。
-
-`sample_order_hash` 和 `split_manifest_hash` 要拆开处理：固定 fold 仍必须按 CSV 行顺序和显式 indices 使用；运行时不再计算/比较整份 manifest SHA，但必须检查 schema、sample count、5 个 fold、索引范围、重复/遗漏以及当前 CSV 行数。nested5 的 hash 排序算法保持不变。
-
-## 3. Checkpoint、Milestone 与完成标记
-
-### 3.1 停止生成周期 milestone
-
-修改 `scripts/pretrain.py`：
-
-- 删除 `save_categorical_milestone()`；
-- 删除 formal profile 每 2000 step 调用该函数的分支；
-- 删除仅为该 milestone 构造的 profile/code/resume metadata；
-- cosine-angle 分支若仍会写 `*.step_XXXXX.pth`，也改为只保留内存中的 best state 或显式诊断 JSON，不再写周期模型 checkpoint；不得改变其 objective 计算。
-
-修改 `scripts/run_mips_trimer_scage.sh` 和相关配置说明，使生产预训练不再暗含 milestone 产物。
-
-`scripts/finalize_mts_g_pretrain_milestone.py` 及 `tests/test_mts_g_family_finalization_recovery.py` 当前只服务于历史 milestone 恢复。实施时先用 `rg` 确认它们不再被活动 launcher/watcher 引用，然后：
-
-- 从生产调用链和文档中移除；
-- 脚本可作为历史只读恢复工具暂存，不要求本周期删除；
-- 不再为它增加新功能或继续维护成正式 finalization 路径。
-
-现有 R2 milestone 因实验已放弃而不再具有恢复职责，但本周期仍不删除它们。
-
-### 3.2 `.last.pt` 是唯一 resume 状态
-
-统一两个入口的默认值：
-
-- `scripts/run_mips_trimer_scage.sh`：`PRETRAIN_CHECKPOINT_INTERVAL_STEPS=2000`；
-- `scripts/pretrain.py::parse_arguments()`：`--checkpoint_interval_steps=2000`。
-
-保留 `scripts/pretrain.py::save_train_state()` 的 rank-state gather 和 `_atomic_torch_save()`，将其提取到 `src/training/common/checkpoint.py` 后仍保持：
+## 状态
 
 ```text
-每 2000 optimizer steps
-→ 收集完整 resume state
-→ 写同目录临时文件
-→ os.replace 原子覆盖 <final>.last.pt
-→ DDP 同步
-→ 恢复 checkpoint 操作前各 rank RNG/loader generator 状态
-→ 继续训练
+completed
 ```
 
-磁盘始终只有一个 `.last.pt`，不产生时间戳副本或历史版本。保存失败时旧文件仍可用，最多回退 2000 optimizer steps。
+R6.1–R6.4 的旧配置、旧实验编排和授权产物清理已经完成；2026-08-14 独立审查发现
+的 T 专用 MSTA diagnostics、过期 R2 执行指令及少量稳定文档措辞已由第 12 节 R6.5
+收尾修复并通过定向验证。当前 R6.1–R6.5 全部完成，生产仍按计划保持 fail-closed，
+等待未来新配置周期。
 
-`.last.pt` 只保存恢复运行真正需要的内容：
+本周期退役当前旧配置体系，并删除 T、G、R、A 四组历史实验在活动源码中的全部实验
+逻辑，不设计下一版配置。这里的“全部”不只指 JSON、launcher 和报告脚本，还包括
+训练参数、arm dispatch、专用初始化、Dataset/collate 字段、模型分支、negative control、
+artifact reader 和实验 metadata。用户后续会单独制定新配置；在新配置和新 resolver
+完成前，MTS 生产入口必须明确拒绝启动，不能通过 CLI 默认值或历史配置悄悄恢复旧
+行为。
 
-- `train_module`/模型参数和当前存在的 auxiliary modules；
-- optimizer、scheduler；
-- AMP scaler（仅在运行实际创建 scaler 时保存；当前 BF16 autocast 没有 scaler，不伪造空 scaler）；
-- epoch、next micro-batch index、global/micro step、optimizer step；
-- 每 rank RNG、DataLoader generator 和 sampler position；
-- 解析该 payload 所需的最小 layout version，以及恢复 DDP position 所必需的 world size/rank state 数量。
+## 1. 结论与边界
 
-删除 `.last.pt` 中的 `resume_contract` 及 profile/code/config/cache/sidecar/hash identity。恢复时只执行：
+### 1.1 已确定的处理方式
 
-1. `torch.load(..., weights_only=False)`；
-2. 必需 key、基本类型和 rank-state 数量检查；
-3. 模型/aux `load_state_dict(..., strict=True)`；
-4. optimizer/scheduler/scaler state 加载；
-5. step、RNG、loader generator、sampler position 恢复。
+- 不再等待、恢复或完成 R2。R2 的旧配置随全部旧配置一起删除。
+- 删除 `configs/mts/` 当前全部 34 个 JSON 配置，不保留旧 schema、旧 profile、旧
+  experiment descriptor 或兼容解析分支。
+- 删除 T0/T1 matched-pretrain、G0–G4/G-family、R2 和 A0–A4 的活动实验逻辑，不保留
+  arm 别名、旧 CLI 参数、环境变量、metadata 字段或隐藏 fallback。
+- 不为旧配置编写迁移器、别名、fallback、translation layer 或 archived-config loader。
+- 不在本周期猜测下一版字段、默认值、schema 名称或目录布局。
+- 新配置出现前，正式 launcher 处于 fail-closed 状态；失败必须发生在 GPU、worker、
+  Dataset、cache audit 和输出目录创建之前。
 
-保留 world-size 与 sampler position 检查，因为它们直接决定 resume 是否能从正确位置继续；它们不是身份哈希。
+### 1.2 必须保留
 
-watcher 和 Finetune 永远不得读取 `.last.pt`。
+- 已按本轮明确授权删除经逐项核对、能够唯一归属于 T/G/R/A（含 R2、A0–A4）的
+  checkpoint、results、logs、sidecar、prediction、shard 和空目录；精确清单见第 11.1
+  节。不得恢复、重新生成或重新标记这些已退役产物。
+- 共享原始数据、通用 cache、保留机制所需 sidecar、维护验证产物及其他非 T/G/R/A
+  实验文件继续保留。剩余历史 metadata 中的旧 config/hash/profile 字段不迁移、不重写，
+  仅作为历史记录存在。
+- 保留 Star-RBF v2、MSTA、Attention、Backbone、非实验主干模型结构、数据定义、
+  训练目标和当前通用科学实现；本周期不增加 3D 构象、不重建 cache/sidecar。保留的
+  是不带实验 arm 身份的机制本身，不保留 T/G/R/A 的选择、配对或比较逻辑。
+- MSTA 层和 `topology_attention_variant` 作为通用模型能力保留，但删除 T0/T1 名称、
+  `model_identity`、function-preserving T1 转换和 paired step-0 合同。
+- Star-RBF v2 的周期 pair 几何、sidecar reader/builder 和 attention bias 保留，但删除
+  R2、`legacy_g1_frozen`、G1-parent conversion、R2 bundle 和共享 step-0 身份。
+- 普通 Star-RBF/MCL 开关可作为底层显式模型参数保留，但删除 A0–A4 descriptor、A4
+  random-mask 机制以及按 experiment ID 切换分支的代码。
+- 本轮产物删除授权仅覆盖第 11.1 节已经核对并删除的目标；R6.5 不再删除任何产物，
+  也不扩大到共享数据、通用 cache、保留机制产物或其他实验文件。
+- 保留仍被活动数据算法使用的 hash，例如 deterministic sampling、sample key、排序、
+  partition、row mapping 和 sidecar locator。只有随已退役调用链一起变成死代码的
+  locator hash 才可删除。
+- 保留 `torch.load`、state-dict key/shape/finite 检查和 `strict=True` 等直接保证模型
+  可加载性的检查。
+- 不再保证清理后仍存在于其他位置的历史 T/G/R/A checkpoint 可由当前代码严格加载；
+  删除 G bias 等专用参数布局后不兼容是已接受结果。未来新 checkpoint 仍必须
+  `strict=True`，禁止为旧 checkpoint 增加兼容 loader。
 
-### 3.3 同路径重新运行时清除旧 marker
+### 1.3 本周期不做
 
-保留 launcher 当前“默认拒绝覆盖已有输出”的安全行为。只有用户明确授权同一路径重新运行时，使用一个清楚的 restart 入口（例如 `RESTART_SAME_PATH=1`，实现时只选定这一种）执行：
+- 不创建任何新 MTS JSON 配置。
+- 不决定新配置是否继承、分层、使用何种 schema 或包含哪些科学参数。
+- 不运行正式 20k 预训练、完整 8×5 微调或 GPU 训练 smoke；没有活动生产配置时，
+  GPU smoke 没有有效配置语义。
+- 不修改与旧配置退役无关的 checkpoint 生命周期、模型数学、Dataset 字段或科学
+  超参数。
+- 不清理 dirty worktree 中的其他用户改动。
+
+### 1.4 “实验逻辑全部删除”的判定口径
+
+| 实验线 | 必须删除 | 可以保留的通用机制 |
+|---|---|---|
+| T | T0/T1 名称、matched/fresh-paired 初始化、step-0 转换、readiness/diagnostics、比较与 checkpoint identity | O8 attention、MSTA layer 类及其纯数学测试 |
+| G | `g_family_arm`、`g0/g1/g2/g3/g4` mode、path-cosine/endpoint/permutation arm、relation-geometry bias 和双 cohort bundle | 无 G arm 身份的 canonical topology 与 Trimer 基础几何工具 |
+| R | R2 experiment、G1→R2 initializer、legacy-backbone binding、R2 step-0/bundle/晋级比较 | Star-RBF v2 周期 relation 几何和 RBF 核心实现 |
+| A | A0–A4 ID、ablation config/env、A4 count-matched random mask、shared-ablation checkpoint 与调度 | 普通模型构造中独立的 Star-RBF/MCL 显式布尔参数 |
+
+若一个符号同时服务通用机制和历史实验，先把通用部分移到已有的中性模块，再删除带
+T/G/R/A 语义的 wrapper；不得仅改名后完整保留旧实验状态机。
+
+## 2. 当前真实依赖清单
+
+### 2.1 待删除的 34 个配置
+
+按当前仓库实际文件分组删除：
 
 ```text
-确认目标是精确的 final 文件路径且没有同路径 writer
-→ 删除该 final 对应的旧 .complete.json
-→ 启动新训练
+configs/mts/default.json                                      1
+configs/mts/explicit_k_ru.json                                1
+configs/mts/pretraining/canonical_ru_angle20_v1.json          1
+configs/mts/experiments/*.json                               26
+configs/mts/geometry_injection_ablation/*.json                5
 ```
 
-不得用递归删除、目录通配符或自动清理历史产物。restart 模式不把旧 `.last.pt` 当作 resume；只有显式 `RESUME=1` 才加载 `.last.pt`。旧 marker 删除后，即使旧 final 暂时仍存在，watcher 也不会启动下游。
+配置删除后允许空目录一并消失，不新增 `.gitkeep`、README 占位配置或旧配置归档目录。
+Git 历史已经提供恢复能力，不再复制一套仓库内 archive。
 
-### 3.4 `final.pth` 只服务下游
+### 2.2 仍绑定旧配置的核心入口
 
-训练达到最后 optimizer step 后的顺序固定为：
+- `scripts/resolve_mips_trimer_scage.py::main()` 默认读取
+  `configs/mts/default.json`，并实现旧 production、experiment、pretrain-experiment、
+  G-family、R2 和 A0–A4 解析。
+- 同文件 `_is_legacy_identity_field()` 会按名称宽泛忽略包含 `hash`、`sha`、
+  `artifact` 或 `semantic` 的未知字段；该兼容行为必须删除。
+- `scripts/run_mips_trimer_scage.sh` 默认使用 `configs/mts/default.json` 和
+  `canonical_ru_angle20_v1`，还会生成 `resolved_input.json`。
+- `scripts/run_mts.sh` 与 `scripts/run_train.sh` 仍把 `EXPERIMENT_CONFIG` 回退到旧
+  `default.json`。
+- `src/training/pretrain/config.py::load_pretrain_profile()`、
+  `validate_mts_pretrain_execution()` 和 `parse_arguments()` 固定旧 profile ID 与路径。
+- `src/dataset/mips_trimer_contract.py` 仍导出配置/profile 常量；只能删除已无消费者的
+  配置常量，cache、layout、feature、sidecar 和 checkpoint schema 常量不得连带删除。
+- `scripts/mts.py`、`scripts/run_mts_sota_campaign.py`、旧 benchmark、T/G/R/A
+  initializer、monitor、watcher、audit 和 comparison 脚本仍内置旧配置路径或 profile。
+- `src/modules/mips_local_graph.py` 仍包含 `topology_attention_identity()`、
+  `add_function_preserving_t1_parameters()`、T0/T1 `model_identity`、
+  `MTSRelationGeometryBias`、`g_family_arm`、G0–G3 geometry dispatch、G2/G3 endpoint
+  distance 和 coordinate-shuffle negative-control 分支。
+- `src/modules/uni_encoder.py` 仍沿三层构造链传递 `g_family_arm`、
+  `relation_geometry_sidecar` 和 `g3_permutation_sidecar`。
+- `src/dataset/dataset.py` 与 `src/dataset/dataloader.py` 仍加载、附加并 collate
+  `mts_relation_geometry_*`、G3 permutation 和 A4 `mcl_random_mask_*` 字段。
+- `src/dataset/mts_relation_geometry.py`、
+  `scripts/build_mts_relation_geometry_sidecar.py` 和
+  `scripts/build_mts_g3_permutation.py` 是 G-family 专用数据链；其中仅
+  `prepare_topology()`/`prepare_trimer()` 被 Star-RBF v2 复用。
+- `src/dataset/mts_ablation_random_mask.py` 和
+  `src/modules/trimer_mcl.py` 的 `count_matched_random` 分支是 A4 专用逻辑。
+- Pretrain/Finetune config 与 engine 仍接受 `initialization_state`、`paired_init_id`、
+  `shared_step0_id`、`g_family_arm`、relation/permutation sidecar、
+  `backbone_definition` 和 ablation 环境变量，并把它们写入 checkpoint/shard metadata。
+- 多个测试和 `PIPELINE.md`、`TODO_优化.md`、`TODO_预训练.md` 仍把旧配置文件当作
+  当前事实源。
+
+### 2.3 同时收尾的已确认启动问题
+
+`scripts/run_mips_trimer_scage.sh` 当前仍使用：
+
+```bash
+CACHE_VALIDATE=${CACHE_VALIDATE:-full}
+```
+
+未来生产入口恢复时默认应为 `sample`；完整扫描只允许由显式离线 QC 命令执行。
+本周期只改默认值和调用边界，不修改冻结 sidecar 内容。
+
+## 3. Stage R6.1：删除旧配置与专用实验编排
+
+### 3.1 删除配置
+
+删除第 2.1 节列出的全部 JSON。不得保留 `default.json` 作为隐式默认，也不得把旧
+配置改名后继续使用。
+
+删除后立即执行：
+
+```bash
+test -z "$(find configs/mts -type f -name '*.json' -print 2>/dev/null)"
+```
+
+### 3.2 删除只服务旧实验的脚本
+
+下列脚本的职责建立在已删除的 T/G/R/A 配置或 profile 上，应直接删除，不改造成
+兼容 wrapper：
 
 ```text
-完成最后 optimizer step
-→ 从内存中的 base model 提取下游需要的 state_dict
-→ 写 final 临时文件
-→ os.replace 原子生成 final.pth
-→ torch.load 验证可读
-→ 按 resolved 参数构造对应预训练模型并 strict=True 加载一次
-→ 原子生成 final.pth.complete.json
+scripts/audit_mts_g0_g1_formal.py
+scripts/audit_mts_g1_g2_formal.py
+scripts/audit_mts_t0_t1_formal.py
+scripts/audit_mts_t_pretrain0.py
+scripts/compare_mts_g0_g1_formal.py
+scripts/compare_mts_g1_g2_formal.py
+scripts/compare_mts_g1_r2_formal.py
+scripts/compare_mts_t0_t1_formal.py
+scripts/initialize_mts_g_family_pretrain.py
+scripts/initialize_mts_g_family.py
+scripts/initialize_mts_star_rbf_v2.py
+scripts/initialize_mts_t1.py
+scripts/initialize_mts_t_pretrain0.py
+scripts/record_mts_t1_readiness.py
+scripts/record_mts_t1_repair.py
+scripts/monitor_mts_t_pretrain0_v1.sh
+scripts/auto_trigger_g1_after_g0.sh
+scripts/auto_trigger_g2_downstream.sh
+scripts/auto_trigger_g_family_downstream.sh
+scripts/run_mts_geometry_injection_ablation.py
+scripts/run_mts_sota_campaign.py
+scripts/finalize_mts_g_pretrain_milestone.py
+scripts/analyze_mts_g_precheck.py
+scripts/build_mts_g3_permutation.py
+scripts/mts_g_family_ddp_smoke.py
+scripts/mts_g_family_readiness_smoke.py
+scripts/mts_g_family_sidecar_alignment_smoke.py
+scripts/mts_g_family_single_fold_smoke.py
+scripts/mts_t1_ddp_smoke.py
+scripts/mts_t1_readiness_smoke.py
+scripts/recheck_mts_t1_diagnostics.py
+scripts/mts.py
 ```
 
-建议最小 payload 固定为：
+`scripts/build_mts_star_rbf_v2_sidecar.py`、Star-RBF v2 reader、checkpoint I/O、
+Pretrain/Finetune engine 和 MSTA 模型类不是旧实验的替代品，不得整体删除；只清除
+其中 T/G/R/A 专用分支。
 
-```python
-{"state_dict": model_state_dict}
-```
+### 3.3 删除 G-family 数据与模型执行链
 
-这样兼容 `scripts/train.py` 当前从 `checkpoint['state_dict']` 取权重的方式。`final.pth` 不保存 optimizer、scheduler、scaler、RNG、sampler、resume 计数器、预训练 heads、hash 或重复身份 metadata。
-
-Finetune 仍保留当前必要的结构迁移逻辑：
-
-- `_scage_checkpoint_key_compatibility()` 的 key/shape 判断；
-- `select_mts_checkpoint_transfer_keys()` 只迁移 topology encoder/MSTA/G-family geometry 参数；
-- 将迁移参数合并进按 fold seed 初始化的 downstream 模型后，调用 `model.load_state_dict(merged_state, strict=True)`。
-
-删除的是 meta/hash 身份 gate，不是 key/shape/strict load。final 自检使用同一模型构造函数，避免出现“保存成功但下游无法读”的假完成。
-
-### 3.5 completion marker
-
-`final.pth.complete.json` 内容固定为：
-
-```json
-{
-  "status": "complete"
-}
-```
-
-在 `src/training/common/checkpoint.py` 中以临时 JSON + `os.replace()` 原子写入。不得保存 checkpoint 路径、step、profile、schema、hash 或 checkpoint metadata 副本。
-
-marker 只能在 final 已完成一次 `torch.load + strict=True` 验证后生成。验证失败时清理临时文件、不生成 marker，保留原 `.last.pt` 供恢复。
-
-### 3.6 watcher
-
-活动 watcher 只检查：
-
-1. `final.pth` 是普通文件；
-2. `final.pth.complete.json` 是普通文件且 JSON 可解析；
-3. `status == "complete"`。
-
-满足后启动 Finetune。watcher 不再 `torch.load`，不计算 hash，不检查 milestone，不交叉比较 checkpoint metadata，也不调用独立 checkpoint audit。
-
-需要处理的真实 watcher/monitor 包括：
-
-- `scripts/auto_trigger_g_family_downstream.sh`：移除 `audit_mts_g0_g1_formal.py --phase checkpoint` 前置调用；
-- `scripts/auto_trigger_g1_after_g0.sh`：移除内嵌 `audit_checkpoint/audit_configs` gate；
-- `scripts/auto_trigger_g2_downstream.sh`：移除 `audit_mts_g1_g2_formal.py --phase checkpoint` 前置调用；
-- `scripts/monitor_mts_t_pretrain0_v1.sh::validate_t1()`：若仍保留为可执行历史 monitor，改为极简 marker 检查，不再计算 SHA 或加载 checkpoint；
-- 当前/未来 Star-RBF v2 watcher：使用同一三项规则，不从已放弃 R2 的旧 watcher 继续运行。
-
-任务/折数、输出目录防覆盖、tmux 窗口去重、子进程退出码和失败后停止派发继续保留。
-
-最终职责只有：
+删除：
 
 ```text
-<final>.last.pt              唯一 crash/resume 状态
-<final>.pth                  唯一正式下游模型
-<final>.pth.complete.json    唯一阶段完成信号
-<final>.step_XXXXX.pth       停止生成
+scripts/build_mts_relation_geometry_sidecar.py
+src/dataset/mts_relation_geometry.py
 ```
 
-## 4. 删除活动运行时哈希检测链
+在删除 `src/dataset/mts_relation_geometry.py` 前，将 Star-RBF v2 唯一复用的
+`prepare_topology()`、`prepare_trimer()` 及其必要私有 helper 直接移入
+`src/dataset/mts_star_rbf_v2.py`。不得把 G relation-sidecar schema、path-cosine、
+endpoint-distance、permutation 或 artifact identity 一起搬入。
 
-本阶段在模块化之前完成，先缩短调用链，再移动代码。每一小组修改后立即跑定向测试，不一次性全仓机械替换 `hash` 字样。
+随后清理：
 
-### 4.1 Resolver 与 experiment 配置入口
+- `src/modules/mips_local_graph.py`：删除 `MTSRelationGeometryBias`、`g_family_arm`、
+  `relation_geometry_sidecar`、`g3_permutation_sidecar`、`g0/g1/g2/g3` geometry alias、
+  `g_geometry` forward 分支以及相关参数冻结逻辑。
+- `src/modules/uni_encoder.py`：从所有构造层删除上述三个 G 参数的透传。
+- `src/dataset/dataset.py`：删除 G arm 解析、`_init_relation_geometry_sidecar()`、
+  `_attach_relation_geometry()`、G3 permutation 和 `mts_relation_geometry_*` 写入。
+- `src/dataset/dataloader.py`：删除 geometry-arm 一致性、G0 空占位和所有
+  `mts_relation_geometry_*` collate/rebase 逻辑。
+- `src/dataset/mips_trimer_contract.py`：删除
+  `CACHE_RELATION_GEOMETRY_SCHEMA` 与 `RELATION_GEOMETRY_BUILDER_VERSION`。
+- `scripts/qc_mts_sidecars.py`：删除 relation-geometry 与 G3-permutation QC 子命令，
+  保留 Star-RBF v2 及其他非 G 专用 QC。
+
+磁盘上已有 `data/processed/.../relation_geometry*` 目录不删除；它们变成无人读取的历史
+产物，后续若要清理必须另行授权。
+
+### 3.4 删除 A0–A4 执行链
+
+删除 `src/dataset/mts_ablation_random_mask.py`，并清理：
+
+- `src/dataset/mips_trimer_contract.py` 中 `ABLATION_IDS`、
+  `ABLATION_RANDOM_MASK_*` 常量；
+- `src/dataset/dataset.py` 中 `ablation_config`、`ablation_id`、random-mask sidecar
+  初始化/lookup，以及写入 `mts_use_*`、`mcl_random_mask_*` 的代码；
+- `src/dataset/dataloader.py` 中 A4 compact-mask 打包、offset 校验和 batch 字段；
+- `src/modules/trimer_mcl.py` 中 `precomputed_visible`/`count_matched_random` 分支；
+- `src/modules/mips_local_graph.py` 中 `mcl_mask_mode=count_matched_random`；
+- Finetune engine 的 `_ablation_switches_from_environment()`、
+  `MTS_USE_STAR_RBF`、`MTS_USE_MCL`、`MTS_MCL_RANDOM_MASK` 与 ablation smoke 判断。
+
+模型构造器若仍需要 `use_star_rbf`/`use_mcl` 来直接测试独立模块，可保留两个普通布尔
+参数；Dataset 不再接收 per-sample ablation descriptor，launcher 不再通过环境变量
+切换它们。
+
+### 3.5 删除 T 与 R 身份/初始化链
+
+清理 `src/modules/mips_local_graph.py`：
+
+- 删除 `topology_attention_identity()`；
+- 删除 `add_function_preserving_t1_parameters()`；
+- 删除 `model_identity="T0"/"T1"` 及所有 T0/T1 文案；
+- 保留 `MSTA_LAYER_INDICES`、MSTA layer 类、`o8`/`msta_last2` 的纯架构选择和数学
+  约束，但用机制名称描述，不能再生成 T 身份 metadata。
+
+清理 Pretrain：
+
+- 从 `src/training/pretrain/config.py` 删除 `--initialization_state`、
+  `--paired_init_id`、`--shared_step0_id`、`--g_family_arm`、
+  `--relation_geometry_sidecar`、`--g3_permutation_sidecar` 和
+  `--backbone_definition`；`--star_rbf_v2_sidecar` 作为通用 Star-RBF v2 输入保留。
+- 从 `src/training/pretrain/engine.py` 删除
+  `_load_fresh_paired_initialization()`、`_is_t1_function_preserving_init_payload()`、
+  T1 local-output 初始化审计、G formal 例外、shared-step0 判断以及 T/G/R identity
+  metadata。
+- `.last.pt` resume 和普通显式 model-weight 加载不得因删除 fresh-paired 实验路径而
+  受影响；本周期不新增另一种初始化协议替代它。
+
+Finetune 同步从 config、engine 和 shard metadata 删除相同的 T/G/R 参数和分支。
+删除 `legacy_g1_frozen` 与 R2 专用判断，但保留 `star_rbf_v2_sidecar` 到 Dataset/模型的
+通用传递能力；同时删除仅为旧 T1 checkpoint 标记保留的 `t1_init_artifact` 等死变量。
+
+### 3.6 删除历史 negative-control mode
+
+从 Dataset、Finetune config、model constructor 和 `TrimerSCAGEMCLResidual` 删除仅为旧
+G/A 实验存在的 mode：
+
+```text
+coordinate_shuffled
+mcl_rbf_coordinate_shuffled
+g0
+g1
+g2
+g3
+count_matched_random
+```
+
+保留当前非实验命名的正常 geometry 实现；不在本周期发明替代 mode 名称。
+
+### 3.7 可复用 benchmark
+
+保留 `scripts/benchmark_mts_pretrain.py` 与 `scripts/benchmark_mts_finetune.py` 的通用
+测量逻辑，但删除旧 default/profile/A3 配置路径。没有显式新配置时，两者应给出清晰
+错误并退出；不得物化旧配置或用旧 CLI 默认值拼出等价配置。
+
+## 4. Stage R6.2：入口停用与兼容代码删除
+
+### 4.1 Resolver
 
 修改 `scripts/resolve_mips_trimer_scage.py`：
 
-- 删除 `digest()`、`_sha256_file()` 和 `g_family_bundle_identity_hash()` 的身份用途；
-- 将 `_resolve_g_family_artifact_bundle()` 改为解析 cohort→root，检查 root/metadata/必要 array 文件、JSON/schema/cohort 和可读性，不再要求 config 中存在 `artifact_hash`，不重算 metadata digest，不绑定 `.done/.frozen` 内容；
-- 将 `_resolve_star_rbf_v2_bundle()` 改为相同的轻量结构解析；保留两个 cohort、record count、RBF upper 和直接 scientific 字段一致性；
-- 删除 resolved payload 中 config/model/feature/geometry/artifact/semantic SHA 字段；
-- 保留 `runtime_contract` 中直接可读的 schema/version/枚举/数值字段，因为它们用于解释数据布局和构造模型；
-- 对历史 experiment JSON 中的 `artifact_hash` 字段采取“允许存在但忽略”，不批量重写历史配置；新配置只写 root 和实际运行参数。
+1. 删除 `DEFAULT`、`PRETRAIN_EXPERIMENT_CONFIG_SCHEMA`、旧字段集合、parent
+   inheritance、G-family/R2/A0–A4 分支以及旧配置默认值。
+2. 删除 `_is_legacy_identity_field()`；以后不得因未知字段名含 `hash` 或 `sha` 而
+   静默接受。
+3. 删除只被旧 resolver 使用的 `_resolve_g_family_artifact_bundle()`、
+   `_resolve_star_rbf_v2_bundle()`、`_random_mask_sidecar_path()` 及其专用 import。
+4. 暂时保留同一 CLI 文件名，但将其收缩为明确的“当前无活动 MTS 配置 schema”入口：
+   配置路径必须显式提供；即使文件存在，也在解析/启动训练前提示需要先实施新配置
+   方案并返回非零退出码。
+5. 不生成 `resolved_input.json`，不输出可被 shell `eval` 的半成品参数。
 
-给 resolver 增加一个简单的原子输出选项，使同一次 resolve 可以：
+这不是新 resolver 的设计。后续新配置周期会重新定义解析规则，并一次性严格拒绝所有
+未知字段，不增加旧 schema 兼容层。
 
-- 向 launcher 输出 shell 变量；
-- 将同一 payload 原子写到 `results/.../configs/resolved_input.json`。
+### 4.2 Shell launcher
 
-`resolved_input.json` 只包含实际 resolved 参数，不包含 hash、运行日志、硬件快照或派生 provenance。
-
-### 4.2 Launcher 与 scheduler 参数
-
-修改 `scripts/run_mips_trimer_scage.sh`：
-
-- 删除 `hash_training_spec()`、`stage3_training_hash()`、`JOINT_TRAINING_HASH`、`FINETUNE_CONFIG_HASH`、`FINETUNE_PROFILE_HASH`；
-- 删除 `COMMON`、`PRETRAIN_G_FAMILY_ARGS`、`TRAIN_G_FAMILY_ARGS`、`STAR_RBF_V2_ARGS_*`、`PRETRAIN_IDENTITY_ARGS`、`TRAIN_IDENTITY_ARGS` 中所有 `*_hash`/`*_sha256` 参数；
-- 删除 `CHECKPOINT_SHA256`、`CACHE_STORE_SHA256`、Topology/Trimer `.done` 内容读取；
-- 删除从 `scripts.audit_mips_trimer_cache::_specs` 仅为算 SHA 而发生的依赖；cache/sidecar root 由 resolved 参数直接提供；
-- 将原来的 `cp -f "$CONFIG" .../resolved_input.json` 替换为 resolver 的真实原子 resolved 输出；
-- `VALIDATE_ONLY` 只验证参数枚举、GPU 列表、batch/world size、路径和直接 schema，不再验证 hash 格式；
-- 保留严格 GPU 列表解析、输出防覆盖、失败清理、LPT 顺序和 tmux 约束。
-
-把 `validate_shard()` 从 hash 审计改成结构验证：CSV 可读且一行、task/fold/seed/experiment_id 匹配、per-fold metrics 可解析且 finite、prediction 文件可读、`y_true/y_pred/sample_indices` 长度一致、prediction metadata 的 task/fold/seed 匹配。删除 prediction SHA、split manifest SHA、checkpoint/cache/config SHA 比对。
-
-### 4.3 Pretrain checkpoint/config 身份链
-
-修改 `scripts/pretrain.py`：
-
-- 删除 `_file_sha256()`、`_path_tree_sha256()`、`_pretrain_code_identity()`、`_build_final_cache_binding()`；
-- 删除所有 hash CLI 参数；
-- 删除 `cache_bundle_binding_hash()`、`build_pretrain_target_contract()` 和 `_canonical_json_hash()` 的运行调用；
-- 删除 fresh paired initialization 中仅用于 parent/file SHA 绑定的字段和检查，但保留 `torch.load`、模型 key/shape 和 `strict=True`；
-- 删除 cost file、CSV、tokenizer tree、git diff 和 final metadata SHA；
-- 将 resume 的巨大 `resume_contract` 替换为第 3.2 节的必要恢复 state；
-- final 保存改为第 3.4 节的最小 payload；
-- 历史 checkpoint 的 `meta` 可被读取但不参与拒载。
-
-必须保留 `_joint_canonical_mask()`、periodic augmentation 和 diagnostics 中实际用于选择样本/mask 的确定性哈希。仅作为日志显示而不影响行为的 `sample_hash/mask_hash` 可删除。
-
-### 4.4 Finetune checkpoint、prediction 和 shard
-
-修改 `scripts/train.py`：
-
-- 删除 `_target_contract_mismatch()`、`_source_contract_digest_mismatch()`、`validate_g_family_checkpoint_binding()`、`_validate_mts_t1_function_preserving_init()` 中的身份/parent SHA 路径；历史 init 专用逻辑若无活动调用则留作历史工具，不进入正式 finetune；
-- 删除 `_sha256_file()` 和 hash CLI 参数；
-- checkpoint 加载简化为 `torch.load → state_dict 提取 → key/shape 选择 → strict=True merge load`；
-- prediction 继续临时文件 + `os.replace()`，但不再计算 `prediction_sha256`；
-- prediction metadata 保留 task/fold/seed/fold_seed、评估协议、AMP、batch、GPU 和 sample indices；删除 checkpoint/cache/config/profile/split SHA；
-- result shard 保留 experiment_id、task、fold、seed、显式科学/运行参数、metrics、prediction path；删除所有 hash 和复制的 checkpoint identity metadata；
-- 固定 shared5 manifest 改为直接结构/索引检查，不比较 `sample_order_hash`/`split_manifest_hash`；nested5 的确定性 hash 排序不动。
-
-`_scage_checkpoint_key_compatibility()` 和 `select_mts_checkpoint_transfer_keys()` 必须保留，它们检查真实 tensor key/shape 和允许迁移范围，不是哈希身份。
-
-### 4.5 Cache、doctor、audit、summarizer
-
-活动 MIPS 读取路径还涉及以下真实模块：
-
-- `src/dataset/mips_cache_validation.py::verify_frozen_cache_bundle()`；
-- `src/dataset/dataset.py::ShardedFeatureStore`、`_scage_cache_metadata_compatible()`、`_init_mts_sidecar()`；
-- `src/dataset/lmdb_cache.py::build_or_load_cohort()`、`load_cohort()` 及 angle/threshold reader；
-- `scripts/doctor_mips_trimer_scage.py`；
-- `scripts/audit_mips_trimer_cache.py`；
-- `scripts/summarize_mips_trimer_scage.py` 及仍用于生产报告的 compare 脚本。
-
-处理方式：
-
-- 训练启动不再调用 `verify_frozen_cache_bundle()` 的全量 hash 审计；只读打开失败、schema、record count、key/index 边界仍直接报错；
-- `ShardedFeatureStore` 保留 manifest/`.done` 存在、SQLite 索引和 `torch.load`，删除 manifest digest 和首次访问 shard 时的全文件 SHA；保留 `stored_smiles == requested_smiles`；
-- cohort 训练读取显式使用轻量模式：mmap、shape/dtype、长度和 key lookup；不把全数组转为 bytes 重算 SHA；cohort hash 路径和 sample keys 仍保持原样；
-- `_init_mts_sidecar()` 现有 hash 目录作为 locator 保留，避免重建；删除对 required NPY 的逐文件 SHA，改为 metadata/spec、shape、dtype 和行数检查；不把 `mts_sidecar_hash` 传进模型/result；
-- doctor 改成路径/JSON/schema、轻量数据读取、checkpoint strict load 和两样本 forward/backward；删除 `_assert_checkpoint_binding()`、`_verify_target_contract()` 和 checkpoint SHA 输出；
-- audit/validate 脚本只作为显式离线 QC，不再被 launcher/watcher import 或自动执行；QC 检查内容语义、shape、offset、finite 和 record 数，不创建 receipt、不作为训练前置；
-- summarizer/compare 直接读取 finite shard/prediction 和 task/fold/seed，不重算文件 SHA。
-
-`src/dataset/mts_cache_integrity.py` 中 topology/trimer record 的科学内容验证函数可继续供离线 QC 使用；删除/忽略报告中的 file SHA 和 artifact binding。`src/dataset/mips_trimer_contract.py` 保留 schema/version 和 `validate_runtime_args()`；等调用方清理完成后，只删除已经无引用的 `_canonical_json_hash()`、`cache_bundle_binding_hash()`、target-contract builder，不碰科学常量。
-
-## 5. Sidecar 启动轻量化
-
-### 5.1 Star-RBF v2 reader
-
-修改 `src/dataset/mts_star_rbf_v2.py::StarRBFV2Sidecar`：
-
-- 构造参数删除 `expected_artifact_hash` 和 `verify_hashes`；
-- 删除 `_sha256_file()`、metadata digest、`.done/.frozen` 内容绑定、NPY SHA；
-- 可以保留 `metadata.json`、`.done`、`.frozen` 的存在检查，作为“writer 已结束”的轻量信号，但不读取其 hash；
-- 保留 sidecar schema、builder/layout version、array 名称、mmap `allow_pickle=False`、metadata 声明的 shape/dtype、sample/relation/pair count、offset 数组首尾边界；
-- 删除构造阶段全数组 monotonic、pair index `min/max`、count/source/valid `any` 扫描；
-- 在 `model_row(index)` 中对当前样本做 O(该样本) 的局部检查：index 范围、`rs <= re`、`ps <= pe`、relation pair index 落在本样本 pair 范围、observation count 取值和所需 tensor shape；错误在首次访问该坏样本时直接报告；
-- 新增 `qc_row(index)` 返回完整 QC 字段；保留 `row()` 为过渡兼容别名并在调用迁移完成后移除；
-- `model_row()` 只返回 forward 实际需要的 `relation_row/relation_pair_index/relation_spd`、pair distances/count/valid/source；不读取 key、multiplicity、path signature、asymmetry、reason code。
-
-`index_for_key()` 的 PI1M ordered `row_hint` 快路径必须保留；key→row fallback 也保留，不能改变数据访问语义。
-
-### 5.2 Dataset 与 collate
-
-修改 `src/dataset/dataset.py`：
-
-- `UniDataset` 构造参数移除 relation/star/permutation expected artifact hash；
-- sidecar 初始化后直接检查 `len(sidecar) == len(dataset)`；该记录数检查只读 shape，不扫描数组内容；
-- Star-RBF v2 attach 改用 `model_row()`；
-- 不再向 `Data` 写 `mts_star_v2_sidecar_artifact`、`mts_star_v2_model_semantic_hash`、relation geometry artifact/cohort hash；
-- 保留 relation row 与当前 `lga_spd` 的直接一致性检查、local row/index 边界和 RBF upper 的直接数值配置；
-- `_init_relation_geometry_sidecar()` 只传 root/cohort 名和必要结构信息，不传 source/artifact hash；G0 bypass 与 G3 permutation 的实际 correspondence/index 检查保留。
-
-修改 `src/dataset/dataloader.py::mips_trimer_collate()`：
-
-- 删除 `star_v2_artifacts/star_v2_semantics`、geometry artifact/cohort set 的收集和 batch 字段；
-- 保留 tensor 拼接、pair offset、relation SPD 对齐、单 batch RBF upper 一致和 geometry arm 一致；
-- 不修改 padding、relation multiplicity、A4 mask 或 invalid geometry 语义。
-
-### 5.3 相关 relation reader
-
-对 `src/dataset/mts_relation_geometry.py::RelationGeometrySidecar` 和 `RelationGeometryPermutation` 做同样处理：
-
-- 删除 `_sha256_file()`、expected hash/cohort/source artifact 绑定和 metadata digest；
-- 构造阶段只检查文件、schema、shape/dtype、offset 首尾和 record count；
-- 全数组 monotonic、valid/reason、permutation min/max 移到离线 QC；
-- `row()`/`permutation_for()` 对当前 slice 做局部边界检查；
-- path cosine、endpoint distance、valid mask 和 G3 permutation 的真实 tensor 行为保持不变。
-
-### 5.4 显式离线 QC
-
-在不改写 sidecar 的前提下，给现有 sidecar 工具增加一个只读 QC 入口，优先采用小型 `scripts/qc_mts_sidecars.py`，避免让 builder 的默认行为兼任训练启动：
-
-- 参数是明确的 sidecar root 和类型；
-- 扫描 offsets monotonic、全局 index、multiplicity、valid/reason、distance finite、Star-RBF source/count、G3 permutation；
-- 只打印摘要并以退出码表示成功/失败；
-- 不写 audit receipt，不修改 `.done/.frozen/metadata`，不被 launcher 自动调用。
-
-## 6. Pretrain / Finetune 渐进式职责拆分
-
-新目录只做职责归位：
+修改：
 
 ```text
-src/training/
-├── common/
-│   ├── checkpoint.py
-│   ├── distributed.py
-│   ├── rng.py
-│   └── runtime.py
-├── pretrain/
-│   ├── config.py
-│   ├── objectives.py
-│   └── engine.py
-└── finetune/
-    ├── config.py
-    ├── engine.py
-    └── scheduler.py
+scripts/run_mips_trimer_scage.sh
+scripts/run_mts.sh
+scripts/run_train.sh
 ```
 
-不得增加 `trainer.py`、基类、registry、hook 系统或跨 Pretrain/Finetune 的训练循环。
+实施方式：
 
-### 6.1 第一步：公共小工具
+- 删除三个入口对 `configs/mts/default.json` 的 fallback。
+- `EXPERIMENT_CONFIG` 缺失时立即报错退出；路径不存在时立即报错退出。
+- 随后调用停用状态 resolver，并传播其非零退出码。
+- 以上检查必须位于创建结果目录、读取 cache、调用 `nvidia-smi`、启动
+  `torch.distributed.run` 或 worker 之前。
+- 删除 `canonical_ru_angle20_v1` 的默认值和专用 shell 条件。
+- 删除 `PRETRAIN_G_FAMILY_ARGS`、`TRAIN_G_FAMILY_ARGS`、`G_FAMILY_FORMAL_PRETRAIN`、
+  `MTS_INITIALIZATION_STATE`、`MTS_PAIRED_INIT_ID`、`SHARED_STEP0_ID`、
+  `BACKBONE_DEFINITION`、G3 permutation、A0–A4 和 R2 专用环境变量/参数数组。
+- 删除旧 `resolved_input.json` 写入调用；磁盘上已有历史 resolved 文件不删除。
+- 将未来运行时的 cache 默认值从 `full` 改为 `sample`；`CACHE_VALIDATE=full` 仅保留
+  为人工显式离线诊断，不得成为普通训练启动默认。
 
-从 `scripts/pretrain.py` 原样提取：
+### 4.3 Pretrain/Finetune 内部入口
 
-- `distributed.py`：distributed 初始化/均值求和、rank state gather、必要 barrier/cleanup；
-- `rng.py`：`_capture_rng_state()`、`_restore_rng_state()`；
-- `checkpoint.py`：原子 torch save、`.last.pt` save/load、final save/strict validation、completion marker 读写；
-- `runtime.py`：device/autocast/AMP 的小型公共选择函数。
+修改 `src/training/pretrain/config.py` 与直接消费者：
 
-只提取已有逻辑，不改变调用顺序；Pretrain 和 Finetune 可以共同调用工具，但各自保留 optimizer step、loss 和 epoch 循环。
+- 删除旧 profile 文件查找、`canonical_ru_angle20_v1` 唯一性判断及旧 profile 默认值。
+- `--pretrain_profile` 不再默认指向旧 ID；在新配置设计完成前，生产 launcher 不得
+  调用 Pretrain。
+- 保留通用 `PretrainRuntimeConfig`、Dataset 参数转换和内部单元测试所需的显式 CLI
+  能力，不重新发明临时 profile。
+- 删除第 3.5 节列出的 T/G/R 参数；Finetune config 同步删除 G arm、relation
+  geometry/permutation、shared step-0、legacy backbone 和 A ablation 参数。
 
-### 6.2 第二步：Pretrain config
+检查 `src/training/pretrain/engine.py`、`src/training/finetune/engine.py` 中对旧
+`CONFIG_SCHEMA`、`EXPERIMENT_CONFIG_SCHEMA` 和 profile ID 的使用：
 
-将以下职责移到 `src/training/pretrain/config.py`：
+- 删除仅用于接受旧配置/旧 checkpoint metadata 的兼容分支。
+- 删除 T/G/R/A 的运行时 dispatch、metadata 输出和 smoke 特例；不能把它们改成
+  `deprecated_*` 参数继续接受。
+- 保留直接控制当前 forward、loss、数据字段和严格 state-dict 加载的代码。
+- 不让本阶段演变成模型或训练循环重构。
 
-- `parse_arguments()`；
-- `_load_pretrain_profile()` 的非 hash 参数解析；
-- `_dataset_kwargs_from_args()`；
-- `validate_mts_pretrain_execution()` 的 world size/global batch/枚举检查。
+最后对 `src/dataset/mips_trimer_contract.py` 做消费者检查：仅删除已经零引用的
+`EXPERIMENT_CONFIG_SCHEMA`、`PRETRAIN_PROFILE_SCHEMA`、`PRETRAIN_PROFILE_ID` 等
+配置层常量；数据/cache/sidecar/checkpoint contract 常量继续保留。
 
-`scripts/pretrain.py` 暂时仍调用这些函数；先只移动定义和 import。固定 batch 对比通过后再继续。
+## 5. Stage R6.3：测试与文档去旧配置化
 
-### 6.3 第三步：Pretrain objectives
+### 5.1 测试处理
 
-按依赖从叶子函数开始，将 objective 代码移到 `src/training/pretrain/objectives.py`：
-
-- loss 权重与 `DynamicPretrainLossWeighter`；
-- masked atom、periodic augmentation、LGA relation/SPD/path、Trimer distance；
-- angle/focal/circular/geometry、repeat-cut、alignment、shortest-path 和 denoise loss；
-- `TrimerAngleHead` 与 `MIPSPretrainContainer` 中只负责 objective/head 的部分。
-
-模型 forward 和现有 loss 数学表达式逐行保留。每移动一组，旧 `scripts/pretrain.py` 调用新函数，在同一固定 batch 上比较所有分项 loss、total loss、梯度和一次 optimizer step；通过后才删除旧定义。
-
-### 6.4 第四步：Pretrain engine
-
-将 `main()` 中下列运行职责移到 `src/training/pretrain/engine.py::run_pretrain(args)`：
-
-- distributed/device/seed；
-- dataset、sampler、DataLoader；
-- model、heads、optimizer、scheduler；
-- resume state 加载；
-- batch/accumulation/DDP `no_sync` 训练循环；
-- `.last.pt`、final 和 marker 生命周期；
-- benchmark/smoke 分支。
-
-`scripts/pretrain.py` 最终只负责 CLI→config→`run_pretrain()`→退出码。diagnostics 仍是显式可选功能，不扩展成 gate。
-
-### 6.5 第五步：Finetune config 与单折 engine
-
-`src/training/finetune/config.py` 接管 `scripts/train.py::parse_arguments()` 和直接参数归一化。
-
-`src/training/finetune/engine.py::run_finetune_job(config, task, seed, fold)` 的边界固定为一个 task×seed×fold，只负责：
-
-- 读取一个任务数据集和固定 fold indices；
-- 按 fold seed 构造模型；
-- 加载 final checkpoint 并迁移/strict load；
-- 构造 train/val/test loader；
-- 调用/逐步接管 `src/utils.py` 中 `train_epoch()`、`evaluate()`、`test_model()`、`train_and_evaluate()`；
-- 原子写一个 prediction 和一个 shard；
-- 返回该 fold 的结构化结果/退出码。
-
-engine 不接收 GPU 列表，不遍历 8 个任务或 5 个 folds，不实现 LPT，不启动子进程。当前 `multitask_pcgrad` 路径属于不同科学运行语义，本周期不删除、不改写；先保持为兼容入口，不能为追求“统一”塞入单折 engine。
-
-### 6.6 第六步：Finetune scheduler
-
-把 `scripts/run_mips_trimer_scage.sh` 中实际存在的以下 Bash 职责移到 `src/training/finetune/scheduler.py`：
-
-- `cleanup_stage3_children`；
-- 结构化后的 `validate_shard`；
-- `launch_stage3_unit`；
-- `run_finetune_seeds`；
-- `LPT_V1_TASK_ORDER/LPT_V1_FOLD_ORDER`；
-- queue、GPU slot 立即补位、verified shard 跳过、失败停止新派发、在途子进程清理。
-
-scheduler 只以独立子进程调用单折 engine；GPU physical id 只写运行 metadata，不进入科学参数。`scripts/run_mips_trimer_scage.sh` 保留解析环境、准备路径和调用 Python scheduler 的薄壳。
-
-迁移期间保留现有 `MTS_FAKE_TRAIN_CMD` 测试注入能力，先让现有 LPT/失败清理测试改为调用 Python scheduler；新 scheduler 行为通过后再删除 Bash 实现，禁止双重调度。
-
-## 7. 配置和文档简化
-
-### 7.1 单一简单链路
-
-最终链路固定为：
+直接删除只证明旧实验配置内容或旧正式比较身份的测试：
 
 ```text
-experiment JSON
-→ scripts/resolve_mips_trimer_scage.py
-→ results/.../configs/resolved_input.json
-→ Pretrain 或 Finetune
-→ .last.pt / final.pth / prediction / shard
+tests/test_mts_g0_g1_formal.py
+tests/test_mts_g1_g2_formal.py
+tests/test_mts_t0_t1_formal_comparison.py
+tests/test_mts_geometry_injection_ablation.py
+tests/test_mts_g_family_finalization_recovery.py
+tests/test_mts_naming.py
+tests/test_mts_g_family_dual_cohort.py
+tests/test_mts_g_family_readiness.py
+tests/test_mts_g_precheck.py
+tests/test_mts_relation_geometry_sidecar.py
+tests/test_mts_t1_readiness_repair.py
+tests/test_mts_watcher_lifecycle.py
 ```
 
-`resolved_input.json` 是 resolved 参数快照，不是 Manifest：
-
-- 不生成新身份 ID；
-- 不记录源码、Git、GPU、文件 SHA 或 artifact tree；
-- 不复制 checkpoint metadata；
-- 不被 watcher 当作 compatibility gate；
-- 训练和结果报告可以读取其中的显式参数用于展示。
-
-### 7.2 文档职责
-
-工程代码完成后最后更新文档，避免文档先于行为：
-
-- `PIPELINE.md`：只写稳定数据流、入口、`.last/final/marker` 生命周期、sidecar runtime/QC 区别和运行方式；
-- `CODEX_CLAUDE_HANDOFF.md` / `CODEX_LUNA_HANDOFF.md`：只保留当前状态、已完成证据和下一步，不复制长期合同；
-- `TODO.md`、`TODO_预训练.md`、`TODO_优化.md`：只保留未完成事项，删除已完成的执行记录和重复 hash 身份说明；
-- 删除文档中“必须 SHA/hash 才能 resume/finetune/watcher”的旧描述；
-- 不改写历史结果报告中已经记录的 hash，它们是历史文本。
-
-## 8. 分阶段实施与最小验证
-
-每个阶段使用“定位→最小修改→立即验证→继续”的方式；任何阶段失败只修该阶段，不新增 gate 或抽象。GPU/多进程/超过一分钟的验证在 `tmux Uni-Poly` 独立窗口运行，输出写入独立工程 smoke 日志，不覆盖正式结果。
-
-### Phase 0：停止已放弃 R2，记录只读起点
-
-操作：
-
-- 用 `tmux list-windows`、`ps`、GPU 进程和打开文件确认所有 R2 writer/watcher/downstream；
-- 停止这些 R2 进程，确认不再写 R2 checkpoint、sidecar staging、log 或 result；
-- 不恢复、不 finalize、不删除 R2 产物；
-- 记录当前 dirty worktree，后续不回退用户修改。
-
-完成：没有 R2 活动 writer，工程文件可安全重构。
-
-### Phase 1：Checkpoint 生命周期
-
-修改：`src/training/common/{checkpoint,rng}.py`、`scripts/pretrain.py`、`scripts/run_mips_trimer_scage.sh`、相关 watcher 和 checkpoint 测试。
-
-验证：
-
-- 临时目录内连续写两次 `.last.pt`，确认只有一个目标文件且第二次可读；
-- 模拟保存异常，确认旧 `.last.pt` 未损坏；
-- final temp→replace→load→strict load→marker，确认 marker 只有 `status`；
-- final strict load 失败时 marker 不存在；
-- watcher 在无 marker、错误 status 时不触发，在 final+complete 时只触发一次 stub 命令；
-- `rg 'step_[0-9].*\.pth|save_categorical_milestone'` 确认活动生产写路径为零。
-
-### Phase 2：Resolver/launcher/hash 参数清理
-
-修改：resolver、launcher、pretrain/train CLI、active watcher/monitor、doctor/summarizer 和直接相关测试。
-
-验证：
-
-- resolver 对当前 experiment JSON 输出可解析的 resolved JSON；
-- `resolved_input.json` 与 resolver payload 相同且不含 identity/integrity hash；
-- launcher `VALIDATE_ONLY=1` 通过；
-- 非法 GPU、缺失路径、非法枚举仍失败；
-- `rg` 审计活动入口不再传 `*_hash/*_sha256`；
-- 历史 JSON 多余 hash 字段存在时 resolver 能忽略并运行。
-
-### Phase 3：Sidecar 轻量启动
-
-修改：`mts_star_rbf_v2.py`、`mts_relation_geometry.py`、`dataset.py`、`dataloader.py`、离线 QC 入口及 sidecar 测试。
-
-验证：
-
-- worker 0 与多 worker 取相同 sample key 时 model tensor 字段逐项相等；
-- `model_row()` 不访问 QC-only arrays，可通过 monkeypatch/spy 证明；
-- shape/dtype/offset 首尾/当前 row index 错误仍精确失败；
-- 离线 QC 能发现构造的 monotonic、index、valid/reason 错误，但训练 reader 不做全量扫描；
-- 单进程与 3-rank 初始化分别记录墙钟，结果只打印/写临时日志，不建立长期 baseline 或门槛；
-- Star-RBF v2 两样本 forward 结果与改前直接 `assert_close`。
-
-### Phase 4：Pretrain 渐进提取
-
-按 config→objective 小组→common→engine 顺序逐次修改。每次仅移动一组符号并删除旧定义。
-
-验证：
-
-- 固定 seed、固定两个样本、克隆模型/optimizer state；
-- 同时调用尚未删除的旧路径与新提取路径，比较各项 loss、total loss、prediction/diagnostic tensor、梯度和一次 optimizer step 后参数；
-- 使用 `torch.testing.assert_close`，容差按当前 dtype 设置，不写 hash baseline；
-- 全部小组通过后才让 CLI 只调用 `run_pretrain()`。
-
-### Phase 5：Finetune 单折 engine 与 scheduler
-
-按 config→单折 engine→Python scheduler 顺序修改。
-
-验证：
-
-- 单 task/seed/fold 旧路径与 engine 使用同一初始 state 和 batch，比较 prediction、loss、一次 step 参数；
-- shard/prediction 的 task/fold/seed、shape、finite 和 sample indices 正确；
-- 用 fake trainer 验证 40 个 unit 唯一、LPT 顺序、四 slot 立即补位、已验证 shard 跳过、任一 unit 失败后停止派发并清理全部子进程；
-- engine 的 import/参数中不存在 GPU 列表、任务列表或 fold 列表。
-
-### Phase 6：短 resume 与真实 smoke
-
-短 resume 测试：
+下列混合测试文件不能整文件删除，只删除/改写其中读取旧 JSON 的用例，保留模型、
+Dataset、checkpoint 和数值行为测试：
 
 ```text
-A：同一初始状态连续训练 8 step
-B：同一初始状态训练 3 step → 原子写 .last.pt → 新进程 resume → 训练至 8 step
+tests/test_mts_multiscale_topology.py
+tests/test_mips_lmdb_cache.py
+tests/test_mts_checkpoint_contract.py
+tests/test_mts_training_modules.py
+tests/test_mts_finetune_v2.py
+tests/test_mts_star_rbf_v2.py
 ```
 
-直接比较：每步 loss、最终参数、optimizer state tensor、scheduler step/LR、后续 sampler sample-key 顺序、optimizer/micro step。比较用 `torch.testing.assert_close` 和显式序列相等，不用 hash。
+其中：
 
-真实 smoke：
+- `test_mts_training_modules.py` 删除 fresh-paired initialization fixture/测试，保留
+  objective、runtime config 和独立 Finetune scheduler 测试。
+- `test_mts_finetune_v2.py` 删除 A ablation 与 G arm 专用用例，保留单 fold engine、
+  AMP、指标和调度行为。
+- `test_mts_star_rbf_v2.py` 删除构造样本时伪造的 `g1/g0` relation-geometry 字段，改为
+  仅使用 Star-RBF v2 自己的 pair/relation 字段；继续验证反演对称、shift、RBF tail
+  和 finite gradient。
+- `test_mts_multiscale_topology.py` 删除 `topology_attention_identity()`、
+  `add_function_preserving_t1_parameters()` 和 T0/T1 identity 断言，但保留 O8/MSTA
+  forward 数学测试。
 
-- GPU 1/2/3 三卡 DDP 预训练 2 optimizer steps；
-- 一个代表性 task×seed42×fold0 的短 Finetune；
-- loss、gradient、parameter、prediction finite；
-- completion watcher 只用 stub 下游验证，不启动正式 8×5；
-- 不创建正式 checkpoint/result 路径，不复用已放弃 R2 路径。
+新增一个小型 `tests/test_mts_config_retirement.py`，只验证现实行为：
 
-### Phase 7：静态回归和文档收尾
+1. `configs/mts` 下不存在 JSON。
+2. 三个 shell launcher 在缺少 `EXPERIMENT_CONFIG` 时非零退出，并且没有创建产物、
+   启动 Python 训练或访问 GPU。
+3. 显式传入任意临时 JSON 时，resolver 以“当前无活动 schema”拒绝，不接受旧
+   `schema_version`，也不静默忽略任意 `*_hash` 字段。
+4. benchmark 缺少新配置时明确失败，不物化旧配置。
+5. 普通训练入口的 cache 默认不是 full audit。
 
-至少执行：
+测试使用临时目录和 subprocess，不新增 baseline、manifest、receipt 或持久 fixture。
+
+### 5.2 文档处理
+
+实施时最小更新：
+
+- `PIPELINE.md`：删除旧配置文件、profile、T/G/R/A launcher 的当前运行说明；明确
+  “配置层已退役，生产启动暂停，等待下一版配置方案”。模型和数据流的稳定说明保留。
+- `TODO_优化.md`、`TODO_预训练.md`：移除指向已删除 R2 配置的链接；历史结论可保留
+  为文字，但不能再称旧配置为活动事实源。
+- `CODEX_CLAUDE_HANDOFF.md` 与 `CODEX_LUNA_HANDOFF.md` 不在本周期顺手改写；只有
+  它们被用于实际委派时才按各自流程维护。
+- 历史 results/logs 中的 Markdown、JSON、CSV 不批量重写链接。
+
+## 6. Stage R6.4：Sidecar 启动默认收尾
+
+本阶段不重做此前已经完成的 sidecar 轻量化，只验证生产调用边界：
+
+- `scripts/run_mips_trimer_scage.sh` 不再默认传 `cache_validate=full`。
+- `src/dataset/dataset.py` 的普通 `sample` 路径只做存在性、metadata、shape、dtype、
+  offset 和有限抽样检查，不因本次配置清理重新加入全文件 SHA 或全数组扫描。
+- 完整 QC 继续通过 `scripts/qc_mts_sidecars.py` 显式运行，不接回 launcher。
+- DDP 各 rank 不重复完整 QC。
+- `src/dataset/mts_star_rbf_v2.py` 的 ordered-row hint、relation/pair index 和
+  `model_row()` 行为保持不变。
+
+如果检查发现 full audit 仍由其他普通生产入口隐式触发，只删除该调用；不扩大为新的
+sidecar 重构周期。
+
+## 7. 实施顺序
+
+严格按以下顺序执行：
+
+1. 删除 34 个旧配置，并立即确认无 JSON 残留。
+2. 删除 T/G/R/A 专用 initializer、builder、watcher、monitor、audit、comparison、
+   campaign 和 smoke 脚本。
+3. 将 Star-RBF v2 需要的中性 topology/Trimer helper 移入其模块，然后删除 G
+   relation-geometry reader/builder/permutation 数据链。
+4. 删除 A4 random-mask Dataset/collate/MCL 数据链。
+5. 删除 model/UniEncoder 中 T identity、G arm/bias、R2 binding 和 A negative-control
+   dispatch，立即运行保留机制的纯数学测试。
+6. 收缩 resolver 为 fail-closed 占位入口，删除全部旧 schema 与 T/G/R/A 解析分支。
+7. 修改三个 launcher，确保无配置时在任何副作用前退出。
+8. 清理 Pretrain/Finetune config、engine、checkpoint/shard metadata 中的 T/G/R/A
+   参数和初始化/运行分支。
+9. 清理两个 benchmark 的旧默认，调整测试并增加配置退役行为测试。
+10. 更新稳定文档中的活动路径描述。
+11. 运行静态检查和 CPU 定向回归，检查无训练、GPU、worker 或新产物。
+12. 在 `PLAN.md` 末尾追加实际删除清单、测试结果与遗留项；完成后把状态改为
+   `completed`。
+
+每一步只处理当前出现的直接引用。发现未列出的旧配置消费者时，将它归入上述三类：
+删除旧实验专用代码、让通用工具显式等待新配置，或把科学/数据算法与配置依赖解耦；
+不得为其增加兼容层。
+
+## 8. 最小验证
+
+### 8.1 残留引用
+
+```bash
+test -z "$(find configs/mts -type f -name '*.json' -print 2>/dev/null)"
+
+rg -n \
+  'configs/mts/(default|explicit_k_ru|experiments|geometry_injection_ablation|pretraining)|canonical_ru_angle20_v1|mts-pretrain-experiment-v1' \
+  scripts src tests PIPELINE.md TODO_优化.md TODO_预训练.md
+
+rg -n \
+  'g_family_arm|relation_geometry_sidecar|mts_relation_geometry_|g3_permutation|paired_init_id|shared_step0_id|legacy_g1_frozen|topology_attention_identity|add_function_preserving_t1_parameters|A[0-4]_(no3d|star|mcl)|MTS_MCL_RANDOM_MASK|count_matched_random|coordinate_shuffled' \
+  scripts src tests PIPELINE.md TODO_优化.md TODO_预训练.md
+```
+
+两条 `rg` 均允许命中明确标记为历史的说明或本计划，但活动代码、测试 fixture 和运行
+文档不得命中。普通回归指标名 `R2`、矩阵变量 `g1` 或化学字符串中的 `A1` 不是实验
+身份，不得按单字母粗暴全仓删除。
+
+### 8.2 Python、Shell 与测试
+
+根据实际保留文件执行：
 
 ```bash
 /opt/conda/envs/MTS/bin/python -m py_compile \
-  scripts/pretrain.py scripts/train.py scripts/resolve_mips_trimer_scage.py \
-  src/training/common/*.py src/training/pretrain/*.py \
-  src/training/finetune/*.py \
-  src/dataset/mts_star_rbf_v2.py src/dataset/mts_relation_geometry.py
+  scripts/resolve_mips_trimer_scage.py \
+  scripts/benchmark_mts_pretrain.py \
+  scripts/benchmark_mts_finetune.py \
+  scripts/pretrain.py scripts/train.py \
+  src/training/pretrain/*.py src/training/finetune/*.py
 
 bash -n scripts/run_mips_trimer_scage.sh
-bash -n scripts/auto_trigger_g_family_downstream.sh
-bash -n scripts/auto_trigger_g1_after_g0.sh
-bash -n scripts/auto_trigger_g2_downstream.sh
+bash -n scripts/run_mts.sh
+bash -n scripts/run_train.sh
 
 /opt/conda/envs/MTS/bin/python -m pytest -q \
-  tests/test_mts_checkpoint_contract.py \
-  tests/test_mts_star_rbf_v2.py \
-  tests/test_mts_relation_geometry_sidecar.py \
+  tests/test_mts_config_retirement.py \
+  tests/test_mts_checkpoint_lifecycle.py \
+  tests/test_mts_training_modules.py \
   tests/test_mts_finetune_v2.py \
+  tests/test_mts_multiscale_topology.py \
+  tests/test_mts_star_rbf_v2.py \
   tests/test_mts_speed_optimization.py
 
 git diff --check
 ```
 
-测试文件要同步改名或重写语义：删除“hash mismatch 必须拒载”的断言，替换为 strict key/shape、轻量结构、原子 lifecycle 和真实行为对比。若拆出新的小型测试文件，应按职责命名，不创建 baseline/gate 框架。
+若某个保留测试仍导入被删的旧配置 fixture，应改为直接构造该测试真正需要的最小
+运行参数；不得重新创建旧 JSON。
 
-最后更新 `PIPELINE.md`、handoff 和 TODO；不启动正式 20k 或 8×5。
+### 8.3 真实行为检查
 
-## 9. 风险点与最小处理
+- 无 `EXPERIMENT_CONFIG` 调用三个 launcher，均应在一秒内非零退出。
+- 退出前后比较目标临时目录，确认没有生成 resolved input、checkpoint、marker 或日志。
+- 检查没有新增 `torchrun`、训练 Python、DataLoader worker 或 GPU 进程。
+- 不执行 DDP、单 fold smoke、20k 或 8×5；本周期验收对象是“旧配置已退役且入口不会
+  误启动”，不是训练性能。
 
-- **误删算法性 hash**：每删除一处先确认它的返回值是否参与采样、排序、key、partition 或 cache locator；参与则保留。
-- **final 过度精简导致 Finetune 缺 key**：用当前 `select_mts_checkpoint_transfer_keys()` 列出所需 tensors，并以真实模型 strict merge load 验证，不重新加入身份 metadata。
-- **resume 缺 rank state**：保留每 rank RNG/loader/sampler 和 world size 数量检查；不以删除 hash 为理由删掉恢复状态。
-- **轻量 sidecar 延迟暴露坏行**：当前 row 做局部边界检查；需要全局结论时显式跑离线 QC，不把全扫放回训练启动。
-- **旧 marker 误触发**：默认拒绝覆盖；显式同路径 restart 第一动作只删除精确 marker。
-- **scheduler 行为漂移**：先用现有 fake trainer 测试 Python scheduler，再删除 Bash 版本；不可让两套 scheduler 同时派发。
-- **多任务语义受损**：`multitask_pcgrad` 不纳入单折 engine，不因工程整理改变或删除。
-- **dirty worktree 冲突**：只修改本阶段目标文件，逐文件审查 diff，不回退其他用户更改。
+## 9. 风险点与处理
+
+- **生产入口暂时不可用是预期结果。** 不得为了让 smoke 通过而恢复旧 default。
+- **脚本删除可能连带删除有价值的模型测试。** 配置内容测试可以删，模型数学和数据
+  行为测试必须保留或移到合适的现有测试文件。
+- **旧结果无法从工作树直接复跑是已接受的取舍。** 代码和配置仍可从 Git 历史恢复，
+  不在仓库内维护第二套兼容路径。
+- **旧 T/G/R/A checkpoint 可能不再严格加载是预期结果。** 已授权目标已按第 11.1 节
+  删除；若其他位置仍有历史文件，活动代码也不保留旧模型参数布局。需要复现时使用
+  对应 Git revision，不给新代码添加 `strict=False` 或兼容转换。
+- **不得继续扩大产物清理。** 本轮授权已经落实为第 11.1 节的精确删除清单；R6.5
+  只处理源码和稳定文档残留，不再删除 checkpoint、results、logs、cache 或 sidecar。
+- **不要误删算法性 hash。** 仅当其唯一消费者随旧实验代码一同删除时才删除；活动
+  sampling、sample-key、partition、row mapping 和 locator 逻辑继续保留。
 
 ## 10. 完成标准
 
-全部满足才结束维护周期：
+只有全部满足时才把状态改为 `completed`：
 
-- 已放弃 R2 没有活动 writer/watcher；其历史产物未被本周期删除或改写；
-- 活动生产路径不再执行 integrity/identity/compatibility hash 计算、传参或拒载；
-- 剩余 hash 均能指向明确的采样、排序、sample key、partition、数据映射或写操作并发保护用途；
-- resolver 真实生成简洁 `resolved_input.json`，没有 Identity/Manifest 系统；
-- 预训练不再生成任何 `step_XXXXX.pth`；
-- `.last.pt` 每 2000 optimizer steps原子滚动覆盖，并能完成 3→8 step resume；
-- `final.pth` 原子保存、只含下游模型参数、并在 marker 前完成一次 strict load；
-- `.complete.json` 只有 `{"status": "complete"}`；
-- watcher 只检查 final、marker 和 status，不加载 checkpoint、不调用 hash audit；
-- sidecar 训练启动没有全文件 SHA、metadata digest 或全数组扫描；
-- `model_row()` 不读取 QC-only 字段，离线 QC 不进入启动路径；
-- Pretrain 和 Finetune 保持独立训练循环，没有统一 Trainer；
-- `finetune/engine.py` 只感知单 task×seed×fold，不感知 8×5、GPU slot 或 LPT；
-- `finetune/scheduler.py` 保持四 slot、LPT、跳过、失败停止和子进程清理行为；
-- 固定 batch、短 resume、三卡 2-step DDP、单折 Finetune、watcher lifecycle 和定向测试通过；
-- 没有运行正式 20k 或完整 8×5，没有重建冻结 cache/sidecar，没有改变科学语义；
-- 没有新增 BaseTrainer、Registry、Manifest、Identity、Contract、audit receipt、持久 baseline 或额外 Gate。
+- `configs/mts` 下 34 个旧 JSON 全部删除，没有改名归档或隐式副本。
+- R2 不再是阻塞项，其配置及第 11.1 节列出的专用产物已删除；共享数据、通用 cache、
+  维护验证产物和非目标实验产物未动。
+- 活动代码和运行文档不再引用旧 config/profile/schema 名称。
+- resolver 不含旧 schema 解析、parent inheritance 或 `_is_legacy_identity_field()`。
+- 三个 launcher 没有旧配置 fallback，并在缺少新配置时于任何副作用前失败。
+- benchmark 不再物化或默认使用旧配置。
+- 旧 T/G/R/A 专用 initializer、watcher、monitor、audit、comparison 和 campaign 脚本
+  已删除。
+- T0/T1 identity、fresh-paired/function-preserving initialization、shared step-0 与专用
+  diagnostics 已从活动源码删除；O8/MSTA 核心 forward 仍可独立测试。
+- G arm、relation-geometry bias/sidecar/permutation、dual-cohort bundle 和 G-specific
+  Dataset/collate 字段已删除；Star-RBF v2 所需的中性几何 helper 已脱离 G 模块。
+- R2 initializer、legacy-G1 binding、R2 bundle/metadata/比较逻辑已删除；Star-RBF v2
+  周期 relation 几何、reader/builder 和模型 bias 测试仍保留。
+- A0–A4 descriptor、A4 random-mask reader/collate/MCL、ablation env 和 negative-control
+  mode 已删除；不存在默认成 A3 的隐式 fallback。
+- 活动代码不再接受或输出 `g_family_arm`、`paired_init_id`、`shared_step0_id`、
+  `legacy_g1_frozen`、`mts_relation_geometry_*` 或 `mcl_random_mask_*`。
+- Pretrain/Finetune 不再为旧配置/profile/checkpoint metadata 保留兼容分支；未来模型
+  仍使用 key/shape/finite 检查和 `strict=True`，但不要求历史 T/G/R/A checkpoint
+  兼容清理后的参数布局。
+- 普通生产路径不默认执行 full cache/sidecar audit；完整 QC 仅由显式离线命令执行。
+- 配置退役测试、保留的定向 pytest、`py_compile`、`bash -n` 和
+  `git diff --check` 全部通过。
+- 没有新增新配置、兼容层、迁移器、Identity、manifest、hash gate 或统一 Trainer。
+- 没有运行训练、启动 GPU/worker 或重建 cache/sidecar；除第 11.1 节明确授权并记录的
+  T/G/R/A 专用产物外，没有修改其他历史产物。
 
-本文件是本维护周期的唯一执行计划。实施时按 Phase 0→7 顺序推进；遇到问题只针对可复现失败做最小修复，不再扩展计划机制。
+## 11. 执行记录
+
+### 11.1 完成状态与删除前核对
+
+执行日期：2026-08-14。执行根目录为
+`/root/workspace/Uni-Poly-Plus-master`。执行前确认工作树存在用户及其他会话的
+dirty 修改，未回滚、覆盖或清理无关改动；确认 `Uni-Poly` 中没有活动训练、迁移或
+`torchrun` 进程，所有窗口均为空闲 shell。
+
+按本轮用户授权先列出并核对删除目标，再执行删除：
+
+- `configs/mts/` 下的 34 个 JSON 全部属于旧 T/G/R/A 配置，已删除；未改名归档，
+  删除后 `find configs/mts -type f -name '*.json'` 为空。
+- 旧实验专用脚本 33 个、旧实验测试 11 个及两个旧 Dataset/sidecar 模块已删除。
+  精确文件清单以 `git diff --name-status --diff-filter=D` 为准，按目录计数为：
+  `configs/mts/` 34、`scripts/` 33、`src/` 2、`tests/` 11。
+- 逐项核对并删除的实验产物目录为：
+
+  ```text
+  pretrained_models/mts_multiscale_topology/g_family_dual_cohort_repair_v1
+  pretrained_models/mts_multiscale_topology/g_family_matched_v1
+  pretrained_models/mts_multiscale_topology/g_family_step0_v1
+  pretrained_models/mts_multiscale_topology/g_family_step0_full_v1
+  pretrained_models/mts_multiscale_topology/g_family_step0_full_v2
+  pretrained_models/mts_multiscale_topology/t1_formal_v1
+  pretrained_models/mts_multiscale_topology/t1_init
+  pretrained_models/mts_multiscale_topology/t_pretrain0_v1
+  pretrained_models/mts_star_rbf_v2/legacy_backbone_formal_v1/R2
+  results/mts_multiscale_topology/g_family_dual_cohort_repair_v1
+  results/mts_multiscale_topology/g_family_matched_v1
+  results/mts_multiscale_topology/g_family_readiness_v1
+  results/mts_multiscale_topology/g_precheck_v1
+  results/mts_multiscale_topology/g_prep_relation_geometry_v1
+  results/mts_multiscale_topology/t0_t1_formal_v1
+  results/mts_multiscale_topology/t1_readiness
+  results/mts_multiscale_topology/t1_repair
+  results/mts_multiscale_topology/t_pretrain0_v1
+  results/mts_sota_v3/R2_g1_periodic_relation_rbf_v2_legacy_backbone_formal_v1
+  results/mts_speed_optimization/r2_worker_sweep_20260813
+  results/mts_star_rbf_v2/legacy_backbone_formal_v1/R2
+  logs/mts_multiscale_topology/g_family_matched_v1
+  logs/mts_multiscale_topology/g_precheck_v1
+  logs/mts_multiscale_topology/g_prep_relation_geometry_v1
+  logs/mts_multiscale_topology/t0_t1_formal_v1
+  logs/mts_multiscale_topology/t1_repair
+  logs/mts_multiscale_topology/t_pretrain0_v1
+  logs/mts_speed_optimization/r2_worker_sweep_20260813
+  logs/mts_star_rbf_v2/legacy_backbone_formal_v1/R2
+  data/processed/mips_trimer_scage/relation_geometry
+  data/processed/mips_trimer_scage/relation_geometry_permutation
+  data/processed/mips_trimer_scage/ablation_random_mask
+  ```
+
+  上述目录均已确认不存在；`results/mts_maintenance_repair_v1/`、
+  `results/mts_maintenance_smoke_v1/` 及对应 maintenance logs 保留。共享原始数据、
+  通用 cache、canonical 冻结 cache、Star-RBF v2/MSTA 机制文件和其他非 T/G/R/A
+  实验文件未列入删除目标。
+
+### 11.2 R6 实际修改
+
+阶段记录：R6.1（34 配置、专用编排和授权产物核对/删除）完成；R6.2（resolver、
+launcher、Dataset/collate、模型、Pretrain/Finetune 的旧链删除）完成；R6.3（benchmark、
+测试与稳定文档去旧配置化）完成；R6.4（sidecar 普通入口边界与 fail-closed 行为）完成。
+每个阶段均在下一阶段前完成对应静态或 CPU 定向验证，没有跨阶段启动训练。
+
+- `src/dataset/mts_star_rbf_v2.py` 接管中性 topology/Trimer helper；删除
+  `src/dataset/mts_relation_geometry.py` 和 `src/dataset/mts_ablation_random_mask.py`。
+- `src/dataset/dataset.py`、`src/dataset/dataloader.py` 删除 G/A sidecar、permutation、
+  random-mask 和旧实验字段；拓扑-only 路径仅在 Trimer `.done` 存在时绑定其身份，
+  不把可选 Trimer 层变成隐式构建要求。
+- `src/modules/mips_local_graph.py`、`src/modules/uni_encoder.py`、
+  `src/modules/trimer_mcl.py` 删除 T/G/R/A identity、bias、negative-control 和
+  permutation 分支，保留通用 MSTA、Attention、Star-RBF v2 和 Trimer MCL 数学能力。
+- `src/training/pretrain/{config,engine}.py`、`src/training/finetune/{config,engine}.py`、
+  `src/utils.py`、`src/dataset/mips_trimer_contract.py` 删除旧 profile、arm、paired
+  step-0、R2 binding 和旧 metadata；未来 checkpoint 仍走 key/shape/finite 检查和
+  `strict=True`。
+- `scripts/resolve_mips_trimer_scage.py` 收缩为无活动 schema 的 fail-closed resolver；
+  `scripts/run_mips_trimer_scage.sh`、`scripts/run_mts.sh`、`scripts/run_train.sh` 在
+  `EXPERIMENT_CONFIG` 缺失或路径不存在时，于 Python、GPU、worker、cache 和输出目录
+  初始化前退出。两个 benchmark 改为必须显式提供新配置，不再物化旧默认。
+- `PIPELINE.md`、`TODO_优化.md`、`TODO_预训练.md` 清理已删除活动路径；历史结论只作
+  文字记录，不再作为活动配置或结果来源。
+- 新增/保留 `tests/test_mts_config_retirement.py` 等定向测试；未创建新配置、迁移器、
+  Identity、manifest、hash gate 或统一 Trainer。
+
+### 11.3 验证与问题修复证据
+
+- Python 静态编译：`py_compile`（resolver、两个 benchmark、pretrain/train、
+  `src/training/pretrain/*.py`、`src/training/finetune/*.py`）退出码 0。
+- Shell 语法：三个 launcher `bash -n` 退出码 0；`git diff --check` 退出码 0。
+- R6 主回归：
+  `tests/test_mts_config_retirement.py`、checkpoint lifecycle、training modules、
+  finetune、multiscale topology、Star-RBF v2、speed optimization 共 `46 passed, 1 warning`
+  （9.29s）。
+- 额外定向回归：`tests/test_mts_checkpoint_contract.py` 与
+  `tests/test_mips_lmdb_cache.py` 共 `31 passed, 1 warning`（5.49s）。首次运行发现
+  checkpoint 测试参数遗漏当前 canonical topology 字段，以及 topology-only 临时
+  cache 缺失 Trimer `.done` 时被错误强制绑定；已分别补齐测试参数并将 Dataset 改为
+  “存在则绑定、缺失则保持 topology-only 合法”，修复后全通过。
+- 残留引用检查：配置路径/旧 schema 检查和旧 T/G/R/A identity 正则检查均无命中
+  （两个 `rg` 返回 1）；仅保留 MorganCount/RDKit 的 `R2`、回归指标 `R2` 及测试中
+  的 checkpoint/cache 字符串等非实验身份命中。
+- 三个 launcher 在无 `EXPERIMENT_CONFIG` 时均返回退出码 2，并输出 retired-config
+  fail-closed 消息；独立临时证据目录中未生成 output/checkpoint，未访问 Python 训练、
+  GPU、worker 或生产 cache。
+- `pgrep` 未发现活动 `torchrun`、pretrain/train、迁移或 scheduler 进程；未启动 GPU
+  训练、正式 20k、8×5 微调、cache/sidecar 重建或生产输出。维护验证产物保持原位。
+
+### 11.4 科学语义与遗留项
+
+Star-RBF v2 周期 relation 几何、MSTA/Attention、Backbone、Trimer 基础 helper、
+数据定义和训练目标未因 R6 改写；变更仅删除旧实验选择/身份/调度链并暂停生产 resolver。
+保留的 `CONFIG_SCHEMA`、cache/layout/feature/sidecar/checkpoint 常量和通用 hash 用于
+当前活动数据与模型消费者，不能删除；通用缓存/RNG 中的 `legacy` 命名、RDKit/Morgan
+指标的 `R2` 以及历史文档文字不是旧实验运行逻辑。旧 T/G/R/A checkpoint 即使仍有
+其他位置也不再由清理后代码提供兼容加载，这是本周期接受的退役边界。
+
+R6.1–R6.4 的修改与验证已完成。独立审查发现的 T 专用 MSTA milestone diagnostics、
+过期 R2 执行指令和旧 explicit/canonical 可运行措辞已在 R6.5 收尾中删除或改为明确
+历史说明；本次审查没有启动下一版 MTS 配置或任何训练任务。
+
+## 12. Stage R6.5：独立审查后的最小收尾
+
+### 12.1 目标与边界
+
+本阶段只修复 R6 已声明但尚未完全落实的三项残留：
+
+1. 删除活动 Pretrain 中 T 专用 MSTA milestone diagnostics 链。
+2. 将 `TODO_优化.md`、`TODO_预训练.md` 中仍可被解释为活动任务的 R2 指令改为明确的
+   历史记录，不能再要求 profiler、继续 R2 或派生 R2 新实验。
+3. 将 `PIPELINE.md` 中 `explicit_k_ru`/canonical 的“当前可运行、默认正式生产”措辞
+   改为“底层能力保留但当前无活动配置，生产暂停”。
+
+不修改 MSTA forward 数学、Star-RBF v2、Attention、Backbone、Dataset、训练目标、
+checkpoint 生命周期或科学超参数；不创建新配置，不启动训练/GPU/worker，不删除任何
+新增产物，也不顺手重构 Pretrain engine。
+
+### 12.2 删除 T 专用 diagnostics 活动链
+
+修改以下真实文件：
+
+- `src/training/pretrain/config.py::parse_arguments()`：删除 `--diagnostics_dir` 和
+  `--diagnostic_steps`。
+- `src/training/pretrain/engine.py`：删除 `_msta_attention_modules()`、
+  `_set_msta_diagnostic_mode()`、`_make_fixed_probe()`、`_fixed_probe_losses()`、
+  `_diagnostic_record()`，以及训练初始化、step 捕获、`resume_smoke` 和 finalization 中
+  对 `diagnostics_enabled`、`diagnostic_steps`、`diagnostic_rows`、`diagnostic_probe`、
+  `diagnostic_jsonl`、`contract.json`、`milestones.jsonl`、`report.json` 的全部调用与写入。
+
+删除时保留：
+
+- `msta_last2` 对应的通用 MSTA layer 和正常 forward；
+- `local_output`、共享 Q/K/V、local/context relation 计算及其纯数学测试；
+- 正常训练、loss、checkpoint、resume smoke 和 final checkpoint 路径；
+- 与 diagnostics 无关的 RNG 保存/恢复工具。
+
+不得把 diagnostics 改名为通用 profiler 后继续保留，也不得为删除它引入新 observer、
+hook、manifest 或诊断框架。若某个 helper 仍有非 diagnostics 消费者，只删除专用调用，
+以 `rg` 和直接消费者为依据决定是否保留。
+
+### 12.3 清理过期活动文档指令
+
+- `TODO_优化.md`：保留已经标明为历史的 R2 配置与结果说明；删除或改写“更新 handoff、
+  对现有 R2 profiler、决定继续跑完 R2、基于 R2 新建 matched 实验、使用 R2 milestone”
+  等活动步骤。改写后必须明确“R2 已由 R6 退役，不得执行；新实验等待未来新配置”。
+- `TODO_预训练.md`：将 `M0：当前 R2` 至后续基于 R2 的推荐链标为历史研究草案，或删除
+  其活动执行语气；不能把已删除 R2 当作下一轮 baseline/config。
+- `PIPELINE.md`：保留 canonical 与 `explicit_k_ru` 的科学语义说明，但把
+  “当前可运行对照”“canonical 是默认且唯一正式 20k 表示”等措辞改为历史/能力描述；
+  与已有“下一版配置前生产启动暂停”结论统一。
+
+不批量改写历史 results/logs，不修改 handoff，不设计下一版实验名称、JSON schema、
+resolver 或生产默认。
+
+### 12.4 最小验证
+
+先执行残留检查：
+
+```bash
+rg -n \
+  'diagnostics_dir|diagnostic_steps|mts-msta-branch-diagnostics-v1|_diagnostic_record|_set_msta_diagnostic_mode' \
+  src/training/pretrain scripts tests
+
+rg -n \
+  '对现有 R2|跑完 R2|M0：当前 R2|当前项目同时保留可运行的 `explicit_k_ru`|canonical 仍是默认' \
+  TODO_优化.md TODO_预训练.md PIPELINE.md
+```
+
+两条命令应无活动命中；历史说明如果必须保留，应在同一段明确标记“已退役、不得执行”。
+
+随后运行：
+
+```bash
+/opt/conda/envs/MTS/bin/python -m py_compile \
+  src/training/pretrain/config.py \
+  src/training/pretrain/engine.py \
+  scripts/pretrain.py
+
+/opt/conda/envs/MTS/bin/python -m pytest -q \
+  tests/test_mts_config_retirement.py \
+  tests/test_mts_checkpoint_lifecycle.py \
+  tests/test_mts_training_modules.py \
+  tests/test_mts_multiscale_topology.py \
+  tests/test_mts_star_rbf_v2.py
+
+git diff --check
+```
+
+不运行 DDP、单 fold、20k 或 8×5。本阶段没有修改 forward 数学和数据路径，CPU 定向
+回归足以验证删除 diagnostics 未破坏正常 Pretrain/MSTA 调用。
+
+### 12.5 完成标准
+
+仅当以下条件全部满足，才把顶部状态改回 `completed`，并在本节末尾追加实际修改与
+测试结果：
+
+- 活动 CLI 和 Pretrain engine 不再包含 T 专用 MSTA milestone diagnostics。
+- MSTA 正常 forward、Pretrain 配置解析、checkpoint/resume smoke 相关测试继续通过。
+- TODO 不再包含继续、profiling 或派生 R2 实验的活动指令。
+- PIPELINE 明确底层机制可保留，但在新配置产生前没有可启动的生产默认或 explicit
+  对照配置。
+- 第 1、9、10、11 节关于授权产物删除的描述互相一致。
+- 未修改其他文件、科学语义或第 11.1 节之外的历史产物。
+- `py_compile`、定向 pytest 和 `git diff --check` 通过。
+
+### 12.6 R6.5 执行记录
+
+执行日期：2026-08-14；根目录为 `/root/workspace/Uni-Poly-Plus-master`。本轮只在
+R6.5 范围内修改了以下文件，保留工作树中其他 dirty 改动：
+
+- `src/training/pretrain/config.py`：删除 `--diagnostics_dir` 与
+  `--diagnostic_steps` 两个 T 专用 milestone diagnostics CLI 参数。
+- `src/training/pretrain/engine.py`：删除 MSTA milestone diagnostics helper、固定
+  probe/local-off 捕获、初始化/step/resume/finalization 的 diagnostics 状态和
+  `contract.json`、`milestones.jsonl`、`report.json` 写入；正常 forward、loss、
+  checkpoint、resume smoke 和 RNG 保存恢复路径保留。
+- `TODO_优化.md`、`TODO_预训练.md`：保留历史数值和研究分析，但把 R2 继续、恢复、
+  profiler、milestone、20k/8×5 与派生 matched 实验指令改为历史不可执行说明。
+- `PIPELINE.md`：将 MTS、canonical、explicit_k_ru、current_mcl 等内容改为保留能力/历史
+  语义，明确当前无活动配置、没有可启动生产默认，且删除对已退役 `scripts/mts.py`
+  doctor 入口的活动引用。
+- 未删除或修改任何新增产物、checkpoint、results、logs、cache、sidecar、handoff 或
+  其他历史文件；未创建新配置、resolver、observer、manifest、hash gate 或兼容层。
+
+第 12.4 节验证结果：
+
+- diagnostics 残留 `rg` 返回 1（无命中）。
+- 过期 R2/旧生产措辞 `rg` 返回 1（无未标记活动命中）。
+- `/opt/conda/envs/MTS/bin/python -m py_compile src/training/pretrain/config.py
+  src/training/pretrain/engine.py scripts/pretrain.py` 退出码 0。
+- 定向 pytest（config retirement、checkpoint lifecycle、training modules、MSTA
+  multiscale、Star-RBF v2）结果为 `25 passed, 1 warning in 6.23s`。
+- `git diff --check` 退出码 0；未启动 GPU、训练、worker、DDP、单 fold、20k 或 8×5，
+  未重建 cache/sidecar，未产生生产输出。
+
+R6.5 的遗留项仅包括未来新配置周期重新定义生产 resolver/default 和是否启用 canonical/
+explicit 能力；本轮不设计、不实现。R6.1–R6.5 全部验收条件满足，顶部状态更新为
+`completed`。
+
+### 12.7 MSTA diagnostics 最小收尾记录
+
+根据后续复核意见，在不改变 MSTA 数学语义的前提下继续完成最小清理：
+
+- `src/modules/mips_local_graph.py` 删除 `MSTAMIPSLocalAttention` 的
+  `diagnostic_capture`、`diagnostic_local_off`、`last_diagnostic` 三个状态字段，
+  删除统计/entropy 分支，并将 forward 恢复为始终直接执行
+  `context_projected + local_projected`。
+- `tests/test_mts_multiscale_topology.py` 删除三个 diagnostics 专用检查，仅保留
+  MSTA layer 选择、relation mask、branch softmax、forward 数学和 local-output 梯度
+  测试；同步移除不再使用的测试导入。
+- 扩大残留检查覆盖
+  `diagnostics_dir|diagnostic_steps|mts-msta-branch-diagnostics-v1|_diagnostic_record|
+  _set_msta_diagnostic_mode|diagnostic_capture|diagnostic_local_off|last_diagnostic`，
+  在 `src/training/pretrain`、`src/modules/mips_local_graph.py` 和 `tests` 中均无命中。
+
+验证结果：定向 pytest（config retirement、checkpoint lifecycle、training modules、
+MSTA multiscale、Star-RBF v2）为 `23 passed, 1 warning in 6.76s`；相关 Python
+`py_compile` 退出码 0；扩大残留 `rg` 返回 1；`git diff --check` 退出码 0。未修改
+缓存、sidecar、checkpoint、results、logs 或其他历史产物，未启动 GPU、训练、worker、
+DDP、20k 或 8×5。该后续最小收尾完成后，PLAN 顶部状态保持/恢复为 `completed`。

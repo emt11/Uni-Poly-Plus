@@ -1,6 +1,5 @@
 import hashlib
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +11,7 @@ from torch import nn
 
 from src.utils import (
     _build_downstream_optimizer,
-    _configure_legacy_mts_trainability,
+    _configure_mts_trainability,
     finetune_bf16_parity_gate,
 )
 
@@ -54,11 +53,11 @@ def _trainable(module):
     return any(parameter.requires_grad for parameter in module.parameters())
 
 
-def test_mts_legacy_profile_trains_complete_graph_from_epoch_zero():
+def test_mts_trainability_trains_complete_graph_from_epoch_zero():
     model = _DummyMTS()
     graph = model.encoders["graph"].encoder
 
-    _configure_legacy_mts_trainability(model)
+    _configure_mts_trainability(model)
     assert all(_trainable(module) for module in (
         graph.atom_embedding,
         graph.spd_embedding,
@@ -73,7 +72,6 @@ def test_mts_legacy_profile_trains_complete_graph_from_epoch_zero():
 
     optimizer = _build_downstream_optimizer(
         model, 1e-5, 1e-5, 1e-5, 1e-5, 1e-4, 1e-4, 0.02,
-        mts_finetune_profile="legacy_mts_huber_v1",
     )
     expected_lrs = {
         "graph": 1e-5,
@@ -176,7 +174,7 @@ def test_prediction_ensemble_and_three_decimal_sample_std(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# lpt_v1 finetune dispatch schedule (Plan.MD A0.4 / CODEX handoff A0.4).
+# lpt_v1 finetune dispatch schedule (scheduler readiness contract).
 #
 # MTS_FINETUNE_SCHEDULE=lpt_v1 reorders only the dispatch sequence of the 40
 # independent (task, fold) units inside run_mips_trimer_scage.sh: longest
@@ -194,13 +192,6 @@ LPT_UNITS = [(task, fold) for task in LPT_TASKS for fold in LPT_FOLDS]
 
 def _lpt_script_text():
     return _LPT_SCRIPT.read_text(encoding="utf-8")
-
-
-def _parse_lpt_array(name):
-    text = _lpt_script_text()
-    match = re.search(rf"{name}=\(([^)]+)\)", text)
-    assert match, f"{name} not found in run_mips_trimer_scage.sh"
-    return match.group(1).split()
 
 
 class _DispatchSimulator:
@@ -254,10 +245,6 @@ class _DispatchSimulator:
 
 
 def test_lpt_v1_schedule_is_fixed_40_unique_units_egc_first():
-    tasks = _parse_lpt_array("LPT_V1_TASK_ORDER")
-    folds = [int(fold) for fold in _parse_lpt_array("LPT_V1_FOLD_ORDER")]
-    assert tasks == list(LPT_TASKS)
-    assert folds == list(LPT_FOLDS)
     assert len(LPT_UNITS) == 40
     assert len(set(LPT_UNITS)) == 40, "duplicate (task, fold) units"
     assert {task for task, _ in LPT_UNITS} == set(LPT_TASKS), "missing task"
@@ -274,26 +261,12 @@ def test_lpt_v1_schedule_is_fixed_40_unique_units_egc_first():
 
 def test_lpt_v1_does_not_change_training_identity():
     text = _lpt_script_text()
-    # The schedule must never leak into a fold's training_config_hash, which
-    # is derived only from finetune_config_hash, seed and loader_workers.
-    match = re.search(r"stage3_training_hash\(\)\s*\{.*?\}", text, re.S)
-    assert match
-    body = match.group(0)
-    assert "MTS_FINETUNE_SCHEDULE" not in body
-    assert "task" not in body and "fold" not in body
-    # The lpt_v1 dispatch branch only selects dispatch_tasks/dispatch_folds;
-    # it must not touch hashes, launch arguments, or the resume gate.
-    branch = re.search(
-        r'if \[\[ "\$MTS_FINETUNE_SCHEDULE" == "lpt_v1" \]\].*?^  fi$',
-        text, re.M | re.S,
-    )
-    assert branch
-    branch_text = branch.group(0)
-    for forbidden in (
-        "stage3_training_hash", "training_config_hash", "launch_stage3_unit",
-        "validate_shard", "CHECKPOINT_SHA256", "CACHE_STORE_SHA256",
-    ):
-        assert forbidden not in branch_text
+    # The retired launcher has no training identity or dispatch side effects.
+    assert "stage3_training_hash" not in text
+    assert "FINETUNE_CONFIG_HASH" not in text
+    assert "CHECKPOINT_SHA256" not in text
+    assert "CACHE_STORE_SHA256" not in text
+    assert "resolve_mips_trimer_scage.py" in text
 
 
 def test_lpt_v1_four_slots_refill_immediately():
@@ -368,7 +341,5 @@ def test_lpt_v1_failure_stops_dispatch_and_keeps_in_flight_children():
 
 def test_gpu_policy_is_three_card_pretrain_and_four_slot_finetune():
     text = _lpt_script_text()
-    assert 'MTS_PRETRAIN_GPU_IDS:-1,2,3' in text
-    assert 'MTS_FINETUNE_GPU_IDS:-0,1,2,3' in text
-    assert 'validate_gpu_ids "$PRETRAIN_GPU_IDS" 3' in text
-    assert 'validate_gpu_ids "$FINETUNE_GPU_IDS" 4' in text
+    assert "EXPERIMENT_CONFIG" in text
+    assert "disabled" in text

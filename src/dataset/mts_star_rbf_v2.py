@@ -19,9 +19,6 @@ from .mips_trimer_contract import (
     STAR_RBF_V2_BUILDER_VERSION,
     STAR_RBF_V2_SIDECAR_SCHEMA,
 )
-from .mts_relation_geometry import prepare_topology, prepare_trimer
-
-
 GEOMETRY_SOURCE = {
     "invalid": 0,
     "trivial_self_no_bias": 1,
@@ -61,6 +58,180 @@ ARRAY_DTYPES = {
     "pair_relative_asymmetry": np.dtype("<f4"),
 }
 ARRAY_NAMES = tuple(ARRAY_DTYPES)
+
+
+def _as_bool(value, default=False) -> bool:
+    if value is None:
+        return bool(default)
+    try:
+        return bool(torch.as_tensor(value).reshape(-1)[0].item())
+    except (IndexError, RuntimeError, TypeError, ValueError):
+        return bool(value)
+
+
+def _tensor(value, *, dtype=None):
+    if value is None:
+        return None
+    return torch.as_tensor(value, dtype=dtype)
+
+
+def _internal_edges(topology):
+    edge = _tensor(getattr(topology, "ru_edge_index", None), dtype=torch.long)
+    if edge is None or edge.ndim != 2 or edge.size(0) != 2:
+        edge = _tensor(getattr(topology, "edge_index", None), dtype=torch.long)
+    if edge is None or edge.ndim != 2 or edge.size(0) != 2:
+        return None
+    unique = set()
+    for left, right in edge.t().tolist():
+        left, right = int(left), int(right)
+        if left == right:
+            continue
+        unique.add((min(left, right), max(left, right)))
+    return sorted(unique)
+
+
+def prepare_topology(topology):
+    """Validate the topology fields required by Star-RBF v2."""
+
+    edge = _tensor(getattr(topology, "lga_edge_index", None), dtype=torch.long)
+    spd = _tensor(getattr(topology, "lga_spd", None), dtype=torch.long)
+    shift = _tensor(getattr(topology, "lga_source_image_shift", None), dtype=torch.long)
+    z = _tensor(
+        getattr(topology, "atomic_numbers", getattr(topology, "z", None)),
+        dtype=torch.long,
+    )
+    left = getattr(topology, "ru_left_boundary", None)
+    right = getattr(topology, "ru_right_boundary", None)
+    internal = _internal_edges(topology)
+    if (
+        edge is None
+        or edge.ndim != 2
+        or edge.size(0) != 2
+        or spd is None
+        or spd.ndim != 1
+        or spd.numel() != edge.size(1)
+        or shift is None
+        or shift.numel() != edge.size(1)
+        or z is None
+        or z.ndim != 1
+        or left is None
+        or right is None
+        or internal is None
+    ):
+        return None, "topology_relation_fields_invalid"
+    if edge.numel() and (int(edge.min()) < 0 or int(edge.max()) >= int(z.numel())):
+        return None, "topology_relation_endpoint_invalid"
+    if int(left) < 0 or int(right) < 0 or int(left) >= int(z.numel()) or int(right) >= int(z.numel()):
+        return None, "topology_relation_endpoint_invalid"
+    return {
+        "edge": edge,
+        "spd": spd,
+        "shift": shift.reshape(-1),
+        "z": z.reshape(-1),
+        "left": int(left),
+        "right": int(right),
+        "internal_edges": internal,
+    }, None
+
+
+def prepare_trimer(trimer, topology=None):
+    """Validate explicit central-RU identity and 3-D geometry fields."""
+
+    if not _as_bool(getattr(trimer, "trimer_geometry_valid", False)):
+        if _as_bool(getattr(trimer, "trimer_2d_fallback", False)):
+            return None, "2d_fallback"
+        if not _as_bool(getattr(trimer, "trimer_geometry_is_3d", False)):
+            return None, "non_3d_geometry"
+        return None, "geometry_invalid"
+    if not _as_bool(getattr(trimer, "trimer_geometry_is_3d", False)):
+        return None, "non_3d_geometry"
+    if _as_bool(getattr(trimer, "trimer_2d_fallback", False)):
+        return None, "2d_fallback"
+    positions = _tensor(getattr(trimer, "trimer_pos", None))
+    atomic = _tensor(getattr(trimer, "trimer_atomic_number", None), dtype=torch.long)
+    base = _tensor(getattr(trimer, "trimer_base_ru_atom_id", None), dtype=torch.long)
+    offsets = _tensor(getattr(trimer, "trimer_ru_offset", None), dtype=torch.long)
+    central = _tensor(getattr(trimer, "trimer_central_ru_mask", None), dtype=torch.bool)
+    mapping = _tensor(getattr(trimer, "mips_to_trimer_central_index", None), dtype=torch.long)
+    edge = _tensor(getattr(trimer, "trimer_edge_index", None), dtype=torch.long)
+    bond = _tensor(getattr(trimer, "trimer_bond_type", None), dtype=torch.long)
+    if positions is None or positions.ndim != 2 or positions.size(1) != 3:
+        return None, "trimer_identity_missing"
+    if not bool(torch.isfinite(positions).all()):
+        return None, "nonfinite_coordinates"
+    if any(value is None for value in (atomic, base, offsets, central, mapping, edge, bond)):
+        return None, "trimer_identity_missing"
+    if (
+        atomic.ndim != 1
+        or base.ndim != 1
+        or offsets.ndim != 1
+        or central.ndim != 1
+        or atomic.numel() != positions.size(0)
+        or base.numel() != positions.size(0)
+        or offsets.numel() != positions.size(0)
+        or central.numel() != positions.size(0)
+        or mapping.ndim != 1
+        or bool((mapping < 0).any())
+        or bool((mapping >= positions.size(0)).any())
+        or not bool(central[mapping].all())
+        or edge.ndim != 2
+        or edge.size(0) != 2
+        or bond.ndim != 1
+        or bond.numel() != edge.size(1)
+    ):
+        return None, "mapping_invalid"
+    state_to_local = {}
+    for index in range(int(positions.size(0))):
+        state = (int(base[index]), int(offsets[index]))
+        if state in state_to_local:
+            return None, "trimer_identity_duplicate"
+        state_to_local[state] = index
+    if topology is not None:
+        topology_z = _tensor(
+            getattr(topology, "atomic_numbers", getattr(topology, "z", None)),
+            dtype=torch.long,
+        )
+        canonical_to_trimer = _tensor(
+            getattr(
+                topology,
+                "canonical_to_trimer_base_atom_id",
+                getattr(topology, "canonical_to_trimer_base_atom_index", None),
+            ),
+            dtype=torch.long,
+        )
+        if (
+            topology_z is None
+            or canonical_to_trimer is None
+            or canonical_to_trimer.numel() != topology_z.numel()
+            or mapping.numel() != topology_z.numel()
+        ):
+            return None, "canonical_trimer_identity_missing"
+        for canonical_id in range(int(topology_z.numel())):
+            base_id = int(canonical_to_trimer[canonical_id])
+            local = state_to_local.get((base_id, 0))
+            if local is None or int(mapping[canonical_id]) != int(local):
+                return None, "canonical_trimer_mapping_mismatch"
+            if int(atomic[local]) != int(topology_z[canonical_id]):
+                return None, "canonical_trimer_atomic_mismatch"
+    bonds = {}
+    for column in range(int(edge.size(1))):
+        left, right = int(edge[0, column]), int(edge[1, column])
+        if (
+            left == right
+            or left < 0
+            or right < 0
+            or left >= positions.size(0)
+            or right >= positions.size(0)
+        ):
+            return None, "real_bond_graph_invalid"
+        pair = (min(left, right), max(left, right))
+        bonds.setdefault(pair, set()).add(int(bond[column]))
+    return {
+        "positions": positions.float(),
+        "atomic": atomic.reshape(-1),
+        "state_to_local": state_to_local,
+        "bonds": bonds,
+    }, None
 
 
 def periodic_pair_key(a: int, b: int, shift: int) -> tuple[int, int, int]:
@@ -236,18 +407,15 @@ def build_star_rbf_v2_sample(key: bytes, topology, trimer):
     return {"sample_key": bytes(key), "relations": relations, "pairs": pairs}
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 class StarRBFV2Sidecar:
-    """Strict read-only mmap reader for a frozen v2 sidecar."""
+    """Lightweight read-only mmap reader for a frozen v2 sidecar.
 
-    def __init__(self, root, *, expected_artifact_hash=None, verify_hashes=True):
+    Startup validates only the immutable layout declaration.  Expensive
+    content/QC checks belong to the explicit offline sidecar QC command; the
+    model reader validates the currently requested row on first access.
+    """
+
+    def __init__(self, root):
         self.root = Path(root).resolve()
         metadata_path = self.root / "metadata.json"
         if not all((self.root / name).is_file() for name in ("metadata.json", ".done", ".frozen")):
@@ -257,20 +425,9 @@ class StarRBFV2Sidecar:
             raise RuntimeError("unsupported Star-RBF v2 sidecar schema")
         if int(self.metadata.get("builder_version", -1)) != STAR_RBF_V2_BUILDER_VERSION:
             raise RuntimeError("Star-RBF v2 builder version mismatch")
-        artifact = str(self.metadata.get("artifact_hash", ""))
-        if expected_artifact_hash and artifact != str(expected_artifact_hash):
-            raise RuntimeError("Star-RBF v2 artifact hash mismatch")
-        if (self.root / ".done").read_text(encoding="utf-8").strip() != artifact:
-            raise RuntimeError("Star-RBF v2 .done binding mismatch")
         frozen = json.loads((self.root / ".frozen").read_text(encoding="utf-8"))
-        if frozen.get("schema") != STAR_RBF_V2_SIDECAR_SCHEMA or frozen.get("artifact_hash") != artifact:
-            raise RuntimeError("Star-RBF v2 .frozen binding mismatch")
-        expected = hashlib.sha256(json.dumps(
-            {k: v for k, v in self.metadata.items() if k != "artifact_hash"},
-            sort_keys=True, separators=(",", ":"), allow_nan=False,
-        ).encode("utf-8")).hexdigest()
-        if expected != artifact:
-            raise RuntimeError("Star-RBF v2 metadata hash mismatch")
+        if frozen.get("schema") != STAR_RBF_V2_SIDECAR_SCHEMA:
+            raise RuntimeError("Star-RBF v2 frozen schema mismatch")
         if set(self.metadata.get("arrays", {})) != set(ARRAY_NAMES):
             raise RuntimeError("Star-RBF v2 array manifest mismatch")
         self.arrays = {}
@@ -280,8 +437,6 @@ class StarRBFV2Sidecar:
             spec = self.metadata["arrays"][name]
             if list(value.shape) != list(spec["shape"]) or np.dtype(value.dtype).str != spec["dtype"]:
                 raise RuntimeError(f"Star-RBF v2 array shape/dtype mismatch: {name}")
-            if verify_hashes and _sha256_file(path) != spec["sha256"]:
-                raise RuntimeError(f"Star-RBF v2 array hash mismatch: {name}")
             self.arrays[name] = value
         sample_count = int(self.arrays["sample_keys"].shape[0])
         relation_count = int(self.arrays["relation_row"].shape[0])
@@ -293,8 +448,6 @@ class StarRBFV2Sidecar:
             expected_end = relation_count if name == "sample_relation_offsets" else pair_count
             if offsets.shape != (sample_count + 1,) or int(offsets[0]) != 0 or int(offsets[-1]) != expected_end:
                 raise RuntimeError(f"Star-RBF v2 offset boundary mismatch: {name}")
-            if not bool(np.all(offsets[1:] >= offsets[:-1])):
-                raise RuntimeError(f"Star-RBF v2 offsets not monotonic: {name}")
         if any(self.arrays[name].shape != (relation_count,) for name in (
             "relation_row", "relation_pair_index", "relation_spd"
         )):
@@ -303,22 +456,6 @@ class StarRBFV2Sidecar:
             raise RuntimeError("Star-RBF v2 distance array shape mismatch")
         if self.arrays["pair_path_signature_hash"].shape != (pair_count, 32):
             raise RuntimeError("Star-RBF v2 path-signature shape mismatch")
-        if relation_count and (
-            int(self.arrays["relation_pair_index"].min()) < 0
-            or int(self.arrays["relation_pair_index"].max()) >= pair_count
-        ):
-            raise RuntimeError("Star-RBF v2 relation pair index out of bounds")
-        counts = self.arrays["pair_observation_count"]
-        sources = self.arrays["pair_geometry_source"]
-        valid = self.arrays["pair_valid"]
-        if bool(np.any(counts > 2)):
-            raise RuntimeError("Star-RBF v2 observation count exceeds two")
-        if bool(np.any((sources == 1) & ((counts != 0) | (~valid)))):
-            raise RuntimeError("Star-RBF v2 trivial-self contract mismatch")
-        if bool(np.any(valid & (sources != 1) & (counts == 0))):
-            raise RuntimeError("Star-RBF v2 valid pair has no observation")
-        self.artifact_hash = artifact
-        self.model_semantic_hash = str(self.metadata["model_semantic_hash"])
         self.rbf_upper = float(self.metadata["rbf"]["upper"])
         self._key_to_row = None
 
@@ -336,15 +473,48 @@ class StarRBFV2Sidecar:
             raise KeyError("sample key absent from Star-RBF v2 sidecar")
         return self._key_to_row[bytes(key)]
 
-    def row(self, index):
+    def model_row(self, index):
         index = int(index)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
         rs, re = (int(self.arrays["sample_relation_offsets"][index + off]) for off in (0, 1))
         ps, pe = (int(self.arrays["sample_pair_offsets"][index + off]) for off in (0, 1))
+        relation_count = int(self.arrays["relation_row"].shape[0])
+        pair_count = int(self.arrays["pair_valid"].shape[0])
+        if rs < 0 or re < rs or re > relation_count or ps < 0 or pe < ps or pe > pair_count:
+            raise IndexError(f"Star-RBF v2 row offsets are invalid: {index}")
+        pair_indices = np.asarray(self.arrays["relation_pair_index"][rs:re], dtype=np.int64)
+        if pair_indices.size and (
+            int(pair_indices.min()) < ps or int(pair_indices.max()) >= pe
+        ):
+            raise RuntimeError(f"Star-RBF v2 relation pair index is outside row {index}")
+        counts = np.asarray(self.arrays["pair_observation_count"][ps:pe], dtype=np.int64)
+        if counts.size and int(counts.max()) > 2:
+            raise RuntimeError(f"Star-RBF v2 observation count exceeds two in row {index}")
         return {
             "relations": {name: np.asarray(self.arrays[name][rs:re]) for name in (
                 "relation_row", "relation_pair_index", "relation_spd")},
-            "pairs": {name: np.asarray(self.arrays[name][ps:pe]) for name in ARRAY_NAMES if name.startswith("pair_")},
+            "pairs": {name: np.asarray(self.arrays[name][ps:pe]) for name in (
+                "pair_observation_distances", "pair_observation_count",
+                "pair_valid", "pair_geometry_source")},
         }
+
+    def qc_row(self, index):
+        """Return the complete row, including fields used only by offline QC."""
+        index = int(index)
+        model = self.model_row(index)
+        ps = int(self.arrays["sample_pair_offsets"][index])
+        pe = int(self.arrays["sample_pair_offsets"][index + 1])
+        model["pairs"].update({
+            name: np.asarray(self.arrays[name][ps:pe])
+            for name in ARRAY_NAMES if name.startswith("pair_")
+            and name not in model["pairs"]
+        })
+        return model
+
+    def row(self, index):
+        """Compatibility alias; new model code should call ``model_row``."""
+        return self.model_row(index)
 
 
 __all__ = [

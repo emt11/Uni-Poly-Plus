@@ -345,12 +345,13 @@ class LmdbLayerStore:
             raise RuntimeError(f"incomplete LMDB feature layer: {self.root}")
         with open(self.manifest_path, encoding="utf-8") as handle:
             manifest = json.load(handle)
-        with open(self.done_path, encoding="utf-8") as handle:
-            observed = handle.read().strip()
-        if observed != _json_digest(manifest):
-            raise RuntimeError(f"LMDB completion hash mismatch: {self.root}")
-        if manifest.get("metadata_hash") != _json_digest(self.meta):
-            raise RuntimeError(f"LMDB metadata hash mismatch: {self.root}")
+        if manifest.get("schema") not in {self.schema, self.meta.get("schema")}:
+            raise RuntimeError(f"LMDB manifest schema mismatch: {self.root}")
+        if int(manifest.get("count", -1)) < 0:
+            raise RuntimeError(f"LMDB manifest count is invalid: {self.root}")
+        # ``.done`` and historical metadata digests are writer/QC evidence;
+        # training readers only need the completion signal and direct layout
+        # fields.  Do not materialise or hash the manifest on startup.
         self.manifest = manifest
 
     def _connect(self):
@@ -1510,20 +1511,12 @@ class LmdbFeatureStore:
                 threshold_meta = json.loads(
                     threshold_meta_path.read_text(encoding="utf-8")
                 )
-                trimer_done = Path(self.roots["trimer"]) / ".done"
-                trimer_hash = trimer_done.read_text(encoding="utf-8").strip()
                 if (
                     threshold_meta.get("schema") == MCL_THRESHOLDS_ARRAY_SCHEMA
                     and threshold_meta.get("cohort_hash")
                     == cohort["manifest"]["cohort_hash"]
                     and threshold_meta.get("ordered_sample_key_hash")
                     == cohort["manifest"]["ordered_sample_key_hash"]
-                    and threshold_meta.get("trimer_artifact_hash") == trimer_hash
-                    and threshold_meta.get("trimer_done_artifact_id", trimer_hash)
-                    == trimer_hash
-                    and threshold_meta.get(
-                        "trimer_done_file_sha256", _sha256_file(trimer_done)
-                    ) == _sha256_file(trimer_done)
                     and tuple(threshold_meta.get("shape", ()))
                     == (len(self.keys), 2)
                 ):
@@ -1576,13 +1569,6 @@ class LmdbFeatureStore:
                         "cohort_hash": cohort["manifest"]["cohort_hash"],
                         "ordered_sample_key_hash": cohort["manifest"]["ordered_sample_key_hash"],
                     }
-                    if self.trimer is not None:
-                        trimer_done = Path(self.roots["trimer"]) / ".done"
-                        if not trimer_done.is_file():
-                            raise RuntimeError("Trimer artifact marker is missing")
-                        expected["trimer_artifact_hash"] = trimer_done.read_text(
-                            encoding="utf-8"
-                        ).strip()
                     if all(angle_meta.get(key) == value for key, value in expected.items()):
                         self.angle_offsets = np.load(angle_root / "angle_offsets.npy", mmap_mode="r")
                         self.angle_indices = np.load(angle_root / "angle_indices.npy", mmap_mode="r")
@@ -1645,9 +1631,7 @@ class LmdbFeatureStore:
                         if common_invalid or categorical_invalid or continuous_invalid:
                             raise RuntimeError("MTS angle cache shape mismatch")
                         self.angle_cache_metadata = angle_meta
-                        self.angle_cache_artifact_hash = done_path.read_text(
-                            encoding="utf-8"
-                        ).strip()
+                        self.angle_cache_artifact_hash = None
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 self.angle_offsets = None
                 self.angle_indices = None

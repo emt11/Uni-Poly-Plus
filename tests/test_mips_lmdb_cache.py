@@ -15,10 +15,6 @@ from src.dataset.lmdb_cache import (
 )
 from src.dataset.mips_trimer_contract import (
     CACHE_LAYOUT_SCHEMA as CONTRACT_LAYOUT_SCHEMA,
-    CONFIG_SCHEMA,
-    FEATURE_SCHEMA,
-    TRIMER_CONTENT_SCHEMA,
-    TRIMER_PROTOCOL,
 )
 from src.dataset.graph_data import (
     build_mips_local_structure,
@@ -281,14 +277,6 @@ def test_compact_missing_mask_and_runtime_contract(tmp_path):
     assert store.missing_mask(keys).tolist() == [0, 1]
     store.close()
 
-    config = json.load(open(
-        "configs/mts/default.json", encoding="utf-8"
-    ))
-    assert config["schema_version"] == CONFIG_SCHEMA
-    assert config["feature_schema"] == FEATURE_SCHEMA
-    assert config["trimer_cache_schema"] == TRIMER_CONTENT_SCHEMA
-    assert config["trimer"]["protocol"] == TRIMER_PROTOCOL
-    assert config["trimer"]["require_mmff_convergence"] is False
 
 
 def test_writer_flush_preserves_parent_received_results(tmp_path):

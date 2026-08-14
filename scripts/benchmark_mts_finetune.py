@@ -285,7 +285,7 @@ def _run_mode(mode, run_root, epochs=EPOCHS, resume=False):
     env.update({
         "PYTHONPATH": str(ROOT),
         "PYTHON_BIN": env.get("PYTHON_BIN", "/opt/conda/envs/MTS/bin/python"),
-        "EXPERIMENT_CONFIG": "configs/mts/geometry_injection_ablation/A3_star_mcl_real.json",
+        "EXPERIMENT_CONFIG": os.environ.get("EXPERIMENT_CONFIG", ""),
         "FINETUNE_ONLY": "1",
         "PRETRAIN_ONLY": "0",
         "TASKS": " ".join(TASKS),
@@ -293,7 +293,6 @@ def _run_mode(mode, run_root, epochs=EPOCHS, resume=False):
         "FINETUNE_SEEDS": "42",
         "MTS_FINETUNE_EPOCHS": str(int(epochs)),
         "MTS_FINETUNE_PATIENCE": str(int(epochs)),
-        "MTS_ABLATION_SMOKE": "1",
         "MTS_FINETUNE_BATCH_SIZE": "32",
         "MTS_FINETUNE_EVAL_BATCH_SIZE": str(int(mode["eval_batch_size"])),
         "MTS_FINETUNE_AMP_DTYPE": str(mode["amp_dtype"]),
@@ -918,7 +917,19 @@ def main(argv=None):
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--config", default="",
+        help="Explicit active MTS configuration; no retired default is supplied.",
+    )
     args = parser.parse_args(argv)
+    if not args.config:
+        raise SystemExit(
+            "No active MTS configuration; pass --config after defining the next schema."
+        )
+    config_path = ROOT / args.config
+    if not config_path.is_file():
+        raise SystemExit(f"MTS configuration does not exist: {config_path}")
+    os.environ["EXPERIMENT_CONFIG"] = str(config_path)
     if args.epochs != EPOCHS:
         raise SystemExit("the speed-readiness benchmark is fixed to two epochs")
     if "/" in args.run_id or args.run_id in {"", ".", ".."}:

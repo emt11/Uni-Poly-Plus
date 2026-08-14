@@ -606,10 +606,10 @@ def _set_module_trainable(module, trainable):
             parameter.requires_grad = bool(trainable)
 
 
-def _configure_legacy_mts_trainability(model):
-    """Apply the explicit pre-F MTS trainability contract.
+def _configure_mts_trainability(model):
+    """Apply the explicit MTS trainability contract.
 
-    The old MTS baseline trained the complete graph wrapper from epoch zero,
+    The MTS downstream path trains the complete graph wrapper from epoch zero,
     but the optional V-stage modalities were deliberately low-capacity
     adapters.  Keeping this policy explicit is important: a blanket
     ``base.parameters()`` toggle would re-enable every RoBERTa parameter and
@@ -617,7 +617,7 @@ def _configure_legacy_mts_trainability(model):
     """
     base = _base_model(model)
     if not _is_mts_model(base):
-        raise ValueError('legacy MTS profile requested for a non-MTS model')
+        raise ValueError('MTS trainability requested for a non-MTS model')
 
     # Start from a frozen model and opt modules in explicitly.  This also
     # handles LoRALinear.base parameters, which are intentionally frozen by
@@ -631,10 +631,8 @@ def _configure_legacy_mts_trainability(model):
     for parameter in graph_module.parameters():
         parameter.requires_grad = True
 
-    # The legacy profile intentionally enables the graph wrapper wholesale,
-    # but geometry-injection ablations are stricter: disabled branches remain
-    # in the state dict for shared-checkpoint loading while staying frozen and
-    # absent from every optimizer group.
+    # Disabled optional geometry modules remain frozen while staying in the
+    # state dict for strict checkpoint loading.
     mts_encoder = getattr(graph_module, "encoder", None)
     if getattr(mts_encoder, "architecture_name", "") == "MIPS-Trimer-SCAGE":
         if not bool(getattr(mts_encoder, "use_star_rbf", True)):
@@ -694,7 +692,6 @@ def _is_mts_model(model):
 def _build_downstream_optimizer(
     model, smiles_lr, graph_lr, geom_lr, fp_lr, fusion_lr, head_lr, weight_decay,
     mts_o8_lr=5e-6, mts_geometry_lr=1e-5, mts_adapter_lr=5e-5,
-    mts_finetune_profile='default',
 ):
     base = _base_model(model)
     groups = []
@@ -734,12 +731,12 @@ def _build_downstream_optimizer(
             })
 
     encoders = base.encoders
-    if _is_mts_model(base) and mts_finetune_profile == 'legacy_mts_huber_v1':
-        # Match the fixed legacy profile.  The historical graph optimizer had
-        # one group for the complete graph wrapper, so norm/projection are
-        # intentionally at graph_lr as well.  Optional V-stage adapters are
-        # registered separately without unfreezing a pretrained SMILES base.
-        def add_legacy_group(module, lr, name):
+    if _is_mts_model(base):
+        # The graph optimizer has one group for the complete graph wrapper, so
+        # norm/projection are intentionally at graph_lr as well. Optional
+        # modality adapters are registered separately without unfreezing a
+        # pretrained SMILES base.
+        def add_mts_group(module, lr, name):
             if module is None:
                 return
             params = [
@@ -756,7 +753,7 @@ def _build_downstream_optimizer(
                 'name': name,
             })
 
-        def add_legacy_group_from_params(params, lr, name):
+        def add_mts_group_from_params(params, lr, name):
             params = [
                 parameter for parameter in params
                 if parameter.requires_grad and id(parameter) not in used
@@ -773,7 +770,7 @@ def _build_downstream_optimizer(
 
         graph_module = encoders['graph'] if 'graph' in encoders else None
         if graph_module is not None:
-            add_legacy_group(graph_module, graph_lr, 'graph')
+            add_mts_group(graph_module, graph_lr, 'graph')
 
         smiles_module = encoders['smiles'] if 'smiles' in encoders else None
         if smiles_module is not None:
@@ -784,19 +781,19 @@ def _build_downstream_optimizer(
                     name.endswith('lora_a') or name.endswith('lora_b')
                 )
             ]
-            add_legacy_group_from_params(lora_parameters, smiles_lr, 'smiles_lora')
-            add_legacy_group(
+            add_mts_group_from_params(lora_parameters, smiles_lr, 'smiles_lora')
+            add_mts_group(
                 nn.ModuleList([smiles_module.norm, smiles_module.projection]),
                 fusion_lr, 'smiles_adapter'
             )
-        add_legacy_group(
+        add_mts_group(
             encoders['fp'] if 'fp' in encoders else None,
             fp_lr, 'fp_adapter'
         )
-        add_legacy_group(getattr(base, 'residual_modality_gates', None), fusion_lr, 'modality_gates')
-        add_legacy_group(base.mlp, head_lr, 'regression_head')
-        add_legacy_group(getattr(base, 'modality_heads', None), head_lr, 'modality_heads')
-        add_legacy_group(getattr(base, 'cross_task_aux_heads', None), head_lr, 'cross_task_aux_heads')
+        add_mts_group(getattr(base, 'residual_modality_gates', None), fusion_lr, 'modality_gates')
+        add_mts_group(base.mlp, head_lr, 'regression_head')
+        add_mts_group(getattr(base, 'modality_heads', None), head_lr, 'modality_heads')
+        add_mts_group(getattr(base, 'cross_task_aux_heads', None), head_lr, 'cross_task_aux_heads')
         remaining = [
             parameter for parameter in base.parameters()
             if parameter.requires_grad and id(parameter) not in used
@@ -809,10 +806,7 @@ def _build_downstream_optimizer(
                 'name': 'remaining',
             })
         return torch.optim.AdamW(groups)
-    raise ValueError(
-        'Only the explicit legacy_mts_huber_v1 MTS optimizer is active; '
-        'retired non-MTS/parallel optimizer paths are unavailable.'
-    )
+    raise ValueError('MTS downstream optimizer requires an MTS graph model')
 
 
 def fit_fixed_epochs(
@@ -841,7 +835,6 @@ def fit_fixed_epochs(
     mts_o8_lr=5e-6,
     mts_geometry_lr=1e-5,
     mts_adapter_lr=5e-5,
-    mts_finetune_profile='default',
     amp_dtype='fp32',
 ):
     """Fit a fresh downstream model for a validation-selected epoch count."""
@@ -853,24 +846,15 @@ def fit_fixed_epochs(
         if regression_loss == 'huber' else nn.MSELoss()
     )
     base = _base_model(model)
-    mts_legacy = (
-        _is_mts_model(base)
-        and mts_finetune_profile == 'legacy_mts_huber_v1'
-    )
-    if _is_mts_model(base) and not mts_legacy:
-        raise ValueError(
-            'MTS must use legacy_mts_huber_v1; staged Phase A/B/C logic is retired'
-        )
-    if not mts_legacy:
-        raise ValueError('Only legacy_mts_huber_v1 is active for MTS')
-    _configure_legacy_mts_trainability(model)
+    if not _is_mts_model(base):
+        raise ValueError('MTS fixed-epoch refit requires an MTS graph model')
+    _configure_mts_trainability(model)
     optimizer = _build_downstream_optimizer(
         model, smiles_lr, graph_lr, geom_lr, fp_lr,
         fusion_lr, head_lr, weight_decay,
         mts_o8_lr=mts_o8_lr,
         mts_geometry_lr=mts_geometry_lr,
         mts_adapter_lr=mts_adapter_lr,
-        mts_finetune_profile=mts_finetune_profile,
     )
     total_steps = max(1, len(train_loader) * num_epochs)
     warmup_steps = min(
@@ -948,26 +932,15 @@ def train_and_evaluate(
     mts_o8_lr=5e-6,
     mts_geometry_lr=1e-5,
     mts_adapter_lr=5e-5,
-    mts_finetune_profile='default',
     pcgrad=False,
     amp_dtype='fp32',
 ):
     # Define loss function and optimizer
     criterion = nn.SmoothL1Loss(beta=float(huber_beta)) if regression_loss == 'huber' else nn.MSELoss()
     base = _base_model(model)
-    mts_legacy = (
-        _is_mts_model(base)
-        and mts_finetune_profile == 'legacy_mts_huber_v1'
-    )
-    if _is_mts_model(base) and not mts_legacy:
-        raise ValueError(
-            'MTS must use legacy_mts_huber_v1; staged Phase A/B/C logic is retired'
-        )
-    if not mts_legacy:
-        raise ValueError('Only legacy_mts_huber_v1 is active for MTS')
-    if int(swa_start_epoch) >= 0:
-        raise ValueError('legacy_mts_huber_v1 requires swa_start_epoch=-1')
-    _configure_legacy_mts_trainability(model)
+    if not _is_mts_model(base):
+        raise ValueError('MTS training requires an MTS graph model')
+    _configure_mts_trainability(model)
     if str(amp_dtype) not in {'fp32', 'bf16'}:
         raise ValueError("amp_dtype must be fp32 or bf16")
     if str(amp_dtype) == 'bf16':
@@ -983,7 +956,6 @@ def train_and_evaluate(
         weight_decay, mts_o8_lr=mts_o8_lr,
         mts_geometry_lr=mts_geometry_lr,
         mts_adapter_lr=mts_adapter_lr,
-        mts_finetune_profile=mts_finetune_profile,
     )
     total_steps = max(1, len(train_loader) * num_epochs)
     warmup_steps = min(total_steps - 1, max(0, int(warmup_epochs) * len(train_loader)))

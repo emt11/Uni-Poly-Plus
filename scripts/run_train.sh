@@ -1,13 +1,17 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-# Compatibility wrapper.  The second route is configured exclusively through
-# the strict non-PBC experiment JSON and the canonical run.sh entry point.
 PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$PROJECT_DIR"
+PYTHON_BIN=${PYTHON_BIN:-/opt/conda/envs/MTS/bin/python}
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2}
-export BASELINE=${BASELINE:-MIPS-Trimer-SCAGE}
-export EXPERIMENT_CONFIG=${EXPERIMENT_CONFIG:-configs/mts/default.json}
+if [[ -z "${EXPERIMENT_CONFIG:-}" ]]; then
+  echo "MTS production is disabled: EXPERIMENT_CONFIG is required while the configuration layer is retired." >&2
+  exit 2
+fi
+if [[ ! -f "$EXPERIMENT_CONFIG" ]]; then
+  echo "MTS production is disabled: configuration path does not exist: $EXPERIMENT_CONFIG" >&2
+  exit 2
+fi
 
-exec bash scripts/run.sh
+exec "$PYTHON_BIN" scripts/resolve_mips_trimer_scage.py "$EXPERIMENT_CONFIG"

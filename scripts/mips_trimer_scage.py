@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Compatibility shim for the renamed MTS dispatcher.
+"""Fail-closed placeholder until the next MTS configuration is defined."""
 
-New automation should call ``scripts/mts.py``.  Keeping this tiny shim avoids
-breaking old tmux commands while ensuring there is only one implementation.
-"""
+import sys
 
-from scripts.mts import main
+
+def main(argv=None):
+    _ = argv
+    print(
+        "No active MTS configuration schema; define the next configuration "
+        "before launching production MTS.",
+        file=sys.stderr,
+    )
+    return 2
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
