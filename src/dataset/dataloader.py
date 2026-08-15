@@ -72,9 +72,16 @@ def mips_trimer_collate(data_list):
     graph_available, boundary, condition = [], [], []
     md_parts, md_valid = [], []
     star_v2_relation_rows, star_v2_relation_pairs = [], []
+    star_v2_pair_key_src, star_v2_pair_key_dst, star_v2_pair_key_shift = [], [], []
     star_v2_pair_distances, star_v2_pair_counts = [], []
     star_v2_pair_valid, star_v2_pair_sources = [], []
     star_v2_uppers = set()
+    star_v2_pair_keys_present = all(
+        all(hasattr(item, name) for name in (
+            "mts_star_v2_pair_key_src", "mts_star_v2_pair_key_dst",
+            "mts_star_v2_pair_key_shift",
+        )) for item in data_list
+    )
     smiles_ids, smiles_masks, fp_parts = [], [], []
     smiles_available, fp_available = [], []
     smiles_fields_present = all(
@@ -189,6 +196,20 @@ def mips_trimer_collate(data_list):
                 raise ValueError("Star-RBF v2 pair index out of bounds")
             star_v2_relation_rows.append(rows + lga_relation_offset)
             star_v2_relation_pairs.append(pairs + star_v2_pair_offset)
+            if star_v2_pair_keys_present:
+                if any(int(getattr(item, name).numel()) != pair_count for name in (
+                    "mts_star_v2_pair_key_src", "mts_star_v2_pair_key_dst",
+                    "mts_star_v2_pair_key_shift",
+                )):
+                    raise ValueError("Star-RBF v2 pair key length mismatch")
+                canonical_base = canonical_offset
+                star_v2_pair_key_src.append(
+                    item.mts_star_v2_pair_key_src.long() + canonical_base
+                )
+                star_v2_pair_key_dst.append(
+                    item.mts_star_v2_pair_key_dst.long() + canonical_base
+                )
+                star_v2_pair_key_shift.append(item.mts_star_v2_pair_key_shift.long())
             star_v2_pair_distances.append(item.mts_star_v2_pair_observation_distances.float())
             star_v2_pair_counts.append(item.mts_star_v2_pair_observation_count.long())
             star_v2_pair_valid.append(item.mts_star_v2_pair_valid.bool())
@@ -406,6 +427,10 @@ def mips_trimer_collate(data_list):
             raise ValueError("Star-RBF v2 batch RBF upper mismatch")
         batch.mts_star_v2_relation_row = torch.cat(star_v2_relation_rows)
         batch.mts_star_v2_relation_pair_index = torch.cat(star_v2_relation_pairs)
+        if star_v2_pair_keys_present:
+            batch.mts_star_v2_pair_key_src = torch.cat(star_v2_pair_key_src)
+            batch.mts_star_v2_pair_key_dst = torch.cat(star_v2_pair_key_dst)
+            batch.mts_star_v2_pair_key_shift = torch.cat(star_v2_pair_key_shift)
         batch.mts_star_v2_pair_observation_distances = torch.cat(star_v2_pair_distances)
         batch.mts_star_v2_pair_observation_count = torch.cat(star_v2_pair_counts)
         batch.mts_star_v2_pair_valid = torch.cat(star_v2_pair_valid)

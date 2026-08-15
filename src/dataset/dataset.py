@@ -2431,7 +2431,12 @@ class UniDataset(Dataset):
             self._star_rbf_v2_sidecar = StarRBFV2Sidecar(
                 self.star_rbf_v2_sidecar_root,
             )
-            if len(self._star_rbf_v2_sidecar) != len(self.data_list):
+            # The pretraining PI1M_v2 reader is row-aligned with the full
+            # cohort and therefore keeps a strict length check.  Downstream
+            # task datasets are smaller labelled subsets; they resolve the
+            # same immutable full-cohort sidecar by sample key in
+            # ``__getitem__`` instead of by task-row position.
+            if self._cohort_row_mode and len(self._star_rbf_v2_sidecar) != len(self.data_list):
                 raise RuntimeError("Star-RBF v2 sidecar record count does not match Dataset")
 
     # ------------------------------------------------------------------
@@ -5204,6 +5209,9 @@ class UniDataset(Dataset):
             data.mts_star_v2_relation_row = torch.as_tensor(relations["relation_row"], dtype=torch.long)
             data.mts_star_v2_relation_pair_index = torch.as_tensor(relations["relation_pair_index"], dtype=torch.long)
             data.mts_star_v2_relation_spd = torch.as_tensor(relations["relation_spd"], dtype=torch.long)
+            data.mts_star_v2_pair_key_src = torch.as_tensor(pairs["pair_key_src"], dtype=torch.long)
+            data.mts_star_v2_pair_key_dst = torch.as_tensor(pairs["pair_key_dst"], dtype=torch.long)
+            data.mts_star_v2_pair_key_shift = torch.as_tensor(pairs["pair_key_shift"], dtype=torch.long)
             data.mts_star_v2_pair_observation_distances = torch.as_tensor(pairs["pair_observation_distances"], dtype=torch.float32)
             data.mts_star_v2_pair_observation_count = torch.as_tensor(pairs["pair_observation_count"], dtype=torch.long)
             data.mts_star_v2_pair_valid = torch.as_tensor(pairs["pair_valid"], dtype=torch.bool)

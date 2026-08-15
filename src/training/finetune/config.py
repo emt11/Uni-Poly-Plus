@@ -384,9 +384,17 @@ def parse_arguments():
         action=argparse.BooleanOptionalAction, default=False,
     )
     parser.add_argument('--msta_local_output_init', choices=['zero'], default='zero')
-    parser.add_argument('--star_rbf_definition', choices=['legacy_sample_direct_link_v1', 'trimer_periodic_relation_rbf_v2'], default='legacy_sample_direct_link_v1')
     parser.add_argument('--star_rbf_upper', type=float, default=3.0)
     parser.add_argument('--star_rbf_v2_sidecar', default=None)
+    parser.add_argument(
+        '--use_star_rbf', action=argparse.BooleanOptionalAction, default=True,
+    )
+    parser.add_argument(
+        '--use_mcl', action=argparse.BooleanOptionalAction, default=True,
+    )
+    parser.add_argument(
+        '--use_md200', action=argparse.BooleanOptionalAction, default=True,
+    )
     parser.add_argument(
         '--topology_representation',
         choices=['canonical_lifted', 'explicit_k_ru'],
@@ -583,4 +591,6 @@ def parse_arguments():
         )
     if args.graph_encoder_type == "mts":
         args.graph_encoder_type = MTS_ROUTE_INTERNAL
+    if args.graph_encoder_type == MTS_ROUTE_INTERNAL and args.mips_max_hops is None:
+        args.mips_max_hops = 2
     return args

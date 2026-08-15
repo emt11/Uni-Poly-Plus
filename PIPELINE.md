@@ -208,7 +208,7 @@ readout        canonical atom mean
 K_source · Q_target / sqrt(head_dim)
 + per-head SPD bias
 + per-head single-path-node bias
-+ direct Star-edge RBF bias
++ Star-RBF v2 relation/pair RBF bias
 → target incoming-edge softmax
 → V_source aggregation
 → residual + LayerNorm
@@ -245,7 +245,7 @@ ETKDGv3生成4个候选
 → 选择松弛后最低finite能量候选
 ```
 
-不要求 MMFF 状态完全收敛。Trimer 超过384个重原子时只允许生成2D诊断字段，MCL和Star-3D必须关闭；2D坐标绝不能进入模型几何分支。
+不要求 MMFF 状态完全收敛。Trimer 超过384个重原子时只允许生成2D诊断字段；2D坐标绝不能进入模型几何分支，Star-RBF v2 对应的几何行保持 invalid 并产生零 bias。
 
 ### 5.3 Canonical RU 与 Trimer 的严格映射
 
@@ -288,29 +288,26 @@ canonical atom a   → central Trimer atom N+a
 
 而是直接以 canonical state 初始化三个 Trimer copy的token，并把中央RU更新直接写回同一个 canonical atom。
 
-### 5.4 对称 Star-edge 距离
+### 5.4 Star-RBF v2 的 relation-wise 周期几何
 
-从Trimer的两条真实inter-RU键计算：
+模型不再读取旧的 sample-level direct-link 距离。Star-RBF v2 对所有
+`SPD≤2` 的 lifted relation 按周期 pair 分组，并把一条关系及其反向关系绑定到同一个
+pair bias：
 
-$$
-d_{left}=\|r_{R,-1}-r_{L,0}\|,
-\qquad
-d_{right}=\|r_{R,0}-r_{L,+1}\|,
-$$
+```text
+shift = 0：central_direct，使用中央 RU 内的直接距离
+shift = 1：adjacent_dual，分别计算左右两个 Trimer 观测
+shift = 2：outer_trimer_direct，使用外侧 Trimer 的直接距离
+true self：trivial_self_no_bias，始终为零 bias
+```
 
-$$
-d_{star}=\frac{d_{left}+d_{right}}{2}.
-$$
+对 `adjacent_dual`，先分别对两个观测距离计算 Gaussian RBF，再对 RBF 向量求平均；
+不是先平均距离再计算 RBF。其余有效 pair 使用对应的单个观测。随后通过共享的
+32-kernel、范围 `0–star_rbf_upper` 的 Gaussian RBF 和无 bias 的 8-head projection，
+将同一个 pair bias gather 回其全部 inverse relation rows。投影零初始化。
 
-当坐标finite且：
-
-$$
-|d_{left}-d_{right}|\le 0.15\ \text{Å}
-$$
-
-时，`star_3d_valid=True`。`d_star`经过32个、范围0–3 Å的Gaussian RBF，再投影成8个head的bias。投影零初始化，且只加到两条直接polymer-link relation；两个方向使用同一个对称标量。
-
-Star-distance是否有效与MCL是否有效相互独立：Star失败只关闭Star-RBF，不应关闭仍然合法的MCL。
+`star_3d_distance`、`star_3d_asymmetry` 和 `star_3d_valid` 仅保留为 Trimer/cache
+质量审计字段，不参与模型 forward；它们与 `trimer_geometry_valid` 的质量统计仍彼此独立。
 
 ### 5.5 两层 SCAGE-MCL
 
@@ -433,7 +430,7 @@ MSTA 层的显式关系支持仍是 `SPD ≤ 2`；六层堆叠后的有效传播
 
 ### 5.8 历史 G-family（已退役）
 
-G0/G1/G2/G3 曾统一使用 T1 拓扑、MD200，关闭旧 Star-RBF 与 full-Trimer MCL；G1
+G0/G1/G2/G3 曾统一使用 T1 拓扑、MD200，关闭 Star-RBF 与 full-Trimer MCL；G1
 只读冻结 relation-geometry sidecar 的 path cosine，G2/G3 额外读取 endpoint distance，
 G3 使用独立的 seed-42 条件分层置乱 artifact。四臂共享同一 T1 common step-0，
 G0 geometry residual 恒为零且不进 optimizer；invalid relation/path 精确回退为零。
@@ -469,7 +466,7 @@ P-SMILES
 │  └─ infinite lifted 0/1/2-hop relation rows
 │        ├─ SPD bias
 │        ├─ single-path-node bias
-│        └─ direct Star relation mask
+│        └─ Star-RBF v2 relation/pair geometry
 │                    │
 │                    ▼
 │             6-layer O8 Transformer
@@ -478,7 +475,7 @@ P-SMILES
 │                    │               │
 ├─ open finite Trimer                │
 │  ├─ canonical a ↔ central N+a      │
-│  ├─ symmetric d_star → Star-RBF ───┘
+│  ├─ relation-wise periodic distances → Star-RBF v2 ───┘
 │  └─ 3D distance masks
 │         → two-layer central-query/full-Trimer MCL
 │         → zero-gated canonical atom residual

@@ -91,8 +91,8 @@ MIPS-Trimer-SCAGE（MTS）
 - 可学习节点身份只有 `canonical_atom_id`；`relative_ru_shift` 只用于构图、校验和诊断，不进入可学习 embedding。
 - 每个 target 保留最大两跳内全部 lifted incoming relation rows。canonical source/target 相同但 shift 不同的 relation 不得去重，其 multiplicity 分别进入 incoming softmax。
 - RU 内部键为 `(a,q) ↔ (b,q)`；聚合连接为 `(right,q) ↔ (left,q+1)`。带非零 shift 的 canonical self relation 不得误删为普通 self-loop。
-- SPD 表示 O8 的 `0/1/2-hop` 图距离，不是欧氏距离。single-path-node bias 与 Star-RBF 语义相互独立；Star mask 只表示直接聚合连接。
-- Star 虚拟关系不得写入 Trimer 真实化学键表，`d_star` 只能来自 Trimer 中两条真实 inter-RU 键。
+- SPD 表示 O8 的 `0/1/2-hop` 图距离，不是欧氏距离。single-path-node bias 与 Star-RBF v2 语义相互独立；Star mask 只表示直接聚合连接。
+- Star 虚拟关系不得写入 Trimer 真实化学键表。Star-RBF v2 的 relation/pair 距离只能来自 Trimer 真实原子坐标，并按周期 pair 的 geometry source 聚合；旧的 sample-level `d_star` 路径不属于生产逻辑。
 - readout 按一个 canonical RU 的原子均值定义；显式模式先按 `canonical_atom_id` 聚合 copies，再做图级均值，不得因 repeat factor 改变样本权重。
 - 显式模式中同一 canonical atom 的 copies 共享 mask 目标和 Trimer 几何残差；copy、方向和 shift 不形成新的可学习 embedding。
 

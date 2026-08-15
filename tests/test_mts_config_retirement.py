@@ -22,8 +22,13 @@ def _run(command, *, env=None):
     )
 
 
-def test_mts_config_tree_has_no_json_files():
-    assert not list((ROOT / "configs" / "mts").rglob("*.json"))
+def test_mts_config_tree_has_only_explicit_b0_configs():
+    configs = list((ROOT / "configs" / "mts").rglob("*.json"))
+    assert ROOT / "configs" / "mts" / "b0_v2_probe.json" in configs
+    assert ROOT / "configs" / "mts" / "b0_v2_resume_probe.json" in configs
+    # The v1 JSON files remain as historical inputs but are rejected by the
+    # resolver and cannot enter the active launcher.
+    assert ROOT / "configs" / "mts" / "b0.json" in configs
 
 
 def test_launchers_fail_before_python_or_outputs(tmp_path):
@@ -44,6 +49,64 @@ def test_resolver_rejects_explicit_json_without_side_effects(tmp_path):
     config = tmp_path / "candidate.json"
     config.write_text('{"schema_version": "retired", "foo_hash": "x"}\n')
     result = _run([sys.executable, "scripts/resolve_mips_trimer_scage.py", str(config)])
+    assert result.returncode != 0
+    assert "No active MTS configuration schema" in result.stdout
+
+
+def test_resolver_accepts_b0_v2_probe_and_writes_resolved_input(tmp_path):
+    import json
+    source = ROOT / "configs" / "mts" / "b0_v2_probe.json"
+    result = _run([
+        sys.executable, "scripts/resolve_mips_trimer_scage.py",
+        str(source), "--print-path",
+    ])
+    assert result.returncode == 0, result.stdout
+    resolved = Path(result.stdout.strip())
+    assert resolved.is_file()
+    payload = json.loads(resolved.read_text())
+    assert payload["schema"] == "mts-b0-v2"
+    assert payload["use_mcl"] is False
+    assert payload["probe_steps"] == [5000, 10000, 20000]
+    assert payload["star_rbf_upper"] == 3.75
+
+
+def test_resolver_rejects_wrong_star_rbf_upper(tmp_path):
+    import json
+    source = ROOT / "configs" / "mts" / "b0_v2_probe.json"
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["star_rbf_upper"] = 3.0
+    candidate = tmp_path / "wrong_upper.json"
+    candidate.write_text(json.dumps(payload))
+    result = _run([
+        sys.executable, "scripts/resolve_mips_trimer_scage.py", str(candidate)
+    ])
+    assert result.returncode != 0
+    assert "star_rbf_upper" in result.stdout
+
+
+def test_b0_downstream_finetune_identity_switches():
+    from src.training.finetune.config import parse_arguments as parse_finetune
+
+    old = sys.argv
+    try:
+        sys.argv = ["train.py", "--topology_attention_variant", "o8",
+                    "--use_star_rbf", "--no-use_mcl", "--use_md200",
+                    "--star_rbf_upper", "3.75"]
+        parsed = parse_finetune()
+    finally:
+        sys.argv = old
+    assert parsed.topology_attention_variant == "o8"
+    assert parsed.use_star_rbf is True
+    assert parsed.use_mcl is False
+    assert parsed.use_md200 is True
+    assert parsed.star_rbf_upper == 3.75
+
+
+def test_resolver_rejects_historical_b0_v1_config_without_side_effects(tmp_path):
+    source = ROOT / "configs" / "mts" / "b0.json"
+    result = _run([
+        sys.executable, "scripts/resolve_mips_trimer_scage.py", str(source)
+    ])
     assert result.returncode != 0
     assert "No active MTS configuration schema" in result.stdout
 
@@ -72,4 +135,3 @@ def test_training_parser_defaults_do_not_request_full_cache_audit():
         sys.argv = old
     assert pretrain.cache_validate == "sample"
     assert finetune.cache_validate == "sample"
-

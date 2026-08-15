@@ -25,6 +25,7 @@ from src.dataset.mips_trimer_contract import (
     CHECKPOINT_SCHEMA as MIPS_TRIMER_CHECKPOINT_SCHEMA,
     EXPLICIT_TOPOLOGY_LMDB_SCHEMA as MIPS_EXPLICIT_TOPOLOGY_SCHEMA,
     TOPOLOGY_EXPLICIT,
+    ROUTE_INTERNAL as MTS_ROUTE_INTERNAL,
     ROUTE_NAME as MTS_ROUTE_NAME,
     ROUTE_SHORT_NAME as MTS_ROUTE_SHORT_NAME,
     STAGE1_ID as MTS_STAGE1_ID,
@@ -251,6 +252,99 @@ def select_mts_checkpoint_transfer_keys(
     return tuple(key for key in candidates if key in checkpoint_keys)
 
 
+def build_mts_downstream_model(args, auxiliary_tasks=()):
+    """Construct the downstream MTS UniEncoder with the exact fixed switches.
+
+    The publish step and every fold job share this one construction so the
+    published final checkpoint always matches the training-time architecture.
+    """
+    from src.modules import UniEncoderAttention
+
+    return UniEncoderAttention(
+        joint_embedding_dim=args.joint_embedding_dim,
+        smiles_model_name=args.smiles_model_name,
+        gnn_model_name="",
+        modality_list=args.modalities,
+        freeze_encoder=args.freeze_encoder,
+        graph_num_layers=args.graph_num_layers,
+        graph_emb_dim=args.graph_emb_dim,
+        graph_dropout=args.graph_dropout,
+        graph_encoder_type=args.graph_encoder_type,
+        scage_dist_bar=args.scage_dist_bar,
+        scage_num_heads=args.scage_num_heads,
+        scage_ffn_hidden_dim=args.scage_ffn_hidden_dim,
+        scage_num_kernels=args.scage_num_kernels,
+        scage_attention_dropout=args.scage_attention_dropout,
+        scage_use_pbc_distance=args.scage_use_pbc_distance,
+        scage_use_descriptors=args.scage_use_descriptors,
+        scage_distance_mode=args.scage_distance_mode,
+        scage_distance_rbf=args.scage_distance_rbf,
+        scage_distance_cutoff=args.scage_distance_cutoff,
+        scage_distance_scales=args.scage_distance_scales,
+        scage_distance_taus=args.scage_distance_taus,
+        scage_topology_bias=args.scage_topology_bias,
+        scage_topology_max_distance=args.scage_topology_max_distance,
+        scage_topology_locality_mode=args.scage_topology_locality_mode,
+        scage_topology_locality_threshold=args.scage_topology_locality_threshold,
+        scage_topology_locality_tau=args.scage_topology_locality_tau,
+        scage_periodic_image_mode=args.scage_periodic_image_mode,
+        scage_periodic_image_cap=args.scage_periodic_image_cap,
+        scage_periodic_image_temperature=args.scage_periodic_image_temperature,
+        scage_force_topology_only=args.scage_force_topology_only,
+        mips_core=args.mips_core,
+        mips_max_hops=args.mips_max_hops,
+        mips_use_descriptors=args.mips_use_descriptors,
+        spatial_mode=args.spatial_mode,
+        graph_geometry_mode=args.graph_geometry_mode,
+        mcl_distance_percentiles=args.mcl_distance_percentiles,
+        trimer_num_candidates=args.trimer_num_candidates,
+        trimer_max_heavy_atoms=args.trimer_max_heavy_atoms,
+        mips_variant=args.mips_variant,
+        mips_fusion_mode=args.mips_fusion_mode,
+        projection_mode=args.projection_mode,
+        modality_control=args.modality_control,
+        controlled_modality=args.controlled_modality,
+        mips_atom_feature_mode=args.mips_atom_feature_mode,
+        mips_attention_scale=args.mips_attention_scale,
+        mips_norm_mode=args.mips_norm_mode,
+        mips_activation=args.mips_activation,
+        mips_spd_bias_mode=args.mips_spd_bias_mode,
+        mips_path_bias_mode=args.mips_path_bias_mode,
+        mips_multi_scale_hop_gate=args.mips_multi_scale_hop_gate,
+        mips_semantics=args.mips_semantics,
+        mips_descriptor_fusion_mode=args.mips_descriptor_fusion_mode,
+        mips_descriptor_components=args.mips_descriptor_components,
+        mips_descriptor_disturbance=args.mips_descriptor_disturbance,
+        mips_backbone_mode=args.mips_backbone_mode,
+        mips_input_norm=args.mips_input_norm,
+        mips_mask_mode=args.mips_mask_mode,
+        mips_mask_policy=args.mips_mask_policy,
+        mips_masked_loss_reduction=args.mips_masked_loss_reduction,
+        topology_attention_variant=args.topology_attention_variant,
+        msta_layer_indices=args.msta_layer_indices,
+        msta_local_spd=args.msta_local_spd,
+        msta_context_spd=args.msta_context_spd,
+        msta_share_relation_dropout=args.msta_share_relation_dropout,
+        msta_local_output_bias=args.msta_local_output_bias,
+        msta_local_output_init=args.msta_local_output_init,
+        star_rbf_upper=args.star_rbf_upper,
+        use_star_rbf=bool(getattr(args, 'use_star_rbf', True)),
+        use_mcl=bool(getattr(args, 'use_mcl', True)),
+        fusion_type=args.fusion_type,
+        fp_mode=args.fp_mode,
+        fusion_dropout=args.fusion_dropout,
+        head_dropout=args.head_dropout,
+        unimodal_auxiliary=args.unimodal_aux_weight > 0,
+        cross_task_auxiliary_tasks=auxiliary_tasks,
+        fp_bit_dropout=args.fp_bit_dropout,
+        modality_dropout={
+            'fp': args.fp_modality_dropout,
+            'smiles': args.smiles_modality_dropout,
+            'graph': args.graph_modality_dropout,
+        },
+    )
+
+
 def run_finetune_job(config=None, task=None, seed=None, fold=None):
     """Run exactly one task/seed/fold through the real MTS training path."""
     args = parse_arguments() if config is None else config
@@ -260,11 +354,6 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
         args.seed = int(seed)
     if fold is not None:
         args.fold_ids = [int(fold)]
-    if args.graph_encoder_type == "mips_trimer_scage":
-        raise RuntimeError(
-            "No active MTS fine-tuning configuration; define the next "
-            "configuration before launching production fine-tuning."
-        )
     validate_mips_trimer_runtime(args)
     from src.dataset import UniDataset
     from src.modules import UniEncoderAttention
@@ -708,90 +797,44 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 persistent_workers=args.loader_workers > 0,
             )
 
-            model = UniEncoderAttention(
-                joint_embedding_dim=args.joint_embedding_dim,
-                smiles_model_name=pre_trained_model_dict['smiles_model_name'],
-                gnn_model_name=pre_trained_model_dict['gnn_model_name'],
-                modality_list=model_modality_list,
-                freeze_encoder=freeze_encoder,
-                graph_num_layers=args.graph_num_layers,
-                graph_emb_dim=args.graph_emb_dim,
-                graph_dropout=args.graph_dropout,
-                graph_encoder_type=args.graph_encoder_type,
-                scage_dist_bar=args.scage_dist_bar,
-                scage_num_heads=args.scage_num_heads,
-                scage_ffn_hidden_dim=args.scage_ffn_hidden_dim,
-                scage_num_kernels=args.scage_num_kernels,
-                scage_attention_dropout=args.scage_attention_dropout,
-                scage_use_pbc_distance=args.scage_use_pbc_distance,
-                scage_use_descriptors=args.scage_use_descriptors,
-                scage_distance_mode=args.scage_distance_mode,
-                scage_distance_rbf=args.scage_distance_rbf,
-                scage_distance_cutoff=args.scage_distance_cutoff,
-                scage_distance_scales=args.scage_distance_scales,
-                scage_distance_taus=args.scage_distance_taus,
-                scage_topology_bias=args.scage_topology_bias,
-                scage_topology_max_distance=args.scage_topology_max_distance,
-                scage_topology_locality_mode=args.scage_topology_locality_mode,
-                scage_topology_locality_threshold=args.scage_topology_locality_threshold,
-                scage_topology_locality_tau=args.scage_topology_locality_tau,
-                scage_periodic_image_mode=args.scage_periodic_image_mode,
-                scage_periodic_image_cap=args.scage_periodic_image_cap,
-                scage_periodic_image_temperature=args.scage_periodic_image_temperature,
-                scage_force_topology_only=args.scage_force_topology_only,
-                mips_core=args.mips_core,
-                mips_max_hops=args.mips_max_hops,
-                mips_use_descriptors=args.mips_use_descriptors,
-                spatial_mode=args.spatial_mode,
-                graph_geometry_mode=args.graph_geometry_mode,
-                mcl_distance_percentiles=args.mcl_distance_percentiles,
-                trimer_num_candidates=args.trimer_num_candidates,
-                trimer_max_heavy_atoms=args.trimer_max_heavy_atoms,
-                mips_variant=args.mips_variant,
-                mips_fusion_mode=args.mips_fusion_mode,
-                projection_mode=args.projection_mode,
-                modality_control=args.modality_control,
-                controlled_modality=args.controlled_modality,
-                mips_atom_feature_mode=args.mips_atom_feature_mode,
-                mips_attention_scale=args.mips_attention_scale,
-                mips_norm_mode=args.mips_norm_mode,
-                mips_activation=args.mips_activation,
-                mips_spd_bias_mode=args.mips_spd_bias_mode,
-                mips_path_bias_mode=args.mips_path_bias_mode,
-                mips_multi_scale_hop_gate=args.mips_multi_scale_hop_gate,
-                mips_semantics=args.mips_semantics,
-                mips_descriptor_fusion_mode=args.mips_descriptor_fusion_mode,
-                mips_descriptor_components=args.mips_descriptor_components,
-                mips_descriptor_disturbance=args.mips_descriptor_disturbance,
-                mips_backbone_mode=args.mips_backbone_mode,
-                mips_input_norm=args.mips_input_norm,
-                mips_mask_mode=args.mips_mask_mode,
-                mips_mask_policy=args.mips_mask_policy,
-                mips_masked_loss_reduction=args.mips_masked_loss_reduction,
-                topology_attention_variant=args.topology_attention_variant,
-                msta_layer_indices=args.msta_layer_indices,
-                msta_local_spd=args.msta_local_spd,
-                msta_context_spd=args.msta_context_spd,
-                msta_share_relation_dropout=args.msta_share_relation_dropout,
-                msta_local_output_bias=args.msta_local_output_bias,
-                msta_local_output_init=args.msta_local_output_init,
-                star_rbf_definition=args.star_rbf_definition,
-                star_rbf_upper=args.star_rbf_upper,
-                use_star_rbf=True,
-                use_mcl=True,
-                fusion_type=args.fusion_type,
-                fp_mode=args.fp_mode,
-                fusion_dropout=args.fusion_dropout,
-                head_dropout=args.head_dropout,
-                unimodal_auxiliary=args.unimodal_aux_weight > 0,
-                cross_task_auxiliary_tasks=auxiliary_tasks,
-                fp_bit_dropout=args.fp_bit_dropout,
-                modality_dropout={
-                    'fp': args.fp_modality_dropout,
-                    'smiles': args.smiles_modality_dropout,
-                    'graph': args.graph_modality_dropout,
-                },
+            model = build_mts_downstream_model(
+                args, auxiliary_tasks=auxiliary_tasks,
             )
+            if (
+                args.graph_encoder_type == MTS_ROUTE_INTERNAL
+                and getattr(args, "star_rbf_upper", None) is not None
+            ):
+                star_bias = model.encoders["graph"].encoder.star_distance_bias
+                sidecar = getattr(dataset, "_star_rbf_v2_sidecar", None)
+                if sidecar is not None and abs(
+                    float(sidecar.rbf_upper) - float(args.star_rbf_upper)
+                ) > 1e-9:
+                    raise RuntimeError(
+                        "MTS RBF upper mismatch: sidecar="
+                        f"{float(sidecar.rbf_upper)}, "
+                        f"config={float(args.star_rbf_upper)}"
+                    )
+                centers = star_bias.centers
+                if (
+                    int(centers.numel()) != 32
+                    or abs(float(centers[0])) > 1e-9
+                    or abs(float(centers[-1]) - float(args.star_rbf_upper)) > 1e-6
+                ):
+                    raise RuntimeError(
+                        "MTS RBF definition mismatch: expected 32 centers in "
+                        f"[0.0, {args.star_rbf_upper}], got num={centers.numel()} "
+                        f"first={float(centers[0])} last={float(centers[-1])}"
+                    )
+                rbf_spacing = float(centers[1] - centers[0])
+                if abs(
+                    float(star_bias.gamma)
+                    - 0.5 / max(rbf_spacing * rbf_spacing, 1e-12)
+                ) > 1e-4:
+                    raise RuntimeError(
+                        "MTS RBF gamma must be 0.5/spacing^2 from the actual "
+                        f"centers, got gamma={float(star_bias.gamma)} "
+                        f"spacing={rbf_spacing}"
+                    )
             if pretrained_model_path:
                 checkpoint = torch.load(pretrained_model_path, map_location='cpu')
                 if args.graph_encoder_type == 'mips_trimer_scage':
@@ -811,6 +854,20 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                     )
                     expected_stage = MTS_STAGE1_ID
                     checkpoint_state = checkpoint['state_dict']
+                    # B0's DDP-visible pretraining container stores the
+                    # UniEncoder under ``model.`` and keeps its two pretext
+                    # heads alongside it.  Downstream consumes only the
+                    # strict UniEncoder state; discard heads and normalize
+                    # the prefix before the existing compatibility audit.
+                    if checkpoint_state and any(
+                        str(key).startswith("model.")
+                        for key in checkpoint_state
+                    ):
+                        checkpoint_state = {
+                            str(key)[len("model."):]: value
+                            for key, value in checkpoint_state.items()
+                            if str(key).startswith("model.")
+                        }
                 else:
                     checkpoint_state = checkpoint.get('state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
                 model_keys = set(model.state_dict())
@@ -1276,7 +1333,6 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 if args.graph_encoder_type == 'mips_trimer_scage' else None
             ),
             'topology_attention_variant': args.topology_attention_variant,
-            'star_rbf_definition': getattr(args, 'star_rbf_definition', None),
             'star_rbf_upper': getattr(args, 'star_rbf_upper', None),
             'star_rbf_v2_sidecar': getattr(args, 'star_rbf_v2_sidecar', None),
             'feature_cohort': getattr(dataset, 'feature_cohort_name', None),

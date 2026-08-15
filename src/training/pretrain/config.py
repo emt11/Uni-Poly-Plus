@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from dataclasses import dataclass
 
 from src.dataset.mips_trimer_contract import ROUTE_INTERNAL as MTS_ROUTE_INTERNAL
@@ -99,11 +101,126 @@ def parse_modality(value):
     return value
 
 
-def parse_arguments():
+_B0_REQUIRED = {
+    "schema", "experiment_id", "dataset_name", "cache_root", "sidecar_root",
+    "result_root", "output_path", "output_kind", "noise_sigma",
+    "coordinate_loss_weight", "masked_atom", "coordinate_denoising",
+    "use_star_rbf", "use_mcl", "use_md200", "topology_attention_variant",
+    "star_rbf_upper", "graph_mask_ratio", "batch_size", "loader_workers",
+    "prefetch_factor", "gradient_accumulation_steps", "global_batch_size",
+    "max_optimizer_steps", "checkpoint_interval_steps", "probe_steps",
+    "amp_dtype", "seed", "lr", "warmup_steps", "end_lr", "weight_decay",
+    "cache_layers",
+}
+_B0_ALLOWED = _B0_REQUIRED | {"source_config", "project_root"}
+_B0_STAR_RBF_UPPER = 3.75
+
+
+def _apply_b0_config(args, config_path):
+    path = Path(config_path).resolve()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("B0 config must be a JSON object")
+    unknown = sorted(set(payload) - _B0_ALLOWED)
+    missing = sorted(_B0_REQUIRED - set(payload))
+    if unknown:
+        raise ValueError("B0 config has unknown fields: " + ", ".join(unknown))
+    if missing:
+        raise ValueError("B0 config is missing fields: " + ", ".join(missing))
+    if payload["schema"] != "mts-b0-v2":
+        raise ValueError("unsupported B0 config schema")
+    for name in ("masked_atom", "coordinate_denoising", "use_star_rbf", "use_md200"):
+        if payload[name] is not True:
+            raise ValueError(f"B0 scientific switch {name} must be true")
+    if payload["use_mcl"] is not False:
+        raise ValueError("B0 pretraining requires use_mcl=false")
+    if float(payload["noise_sigma"]) <= 0.0:
+        raise ValueError("B0 noise_sigma must be positive")
+    if float(payload["coordinate_loss_weight"]) <= 0.0:
+        raise ValueError("B0 coordinate_loss_weight must be positive")
+    if payload["topology_attention_variant"] != "o8":
+        raise ValueError("B0 requires topology_attention_variant=o8")
+    if abs(float(payload["star_rbf_upper"]) - _B0_STAR_RBF_UPPER) > 1e-9:
+        raise ValueError(
+            f"B0 requires star_rbf_upper={_B0_STAR_RBF_UPPER}, "
+            f"got {payload['star_rbf_upper']}"
+        )
+    if int(payload["checkpoint_interval_steps"]) != 2000:
+        raise ValueError("B0 checkpoint_interval_steps is fixed at 2000")
+    if [int(value) for value in payload["probe_steps"]] != [5000, 10000, 20000]:
+        raise ValueError("B0-v2 probe_steps must be exactly [5000, 10000, 20000]")
+    if int(payload["gradient_accumulation_steps"]) < 1:
+        raise ValueError("B0 gradient_accumulation_steps must be positive")
+    if int(payload["global_batch_size"]) < 1:
+        raise ValueError("B0 global_batch_size must be positive")
+    if str(payload["amp_dtype"]) not in {"fp32", "bf16"}:
+        raise ValueError("B0 amp_dtype must be fp32 or bf16")
+    if payload["output_kind"] != "trajectory":
+        raise ValueError("B0-v2 output_kind must be trajectory")
+    args.config_schema = "mts-b0-v2"
+    args.config_source_schema = "mts-b0-v2"
+    args.experiment_id = str(payload["experiment_id"])
+    args.dataset_name = str(payload["dataset_name"])
+    args.root = str(payload["cache_root"])
+    args.star_rbf_v2_sidecar = str(payload["sidecar_root"])
+    args.save_path = str(payload["output_path"])
+    args.b0_result_root = str(payload["result_root"])
+    args.b0_output_kind = "trajectory"
+    args.b0_noise_sigma = float(payload["noise_sigma"])
+    args.b0_coordinate_loss_weight = float(payload["coordinate_loss_weight"])
+    args.b0_use_star_rbf = bool(payload["use_star_rbf"])
+    args.b0_use_mcl = bool(payload["use_mcl"])
+    args.b0_use_md200 = bool(payload["use_md200"])
+    args.b0_coordinate_denoising = bool(payload["coordinate_denoising"])
+    args.b0_masked_atom = bool(payload["masked_atom"])
+    args.topology_attention_variant = "o8"
+    args.star_rbf_upper = float(payload["star_rbf_upper"])
+    args.graph_mask_ratio = float(payload["graph_mask_ratio"])
+    args.batch_size = int(payload["batch_size"])
+    args.loader_workers = int(payload["loader_workers"])
+    args.loader_prefetch_factor = int(payload["prefetch_factor"])
+    args.gradient_accumulation_steps = int(payload["gradient_accumulation_steps"])
+    args.global_batch_size = int(payload["global_batch_size"])
+    args.max_optimizer_steps = int(payload["max_optimizer_steps"])
+    args.checkpoint_interval_steps = 2000
+    args.b0_probe_steps = tuple(int(value) for value in payload["probe_steps"])
+    args.amp_dtype = str(payload["amp_dtype"])
+    args.seed = int(payload["seed"])
+    args.lr = float(payload["lr"])
+    args.warmup_steps = int(payload["warmup_steps"])
+    args.end_lr = float(payload["end_lr"])
+    args.weight_decay = float(payload["weight_decay"])
+    args.cache_layers = str(payload["cache_layers"])
+    args.pretrain_stage = "b0_periodic_coordinate_denoising"
+    args.graph_encoder_type = MTS_ROUTE_INTERNAL
+    args.graph_input = "star_linking"
+    args.geom_input = "repeat_unit"
+    args.graph_geometry_mode = "trimer_scage_mcl"
+    args.mips_use_descriptors = True
+    args.scage_mips_mask_weight = 1.0
+    args.graph_angle_weight = 0.0
+    args.angle_loss_weight = 0.0
+    args.mips_spd_weight = 0.0
+    args.mips_path_bond_weight = 0.0
+    args.mips_repeat_consistency_weight = 0.0
+    args.mips_distance_weight = 0.0
+    args.mips_conformer_weight = 0.0
+    args.scage_screw_geometry_weight = 0.0
+    args.dynamic_pretrain_loss = False
+    args.rebuild_feature_cache = False
+    args.cache_only = False
+    # Preserve runtime controls supplied after/alongside the config.  In
+    # particular, B0-v2 resume smoke must be able to stop at step 3 and then
+    # continue the same state to step 8.
+    return args
+
+
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description="Pretrain UniEncoderAttention Model")
     parser.add_argument('--experiment_id', default='manual')
     parser.add_argument('--config_schema', default='manual')
     parser.add_argument('--config_source_schema', default='')
+    parser.add_argument('--b0_config', default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         '--modalities',
         nargs='+',
@@ -391,7 +508,6 @@ def parse_arguments():
         action=argparse.BooleanOptionalAction, default=False,
     )
     parser.add_argument('--msta_local_output_init', choices=['zero'], default='zero')
-    parser.add_argument('--star_rbf_definition', choices=['legacy_sample_direct_link_v1', 'trimer_periodic_relation_rbf_v2'], default='legacy_sample_direct_link_v1')
     parser.add_argument('--star_rbf_upper', type=float, default=3.0)
     parser.add_argument('--star_rbf_v2_sidecar', default=None)
     parser.add_argument('--pretraining_objective', choices=['joint', 'masked_atom_only'], default='joint')
@@ -760,7 +876,7 @@ def parse_arguments():
         '--mips_scheduler', choices=('polynomial', 'cosine', 'linear'), default='polynomial',
         help='Learning-rate decay after warm-up. MTS uses polynomial power 1.',
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     # Fixed MTS route internals.  Retired geometry and peer-fusion options are
     # deliberately absent from the public CLI.
     args.gnn_model_name = ""
@@ -802,4 +918,6 @@ def parse_arguments():
     # compatible during the naming migration.
     if args.graph_encoder_type == "mts":
         args.graph_encoder_type = MTS_ROUTE_INTERNAL
+    if args.b0_config:
+        args = _apply_b0_config(args, args.b0_config)
     return args

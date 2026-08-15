@@ -114,7 +114,7 @@ def test_encode_first_average_and_inverse_bitwise_identity():
     model = MIPSLocalGraphEncoder(
         graph_geometry_mode="trimer_scage_mcl", use_star_rbf=True,
         use_mcl=False, topology_attention_variant="msta_last2",
-        star_rbf_definition="trimer_periodic_relation_rbf_v2", star_rbf_upper=6.0,
+        star_rbf_upper=6.0,
     )
     model.star_distance_bias.projection.weight.data.normal_()
     bias = model.star_distance_bias.forward_periodic_relation_v2(batch, torch.float32)
@@ -137,7 +137,7 @@ def test_rbf_upper_margin_and_valid_tail_nonzero():
     model = MIPSLocalGraphEncoder(
         graph_geometry_mode="trimer_scage_mcl", use_star_rbf=True,
         use_mcl=False, topology_attention_variant="msta_last2",
-        star_rbf_definition="trimer_periodic_relation_rbf_v2", star_rbf_upper=3.0,
+        star_rbf_upper=3.0,
     )
     tail = torch.exp(-model.star_distance_bias.gamma * (torch.tensor(3.5) - model.star_distance_bias.centers) ** 2)
     assert bool((tail > 0).any())
@@ -154,7 +154,7 @@ def test_asymmetry_is_qc_only_and_step0_forward_matches_g1():
     candidate = MIPSLocalGraphEncoder(
         graph_geometry_mode="trimer_scage_mcl", use_star_rbf=True,
         use_mcl=False, topology_attention_variant="msta_last2",
-        star_rbf_definition="trimer_periodic_relation_rbf_v2", star_rbf_upper=6.0,
+        star_rbf_upper=6.0,
     ).eval()
     candidate.load_state_dict(legacy.state_dict(), strict=True)
     with torch.no_grad():

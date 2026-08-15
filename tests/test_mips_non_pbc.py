@@ -6,6 +6,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 from src.dataset.dataloader import custom_collate, mips_trimer_collate
+from src.dataset.mts_star_rbf_v2 import build_star_rbf_v2_sample
 from src.dataset import trimer_mcl as trimer_mcl_module
 from src.dataset.dataset import (
     _attach_mips_descriptors,
@@ -29,6 +30,32 @@ def graph_data(smiles="*CCO*", *, trimer_max_heavy_atoms=384):
         trimer_num_candidates=4,
         trimer_max_heavy_atoms=trimer_max_heavy_atoms,
     )
+    record = build_star_rbf_v2_sample(b"k" * 32, data, data)
+    relations, pairs = record["relations"], record["pairs"]
+    data.mts_star_v2_relation_row = torch.tensor(
+        [item["row"] for item in relations], dtype=torch.long
+    )
+    data.mts_star_v2_relation_pair_index = torch.tensor(
+        [item["pair_index"] for item in relations], dtype=torch.long
+    )
+    data.mts_star_v2_relation_spd = torch.tensor(
+        [item["spd"] for item in relations], dtype=torch.long
+    )
+    data.mts_star_v2_pair_observation_distances = torch.tensor(
+        [item["distances"] for item in pairs], dtype=torch.float
+    )
+    data.mts_star_v2_pair_observation_count = torch.tensor(
+        [item["observation_count"] for item in pairs], dtype=torch.long
+    )
+    data.mts_star_v2_pair_valid = torch.tensor(
+        [item["valid"] for item in pairs], dtype=torch.bool
+    )
+    data.mts_star_v2_pair_geometry_source = torch.tensor(
+        [item["geometry_source"] for item in pairs], dtype=torch.long
+    )
+    data.mts_star_v2_sidecar_artifact = "a" * 64
+    data.mts_star_v2_model_semantic_hash = "b" * 64
+    data.mts_star_v2_rbf_upper = 6.0
     data.y = torch.zeros(1)
     return data
 
@@ -93,7 +120,7 @@ def test_short_ru_mapping_and_polymerized_features():
         assert torch.equal(rows, rows[:1].expand_as(rows))
 
 
-def test_symmetric_star_distance_and_direct_edge_mask():
+def test_star_relation_geometry_and_direct_edge_mask():
     data = graph_data("*CCO*")
     assert data.star_3d_valid
     metadata_edges = data.trimer_edge_index[:, ::2].T
@@ -111,14 +138,23 @@ def test_symmetric_star_distance_and_direct_edge_mask():
 
     batch = custom_collate([data])
     encoder = MIPSLocalGraphEncoder().eval()
-    bias = encoder.star_distance_bias(batch, torch.float32)
+    bias = encoder.star_distance_bias.forward_periodic_relation_v2(
+        batch, torch.float32
+    )
     assert torch.equal(bias, torch.zeros_like(bias))
     encoder.star_distance_bias.projection.weight.data.fill_(0.1)
-    bias = encoder.star_distance_bias(batch, torch.float32)
+    bias = encoder.star_distance_bias.forward_periodic_relation_v2(
+        batch, torch.float32
+    )
     assert bool((bias[batch.lga_star_edge_mask] != 0).all())
+    relation_source = batch.mts_star_v2_pair_geometry_source[
+        batch.mts_star_v2_relation_pair_index
+    ]
+    # v2 encodes every valid periodic relation (not only direct Star links),
+    # while the audited true-self relation remains an exact zero bias.
     assert torch.equal(
-        bias[~batch.lga_star_edge_mask],
-        torch.zeros_like(bias[~batch.lga_star_edge_mask]),
+        bias[relation_source == 1],
+        torch.zeros_like(bias[relation_source == 1]),
     )
 
 
@@ -151,7 +187,7 @@ def test_geometry_fallback_and_stage_boundaries():
     encoder.trimer_mcl.geometry_gate.data.fill_(0.2)
     encoder.star_distance_bias.projection.weight.data.fill_(0.1)
     star_invalid = copy.deepcopy(batch)
-    star_invalid.star_3d_valid.zero_()
+    star_invalid.mts_star_v2_pair_valid.zero_()
     with torch.no_grad():
         expected, expected_nodes = encoder._forward_impl(
             star_invalid, use_star=False, use_geometry=True, use_md=True

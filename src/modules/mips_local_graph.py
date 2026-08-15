@@ -69,7 +69,7 @@ class MIPSSinglePathNodeBias(nn.Module):
 
 
 class SymmetricStarDistanceBias(nn.Module):
-    """Zero-initialized per-head RBF bias for direct virtual Star edges."""
+    """Zero-initialized per-head RBF bias for periodic Trimer relations."""
 
     def __init__(self, num_heads=8, num_rbf=32, lower=0.0, upper=3.0):
         super().__init__()
@@ -82,38 +82,10 @@ class SymmetricStarDistanceBias(nn.Module):
         )
         nn.init.zeros_(self.projection.weight)
 
-    def forward(self, data, dtype):
-        edge_count = int(data.lga_edge_index.size(1))
-        output = data.lga_spd.new_zeros(
-            (edge_count, self.projection.out_features), dtype=dtype
-        )
-        star_edges = data.lga_star_edge_mask.bool()
-        if not bool(star_edges.any()):
-            return output
-        _, target = data.lga_edge_index.long()
-        graph_id = data.batch[target[star_edges]].long()
-        valid = data.star_3d_valid.bool().flatten()[graph_id]
-        if not bool(valid.any()):
-            return output + self.projection.weight.reshape(-1)[0] * 0.0
-        distance = data.star_3d_distance.float().flatten()[graph_id[valid]]
-        # Build the RBF in float32 for stable exponentials, then feed the
-        # projection with the parameter dtype.  Under CUDA autocast the
-        # Linear may return BF16 while ``output`` can still be float32 (or
-        # vice versa), so cast the projected result explicitly before the
-        # indexed write below.  Without this, the joint-pretraining BF16
-        # parity gate can fail with a Float/BFloat16 mismatch.
-        rbf = torch.exp(
-            -self.gamma * (distance.unsqueeze(-1) - self.centers.float()) ** 2
-        )
-        projection_input = rbf.to(dtype=self.projection.weight.dtype)
-        selected_edges = torch.nonzero(
-            star_edges, as_tuple=False
-        ).flatten()[valid]
-        projected = self.projection(projection_input)
-        output[selected_edges] = projected.to(dtype=output.dtype)
-        return output
-
-    def forward_periodic_relation_v2(self, data, dtype):
+    def forward_periodic_relation_v2(
+        self, data, dtype, pair_observation_distances=None,
+        pair_observation_mask=None,
+    ):
         """Encode unique periodic pairs, then gather one shared value per inverse relation."""
         edge_count = int(data.lga_edge_index.size(1))
         output = data.lga_spd.new_zeros(
@@ -121,8 +93,18 @@ class SymmetricStarDistanceBias(nn.Module):
         )
         rows = data.mts_star_v2_relation_row.long().reshape(-1)
         pair_index = data.mts_star_v2_relation_pair_index.long().reshape(-1)
-        distances = data.mts_star_v2_pair_observation_distances.float().reshape(-1, 2)
-        counts = data.mts_star_v2_pair_observation_count.long().reshape(-1)
+        distances = (
+            data.mts_star_v2_pair_observation_distances
+            if pair_observation_distances is None
+            else pair_observation_distances
+        ).float().reshape(-1, 2)
+        if pair_observation_mask is None:
+            counts = data.mts_star_v2_pair_observation_count.long().reshape(-1)
+        else:
+            mask = torch.as_tensor(
+                pair_observation_mask, device=distances.device, dtype=torch.bool
+            ).reshape(-1, 2)
+            counts = mask.sum(dim=1).long()
         valid = data.mts_star_v2_pair_valid.bool().reshape(-1)
         sources = data.mts_star_v2_pair_geometry_source.long().reshape(-1)
         pair_count = int(valid.numel())
@@ -146,10 +128,16 @@ class SymmetricStarDistanceBias(nn.Module):
                 -self.gamma
                 * (selected.unsqueeze(-1) - self.centers.float().reshape(1, 1, -1)) ** 2
             )
-            observation_mask = (
-                torch.arange(2, device=counts.device).reshape(1, 2)
-                < counts[encode].reshape(-1, 1)
-            ).unsqueeze(-1)
+            if pair_observation_mask is None:
+                observation_mask = (
+                    torch.arange(2, device=counts.device).reshape(1, 2)
+                    < counts[encode].reshape(-1, 1)
+                ).unsqueeze(-1)
+            else:
+                observation_mask = torch.as_tensor(
+                    pair_observation_mask, device=distances.device,
+                    dtype=torch.bool,
+                ).reshape(-1, 2)[encode].unsqueeze(-1)
             rbf = (rbf * observation_mask).sum(dim=1) / counts[encode].clamp_min(1).unsqueeze(-1)
             projected = self.projection(rbf.to(self.projection.weight.dtype))
             pair_bias[encode] = projected.to(pair_bias.dtype)
@@ -471,7 +459,6 @@ class MIPSLocalGraphEncoder(nn.Module):
         input_norm=False,
         qk_direction="paper",
         use_star_rbf=True,
-        star_rbf_definition="legacy_sample_direct_link_v1",
         star_rbf_upper=3.0,
         use_mcl=True,
         topology_attention_variant="o8",
@@ -568,11 +555,6 @@ class MIPSLocalGraphEncoder(nn.Module):
         self.spatial_mode = "trimer_scage"
         self.graph_geometry_mode = requested_geometry
         self.geometry_mode = resolved_geometry
-        self.star_rbf_definition = str(star_rbf_definition)
-        if self.star_rbf_definition not in {
-            "legacy_sample_direct_link_v1", "trimer_periodic_relation_rbf_v2"
-        }:
-            raise ValueError("unsupported Star-RBF definition")
         self.topology_attention_variant = topology_attention_variant
         self.msta_layer_indices = normalized_layers
         self.msta_local_spd = normalized_local_spd
@@ -685,16 +667,12 @@ class MIPSLocalGraphEncoder(nn.Module):
         if require_geometry:
             if self.use_star_rbf:
                 required += (
-                    (
-                        "mts_star_v2_relation_row",
-                        "mts_star_v2_relation_pair_index",
-                        "mts_star_v2_pair_observation_distances",
-                        "mts_star_v2_pair_observation_count",
-                        "mts_star_v2_pair_valid",
-                        "mts_star_v2_pair_geometry_source",
-                    ) if self.star_rbf_definition == "trimer_periodic_relation_rbf_v2" else (
-                        "star_3d_distance", "star_3d_asymmetry", "star_3d_valid",
-                    )
+                    "mts_star_v2_relation_row",
+                    "mts_star_v2_relation_pair_index",
+                    "mts_star_v2_pair_observation_distances",
+                    "mts_star_v2_pair_observation_count",
+                    "mts_star_v2_pair_valid",
+                    "mts_star_v2_pair_geometry_source",
                 )
             if self.use_mcl:
                 required += (
@@ -777,10 +755,8 @@ class MIPSLocalGraphEncoder(nn.Module):
         path_bias = self.path_bias(initial, data)
         star_bias = torch.zeros_like(spd_bias)
         if use_star:
-            star_bias = (
-                self.star_distance_bias.forward_periodic_relation_v2(data, initial.dtype)
-                if self.star_rbf_definition == "trimer_periodic_relation_rbf_v2"
-                else self.star_distance_bias(data, initial.dtype)
+            star_bias = self.star_distance_bias.forward_periodic_relation_v2(
+                data, initial.dtype
             )
         relation_mask = getattr(data, "lga_relation_mask", None)
         if relation_mask is not None:
@@ -854,10 +830,8 @@ class MIPSLocalGraphEncoder(nn.Module):
         path_bias = self.path_bias(initial, data)
         star_bias = torch.zeros_like(spd_bias)
         if self.use_star_rbf:
-            star_bias = (
-                self.star_distance_bias.forward_periodic_relation_v2(data, initial.dtype)
-                if self.star_rbf_definition == "trimer_periodic_relation_rbf_v2"
-                else self.star_distance_bias(data, initial.dtype)
+            star_bias = self.star_distance_bias.forward_periodic_relation_v2(
+                data, initial.dtype
             )
         relation_mask = getattr(data, "lga_relation_mask", None)
         if relation_mask is not None:
@@ -901,6 +875,56 @@ class MIPSLocalGraphEncoder(nn.Module):
                 data, "trimer_angle_valid", torch.zeros_like(mcl_valid)
             ).bool().flatten(),
         }
+
+    def forward_b0_pretrain(
+        self, data, canonical_atom_mask,
+        noisy_pair_observation_distances=None,
+        noisy_pair_observation_mask=None,
+    ):
+        """Run the B0 masked/dynamic Star-RBF O8 backbone.
+
+        B0 intentionally omits Trimer-MCL and MD200 from the pretext path.
+        Dynamic observation tensors are transient batch values; the frozen
+        sidecar attached to ``data`` remains the clean fallback and is never
+        modified.
+        """
+        mask = torch.as_tensor(
+            canonical_atom_mask, dtype=torch.bool, device=data.mips_x.device
+        ).reshape(-1)
+        if mask.numel() != data.mips_x.size(0):
+            raise ValueError("B0 canonical_atom_mask length mismatch")
+        self._validate(data, require_geometry=self.use_star_rbf, require_md=False)
+        initial = self.atom_embedding(data, atom_mask=mask)
+        spd_bias = self.spd_embedding(data.lga_spd.long())
+        path_bias = self.path_bias(initial, data)
+        star_bias = torch.zeros_like(spd_bias)
+        if self.use_star_rbf:
+            star_bias = self.star_distance_bias.forward_periodic_relation_v2(
+                data, initial.dtype,
+                pair_observation_distances=noisy_pair_observation_distances,
+                pair_observation_mask=noisy_pair_observation_mask,
+            )
+        relation_mask = getattr(data, "lga_relation_mask", None)
+        if relation_mask is not None:
+            keep = (~relation_mask.bool()).unsqueeze(-1).to(initial.dtype)
+            spd_bias, path_bias, star_bias = (
+                value * keep for value in (spd_bias, path_bias, star_bias)
+            )
+        attention_bias = spd_bias + path_bias + star_bias
+        nodes = initial
+        for layer in self.layers:
+            if isinstance(layer, MSTAMIPSLocalLayer):
+                nodes = layer(
+                    nodes, data.lga_edge_index.long(), attention_bias,
+                    spd=data.lga_spd, relation_mask=relation_mask,
+                )
+            else:
+                nodes = layer(nodes, data.lga_edge_index.long(), attention_bias)
+        graph_available = data.graph_available.bool().flatten()
+        nodes = nodes * graph_available[data.batch.long()].unsqueeze(-1).to(nodes.dtype)
+        graph, canonical_nodes = self._canonical_pool(nodes, data)
+        graph = graph * graph_available.unsqueeze(-1).to(graph.dtype)
+        return graph, nodes, canonical_nodes
 
     def _atom_mask_from_override(self, data, x_override):
         if x_override.shape != data.x.shape:

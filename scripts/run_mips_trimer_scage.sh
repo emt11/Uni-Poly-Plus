@@ -6,7 +6,7 @@ cd "$PROJECT_DIR"
 PYTHON_BIN=${PYTHON_BIN:-/opt/conda/envs/MTS/bin/python}
 
 if [[ -z "${EXPERIMENT_CONFIG:-}" ]]; then
-  echo "MTS production is disabled: EXPERIMENT_CONFIG is required while the configuration layer is retired." >&2
+  echo "MTS B0-v2 requires EXPERIMENT_CONFIG pointing to an mts-b0-v2 JSON file." >&2
   exit 2
 fi
 if [[ ! -f "$EXPERIMENT_CONFIG" ]]; then
@@ -14,6 +14,12 @@ if [[ ! -f "$EXPERIMENT_CONFIG" ]]; then
   exit 2
 fi
 
-# The resolver is deliberately fail-closed and must run before any GPU,
-# worker, cache, output-directory, or training initialization.
-exec "$PYTHON_BIN" scripts/resolve_mips_trimer_scage.py "$EXPERIMENT_CONFIG"
+RESOLVED_INPUT=$("$PYTHON_BIN" scripts/resolve_mips_trimer_scage.py \
+  "$EXPERIMENT_CONFIG" --print-path)
+TORCHRUN_BIN=${TORCHRUN_BIN:-/opt/conda/envs/MTS/bin/torchrun}
+export CUDA_VISIBLE_DEVICES=1,2,3
+# EXTRA_ARGS carries runtime-only controls (e.g. --resume_smoke) that never
+# alter the resolved experiment identity.
+# shellcheck disable=SC2086
+exec "$TORCHRUN_BIN" --standalone --nproc_per_node=3 \
+  scripts/pretrain.py --b0_config "$RESOLVED_INPUT" ${EXTRA_ARGS:-}

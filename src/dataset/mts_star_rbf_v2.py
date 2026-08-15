@@ -484,8 +484,9 @@ class StarRBFV2Sidecar:
         if rs < 0 or re < rs or re > relation_count or ps < 0 or pe < ps or pe > pair_count:
             raise IndexError(f"Star-RBF v2 row offsets are invalid: {index}")
         pair_indices = np.asarray(self.arrays["relation_pair_index"][rs:re], dtype=np.int64)
+        row_pair_count = pe - ps
         if pair_indices.size and (
-            int(pair_indices.min()) < ps or int(pair_indices.max()) >= pe
+            int(pair_indices.min()) < 0 or int(pair_indices.max()) >= row_pair_count
         ):
             raise RuntimeError(f"Star-RBF v2 relation pair index is outside row {index}")
         counts = np.asarray(self.arrays["pair_observation_count"][ps:pe], dtype=np.int64)
@@ -495,6 +496,7 @@ class StarRBFV2Sidecar:
             "relations": {name: np.asarray(self.arrays[name][rs:re]) for name in (
                 "relation_row", "relation_pair_index", "relation_spd")},
             "pairs": {name: np.asarray(self.arrays[name][ps:pe]) for name in (
+                "pair_key_src", "pair_key_dst", "pair_key_shift",
                 "pair_observation_distances", "pair_observation_count",
                 "pair_valid", "pair_geometry_source")},
         }
