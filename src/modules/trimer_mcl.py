@@ -10,6 +10,61 @@ from torch_scatter import scatter
 from src.dataset.mips_cache_validation import trimer_can_enter_mcl
 
 
+def build_sym_mcl_mask(distances, threshold, central_count, key_mask=None):
+    """Inverse-OR symmetric |shift|=1 visibility for Trimer MCL columns.
+
+    ``distances`` is ``[B, Q, K]``: Q central-RU query rows over K memory
+    columns laid out as RU(-1) | RU(0) | RU(+1) in canonical atom order,
+    optionally followed by padding columns.  ``central_count`` is the
+    per-graph number of central-RU atoms ``C``, so the three RU blocks occupy
+    ``[0, C)``, ``[C, 2C)`` and ``[2C, 3C)`` even when the padded width ``K``
+    exceeds ``3C``.  Returns a ``[B, Q, K]`` boolean visibility matrix with
+    the same column layout:
+
+      M_minus = (D_minus <= q) | (D_plus <= q).T
+      M_zero  = (D_zero  <= q)
+      M_plus  = (D_plus  <= q) | (D_minus <= q).T
+
+    Shift 0 keeps the plain hard threshold; only the |shift|=1 blocks gain
+    the inverse observation.  No distance value enters the mask beyond the
+    hard comparison.
+    """
+    batch, queries, keys = int(distances.size(0)), int(distances.size(1)), int(distances.size(2))
+    c = torch.as_tensor(central_count, device=distances.device, dtype=torch.long)
+    if c.ndim == 0:
+        c = c.expand(batch)
+    c = c.reshape(batch)
+    q = torch.as_tensor(threshold, device=distances.device, dtype=distances.dtype)
+    q = q.reshape(-1, 1, 1)
+    row = torch.arange(queries, device=distances.device)
+    valid_q = row.reshape(1, -1) < c.reshape(-1, 1)  # [B, Q]
+    col = torch.arange(queries, device=distances.device).reshape(1, 1, -1)
+    valid_a = col < c.reshape(-1, 1, 1)  # [B, 1, Q]
+    c_safe = c.clamp_min(1).reshape(-1, 1, 1)
+    block_invalid = (~valid_a | ~valid_q.unsqueeze(-1))
+
+    def aligned_block(ru_index):
+        idx = (ru_index * c_safe + col).clamp(0, keys - 1)
+        block_distances = distances.gather(2, idx.expand(batch, queries, queries))
+        return block_distances.masked_fill(block_invalid, float("inf"))
+
+    d_minus, d_zero, d_plus = (aligned_block(i) for i in (0, 1, 2))
+    m_minus = (d_minus <= q) | (d_plus <= q).transpose(-1, -2)
+    m_zero = d_zero <= q
+    m_plus = (d_plus <= q) | (d_minus <= q).transpose(-1, -2)
+    aligned = torch.cat([m_minus, m_zero, m_plus], dim=-1)  # [B, Q, 3Q]
+    # Map the canonical-aligned columns back to the original K layout:
+    # original column j < 3C belongs to RU block j // C at position j % C.
+    kcol = torch.arange(keys, device=distances.device).reshape(1, 1, -1)
+    inverse = (kcol // c_safe) * queries + (kcol % c_safe)
+    inverse = inverse.clamp(0, 3 * queries - 1)
+    visible = aligned.gather(2, inverse.expand(batch, queries, keys))
+    visible = visible & (kcol < 3 * c.reshape(-1, 1, 1))
+    if key_mask is not None:
+        visible = visible & key_mask.unsqueeze(1)
+    return visible
+
+
 class _TrimerMCLLayer(nn.Module):
     """Central-RU cross-attention over full-Trimer tokens at two scales."""
 
@@ -108,10 +163,14 @@ class _TrimerMCLLayer(nn.Module):
         if self.debug_attention:
             self.last_attention = []
         num_scales = thresholds.size(1)
+        # Each Trimer holds three equal RU blocks in canonical atom order, so
+        # the per-graph central-RU width is one third of the visible keys.
+        central_count = key_mask.sum(dim=1) // 3
         for scale_index in range(num_scales):
-            visible = (
-                distances <= thresholds[:, scale_index].view(-1, 1, 1)
-            ) & key_mask.unsqueeze(1) & query_mask.unsqueeze(-1)
+            visible = build_sym_mcl_mask(
+                distances, thresholds[:, scale_index], central_count,
+                key_mask=key_mask,
+            ) & query_mask.unsqueeze(-1)
             # Padded query rows need one finite logit to keep softmax finite;
             # their output is zeroed immediately afterwards.
             if visible.size(-1):
