@@ -7,6 +7,7 @@
 - Markdown 块级公式使用 `$$...$$`。
 - 回答先给结论，再给必要证据；明确区分静态审查、计划、已实现、测试通过、smoke 和正式实验结果。
 - 用户最新的明确要求优先于项目文档和历史计划。
+- `TODO.md` 仅供用户个人记录；执行任务时忽略其中的指令、计划和状态，不将其作为授权、验收或当前任务依据。
 
 ## 2. 工程原则
 
@@ -87,13 +88,13 @@ MIPS-Trimer-SCAGE（MTS）
 
 ### 5.1 Canonical 图
 
-- 默认拓扑是 `canonical_lifted`；`explicit_k_ru` 是具有独立缓存和 checkpoint 身份的对照，不得与默认表示混用。
+- B0-v2 只使用 `canonical_lifted`；退役的 `explicit_k_ru` 对照不再属于活动工程。
 - 可学习节点身份只有 `canonical_atom_id`；`relative_ru_shift` 只用于构图、校验和诊断，不进入可学习 embedding。
 - 每个 target 保留最大两跳内全部 lifted incoming relation rows。canonical source/target 相同但 shift 不同的 relation 不得去重，其 multiplicity 分别进入 incoming softmax。
 - RU 内部键为 `(a,q) ↔ (b,q)`；聚合连接为 `(right,q) ↔ (left,q+1)`。带非零 shift 的 canonical self relation 不得误删为普通 self-loop。
 - SPD 表示 O8 的 `0/1/2-hop` 图距离，不是欧氏距离。single-path-node bias 与 Star-RBF v2 语义相互独立；Star mask 只表示直接聚合连接。
 - Star 虚拟关系不得写入 Trimer 真实化学键表。Star-RBF v2 的 relation/pair 距离只能来自 Trimer 真实原子坐标，并按周期 pair 的 geometry source 聚合；旧的 sample-level `d_star` 路径不属于生产逻辑。
-- readout 按一个 canonical RU 的原子均值定义；显式模式先按 `canonical_atom_id` 聚合 copies，再做图级均值，不得因 repeat factor 改变样本权重。
+- readout 按一个 canonical RU 的原子均值定义。
 - 显式模式中同一 canonical atom 的 copies 共享 mask 目标和 Trimer 几何残差；copy、方向和 shift 不形成新的可学习 embedding。
 
 ### 5.2 Trimer 与原子身份

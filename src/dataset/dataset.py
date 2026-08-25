@@ -46,12 +46,8 @@ from .canonical_periodic import (
     build_canonical_periodic_topology,
     find_base_atom_mapping,
 )
-from .explicit_k_ru import build_explicit_k_ru_topology
 from .mips_trimer_contract import (
-    EXPLICIT_FEATURE_SCHEMA,
-    EXPLICIT_TOPOLOGY_LMDB_SCHEMA,
     TOPOLOGY_CANONICAL,
-    TOPOLOGY_EXPLICIT,
     TOPOLOGY_REPRESENTATIONS,
 )
 from .lmdb_cache import (
@@ -70,7 +66,6 @@ from .lmdb_cache import (
     sample_key_from_normalized,
     sample_key_from_smiles,
 )
-from .trimer_angle_cache import angle_cache_root
 from .diagnostics import (
     print_dataset_diagnostics,
     summarize_feature_cache,
@@ -90,6 +85,11 @@ from .trimer_mcl import (
 )
 from .mips_cache_validation import validate_mcl_record
 from .mts_star_rbf_v2 import StarRBFV2Sidecar
+from .periodic_line_glt import PeriodicLineGLTSidecar
+from .periodic_line_glt_central import (
+    PeriodicLineGLTCentralSidecar,
+    SIDECAR_SCHEMA as CENTRAL_GLT_SIDECAR_SCHEMA,
+)
 from .mts_target_contract import make_target_contract
 from transformers import AutoTokenizer
 from rdkit.Chem import rdFingerprintGenerator
@@ -1609,31 +1609,21 @@ def _topology_placeholder_from_ru(
     canonical_molecule = Chem.MolFromSmiles(str(normalized))
     if canonical_molecule is not None:
         molecule = canonical_molecule
-    builder = (
-        build_explicit_k_ru_topology
-        if topology_representation == TOPOLOGY_EXPLICIT
-        else build_canonical_periodic_topology
-    )
     try:
-        data = builder(molecule, max_hops=2)
+        data = build_canonical_periodic_topology(molecule, max_hops=2)
     except Exception:
-        data = builder("*CC*", max_hops=2)
+        data = build_canonical_periodic_topology("*CC*", max_hops=2)
     data.smiles = str(smiles)
     data.graph_available = False
     data.mips_condition_valid = False
     data.mips_alias_free = False
-    data.mts_canonical_periodic = topology_representation == TOPOLOGY_CANONICAL
-    data.mts_topology_representation = topology_representation
-    data.topology_representation = topology_representation
-    if topology_representation == TOPOLOGY_EXPLICIT:
-        data.feature_schema = EXPLICIT_FEATURE_SCHEMA
-        data.explicit_k_ru_topology_schema = EXPLICIT_TOPOLOGY_LMDB_SCHEMA
-        data.topology_failure_code = "explicit_k_ru_topology_unavailable"
-    else:
-        data.feature_schema = CANONICAL_FEATURE_SCHEMA
-        data.canonical_periodic_topology_schema = CANONICAL_TOPOLOGY_SCHEMA
-        data.mips_local_lga_schema_version = CANONICAL_LGA_SCHEMA_VERSION
-        data.topology_failure_code = "canonical_topology_unavailable"
+    data.mts_canonical_periodic = True
+    data.mts_topology_representation = TOPOLOGY_CANONICAL
+    data.topology_representation = TOPOLOGY_CANONICAL
+    data.feature_schema = CANONICAL_FEATURE_SCHEMA
+    data.canonical_periodic_topology_schema = CANONICAL_TOPOLOGY_SCHEMA
+    data.mips_local_lga_schema_version = CANONICAL_LGA_SCHEMA_VERSION
+    data.topology_failure_code = "canonical_topology_unavailable"
     for name in (
         "ru_attachment_bond_type",
         "ru_attachment_bond_type_left",
@@ -1653,33 +1643,22 @@ def _compute_topology_layer_impl(
     smiles, ru_base, *, max_hops=2,
     topology_representation=TOPOLOGY_CANONICAL,
 ):
-    # The canonical representation remains the production default.  The
-    # corrected explicit k-RU representation is a separately hashed, runnable
-    # comparison path; it never reuses the retired explicit cache contract.
+    if topology_representation != TOPOLOGY_CANONICAL:
+        raise ValueError("B0-v2 only supports canonical_lifted topology")
     source_molecule = _mol_from_ru_base(ru_base)
     molecule = source_molecule
     normalized, _ = normalize_polymer_smiles(smiles)
     canonical_molecule = Chem.MolFromSmiles(str(normalized))
     if canonical_molecule is not None:
         molecule = canonical_molecule
-    if topology_representation == TOPOLOGY_EXPLICIT:
-        data = build_explicit_k_ru_topology(molecule, max_hops=int(max_hops))
-    elif topology_representation == TOPOLOGY_CANONICAL:
-        data = build_canonical_periodic_topology(molecule, max_hops=int(max_hops))
-    else:
-        raise ValueError("unsupported topology_representation")
+    data = build_canonical_periodic_topology(molecule, max_hops=int(max_hops))
     data.smiles = str(smiles)
-    if topology_representation == TOPOLOGY_CANONICAL:
-        data.feature_schema = CANONICAL_FEATURE_SCHEMA
-        data.canonical_periodic_topology_schema = CANONICAL_TOPOLOGY_SCHEMA
-        data.mips_local_lga_schema_version = CANONICAL_LGA_SCHEMA_VERSION
-        data.mts_canonical_periodic = True
-    else:
-        data.feature_schema = EXPLICIT_FEATURE_SCHEMA
-        data.explicit_k_ru_topology_schema = EXPLICIT_TOPOLOGY_LMDB_SCHEMA
-        data.mts_canonical_periodic = False
-    data.mts_topology_representation = topology_representation
-    data.topology_representation = topology_representation
+    data.feature_schema = CANONICAL_FEATURE_SCHEMA
+    data.canonical_periodic_topology_schema = CANONICAL_TOPOLOGY_SCHEMA
+    data.mips_local_lga_schema_version = CANONICAL_LGA_SCHEMA_VERSION
+    data.mts_canonical_periodic = True
+    data.mts_topology_representation = TOPOLOGY_CANONICAL
+    data.topology_representation = TOPOLOGY_CANONICAL
     # Persist the explicit atom identity table used by Trimer migration.  The
     # canonical topology itself is in normalized-RU order; the source row may
     # use a reversed or otherwise non-canonical P-SMILES order.
@@ -2176,20 +2155,23 @@ class UniDataset(Dataset):
         topology_representation=TOPOLOGY_CANONICAL,
         trimer_num_candidates=4,
         trimer_max_heavy_atoms=384,
-        mcl_distance_percentiles=(0.20, 0.50),
-        angle_cache_root_override=None,
         modalities=None,
         experiment_id='manual',
         feature_config_hash='manual',
         transform=None,
         pre_transform=None,
         star_rbf_v2_sidecar=None,
+        periodic_line_glt_sidecar=None,
     ):
         self.dataset = dataset
         self.star_rbf_v2_sidecar_root = (
             str(star_rbf_v2_sidecar) if star_rbf_v2_sidecar else None
         )
         self._star_rbf_v2_sidecar = None
+        self.periodic_line_glt_sidecar_root = (
+            str(periodic_line_glt_sidecar) if periodic_line_glt_sidecar else None
+        )
+        self._periodic_line_glt_sidecar = None
         self.root = root
         self.transform = transform
         self.pre_transform = pre_transform
@@ -2296,7 +2278,7 @@ class UniDataset(Dataset):
         self.topology_representation = str(topology_representation)
         if self.topology_representation not in TOPOLOGY_REPRESENTATIONS:
             raise ValueError(
-                "topology_representation must be canonical_lifted or explicit_k_ru"
+                "B0-v2 only supports topology_representation=canonical_lifted"
             )
         self.mips_core = str(mips_core)
         if self.mips_core != "paper_corrected":
@@ -2328,22 +2310,13 @@ class UniDataset(Dataset):
             )
         self.trimer_num_candidates = int(trimer_num_candidates)
         self.trimer_max_heavy_atoms = int(trimer_max_heavy_atoms)
-        self.mcl_distance_percentiles = tuple(
-            float(value) for value in mcl_distance_percentiles
-        )
-        self.angle_cache_root_override = (
-            str(angle_cache_root_override)
-            if angle_cache_root_override is not None else None
-        )
         if self.graph_geometry_mode == "trimer_scage_mcl":
             if self.graph_encoder_type != "mips_trimer_scage":
-                raise ValueError("Trimer-MCL is only valid for the selected O8 route")
+                raise ValueError("Trimer geometry is only valid for the B0-v2 route")
             if self.trimer_num_candidates != 4:
-                raise ValueError("selected Trimer-MCL requires 4 candidates")
+                raise ValueError("B0-v2 Trimer requires 4 candidates")
             if self.trimer_max_heavy_atoms != 384:
-                raise ValueError("selected Trimer-MCL requires max 384 heavy atoms")
-            if self.mcl_distance_percentiles != (0.20, 0.50):
-                raise ValueError("selected Trimer-MCL requires percentiles 0.20/0.50")
+                raise ValueError("B0-v2 Trimer requires max 384 heavy atoms")
         self.mips_variant = "O8"
         if self.graph_encoder_type == "mips_trimer_scage":
             if self.graph_geometry_mode != "trimer_scage_mcl":
@@ -2438,6 +2411,17 @@ class UniDataset(Dataset):
             # ``__getitem__`` instead of by task-row position.
             if self._cohort_row_mode and len(self._star_rbf_v2_sidecar) != len(self.data_list):
                 raise RuntimeError("Star-RBF v2 sidecar record count does not match Dataset")
+        if self.periodic_line_glt_sidecar_root is not None:
+            metadata_path = Path(self.periodic_line_glt_sidecar_root) / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            reader = (
+                PeriodicLineGLTCentralSidecar
+                if metadata.get("schema") == CENTRAL_GLT_SIDECAR_SCHEMA
+                else PeriodicLineGLTSidecar
+            )
+            self._periodic_line_glt_sidecar = reader(self.periodic_line_glt_sidecar_root)
+            if self._cohort_row_mode and len(self._periodic_line_glt_sidecar) != len(self.data_list):
+                raise RuntimeError("periodic line GLT sidecar record count does not match Dataset")
 
     # ------------------------------------------------------------------
     # Legacy path (--disable_feature_cache)
@@ -2811,43 +2795,14 @@ class UniDataset(Dataset):
             rdkit_version=rdBase.rdkitVersion,
             random_seed=42,
         )
-        if topology_representation == TOPOLOGY_EXPLICIT:
-            add_definition(
-                "topology",
-                EXPLICIT_TOPOLOGY_LMDB_SCHEMA,
-                {
-                    "ru_base_hash": ru_base_hash,
-                    "topology_representation": TOPOLOGY_EXPLICIT,
-                    "feature_schema": EXPLICIT_FEATURE_SCHEMA,
-                    "builder_version": 1,
-                    "boundary_distance_algorithm":
-                        "expanded_graph_shortest_path",
-                    "boundary_threshold": 5,
-                    "max_hops": 2,
-                    "max_repeat_units": 16,
-                    "max_model_atoms": 384,
-                    "connection_bond_policy":
-                        "matching_or_mismatch_single",
-                },
-            )
-            # Geometry remains the already-frozen canonical-identity Trimer
-            # layer.  Explicit copy ids never become Trimer RU offsets.
-            trimer_meta = copy.deepcopy(target_contract["trimer"])
-            definitions["trimer"] = {
+        for name in ("topology", "trimer"):
+            layer_meta = copy.deepcopy(target_contract[name])
+            definitions[name] = {
                 "root": os.path.join(
-                    root, "trimer", trimer_meta["feature_config_hash"]
+                    root, name, layer_meta["feature_config_hash"]
                 ),
-                "meta": trimer_meta,
+                "meta": layer_meta,
             }
-        else:
-            for name in ("topology", "trimer"):
-                layer_meta = copy.deepcopy(target_contract[name])
-                definitions[name] = {
-                    "root": os.path.join(
-                        root, name, layer_meta["feature_config_hash"]
-                    ),
-                    "meta": layer_meta,
-                }
         # MD200 is intentionally independent of RU/topology/Trimer protocols.
         add_definition(
             "md200",
@@ -3362,15 +3317,7 @@ class UniDataset(Dataset):
         downstream validation from overwriting the PI1M_v2 result.
         """
 
-        # Explicit k-RU reuses the immutable canonical Trimer content, but its
-        # validation report belongs to the independent explicit Topology
-        # artifact.  Never write experiment reports into the frozen canonical
-        # Trimer root.
-        marker_spec = (
-            specs.get("topology")
-            if self.topology_representation == TOPOLOGY_EXPLICIT
-            else specs.get("trimer")
-        )
+        marker_spec = specs.get("trimer")
         if marker_spec is None:
             # Stage 1 requests only RU base + topology, but validation is a
             # bundle-level artifact shared with Stage 2/3.  Resolve the
@@ -3533,32 +3480,7 @@ class UniDataset(Dataset):
                 trimer = decoded.get("trimer")
                 if trimer is None:
                     continue
-                validation_trimer = trimer
-                if str(getattr(
-                    topology, "topology_representation", ""
-                )) == TOPOLOGY_EXPLICIT:
-                    validation_trimer = copy.copy(trimer)
-                    canonical_mapping = torch.as_tensor(
-                        trimer.mips_to_trimer_central_index
-                    ).long()
-                    canonical_index = torch.as_tensor(
-                        topology.canonical_ru_atom_index
-                    ).long()
-                    if canonical_index.numel() != int(topology.x.size(0)):
-                        raise RuntimeError(
-                            "explicit Topology canonical identity length mismatch"
-                        )
-                    if canonical_index.numel() and (
-                        bool((canonical_index < 0).any())
-                        or int(canonical_index.max()) >= canonical_mapping.numel()
-                    ):
-                        raise RuntimeError(
-                            "explicit Topology canonical identity exceeds Trimer mapping"
-                        )
-                    validation_trimer.mips_to_trimer_central_index = (
-                        canonical_mapping[canonical_index]
-                    )
-                quality = validate_mcl_record(topology, validation_trimer)
+                quality = validate_mcl_record(topology, trimer)
                 valid = quality["geometry_valid"]
                 trimer_valid += int(valid)
                 trimer_unavailable += int(not valid)
@@ -3699,15 +3621,6 @@ class UniDataset(Dataset):
             md_path, md_valid_path, _ = materialize_md200_array(
                 cohort, stores["md200"], md_dir
             )
-        angle_root = None
-        if "trimer" in stores and self.graph_encoder_type == "mips_trimer_scage":
-            trimer_done = Path(specs["trimer"]["root"]) / ".done"
-            trimer_artifact = trimer_done.read_text(encoding="utf-8").strip()
-            angle_root = self.angle_cache_root_override or str(
-                angle_cache_root(specs["trimer"]["root"], cohort["manifest"]["cohort_hash"])
-            )
-            if not Path(angle_root).is_dir():
-                angle_root = None
         for store in stores.values():
             store.close()
         feature_store = LmdbFeatureStore(
@@ -3718,15 +3631,6 @@ class UniDataset(Dataset):
             cohort=cohort,
             md200_path=md_path,
             md200_valid_path=md_valid_path,
-            angle_cache_root=angle_root,
-        )
-        self.angle_cache_metadata = getattr(feature_store, "angle_cache_metadata", None)
-        self.angle_class_counts = getattr(feature_store, "angle_class_counts", None)
-        self.angle_validation_mask = getattr(
-            feature_store, "angle_validation_mask", None
-        )
-        self.angle_cache_artifact_hash = getattr(
-            feature_store, "angle_cache_artifact_hash", None
         )
         self.feature_cache_path = os.path.join(
             cohort["root"], "manifest.json"
@@ -4029,27 +3933,21 @@ class UniDataset(Dataset):
             "graph_input": self.graph_input,
             "geometry_structure": "canonical_identity_trimer_mcl",
             "geom_input": self.geom_input,
-            "graph_features": (
-                "explicit_k_ru_mips137_local_relations"
-                if self.topology_representation == TOPOLOGY_EXPLICIT
-                else "canonical_mips137_backbone_lifted_periodic_relations"
-            ),
+            "graph_features": "canonical_mips137_backbone_lifted_periodic_relations",
             "scage_input": (
                 "chemical_fields_backbone_no_ru_index"
                 if self.graph_encoder_type == "mips_trimer_scage" else "not_applicable"
             ),
             "scage_input_schema_version": 2 if self.graph_encoder_type == "mips_trimer_scage" else 0,
             "scage_data_schema": (
-                EXPLICIT_FEATURE_SCHEMA
-                if self.topology_representation == TOPOLOGY_EXPLICIT
-                else MIPS_EXPERIMENT_FEATURE_SCHEMA
+                MIPS_EXPERIMENT_FEATURE_SCHEMA
                 if self.graph_encoder_type == "mips_trimer_scage" else None
             ),
             "scage_topology_schema_version": 2 if self.graph_encoder_type == "mips_trimer_scage" else 0,
             "periodic_lga_schema_version": 2 if self.graph_encoder_type == "mips_trimer_scage" else 0,
             "mips_local_lga_schema_version": (
-                3 if self.topology_representation == TOPOLOGY_EXPLICIT else 2
-            ) if self.graph_encoder_type == "mips_trimer_scage" else 0,
+                2 if self.graph_encoder_type == "mips_trimer_scage" else 0
+            ),
             "mips_core": self.mips_core if self.graph_encoder_type == "mips_trimer_scage" else None,
             "mips_max_hops": self.mips_max_hops if self.graph_encoder_type == "mips_trimer_scage" else 0,
             "mips_variant": self.mips_variant if self.graph_encoder_type == "mips_trimer_scage" else None,
@@ -4100,10 +3998,6 @@ class UniDataset(Dataset):
             "trimer_max_heavy_atoms": (
                 self.trimer_max_heavy_atoms
                 if self.graph_geometry_mode == "trimer_scage_mcl" else 0
-            ),
-            "mcl_distance_percentiles": (
-                list(self.mcl_distance_percentiles)
-                if self.graph_geometry_mode == "trimer_scage_mcl" else []
             ),
             "experiment_id": self.experiment_id,
             "feature_config_hash": self.feature_config_hash,
@@ -4247,7 +4141,6 @@ class UniDataset(Dataset):
             "trimer_conformer_protocol",
             "trimer_num_candidates",
             "trimer_max_heavy_atoms",
-            "mcl_distance_percentiles",
             "feature_config_hash",
             "source_data_hash",
             "mips_input_schema_version",
@@ -4638,9 +4531,8 @@ class UniDataset(Dataset):
     def _compute_smiles_features(self, smiles):
         """Compute all structural features for a single SMILES. Does NOT set data.y."""
         if self.graph_encoder_type == "mips_trimer_scage":
-            # ``use_feature_cache=False`` is a compatibility/debug option, not
-            # a license to select the retired explicit k-RU route.  Delegate
-            # to the canonical per-record builder so both paths share schema,
+            # ``use_feature_cache=False`` is a compatibility/debug option.
+            # Delegate to the canonical per-record builder so both paths share schema,
             # atom identity and invalid-geometry fallback semantics.
             return _compute_smiles_features_from_config(
                 smiles=str(smiles),
@@ -5217,6 +5109,41 @@ class UniDataset(Dataset):
             data.mts_star_v2_pair_valid = torch.as_tensor(pairs["pair_valid"], dtype=torch.bool)
             data.mts_star_v2_pair_geometry_source = torch.as_tensor(pairs["pair_geometry_source"], dtype=torch.long)
             data.mts_star_v2_rbf_upper = float(self._star_rbf_v2_sidecar.rbf_upper)
+        if self._periodic_line_glt_sidecar is not None:
+            row_hint = int(idx) if self._cohort_row_mode else None
+            line_row = self._periodic_line_glt_sidecar.model_row(
+                self._periodic_line_glt_sidecar.index_for_key(
+                    lookup_key_for_hash, row_hint=row_hint
+                )
+            )
+            tokens, relations = line_row["tokens"], line_row["relations"]
+            data.glt_geometry_valid = bool(line_row["geometry_valid"])
+            data.glt_query_valid = bool(line_row["geometry_valid"] and len(tokens["token_atom_a"]) > 0)
+            data.glt_base_mapping_valid = bool(line_row.get("base_mapping_valid", line_row["geometry_valid"]))
+            data.glt_invalid_reason = int(line_row.get("invalid_reason", 0))
+            for name, value in tokens.items():
+                dtype = torch.float32 if name == "token_observation_distances" else (
+                    torch.bool if name in {"token_valid", "token_runtime_valid", "token_observation_valid"} else torch.long
+                )
+                setattr(
+                    data,
+                    f"glt_{name}",
+                    torch.as_tensor(np.array(value, copy=True), dtype=dtype),
+                )
+            for name, value in relations.items():
+                dtype = torch.float32 if name == "relation_observation_angles" else (
+                    torch.bool if name in {"relation_valid", "relation_runtime_valid", "relation_observation_valid", "relation_is_fallback"}
+                    else torch.long
+                )
+                setattr(
+                    data,
+                    f"glt_{name}",
+                    torch.as_tensor(np.array(value, copy=True), dtype=dtype),
+                )
+            if hasattr(data, "glt_token_runtime_valid"):
+                data.glt_token_valid = data.glt_token_runtime_valid
+            if hasattr(data, "glt_relation_runtime_valid"):
+                data.glt_relation_valid = data.glt_relation_runtime_valid
         if getattr(self, "_mts_input_ids", None) is not None:
             data.input_ids_smiles = torch.from_numpy(
                 np.array(self._mts_input_ids[int(idx)], dtype=np.int64, copy=True)

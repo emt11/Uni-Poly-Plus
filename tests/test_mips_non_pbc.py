@@ -67,7 +67,7 @@ def test_fixed_architecture_and_incoming_attention():
     assert encoder.architecture_name == "MIPS-Trimer-SCAGE"
     assert encoder.max_hops == 2
     assert len(encoder.layers) == 6
-    assert len(encoder.trimer_mcl.layers) == 2
+    assert not hasattr(encoder, "trimer_mcl")
     assert not any("atom_pair" in key for key in encoder.state_dict())
     assert not hasattr(batch, "mips_atom_pair_3d")
     assert not hasattr(batch, "input_ids_smiles")
@@ -76,7 +76,7 @@ def test_fixed_architecture_and_incoming_attention():
     assert not hasattr(batch, "pbc")
     assert graph.shape == (1, 512)
     assert nodes.shape == (batch.num_nodes, 512)
-    # Both new residual gates are zero at initialization.
+    # B0-v2 keeps graph readout as the mean of final atom states.
     assert torch.allclose(graph[0], nodes.mean(0), atol=1e-6)
     target = batch.lga_edge_index[1]
     attention = encoder.layers[-1].attention.last_attention
@@ -96,9 +96,8 @@ def test_production_mips_collate_excludes_legacy_modalities():
     assert not hasattr(batch, "fp")
     assert not hasattr(batch, "cell")
     assert not hasattr(batch, "pbc")
-    # LMDB records are unbatched, so the collator must evaluate the shared
-    # MCL predicate before it creates the explicit PyG graph-batch vectors.
-    assert bool(batch.mcl_valid.any())
+    assert not hasattr(batch, "mcl_valid")
+    assert not hasattr(batch, "trimer_mcl_thresholds")
 
 
 def test_short_ru_mapping_and_polymerized_features():
@@ -179,77 +178,6 @@ def test_md200_is_2d_only_and_invalid_is_exact_fallback():
         expected, _ = encoder._forward_impl(invalid, use_md=False)
         observed, _ = encoder(invalid)
     assert torch.equal(expected, observed)
-
-
-def test_geometry_fallback_and_stage_boundaries():
-    batch = custom_collate([graph_data()])
-    encoder = MIPSLocalGraphEncoder().eval()
-    encoder.trimer_mcl.geometry_gate.data.fill_(0.2)
-    encoder.star_distance_bias.projection.weight.data.fill_(0.1)
-    star_invalid = copy.deepcopy(batch)
-    star_invalid.mts_star_v2_pair_valid.zero_()
-    with torch.no_grad():
-        expected, expected_nodes = encoder._forward_impl(
-            star_invalid, use_star=False, use_geometry=True, use_md=True
-        )
-        observed, observed_nodes = encoder(star_invalid)
-    assert torch.equal(expected, observed)
-    assert torch.equal(expected_nodes, observed_nodes)
-
-    geometry_invalid = copy.deepcopy(batch)
-    geometry_invalid.trimer_geometry_valid.zero_()
-    with torch.no_grad():
-        expected, expected_nodes = encoder._forward_impl(
-            geometry_invalid, use_star=True, use_geometry=False, use_md=True
-        )
-        observed, observed_nodes = encoder(geometry_invalid)
-    assert torch.equal(expected, observed)
-    assert torch.equal(expected_nodes, observed_nodes)
-
-    masked = batch.x.clone()
-    masked[0] = 0
-    with torch.no_grad():
-        topology, _ = encoder.forward_with_x(batch, masked)
-        adapted, _ = encoder.forward_geometry_with_x(batch, masked)
-    assert torch.isfinite(topology).all()
-    assert torch.isfinite(adapted).all()
-
-
-def test_2d_flags_never_enable_trimer_mcl():
-    batch = custom_collate([graph_data()])
-    encoder = MIPSLocalGraphEncoder().eval()
-    encoder.trimer_mcl.geometry_gate.data.fill_(0.4)
-    invalid_2d = copy.deepcopy(batch)
-    invalid_2d.trimer_geometry_valid.fill_(True)
-    invalid_2d.trimer_geometry_is_3d.fill_(False)
-    invalid_2d.trimer_2d_fallback.fill_(True)
-    with torch.no_grad():
-        expected, expected_nodes = encoder._forward_impl(
-            invalid_2d, use_geometry=False, use_md=True
-        )
-        observed, observed_nodes = encoder(invalid_2d)
-    assert torch.equal(expected, observed)
-    assert torch.equal(expected_nodes, observed_nodes)
-
-
-def test_mcl_rigid_motion_invariance():
-    batch = custom_collate([graph_data("*CCCCCCC*")])
-    encoder = MIPSLocalGraphEncoder().eval()
-    encoder.trimer_mcl.geometry_gate.data.fill_(0.2)
-    with torch.no_grad():
-        reference, _ = encoder(batch)
-    moved = copy.deepcopy(batch)
-    rotation = torch.tensor([
-        [0.0, -1.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ])
-    moved.trimer_pos = moved.trimer_pos @ rotation.T + torch.tensor(
-        [3.0, -2.0, 5.0]
-    )
-    with torch.no_grad():
-        transformed, _ = encoder(moved)
-    assert torch.allclose(reference, transformed, atol=1e-6, rtol=1e-6)
 
 
 def test_targeted_etkdg_retry_only_runs_after_fast_failure(monkeypatch):
@@ -349,11 +277,10 @@ def test_large_trimer_keeps_2d_diagnostics_but_disables_mcl():
 
     batch = custom_collate([data])
     encoder = MIPSLocalGraphEncoder().eval()
-    encoder.trimer_mcl.geometry_gate.data.fill_(0.2)
     encoder.star_distance_bias.projection.weight.data.fill_(0.1)
     with torch.no_grad():
         expected_graph, expected_nodes = encoder._forward_impl(
-            batch, use_geometry=False
+            batch, use_star=False
         )
         graph, nodes = encoder(batch)
     assert torch.equal(graph, expected_graph)

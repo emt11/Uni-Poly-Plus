@@ -26,9 +26,8 @@ def test_mts_config_tree_has_only_explicit_b0_configs():
     configs = list((ROOT / "configs" / "mts").rglob("*.json"))
     assert ROOT / "configs" / "mts" / "b0_v2_probe.json" in configs
     assert ROOT / "configs" / "mts" / "b0_v2_resume_probe.json" in configs
-    # The v1 JSON files remain as historical inputs but are rejected by the
-    # resolver and cannot enter the active launcher.
-    assert ROOT / "configs" / "mts" / "b0.json" in configs
+    assert ROOT / "configs" / "mts" / "b0.json" not in configs
+    assert ROOT / "configs" / "mts" / "b0_probe.json" not in configs
 
 
 def test_launchers_fail_before_python_or_outputs(tmp_path):

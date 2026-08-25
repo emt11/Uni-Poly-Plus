@@ -1255,6 +1255,44 @@ def attach_mips_local_lga(data, structure, config=None):
     representative_paths = []
     bond_histograms = []
     canonical_pairs = []
+    adjacency_set = {
+        (int(left), int(right))
+        for left, neighbors in enumerate(adjacency)
+        for right, _ in neighbors
+    }
+
+    def _representative_path(source, distance, source_distances, target_distances):
+        """Rebuild one continuous shortest path from source to target.
+
+        The per-position member sets can contain nodes that are not adjacent
+        across positions (multiple shortest paths in cyclic topologies).  The
+        legacy ``members[0]`` choice then produced a non-contiguous path and a
+        ``StopIteration`` on the edge lookup.  Fall back to a greedy
+        continuous reconstruction; if none exists, return an empty path so the
+        caller records an all-masked path instead of crashing.
+        """
+        path = [source]
+        current = source
+        for position in range(1, int(distance) + 1):
+            candidates = sorted(
+                node for node, source_distance in source_distances.items()
+                if source_distance == position
+                and node in target_distances
+                and source_distance + target_distances[node] == distance
+            )
+            chosen = next(
+                (
+                    node for node in candidates
+                    if (current, node) in adjacency_set
+                    or (node, current) in adjacency_set
+                ),
+                None,
+            )
+            if chosen is None:
+                return []
+            path.append(chosen)
+            current = chosen
+        return path
 
     for target in range(num_atoms):
         if graph_available:
@@ -1282,37 +1320,29 @@ def attach_mips_local_lga(data, structure, config=None):
             source_distances = _bounded_distances(
                 source, adjacency, config.max_hops
             )
-            path_by_position = []
-            for position in range(distance + 1):
-                members = sorted(
-                    node for node, source_distance in source_distances.items()
-                    if source_distance == position
-                    and node in target_distances
-                    and source_distance + target_distances[node] == distance
-                )
-                path_by_position.append(members)
-            representative_path = [
-                members[0] for members in path_by_position if members
-            ]
+            representative_path = _representative_path(
+                source, distance, source_distances, target_distances
+            )
             representative_paths.append(representative_path)
 
             histogram = torch.zeros(
                 int(config.max_hops), 6, dtype=torch.float
             )
-            for position in range(distance):
-                left = representative_path[position]
-                right = representative_path[position + 1]
-                codes = next(
-                    edge_codes
-                    for neighbor, edge_codes in adjacency[left]
-                    if neighbor == right
-                )
-                # Six categories: four bond types, other, and virtual star.
-                category = (
-                    5 if int(codes[4]) == 2
-                    else min(4, int(codes[0]) - 1)
-                )
-                histogram[position, category] = 1.0
+            if representative_path:
+                for position in range(distance):
+                    left = representative_path[position]
+                    right = representative_path[position + 1]
+                    codes = next(
+                        edge_codes
+                        for neighbor, edge_codes in adjacency[left]
+                        if neighbor == right
+                    )
+                    # Six categories: four bond types, other, and virtual star.
+                    category = (
+                        5 if int(codes[4]) == 2
+                        else min(4, int(codes[0]) - 1)
+                    )
+                    histogram[position, category] = 1.0
             bond_histograms.append(histogram)
 
     edge_count = len(sources)

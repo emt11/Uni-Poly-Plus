@@ -2,14 +2,10 @@ import torch
 from torch_geometric.data import Batch
 from .mips_trimer_contract import (
     FEATURE_SCHEMA,
-    EXPLICIT_FEATURE_SCHEMA,
-    EXPLICIT_LGA_SCHEMA_VERSION,
     TOPOLOGY_CANONICAL,
-    TOPOLOGY_EXPLICIT,
     TRIMER_CONTENT_SCHEMA,
     TRIMER_SCHEMA_VERSION,
 )
-from .mips_cache_validation import trimer_can_enter_mcl
 
 
 def mips_trimer_collate(data_list):
@@ -34,27 +30,22 @@ def mips_trimer_collate(data_list):
         str(getattr(
             item,
             "topology_representation",
-            TOPOLOGY_CANONICAL
-            if (
-                bool(getattr(item, "mts_canonical_periodic", False))
-                or int(getattr(item, "mips_local_lga_schema_version", 0)) == 2
-            )
-            else TOPOLOGY_EXPLICIT,
+            TOPOLOGY_CANONICAL,
         ))
         for item in data_list
     }
     if len(representations) != 1:
         raise ValueError("cannot mix MTS topology representations in one batch")
     topology_representation = next(iter(representations))
-    if topology_representation not in {TOPOLOGY_CANONICAL, TOPOLOGY_EXPLICIT}:
-        raise ValueError("unsupported MTS topology representation")
+    if topology_representation != TOPOLOGY_CANONICAL:
+        raise ValueError("B0-v2 only supports canonical_lifted topology")
     if any(
         bool(getattr(item, "mts_canonical_periodic", False))
         or int(getattr(item, "mips_local_lga_schema_version", 0)) == 2
         for item in data_list
     ) and not canonical_periodic_batch:
         raise ValueError(
-            "cannot mix canonical-periodic and explicit MTS topology records"
+            "B0-v2 batches must contain canonical-periodic topology records"
         )
 
     batch = Batch()
@@ -76,6 +67,21 @@ def mips_trimer_collate(data_list):
     star_v2_pair_distances, star_v2_pair_counts = [], []
     star_v2_pair_valid, star_v2_pair_sources = [], []
     star_v2_uppers = set()
+    glt_fields_present = all(hasattr(item, "glt_token_atom_a") for item in data_list)
+    glt_token_atom_a, glt_token_atom_b, glt_token_shift = [], [], []
+    glt_token_z_a, glt_token_z_b, glt_token_label = [], [], []
+    glt_token_distances, glt_token_counts, glt_token_valid = [], [], []
+    glt_token_batch = []
+    glt_relation_source, glt_relation_target, glt_relation_center = [], [], []
+    glt_relation_multiplicity, glt_relation_angles = [], []
+    glt_relation_counts, glt_relation_valid, glt_relation_fallback = [], [], []
+    glt_geometry_valid = []
+    glt_query_valid = []
+    glt_token_observation_valid, glt_token_observation_translation = [], []
+    glt_token_observation_q_a, glt_token_observation_q_b = [], []
+    glt_relation_outer_offset_a, glt_relation_outer_offset_b = [], []
+    glt_relation_span = []
+    glt_relation_observation_valid, glt_relation_observation_translation = [], []
     star_v2_pair_keys_present = all(
         all(hasattr(item, name) for name in (
             "mts_star_v2_pair_key_src", "mts_star_v2_pair_key_dst",
@@ -93,32 +99,12 @@ def mips_trimer_collate(data_list):
         hasattr(item, "mts_task_index") for item in data_list
     )
     trimer_fields_present = all(hasattr(item, "trimer_pos") for item in data_list)
-    # MCL and Star-RBF are ordinary model capabilities.  Experiment-specific
-    # ablation descriptors are retired and are not carried in Dataset items.
-    mcl_enabled = True
     star_enabled = True
     trimer_pos, trimer_z, trimer_edges, trimer_bonds = [], [], [], []
     trimer_base, trimer_offset, trimer_central = [], [], []
     trimer_central_index, trimer_mapping, trimer_batch = [], [], []
     trimer_valid, trimer_is_3d, trimer_2d = [], [], []
-    mcl_valid = []
     star_distance, star_asymmetry, star_valid = [], [], []
-    mcl_thresholds = []
-    angle_indices = []
-    angle_bins = []
-    angle_cos = []
-    angle_ptr = [0]
-    angle_valid = []
-    # Fixed-shape lookup tables let the CUDA MCL path gather ragged Trimer
-    # records without a Python loop or per-graph synchronisation.  They are
-    # inexpensive (512 int32 values per graph at the largest bucket) and are
-    # derived from already validated cache records; no cache schema change is
-    # required.
-    mcl_bucket_sizes = []
-    mcl_key_rows = []
-    mcl_query_rows = []
-    mcl_query_local_rows = []
-    mcl_query_canonical_rows = []
     node_offset = 0
     canonical_offset = 0
     pair_offset = 0
@@ -126,6 +112,7 @@ def mips_trimer_collate(data_list):
     trimer_ptr = [0]
     lga_relation_offset = 0
     star_v2_pair_offset = 0
+    glt_token_offset = 0
 
     for graph_id, item in enumerate(data_list):
         # A legacy single-node canonical placeholder carries a one-column path
@@ -216,6 +203,68 @@ def mips_trimer_collate(data_list):
             star_v2_pair_sources.append(item.mts_star_v2_pair_geometry_source.long())
             star_v2_uppers.add(float(item.mts_star_v2_rbf_upper))
             star_v2_pair_offset += pair_count
+
+        if glt_fields_present:
+            token_count = int(item.glt_token_atom_a.numel())
+            relation_count = int(item.glt_relation_source.numel())
+            for name in (
+                "glt_token_atom_b", "glt_token_shift", "glt_token_endpoint_z_a",
+                "glt_token_endpoint_z_b", "glt_token_label",
+                "glt_token_observation_count", "glt_token_valid",
+            ):
+                if int(getattr(item, name).numel()) != token_count:
+                    raise ValueError(f"periodic line GLT token length mismatch: {name}")
+            if tuple(item.glt_token_observation_distances.shape) != (token_count, 3):
+                raise ValueError("periodic line GLT distance shape mismatch")
+            for name in (
+                "glt_relation_target", "glt_relation_center_atom",
+                "glt_relation_multiplicity", "glt_relation_observation_count",
+                "glt_relation_valid", "glt_relation_is_fallback",
+            ):
+                if int(getattr(item, name).numel()) != relation_count:
+                    raise ValueError(f"periodic line GLT relation length mismatch: {name}")
+            if tuple(item.glt_relation_observation_angles.shape) != (relation_count, 3):
+                raise ValueError("periodic line GLT angle shape mismatch")
+            source = item.glt_relation_source.long()
+            target = item.glt_relation_target.long()
+            if relation_count and (
+                int(source.min()) < 0 or int(source.max()) >= token_count
+                or int(target.min()) < 0 or int(target.max()) >= token_count
+            ):
+                raise ValueError("periodic line GLT relation endpoint out of bounds")
+            glt_token_atom_a.append(item.glt_token_atom_a.long() + canonical_offset)
+            glt_token_atom_b.append(item.glt_token_atom_b.long() + canonical_offset)
+            glt_token_shift.append(item.glt_token_shift.long())
+            glt_token_z_a.append(item.glt_token_endpoint_z_a.long())
+            glt_token_z_b.append(item.glt_token_endpoint_z_b.long())
+            glt_token_label.append(item.glt_token_label.long())
+            glt_token_distances.append(item.glt_token_observation_distances.float())
+            glt_token_counts.append(item.glt_token_observation_count.long())
+            glt_token_valid.append(item.glt_token_valid.bool())
+            glt_token_batch.append(torch.full((token_count,), graph_id, dtype=torch.long))
+            glt_relation_source.append(source + glt_token_offset)
+            glt_relation_target.append(target + glt_token_offset)
+            center = item.glt_relation_center_atom.long().clone()
+            center[center >= 0] += canonical_offset
+            glt_relation_center.append(center)
+            glt_relation_multiplicity.append(item.glt_relation_multiplicity.long())
+            glt_relation_angles.append(item.glt_relation_observation_angles.float())
+            glt_relation_counts.append(item.glt_relation_observation_count.long())
+            glt_relation_valid.append(item.glt_relation_valid.bool())
+            glt_relation_fallback.append(item.glt_relation_is_fallback.bool())
+            glt_geometry_valid.append(bool(item.glt_geometry_valid))
+            glt_query_valid.append(bool(getattr(item, "glt_query_valid", item.glt_geometry_valid)))
+            if hasattr(item, "glt_token_observation_valid"):
+                glt_token_observation_valid.append(item.glt_token_observation_valid.bool())
+                glt_token_observation_translation.append(item.glt_token_observation_translation.long())
+                glt_token_observation_q_a.append(item.glt_token_observation_q_a.long())
+                glt_token_observation_q_b.append(item.glt_token_observation_q_b.long())
+                glt_relation_outer_offset_a.append(item.glt_relation_outer_offset_a.long())
+                glt_relation_outer_offset_b.append(item.glt_relation_outer_offset_b.long())
+                glt_relation_span.append(item.glt_relation_span.long())
+                glt_relation_observation_valid.append(item.glt_relation_observation_valid.bool())
+                glt_relation_observation_translation.append(item.glt_relation_observation_translation.long())
+            glt_token_offset += token_count
 
         lga_relation_offset += int(item.lga_edge_index.size(1))
 
@@ -309,97 +358,9 @@ def mips_trimer_collate(data_list):
             trimer_valid.append(bool(getattr(item, "trimer_geometry_valid", False)))
             trimer_is_3d.append(bool(getattr(item, "trimer_geometry_is_3d", False)))
             trimer_2d.append(bool(getattr(item, "trimer_2d_fallback", False)))
-            item_mcl_valid = bool(trimer_can_enter_mcl(item, 0))
-            mcl_valid.append(item_mcl_valid)
             star_distance.append(float(getattr(item, "star_3d_distance", 0.0)))
             star_asymmetry.append(float(getattr(item, "star_3d_asymmetry", 0.0)))
             star_valid.append(bool(getattr(item, "star_3d_valid", False)))
-            raw_thresholds = getattr(item, "trimer_mcl_thresholds", None)
-            if raw_thresholds is None:
-                raw_thresholds = torch.full((2,), float("nan"))
-            raw_thresholds = torch.as_tensor(raw_thresholds).float().reshape(2)
-            if (
-                bool(item_mcl_valid)
-                and not bool(torch.isfinite(raw_thresholds).all())
-                and n_trimer > 1
-            ):
-                pair_distances = torch.pdist(item.trimer_pos.float())
-                if pair_distances.numel() and bool(torch.isfinite(pair_distances).all()):
-                    raw_thresholds = torch.quantile(
-                        pair_distances, pair_distances.new_tensor((0.20, 0.50))
-                    ).float()
-            mcl_thresholds.append(raw_thresholds)
-            local_angles = getattr(
-                item, "trimer_angle_index", torch.empty((0, 3), dtype=torch.long)
-            ).long().reshape(-1, 3).clone()
-            if local_angles.numel():
-                local_angles += trimer_offset_global
-            angle_indices.append(local_angles)
-            angle_bins.append(getattr(
-                item, "trimer_angle_bins", torch.empty((0,), dtype=torch.long)
-            ).long().reshape(-1))
-            angle_cos.append(getattr(
-                item, "trimer_angle_cos", torch.empty((0,), dtype=torch.float)
-            ).float().reshape(-1))
-            angle_ptr.append(angle_ptr[-1] + int(local_angles.size(0)))
-            angle_valid.append(bool(getattr(item, "trimer_angle_valid", False)))
-
-            central_local = torch.nonzero(
-                item.trimer_central_ru_mask.bool(), as_tuple=False
-            ).flatten()
-            central_count = int(central_local.numel())
-            bucket_size = next(
-                (
-                    size for size in (24, 48, 96, 192, 384)
-                    if n_trimer <= size and central_count <= size // 3
-                ),
-                0,
-            )
-            # Records outside the production 384-heavy-atom contract are
-            # unavailable geometry.  Keep their rows empty so they retain the
-            # exact O8 fallback.
-            if not item_mcl_valid or bucket_size == 0:
-                bucket_size = 0
-                key_row = torch.full((384,), -1, dtype=torch.int32)
-                query_row = torch.full((128,), -1, dtype=torch.int32)
-                query_local_row = torch.full((128,), -1, dtype=torch.int32)
-                query_canonical_row = torch.full((128,), -1, dtype=torch.int32)
-            else:
-                key_row = torch.full((384,), -1, dtype=torch.int32)
-                query_row = torch.full((128,), -1, dtype=torch.int32)
-                query_local_row = torch.full((128,), -1, dtype=torch.int32)
-                query_canonical_row = torch.full((128,), -1, dtype=torch.int32)
-                key_row[:n_trimer] = torch.arange(
-                    trimer_offset_global,
-                    trimer_offset_global + n_trimer,
-                    dtype=torch.int32,
-                )
-                query_row[:central_count] = (
-                    central_local.to(torch.int32) + trimer_offset_global
-                )
-                query_local_row[:central_count] = central_local.to(torch.int32)
-                query_canonical_row[:central_count] = (
-                    getattr(item, base_name)[central_local].to(torch.int32)
-                    + canonical_offset - canonical_count
-                )
-                if not bool((
-                    query_canonical_row[:central_count] >= 0
-                ).all()) or not bool((
-                    query_canonical_row[:central_count] < canonical_offset
-                ).all()):
-                    raise ValueError(
-                        "MCL padded canonical index is outside the current "
-                        "batched canonical range"
-                    )
-                if not bool((central_local < n_trimer).all()):
-                    raise ValueError(
-                        "MCL central-RU local index exceeds Trimer atom count"
-                    )
-            mcl_bucket_sizes.append(bucket_size)
-            mcl_key_rows.append(key_row)
-            mcl_query_rows.append(query_row)
-            mcl_query_local_rows.append(query_local_row)
-            mcl_query_canonical_rows.append(query_canonical_row)
             trimer_offset_global += n_trimer
             trimer_ptr.append(trimer_offset_global)
 
@@ -436,6 +397,37 @@ def mips_trimer_collate(data_list):
         batch.mts_star_v2_pair_valid = torch.cat(star_v2_pair_valid)
         batch.mts_star_v2_pair_geometry_source = torch.cat(star_v2_pair_sources)
         batch.mts_star_v2_rbf_upper = next(iter(star_v2_uppers))
+    if glt_fields_present:
+        batch.glt_token_atom_a = torch.cat(glt_token_atom_a)
+        batch.glt_token_atom_b = torch.cat(glt_token_atom_b)
+        batch.glt_token_shift = torch.cat(glt_token_shift)
+        batch.glt_token_endpoint_z_a = torch.cat(glt_token_z_a)
+        batch.glt_token_endpoint_z_b = torch.cat(glt_token_z_b)
+        batch.glt_token_label = torch.cat(glt_token_label)
+        batch.glt_token_observation_distances = torch.cat(glt_token_distances)
+        batch.glt_token_observation_count = torch.cat(glt_token_counts)
+        batch.glt_token_valid = torch.cat(glt_token_valid)
+        batch.glt_token_batch = torch.cat(glt_token_batch)
+        batch.glt_relation_source = torch.cat(glt_relation_source)
+        batch.glt_relation_target = torch.cat(glt_relation_target)
+        batch.glt_relation_center_atom = torch.cat(glt_relation_center)
+        batch.glt_relation_multiplicity = torch.cat(glt_relation_multiplicity)
+        batch.glt_relation_observation_angles = torch.cat(glt_relation_angles)
+        batch.glt_relation_observation_count = torch.cat(glt_relation_counts)
+        batch.glt_relation_valid = torch.cat(glt_relation_valid)
+        batch.glt_relation_is_fallback = torch.cat(glt_relation_fallback)
+        batch.glt_geometry_valid = torch.tensor(glt_geometry_valid, dtype=torch.bool)
+        batch.glt_query_valid = torch.tensor(glt_query_valid, dtype=torch.bool)
+        if glt_token_observation_valid:
+            batch.glt_token_observation_valid = torch.cat(glt_token_observation_valid)
+            batch.glt_token_observation_translation = torch.cat(glt_token_observation_translation)
+            batch.glt_token_observation_q_a = torch.cat(glt_token_observation_q_a)
+            batch.glt_token_observation_q_b = torch.cat(glt_token_observation_q_b)
+            batch.glt_relation_outer_offset_a = torch.cat(glt_relation_outer_offset_a)
+            batch.glt_relation_outer_offset_b = torch.cat(glt_relation_outer_offset_b)
+            batch.glt_relation_span = torch.cat(glt_relation_span)
+            batch.glt_relation_observation_valid = torch.cat(glt_relation_observation_valid)
+            batch.glt_relation_observation_translation = torch.cat(glt_relation_observation_translation)
     batch.canonical_ru_atom_index = torch.cat(canonical_parts, dim=0)
     if canonical_periodic_batch:
         batch.canonical_atom_id = torch.cat(canonical_id_parts, dim=0)
@@ -499,15 +491,8 @@ def mips_trimer_collate(data_list):
     if md_fields_present:
         batch.mips_md = torch.stack(md_parts, dim=0)
         batch.mips_md_valid = torch.tensor(md_valid, dtype=torch.bool)
-    batch.feature_schema = (
-        FEATURE_SCHEMA
-        if topology_representation == TOPOLOGY_CANONICAL
-        else EXPLICIT_FEATURE_SCHEMA
-    )
-    batch.mips_local_lga_schema_version = (
-        2 if topology_representation == TOPOLOGY_CANONICAL
-        else EXPLICIT_LGA_SCHEMA_VERSION
-    )
+    batch.feature_schema = FEATURE_SCHEMA
+    batch.mips_local_lga_schema_version = 2
     batch.mts_canonical_periodic = bool(canonical_periodic_batch)
     batch.topology_representation = topology_representation
     batch.mts_topology_representation = topology_representation
@@ -529,39 +514,10 @@ def mips_trimer_collate(data_list):
         batch.trimer_geometry_valid = torch.tensor(trimer_valid, dtype=torch.bool)
         batch.trimer_geometry_is_3d = torch.tensor(trimer_is_3d, dtype=torch.bool)
         batch.trimer_2d_fallback = torch.tensor(trimer_2d, dtype=torch.bool)
-        if mcl_enabled:
-            batch.mcl_valid = torch.tensor(mcl_valid, dtype=torch.bool)
         if star_enabled:
             batch.star_3d_distance = torch.tensor(star_distance, dtype=torch.float)
             batch.star_3d_asymmetry = torch.tensor(star_asymmetry, dtype=torch.float)
             batch.star_3d_valid = torch.tensor(star_valid, dtype=torch.bool)
-        if mcl_enabled:
-            batch.trimer_mcl_thresholds = torch.stack(mcl_thresholds, dim=0)
-        batch.trimer_angle_index = torch.cat(angle_indices, dim=0)
-        batch.trimer_angle_bins = torch.cat(angle_bins, dim=0)
-        batch.trimer_angle_cos = torch.cat(angle_cos, dim=0)
-        batch.trimer_angle_ptr = torch.tensor(angle_ptr, dtype=torch.long)
-        batch.trimer_angle_valid = torch.tensor(angle_valid, dtype=torch.bool)
-        schemas = {
-            str(getattr(item, "trimer_angle_cache_schema", ""))
-            for item in data_list if hasattr(item, "trimer_angle_cache_schema")
-        }
-        batch.trimer_angle_cache_schema = (
-            next(iter(schemas)) if len(schemas) == 1 else "mixed-or-missing"
-        )
-        if mcl_enabled:
-            batch.mcl_bucket_size = torch.tensor(mcl_bucket_sizes, dtype=torch.int16)
-            batch.mcl_key_index_padded = torch.stack(mcl_key_rows, dim=0)
-            batch.mcl_query_index_padded = torch.stack(mcl_query_rows, dim=0)
-            batch.mcl_query_local_index_padded = torch.stack(
-                mcl_query_local_rows, dim=0
-            )
-            batch.mcl_query_canonical_index_padded = torch.stack(
-                mcl_query_canonical_rows, dim=0
-            )
-        if mcl_enabled:
-            batch.trimer_mcl_schema = TRIMER_CONTENT_SCHEMA
-            batch.trimer_mcl_schema_version = TRIMER_SCHEMA_VERSION
     return batch
 
 

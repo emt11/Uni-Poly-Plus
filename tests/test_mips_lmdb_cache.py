@@ -45,7 +45,6 @@ def _dataset_kwargs(root, *, layers, rebuild=False):
         graph_geometry_mode="trimer_scage_mcl",
         trimer_num_candidates=4,
         trimer_max_heavy_atoms=384,
-        mcl_distance_percentiles=(0.20, 0.50),
         experiment_id="lmdb_test",
         feature_config_hash="lmdb-test-v1",
         cache_layers=layers,

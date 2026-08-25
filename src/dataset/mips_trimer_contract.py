@@ -6,14 +6,9 @@ force a needless million-record cache rebuild.  Route and stage display names
 are kept separately below.
 """
 
-import hashlib
-import json
-
 CONFIG_SCHEMA = "mts-config-v3"
 FEATURE_SCHEMA = "mts-canonical-periodic-feature-v3"
 LEGACY_FEATURE_SCHEMA = "mips-trimer-scage-feature-v4"
-EXPLICIT_FEATURE_SCHEMA = "mts-explicit-kru-feature-v1"
-EXPLICIT_TOPOLOGY_LMDB_SCHEMA = "mts-explicit-kru-topology-lmdb-v1"
 # v7/v5 bind the independent normalized-Trimer atom identity table and the
 # canonical periodic topology contract.  Keep these as single-source
 # constants: changing a builder or config independently would make a cache
@@ -40,10 +35,8 @@ TARGET_CONTRACT_SCHEMA = "mts-canonical-target-contract-v1"
 PRETRAIN_TARGET_CONTRACT_SCHEMA = "mts-canonical-target-contract-v2"
 BUILDER_VERSION = 12
 CANONICAL_LGA_SCHEMA_VERSION = 2
-EXPLICIT_LGA_SCHEMA_VERSION = 3
 TOPOLOGY_CANONICAL = "canonical_lifted"
-TOPOLOGY_EXPLICIT = "explicit_k_ru"
-TOPOLOGY_REPRESENTATIONS = (TOPOLOGY_CANONICAL, TOPOLOGY_EXPLICIT)
+TOPOLOGY_REPRESENTATIONS = (TOPOLOGY_CANONICAL,)
 # Descriptive aliases used by topology-only tools/tests.
 CANONICAL_FEATURE_SCHEMA = FEATURE_SCHEMA
 CANONICAL_TOPOLOGY_SCHEMA = TOPOLOGY_LMDB_SCHEMA
@@ -129,171 +122,29 @@ def stage_display_name(value):
     }[stage]
 
 
-def _canonical_json_hash(value) -> str:
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-    ).hexdigest()
-
-
-def cache_bundle_binding_hash(
-    *,
-    cohort_hash,
-    topology_artifact_hash,
-    trimer_artifact_hash=None,
-):
-    """Return the immutable cache binding used by checkpoints.
-
-    The hash deliberately contains only cache content identity.  Optimizer
-    settings, loss weights and random seeds belong to a training hash and must
-    not make an otherwise identical frozen feature bundle look different.
-    ``None`` is retained for the topology-only Stage 1 export.
-    """
-    payload = {
-        "schema": CACHE_BUNDLE_SCHEMA,
-        "cohort_hash": str(cohort_hash or ""),
-        "topology_artifact_hash": str(topology_artifact_hash or ""),
-        "trimer_artifact_hash": str(trimer_artifact_hash or ""),
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-    ).hexdigest()
-
-
-def build_target_contract(
-    *,
-    source_cohort_hash,
-    feature_config_hash,
-    graph_model_config_hash,
-    geometry_model_config_hash,
-    topology_cache_artifact_hash,
-    trimer_cache_artifact_hash,
-    angle_cache_artifact_hash,
-    cache_bundle_hash,
-    store_json_sha256,
-    topology_frozen_payload_sha256,
-    trimer_frozen_payload_sha256,
-    optimizer_steps,
-    pretraining_objective,
-):
-    """Compute the complete target contract for a migrated canonical checkpoint.
-
-    This is the single source of truth for the frozen production identity of a
-    canonical single-RU checkpoint.  The schema constants come exclusively from
-    this contract module; the hashes and artifact bindings come from the frozen
-    bundle/store.  Callers must never hand-write a second set of schema
-    constants, so the checkpoint cannot silently drift from the active
-    contract.  ``source_contract`` (the pre-migration identity) is kept
-    separately by the migration tool and is never computed here.
-    """
-    contract = {
-        "schema": TARGET_CONTRACT_SCHEMA,
-        "config_schema": CONFIG_SCHEMA,
-        "feature_schema": FEATURE_SCHEMA,
-        "topology_representation": TOPOLOGY_CANONICAL,
-        "cache_layout_schema": CACHE_LAYOUT_SCHEMA,
-        "cache_bundle_schema": CACHE_BUNDLE_SCHEMA,
-        "topology_lmdb_schema": TOPOLOGY_LMDB_SCHEMA,
-        "trimer_content_schema": TRIMER_CONTENT_SCHEMA,
-        "trimer_lmdb_schema": TRIMER_LMDB_SCHEMA,
-        "trimer_builder_version": TRIMER_BUILDER_VERSION,
-        "canonical_lga_schema_version": CANONICAL_LGA_SCHEMA_VERSION,
-        "trimer_protocol": TRIMER_PROTOCOL,
-        "checkpoint_schema": CHECKPOINT_SCHEMA,
-        "source_cohort_hash": str(source_cohort_hash),
-        "feature_config_hash": str(feature_config_hash),
-        "graph_model_config_hash": str(graph_model_config_hash),
-        "geometry_model_config_hash": str(geometry_model_config_hash),
-        "topology_cache_artifact_hash": str(topology_cache_artifact_hash),
-        "trimer_cache_artifact_hash": str(trimer_cache_artifact_hash),
-        # The angle cache schema is fixed to the continuous sidecar contract
-        # (Plan contract-g0-baseline §3.2); the expected value comes from this
-        # module's constant, never from the checkpoint itself.
-        "angle_cache_schema": CACHE_CONTINUOUS_ANGLE_SCHEMA,
-        "angle_cache_artifact_hash": str(angle_cache_artifact_hash),
-        "cache_bundle_hash": str(cache_bundle_hash),
-        "store_json_sha256": str(store_json_sha256),
-        "topology_frozen_payload_sha256": str(topology_frozen_payload_sha256),
-        "trimer_frozen_payload_sha256": str(trimer_frozen_payload_sha256),
-        "optimizer_steps": int(optimizer_steps),
-        "pretraining_objective": str(pretraining_objective),
-    }
-    # Self-excluding digest: target_contract_sha256 is computed over every
-    # other field, so it cannot be part of its own definition.  The loader and
-    # the doctor recompute it the same way.
-    contract["target_contract_sha256"] = _canonical_json_hash(contract)
-    return contract
-
-
-def build_pretrain_target_contract(
-    *,
-    source_cohort_hash,
-    feature_config_hash,
-    graph_model_config_hash,
-    geometry_model_config_hash,
-    topology_cache_artifact_hash,
-    trimer_cache_artifact_hash,
-    angle_cache_schema,
-    angle_cache_artifact_hash,
-    cache_bundle_hash,
-    store_json_sha256,
-    topology_frozen_payload_sha256,
-    trimer_frozen_payload_sha256,
-    optimizer_steps,
-    pretraining_objective,
-    topology_representation=TOPOLOGY_CANONICAL,
-):
-    """Build the v2 target contract used by fresh Angle-20 pretraining.
-
-    ``build_target_contract`` remains the v1 migration contract for historical
-    ``mts-model-v3`` artifacts.  Fresh training must carry its actual
-    categorical sidecar identity and the v4 checkpoint schema directly, so it
-    uses this separate constructor rather than mutating a migrated contract.
-    """
-    contract = {
-        "schema": PRETRAIN_TARGET_CONTRACT_SCHEMA,
-        "topology_representation": str(topology_representation),
-        "config_schema": CONFIG_SCHEMA,
-        "feature_schema": FEATURE_SCHEMA,
-        "cache_layout_schema": CACHE_LAYOUT_SCHEMA,
-        "cache_bundle_schema": CACHE_BUNDLE_SCHEMA,
-        "topology_lmdb_schema": TOPOLOGY_LMDB_SCHEMA,
-        "trimer_content_schema": TRIMER_CONTENT_SCHEMA,
-        "trimer_lmdb_schema": TRIMER_LMDB_SCHEMA,
-        "trimer_builder_version": TRIMER_BUILDER_VERSION,
-        "canonical_lga_schema_version": CANONICAL_LGA_SCHEMA_VERSION,
-        "trimer_protocol": TRIMER_PROTOCOL,
-        "checkpoint_schema": PRETRAIN_CHECKPOINT_SCHEMA,
-        "source_cohort_hash": str(source_cohort_hash),
-        "feature_config_hash": str(feature_config_hash),
-        "graph_model_config_hash": str(graph_model_config_hash),
-        "geometry_model_config_hash": str(geometry_model_config_hash),
-        "topology_cache_artifact_hash": str(topology_cache_artifact_hash),
-        "trimer_cache_artifact_hash": str(trimer_cache_artifact_hash),
-        "angle_cache_schema": str(angle_cache_schema),
-        "angle_cache_artifact_hash": str(angle_cache_artifact_hash),
-        "cache_bundle_hash": str(cache_bundle_hash),
-        "store_json_sha256": str(store_json_sha256),
-        "topology_frozen_payload_sha256": str(topology_frozen_payload_sha256),
-        "trimer_frozen_payload_sha256": str(trimer_frozen_payload_sha256),
-        "optimizer_steps": int(optimizer_steps),
-        "pretraining_objective": str(pretraining_objective),
-    }
-    contract["target_contract_sha256"] = _canonical_json_hash(contract)
-    return contract
-
-
 def validate_runtime_args(args) -> None:
-    """Reject CLI overrides that would create a second production contract."""
+    """Validate an explicitly selected B0-v2 or MTS-GLT-v1 runtime."""
 
-    if getattr(args, "graph_encoder_type", None) != "mips_trimer_scage":
+    if getattr(args, "graph_encoder_type", None) != ROUTE_INTERNAL:
         return
+    schema = getattr(args, "config_schema", None)
+    if schema not in {
+        CONFIG_SCHEMA,
+        "mts-glt-v1-downstream",
+        "mts-glt-v2-downstream",
+        "mts-glt-graphgate-v1-downstream",
+    }:
+        raise ValueError(f"unsupported {ROUTE_NAME} config schema: {schema!r}")
+    is_glt = schema in {
+        "mts-glt-v1-downstream",
+        "mts-glt-v2-downstream",
+        "mts-glt-graphgate-v1-downstream",
+    }
+    is_glt_v2 = schema == "mts-glt-v2-downstream"
+    is_graphgate = schema == "mts-glt-graphgate-v1-downstream"
     fixed = {
-        "config_schema": CONFIG_SCHEMA,
         "topology_representation": TOPOLOGY_CANONICAL,
+        "topology_attention_variant": "o8",
         "mips_core": "paper_corrected",
         "mips_variant": "O8",
         "mips_max_hops": 2,
@@ -307,47 +158,53 @@ def validate_runtime_args(args) -> None:
         "mips_descriptor_protocol": "source_star_sub",
         "mips_descriptor_fusion_mode": "graph_md_residual",
         "spatial_mode": "trimer_scage",
+        "graph_geometry_mode": "trimer_scage_mcl",
         "mips_fusion_mode": "none",
         "projection_mode": "plain",
         "trimer_num_candidates": 4,
         "trimer_max_heavy_atoms": 384,
     }
-    fixed["graph_geometry_mode"] = "trimer_scage_mcl"
     for name, expected in fixed.items():
         observed = getattr(args, name, None)
         if observed != expected:
             raise ValueError(
-                f"{ROUTE_NAME} fixed contract mismatch for {name}: "
+                f"{ROUTE_NAME} runtime mismatch for {name}: "
                 f"expected {expected!r}, got {observed!r}"
             )
-    attention_variant = str(getattr(args, "topology_attention_variant", "o8"))
-    if attention_variant not in {"o8", "msta_last2"}:
-        raise ValueError("unsupported topology_attention_variant")
-    if list(getattr(args, "msta_layer_indices", [4, 5])) != [4, 5]:
-        raise ValueError("MSTA layer indices must be [4, 5]")
-    if list(getattr(args, "msta_local_spd", [0, 1])) != [0, 1]:
-        raise ValueError("MSTA local SPD support must be [0, 1]")
-    if list(getattr(args, "msta_context_spd", [0, 1, 2])) != [0, 1, 2]:
-        raise ValueError("MSTA context SPD support must be [0, 1, 2]")
-    if not bool(getattr(args, "msta_share_relation_dropout", True)):
-        raise ValueError("MSTA requires shared relation dropout")
-    if bool(getattr(args, "msta_local_output_bias", False)):
-        raise ValueError("MSTA local_output must be bias-free")
-    if str(getattr(args, "msta_local_output_init", "zero")) != "zero":
-        raise ValueError("MSTA local_output must use zero initialization")
-    if not bool(getattr(args, "mips_use_descriptors", False)):
-        raise ValueError(f"{ROUTE_NAME} requires MD200")
+    switches = {
+        "use_star_rbf": not is_glt,
+        "use_mcl": False,
+        "use_md200": True,
+        "mips_use_descriptors": True,
+    }
+    for name, expected in switches.items():
+        if bool(getattr(args, name, not expected)) is not expected:
+            raise ValueError(
+                f"{ROUTE_NAME} runtime requires {name}={expected}"
+            )
+    if is_graphgate:
+        if getattr(args, "mts_glt_version", None) != "graphgate_v1":
+            raise ValueError(
+                "MTS-GLT-GraphGate-v1 schema requires "
+                "mts_glt_version=graphgate_v1"
+            )
+        if getattr(args, "mts_glt_mode", None) not in {
+            "o8_only", "o8_glt_graph"
+        }:
+            raise ValueError("MTS-GLT-GraphGate-v1 downstream mode is invalid")
+    elif is_glt_v2:
+        if getattr(args, "mts_glt_version", None) != "v2":
+            raise ValueError("MTS-GLT-v2 schema requires mts_glt_version=v2")
+        if getattr(args, "mts_glt_mode", None) not in {
+            "o8_only", "o8_glt_atom", "o8_glt_atom_desc"
+        }:
+            raise ValueError("MTS-GLT-v2 downstream mode is invalid")
+    elif is_glt and getattr(args, "mts_glt_mode", None) not in {"o8_only", "o8_glt"}:
+        raise ValueError("MTS-GLT-v1 requires mts_glt_mode=o8_only or o8_glt")
     if list(getattr(args, "modalities", [])) != ["graph"]:
-        raise ValueError(f"{ROUTE_NAME} production config is graph-only")
+        raise ValueError(f"{ROUTE_NAME} B0-v2 is graph-only")
     if getattr(args, "fusion_type", None) != "none":
-        raise ValueError(f"{ROUTE_NAME} production config requires fusion_type=none")
-    if getattr(args, "graph_geometry_mode", None) != "trimer_scage_mcl":
-        raise ValueError("unsupported MTS geometry mode")
-    percentiles = tuple(float(value) for value in getattr(
-        args, "mcl_distance_percentiles", (0.20, 0.50)
-    ))
-    if percentiles != (0.20, 0.50):
-        raise ValueError(f"{ROUTE_NAME} requires MCL percentiles 0.20/0.50")
+        raise ValueError(f"{ROUTE_NAME} B0-v2 requires fusion_type=none")
     if bool(getattr(args, "scage_use_pbc_distance", False)):
         raise ValueError(f"PBC distance is not part of {ROUTE_NAME}")
     if bool(getattr(args, "scage_use_descriptors", False)):

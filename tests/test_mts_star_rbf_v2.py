@@ -113,7 +113,7 @@ def test_encode_first_average_and_inverse_bitwise_identity():
     batch = mips_trimer_collate([_attach(topology, record)])
     model = MIPSLocalGraphEncoder(
         graph_geometry_mode="trimer_scage_mcl", use_star_rbf=True,
-        use_mcl=False, topology_attention_variant="msta_last2",
+        use_mcl=False, topology_attention_variant="o8",
         star_rbf_upper=6.0,
     )
     model.star_distance_bias.projection.weight.data.normal_()
@@ -136,7 +136,7 @@ def test_rbf_upper_margin_and_valid_tail_nonzero():
     assert rbf_upper_from_distances([5.61] * 1000) == 6.0
     model = MIPSLocalGraphEncoder(
         graph_geometry_mode="trimer_scage_mcl", use_star_rbf=True,
-        use_mcl=False, topology_attention_variant="msta_last2",
+        use_mcl=False, topology_attention_variant="o8",
         star_rbf_upper=3.0,
     )
     tail = torch.exp(-model.star_distance_bias.gamma * (torch.tensor(3.5) - model.star_distance_bias.centers) ** 2)
@@ -149,15 +149,15 @@ def test_asymmetry_is_qc_only_and_step0_forward_matches_g1():
     batch = mips_trimer_collate([_attach(topology, record)])
     legacy = MIPSLocalGraphEncoder(
         graph_geometry_mode="trimer_scage_mcl", use_star_rbf=False,
-        use_mcl=False, topology_attention_variant="msta_last2",
+        use_mcl=False, topology_attention_variant="o8",
     ).eval()
     candidate = MIPSLocalGraphEncoder(
         graph_geometry_mode="trimer_scage_mcl", use_star_rbf=True,
-        use_mcl=False, topology_attention_variant="msta_last2",
+        use_mcl=False, topology_attention_variant="o8",
         star_rbf_upper=6.0,
     ).eval()
     candidate.load_state_dict(legacy.state_dict(), strict=True)
     with torch.no_grad():
-        expected = legacy._forward_impl(batch, use_star=False, use_geometry=False, use_md=False)[0]
-        observed = candidate._forward_impl(batch, use_geometry=False, use_md=False)[0]
+        expected = legacy._forward_impl(batch, use_star=False, use_md=False)[0]
+        observed = candidate._forward_impl(batch, use_md=False)[0]
     assert torch.equal(expected, observed)

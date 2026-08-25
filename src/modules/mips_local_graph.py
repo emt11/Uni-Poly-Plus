@@ -12,19 +12,9 @@ from src.dataset.mips_trimer_contract import (
     ROUTE_NAME,
     FEATURE_SCHEMA,
     LEGACY_FEATURE_SCHEMA,
-    EXPLICIT_FEATURE_SCHEMA,
-    EXPLICIT_LGA_SCHEMA_VERSION,
     CANONICAL_LGA_SCHEMA_VERSION,
     TOPOLOGY_CANONICAL,
-    TOPOLOGY_EXPLICIT,
 )
-from .trimer_mcl import TrimerSCAGEMCLResidual
-
-
-MSTA_LAYER_INDICES = (4, 5)
-MSTA_LOCAL_SPD = (0, 1)
-MSTA_CONTEXT_SPD = (0, 1, 2)
-
 
 class MIPSLocalAtomEmbedding(nn.Module):
     def __init__(self, hidden_dim=512):
@@ -193,138 +183,6 @@ class MIPSLocalAttention(nn.Module):
         )
 
 
-class MSTAMIPSLocalAttention(nn.Module):
-    """Final-layer multi-scale topology attention over local/context SPD."""
-
-    def __init__(
-        self,
-        dim=512,
-        num_heads=8,
-        dropout=0.1,
-        local_spd=(0, 1),
-        context_spd=(0, 1, 2),
-        share_relation_dropout=True,
-        local_output_bias=False,
-        local_output_init="zero",
-    ):
-        super().__init__()
-        self.dim = int(dim)
-        self.num_heads = int(num_heads)
-        self.head_dim = self.dim // self.num_heads
-        if self.dim % self.num_heads:
-            raise ValueError("MSTA hidden dimension must divide num_heads")
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(self.dim, 3 * self.dim)
-        self.output = nn.Linear(self.dim, self.dim)
-        self.local_output = nn.Linear(
-            self.dim, self.dim, bias=bool(local_output_bias)
-        )
-        if str(local_output_init) != "zero":
-            raise ValueError("MSTA local_output_init must be 'zero'")
-        nn.init.zeros_(self.local_output.weight)
-        if self.local_output.bias is not None:
-            nn.init.zeros_(self.local_output.bias)
-        self.dropout = nn.Dropout(float(dropout))
-        self.attention_dropout = nn.Dropout(float(dropout))
-        self.output_norm = nn.LayerNorm(self.dim)
-        self.local_spd = tuple(sorted({int(value) for value in local_spd}))
-        self.context_spd = tuple(sorted({int(value) for value in context_spd}))
-        self.share_relation_dropout = bool(share_relation_dropout)
-        if self.local_spd != (0, 1):
-            raise ValueError("MSTA local SPD support must be exactly (0, 1)")
-        if self.context_spd != (0, 1, 2):
-            raise ValueError("MSTA context SPD support must be exactly (0, 1, 2)")
-        if not self.share_relation_dropout:
-            raise ValueError("MSTA requires shared relation dropout")
-        self.debug_attention = os.environ.get("MIPS_DEBUG_ATTENTION", "0") == "1"
-        self.last_attention = None
-        self.last_attention_branches = None
-
-    @staticmethod
-    def _branch_mask(spd, allowed, target, relation_mask):
-        allowed_tensor = torch.zeros_like(spd, dtype=torch.bool)
-        for value in allowed:
-            allowed_tensor |= spd == int(value)
-        if relation_mask is not None:
-            allowed_tensor &= ~relation_mask.bool().reshape(-1)
-        if allowed_tensor.numel() != target.numel():
-            raise ValueError("MSTA relation mask and edge count mismatch")
-        # Both branches include SPD=0, but retain an explicit check so a
-        # malformed padded batch cannot silently create an all -inf softmax.
-        if target.numel():
-            counts = scatter(
-                allowed_tensor.to(torch.long), target.long(), dim=0,
-                dim_size=int(target.max().item()) + 1, reduce="sum",
-            )
-            if bool((counts == 0).any()):
-                raise ValueError(
-                    "MSTA branch has a target without a valid self relation"
-                )
-        return allowed_tensor
-
-    @staticmethod
-    def _normalize(logits, target, mask, num_nodes):
-        masked = logits.float().masked_fill(~mask.unsqueeze(-1), float("-inf"))
-        return softmax(masked, target.long(), num_nodes=num_nodes, dim=0)
-
-    def forward(
-        self, x, edge_index, attention_bias, spd, relation_mask=None,
-    ):
-        qkv = self.qkv(x).view(x.size(0), 3, self.num_heads, self.head_dim)
-        query, key, value = qkv.unbind(dim=1)
-        source, target = edge_index.long()
-        logits = (
-            (query[target] * key[source]).sum(dim=-1) * self.scale
-            + attention_bias
-        )
-        local_mask = self._branch_mask(
-            spd.long().reshape(-1), self.local_spd, target, relation_mask
-        )
-        context_mask = self._branch_mask(
-            spd.long().reshape(-1), self.context_spd, target, relation_mask
-        )
-        local_weights = self._normalize(
-            logits, target, local_mask, x.size(0)
-        ).to(value.dtype)
-        context_logits = logits
-        context_weights = self._normalize(
-            context_logits, target, context_mask, x.size(0)
-        ).to(value.dtype)
-        if self.training and self.attention_dropout.p:
-            if self.share_relation_dropout:
-                relation_keep = (
-                    torch.rand_like(local_weights) >= self.attention_dropout.p
-                ).to(local_weights.dtype) / (1.0 - self.attention_dropout.p)
-                local_weights = local_weights * relation_keep
-                context_weights = context_weights * relation_keep
-            else:  # Defensive branch; constructor currently forbids this.
-                local_weights = self.attention_dropout(local_weights)
-                context_weights = self.attention_dropout(context_weights)
-        if self.debug_attention or not self.training:
-            self.last_attention = context_weights.detach()
-            self.last_attention_branches = {
-                "local": local_weights.detach(),
-                "context": context_weights.detach(),
-                "local_mask": local_mask.detach(),
-                "context_mask": context_mask.detach(),
-            }
-        else:
-            self.last_attention = None
-            self.last_attention_branches = None
-        local_messages = local_weights.unsqueeze(-1) * value[source]
-        context_messages = context_weights.unsqueeze(-1) * value[source]
-        local_aggregated = scatter(
-            local_messages, target, dim=0, dim_size=x.size(0), reduce="sum"
-        ).reshape(x.size(0), self.dim)
-        context_aggregated = scatter(
-            context_messages, target, dim=0, dim_size=x.size(0), reduce="sum"
-        ).reshape(x.size(0), self.dim)
-        local_projected = self.local_output(local_aggregated)
-        context_projected = self.output(context_aggregated)
-        projected = context_projected + local_projected
-        return self.output_norm(x + self.dropout(projected))
-
-
 class MIPSLocalLayer(nn.Module):
     def __init__(self, dim=512, num_heads=8, dropout=0.1):
         super().__init__()
@@ -340,50 +198,6 @@ class MIPSLocalLayer(nn.Module):
 
     def forward(self, x, edge_index, attention_bias):
         x = self.attention(x, edge_index, attention_bias)
-        return self.output_norm(x + self.dropout(self.ffn(x)))
-
-
-class MSTAMIPSLocalLayer(nn.Module):
-    """Multi-scale replacement for one O8 layer with two SPD branches."""
-
-    def __init__(
-        self,
-        dim=512,
-        num_heads=8,
-        dropout=0.1,
-        local_spd=(0, 1),
-        context_spd=(0, 1, 2),
-        share_relation_dropout=True,
-        local_output_bias=False,
-        local_output_init="zero",
-    ):
-        super().__init__()
-        self.attention = MSTAMIPSLocalAttention(
-            dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            local_spd=local_spd,
-            context_spd=context_spd,
-            share_relation_dropout=share_relation_dropout,
-            local_output_bias=local_output_bias,
-            local_output_init=local_output_init,
-        )
-        self.ffn = nn.Sequential(
-            nn.Linear(int(dim), 4 * int(dim)),
-            nn.ReLU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(4 * int(dim), int(dim)),
-        )
-        self.dropout = nn.Dropout(float(dropout))
-        self.output_norm = nn.LayerNorm(int(dim))
-
-    def forward(
-        self, x, edge_index, attention_bias, spd, relation_mask=None,
-    ):
-        x = self.attention(
-            x, edge_index, attention_bias, spd=spd,
-            relation_mask=relation_mask,
-        )
         return self.output_norm(x + self.dropout(self.ffn(x)))
 
 
@@ -419,7 +233,7 @@ class MD200GraphResidual(nn.Module):
 
 
 class MIPSLocalGraphEncoder(nn.Module):
-    """O8/MSTA topology + symmetric Star RBF + Trimer MCL + MD200."""
+    """B0-v2 O8 topology + symmetric Star-RBF v2 + MD200."""
 
     expects_data = True
     uses_geometry = True
@@ -437,7 +251,6 @@ class MIPSLocalGraphEncoder(nn.Module):
         use_descriptors=True,
         spatial_mode="trimer_scage",
         graph_geometry_mode="trimer_scage_mcl",
-        mcl_distance_percentiles=(0.20, 0.50),
         trimer_num_candidates=4,
         trimer_max_heavy_atoms=384,
         variant="O8",
@@ -460,14 +273,8 @@ class MIPSLocalGraphEncoder(nn.Module):
         qk_direction="paper",
         use_star_rbf=True,
         star_rbf_upper=3.0,
-        use_mcl=True,
+        use_mcl=False,
         topology_attention_variant="o8",
-        msta_layer_indices=(4, 5),
-        msta_local_spd=(0, 1),
-        msta_context_spd=(0, 1, 2),
-        msta_share_relation_dropout=True,
-        msta_local_output_bias=False,
-        msta_local_output_init="zero",
         **retired,
     ):
         super().__init__()
@@ -483,7 +290,6 @@ class MIPSLocalGraphEncoder(nn.Module):
             "num_layer": (int(num_layer), 6),
             "emb_dim": (int(emb_dim), 512),
             "num_heads": (int(num_heads), 8),
-            "max_hops": (int(max_hops), 2),
             "feature_mode": (str(atom_feature_mode or feature_mode), "mips137"),
             "spatial_mode": (str(spatial_mode), "trimer_scage"),
             "variant": (str(variant), "O8"),
@@ -501,6 +307,8 @@ class MIPSLocalGraphEncoder(nn.Module):
                 str(descriptor_components), "md200"
             ),
         }
+        if int(max_hops) != 2:
+            raise ValueError("B0-v2 requires max_hops=2")
         mismatches = [
             f"{name}={actual!r} (required {expected!r})"
             for name, (actual, expected) in contract.items()
@@ -514,58 +322,33 @@ class MIPSLocalGraphEncoder(nn.Module):
                 + "; ".join(mismatches)
             )
         if not bool(use_descriptors):
-            raise ValueError(f"{ROUTE_NAME} requires graph-level MD200")
+            raise ValueError(f"{ROUTE_NAME} B0-v2 downstream requires MD200")
         if bool(multi_scale_hop_gate) or bool(input_norm):
             raise ValueError("retired O8 topology options are not supported")
         if abs(float(dropout) - 0.10) > 1e-12:
             raise ValueError("dropout must be 0.10")
-        if tuple(float(x) for x in mcl_distance_percentiles) != (0.20, 0.50):
-            raise ValueError("MCL percentiles must be 0.20/0.50")
         if int(trimer_num_candidates) != 4 or int(trimer_max_heavy_atoms) != 384:
             raise ValueError("Trimer contract requires 4 candidates/384 atoms")
         topology_attention_variant = str(topology_attention_variant)
-        if topology_attention_variant not in {"o8", "msta_last2"}:
-            raise ValueError(
-                "topology_attention_variant must be 'o8' or 'msta_last2'"
-            )
-        normalized_layers = tuple(int(value) for value in msta_layer_indices)
-        normalized_local_spd = tuple(sorted({int(value) for value in msta_local_spd}))
-        normalized_context_spd = tuple(sorted({int(value) for value in msta_context_spd}))
-        if topology_attention_variant == "msta_last2" and normalized_layers != (4, 5):
-            raise ValueError("MSTA currently supports only layer indices (4, 5)")
-        if topology_attention_variant == "o8" and normalized_layers != (4, 5):
-            raise ValueError("o8 msta_layer_indices must remain the default (4, 5)")
-        if normalized_local_spd != (0, 1):
-            raise ValueError("MSTA local SPD support must be exactly (0, 1)")
-        if normalized_context_spd != (0, 1, 2):
-            raise ValueError("MSTA context SPD support must be exactly (0, 1, 2)")
-        if not bool(msta_share_relation_dropout):
-            raise ValueError("MSTA requires shared relation dropout")
-        if bool(msta_local_output_bias):
-            raise ValueError("MSTA local_output must be bias-free")
-        if str(msta_local_output_init) != "zero":
-            raise ValueError("MSTA local_output_init must be 'zero'")
+        if topology_attention_variant != "o8":
+            raise ValueError("B0-v2 requires topology_attention_variant='o8'")
+        if bool(use_mcl):
+            raise ValueError("B0-v2 removed the Trimer-MCL model branch")
 
         self.core = "paper_corrected"
         self.variant = "O8"
         self.emb_dim = 512
         self.num_heads = 8
-        self.max_hops = 2
+        self.max_hops = int(max_hops)
         self.feature_mode = "mips137"
         self.spatial_mode = "trimer_scage"
         self.graph_geometry_mode = requested_geometry
         self.geometry_mode = resolved_geometry
         self.topology_attention_variant = topology_attention_variant
-        self.msta_layer_indices = normalized_layers
-        self.msta_local_spd = normalized_local_spd
-        self.msta_context_spd = normalized_context_spd
-        self.msta_share_relation_dropout = bool(msta_share_relation_dropout)
-        self.msta_local_output_bias = bool(msta_local_output_bias)
-        self.msta_local_output_init = str(msta_local_output_init)
-        self.use_descriptors = True
+        self.use_descriptors = bool(use_descriptors)
         self.descriptor_components = "md200"
         self.use_star_rbf = bool(use_star_rbf)
-        self.use_mcl = bool(use_mcl)
+        self.use_mcl = False
         if str(mask_policy) != "canonical_exact":
             raise ValueError(
                 "all canonical-equivalent O8 copies must be masked together"
@@ -576,7 +359,7 @@ class MIPSLocalGraphEncoder(nn.Module):
         self.masked_loss_reduction = "atom_mean"
 
         self.atom_embedding = MIPSLocalAtomEmbedding(self.emb_dim)
-        self.spd_embedding = nn.Embedding(3, self.num_heads)
+        self.spd_embedding = nn.Embedding(self.max_hops + 1, self.num_heads)
         nn.init.zeros_(self.spd_embedding.weight)
         self.path_bias = MIPSSinglePathNodeBias(
             self.emb_dim, self.num_heads, self.max_hops
@@ -584,41 +367,12 @@ class MIPSLocalGraphEncoder(nn.Module):
         self.star_distance_bias = SymmetricStarDistanceBias(
             self.num_heads, upper=float(star_rbf_upper)
         )
-        layers = []
-        for index in range(6):
-            if (
-                self.topology_attention_variant == "msta_last2"
-                and index in self.msta_layer_indices
-            ):
-                layers.append(
-                    MSTAMIPSLocalLayer(
-                        self.emb_dim,
-                        self.num_heads,
-                        dropout,
-                        local_spd=self.msta_local_spd,
-                        context_spd=self.msta_context_spd,
-                        share_relation_dropout=self.msta_share_relation_dropout,
-                        local_output_bias=self.msta_local_output_bias,
-                        local_output_init=self.msta_local_output_init,
-                    )
-                )
-            else:
-                layers.append(MIPSLocalLayer(self.emb_dim, self.num_heads, dropout))
-        self.layers = nn.ModuleList(layers)
-        self.final_norm = nn.Identity()
-        self.trimer_mcl = TrimerSCAGEMCLResidual(
-            dim=self.emb_dim, num_heads=self.num_heads,
-            percentiles=(0.20, 0.50), dropout=dropout,
+        self.layers = nn.ModuleList(
+            MIPSLocalLayer(self.emb_dim, self.num_heads, dropout)
+            for _ in range(6)
         )
-        self.md_residual = MD200GraphResidual(self.emb_dim, dropout)
-        # Bypassed branches stay visible to strict state-dict loading but are
-        # frozen; the downstream optimizer only collects requires_grad params.
-        if not self.use_star_rbf:
-            for _parameter in self.star_distance_bias.parameters():
-                _parameter.requires_grad_(False)
-        if not self.use_mcl:
-            for _parameter in self.trimer_mcl.parameters():
-                _parameter.requires_grad_(False)
+        self.final_norm = nn.Identity()
+        self.md_residual = MD200GraphResidual(self.emb_dim, dropout=dropout)
 
     def _validate(self, data, *, require_geometry, require_md):
         if getattr(data, "feature_schema", None) == LEGACY_FEATURE_SCHEMA:
@@ -635,20 +389,12 @@ class MIPSLocalGraphEncoder(nn.Module):
             data, "topology_representation",
             TOPOLOGY_CANONICAL if canonical_periodic else "",
         ))
-        if representation not in {TOPOLOGY_CANONICAL, TOPOLOGY_EXPLICIT}:
-            raise ValueError("MTS batch has an unknown topology representation")
-        expected_feature = (
-            FEATURE_SCHEMA
-            if representation == TOPOLOGY_CANONICAL else EXPLICIT_FEATURE_SCHEMA
-        )
-        if getattr(data, "feature_schema", None) != expected_feature:
-            raise ValueError("MTS topology representation/feature schema mismatch")
-        expected_lga = (
-            CANONICAL_LGA_SCHEMA_VERSION
-            if representation == TOPOLOGY_CANONICAL else EXPLICIT_LGA_SCHEMA_VERSION
-        )
-        if int(getattr(data, "mips_local_lga_schema_version", -1)) != expected_lga:
-            raise ValueError("MTS topology representation/LGA schema mismatch")
+        if representation != TOPOLOGY_CANONICAL:
+            raise ValueError("B0-v2 only supports canonical_lifted topology")
+        if getattr(data, "feature_schema", None) != FEATURE_SCHEMA:
+            raise ValueError("B0-v2 canonical feature schema mismatch")
+        if int(getattr(data, "mips_local_lga_schema_version", -1)) != CANONICAL_LGA_SCHEMA_VERSION:
+            raise ValueError("B0-v2 canonical LGA schema mismatch")
         required = (
             "mips_x", "mips_backbone_mask", "lga_edge_index", "lga_spd",
             "lga_path_index", "lga_path_mask", "lga_star_edge_mask",
@@ -658,11 +404,6 @@ class MIPSLocalGraphEncoder(nn.Module):
             required += (
                 "lga_source_image_shift", "lga_path_shift",
                 "polymer_link_mask",
-            )
-        else:
-            required += (
-                "canonical_ru_atom_index", "ru_copy_index",
-                "canonical_pair_index",
             )
         if require_geometry:
             if self.use_star_rbf:
@@ -674,29 +415,19 @@ class MIPSLocalGraphEncoder(nn.Module):
                     "mts_star_v2_pair_valid",
                     "mts_star_v2_pair_geometry_source",
                 )
-            if self.use_mcl:
-                required += (
-                    "trimer_pos",
-                    "trimer_central_ru_mask", "mips_to_trimer_central_index",
-                    "trimer_geometry_valid", "trimer_geometry_is_3d",
-                    "trimer_2d_fallback", "trimer_batch",
-                )
         if require_md:
             required += ("mips_md", "mips_md_valid")
         missing = [name for name in required if not hasattr(data, name)]
-        if require_geometry and self.use_mcl and not (
-            hasattr(data, "trimer_base_ru_atom_index")
-            or hasattr(data, "trimer_base_ru_atom_id")
-        ):
-            missing.append("trimer_base_ru_atom_index/trimer_base_ru_atom_id")
         if missing:
             raise ValueError(
                 f"{ROUTE_NAME} cache is missing " + ", ".join(missing)
             )
         if data.lga_spd.numel() and (
-            int(data.lga_spd.min()) < 0 or int(data.lga_spd.max()) > 2
+            int(data.lga_spd.min()) < 0 or int(data.lga_spd.max()) > self.max_hops
         ):
-            raise ValueError("O8 only permits 0/1/2-hop attention")
+            raise ValueError(
+                f"{ROUTE_NAME} only permits 0..{self.max_hops}-hop attention"
+            )
         if data.lga_star_edge_mask.numel() != data.lga_edge_index.size(1):
             raise ValueError("Star-edge mask length mismatch")
         if canonical_periodic:
@@ -719,8 +450,6 @@ class MIPSLocalGraphEncoder(nn.Module):
         condition = torch.as_tensor(
             data.mips_condition_valid, device=available.device
         ).bool().flatten()
-        if not canonical_periodic and bool((available & ((boundary <= 5) | ~condition)).any()):
-            raise ValueError("available O8 graph violates boundary distance >5")
 
     @staticmethod
     def _canonical_pool(nodes, data):
@@ -743,11 +472,10 @@ class MIPSLocalGraphEncoder(nn.Module):
         return graph, canonical_nodes
 
     def _forward_impl(
-        self, data, atom_mask=None, *,
-        use_star=True, use_geometry=True, use_md=True,
+        self, data, atom_mask=None, *, use_star=True, use_md=True,
     ):
         self._validate(
-            data, require_geometry=(use_star or use_geometry),
+            data, require_geometry=use_star,
             require_md=use_md,
         )
         initial = self.atom_embedding(data, atom_mask=atom_mask)
@@ -766,17 +494,8 @@ class MIPSLocalGraphEncoder(nn.Module):
             star_bias = star_bias * keep
         attention_bias = spd_bias + path_bias + star_bias
         x = initial
-        relation_mask = getattr(data, "lga_relation_mask", None)
         for layer in self.layers:
-            if isinstance(layer, MSTAMIPSLocalLayer):
-                x = layer(
-                    x, data.lga_edge_index.long(), attention_bias,
-                    spd=data.lga_spd, relation_mask=relation_mask,
-                )
-            else:
-                x = layer(x, data.lga_edge_index.long(), attention_bias)
-        if use_geometry:
-            x = x + self.trimer_mcl(x, data)
+            x = layer(x, data.lga_edge_index.long(), attention_bias)
 
         graph_available = data.graph_available.bool().flatten()
         x = x * graph_available[data.batch.long()].unsqueeze(-1).to(x.dtype)
@@ -807,74 +526,8 @@ class MIPSLocalGraphEncoder(nn.Module):
         return self._forward_impl(
             data,
             use_star=self.use_star_rbf,
-            use_geometry=self.use_mcl,
+            use_md=self.use_descriptors,
         )
-
-    def forward_joint_pretrain(self, data, canonical_atom_mask):
-        """One O8+Star-RBF+Trimer-MCL forward for both pretext tasks.
-
-        The angle head consumes the raw final Trimer memory returned by MCL;
-        the masked-atom head consumes the copy-broadcast graph node states.
-        MD200 is intentionally absent from this path.
-        """
-        if canonical_atom_mask is None:
-            raise ValueError("joint pretraining requires canonical_atom_mask")
-        canonical_atom_mask = torch.as_tensor(
-            canonical_atom_mask, dtype=torch.bool, device=data.mips_x.device
-        ).reshape(-1)
-        if canonical_atom_mask.numel() != data.mips_x.size(0):
-            raise ValueError("canonical_atom_mask length mismatch")
-        self._validate(data, require_geometry=(self.use_star_rbf or self.use_mcl), require_md=False)
-        initial = self.atom_embedding(data, atom_mask=canonical_atom_mask)
-        spd_bias = self.spd_embedding(data.lga_spd.long())
-        path_bias = self.path_bias(initial, data)
-        star_bias = torch.zeros_like(spd_bias)
-        if self.use_star_rbf:
-            star_bias = self.star_distance_bias.forward_periodic_relation_v2(
-                data, initial.dtype
-            )
-        relation_mask = getattr(data, "lga_relation_mask", None)
-        if relation_mask is not None:
-            keep = (~relation_mask.bool()).unsqueeze(-1).to(initial.dtype)
-            spd_bias = spd_bias * keep
-            path_bias = path_bias * keep
-            star_bias = star_bias * keep
-        attention_bias = spd_bias + path_bias + star_bias
-        topology_nodes = initial
-        for layer in self.layers:
-            if isinstance(layer, MSTAMIPSLocalLayer):
-                topology_nodes = layer(
-                    topology_nodes, data.lga_edge_index.long(), attention_bias,
-                    spd=data.lga_spd, relation_mask=relation_mask,
-                )
-            else:
-                topology_nodes = layer(
-                    topology_nodes, data.lga_edge_index.long(), attention_bias
-                )
-        if self.use_mcl:
-            geometry_delta, trimer_states, mcl_valid = (
-                self.trimer_mcl.forward_with_aux(topology_nodes, data)
-            )
-        else:
-            geometry_delta = torch.zeros_like(topology_nodes)
-            trimer_states = topology_nodes.new_zeros((0, topology_nodes.size(-1)))
-            mcl_valid = torch.zeros(
-                (int(data.graph_available.numel()),), dtype=torch.bool,
-                device=topology_nodes.device,
-            )
-        nodes = topology_nodes + geometry_delta
-        graph_available = data.graph_available.bool().flatten()
-        nodes = nodes * graph_available[data.batch.long()].unsqueeze(-1).to(nodes.dtype)
-        graph, canonical_nodes = self._canonical_pool(nodes, data)
-        graph = graph * graph_available.unsqueeze(-1).to(graph.dtype)
-        return graph, nodes, {
-            "final_trimer_states": trimer_states,
-            "canonical_node_states": canonical_nodes,
-            "mcl_valid_graph_mask": mcl_valid,
-            "angle_valid_graph_mask": getattr(
-                data, "trimer_angle_valid", torch.zeros_like(mcl_valid)
-            ).bool().flatten(),
-        }
 
     def forward_b0_pretrain(
         self, data, canonical_atom_mask,
@@ -913,56 +566,9 @@ class MIPSLocalGraphEncoder(nn.Module):
         attention_bias = spd_bias + path_bias + star_bias
         nodes = initial
         for layer in self.layers:
-            if isinstance(layer, MSTAMIPSLocalLayer):
-                nodes = layer(
-                    nodes, data.lga_edge_index.long(), attention_bias,
-                    spd=data.lga_spd, relation_mask=relation_mask,
-                )
-            else:
-                nodes = layer(nodes, data.lga_edge_index.long(), attention_bias)
+            nodes = layer(nodes, data.lga_edge_index.long(), attention_bias)
         graph_available = data.graph_available.bool().flatten()
         nodes = nodes * graph_available[data.batch.long()].unsqueeze(-1).to(nodes.dtype)
         graph, canonical_nodes = self._canonical_pool(nodes, data)
         graph = graph * graph_available.unsqueeze(-1).to(graph.dtype)
         return graph, nodes, canonical_nodes
-
-    def _atom_mask_from_override(self, data, x_override):
-        if x_override.shape != data.x.shape:
-            raise ValueError("masked x override must match data.x")
-        return (
-            (x_override.abs().sum(dim=-1) == 0)
-            & (data.x.abs().sum(dim=-1) != 0)
-        )
-
-    def forward_with_x(self, data, x_override):
-        """Stage 1: topology only; never read Trimer or MD fields."""
-        graph, nodes = self._forward_impl(
-            data, atom_mask=self._atom_mask_from_override(data, x_override),
-            use_star=False, use_geometry=False, use_md=False,
-        )
-        anchor = self._zero_parameter_anchor(
-            nodes, self.star_distance_bias, self.trimer_mcl, self.md_residual
-        )
-        nodes = nodes + anchor
-        graph = graph + anchor
-        return graph, nodes
-
-    def forward_geometry_with_x(self, data, x_override):
-        """Stage 2: Star/MCL active, MD disabled."""
-        graph, nodes = self._forward_impl(
-            data, atom_mask=self._atom_mask_from_override(data, x_override),
-            use_star=True, use_geometry=True, use_md=False,
-        )
-        anchor = self._zero_parameter_anchor(nodes, self.md_residual)
-        nodes = nodes + anchor
-        graph = graph + anchor
-        return graph, nodes
-
-    def forward_relation_pretext(self, data):
-        graph, nodes = self._forward_impl(
-            data, use_star=False, use_geometry=False, use_md=False
-        )
-        anchor = self._zero_parameter_anchor(
-            nodes, self.star_distance_bias, self.trimer_mcl, self.md_residual
-        )
-        return graph + anchor, nodes + anchor

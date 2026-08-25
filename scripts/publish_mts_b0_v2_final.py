@@ -5,7 +5,7 @@ The published ``final.pth`` is the complete downstream B0-v2 model state
 (O8 / Star ON / MCL OFF / MD200 ON / upper=3.75) in which every learned
 topology module comes from the selected probe and everything else keeps the
 deterministic downstream initialization.  Masked-atom head, coordinate
-decoder, disabled MCL parameters and the fold-specific MD200 residual are
+decoder and the fold-specific MD200 residual are
 excluded from the transferred state.  A fresh downstream model must load the
 assembled state with ``strict=True`` before the atomic write.
 """
@@ -24,8 +24,8 @@ from src.training.finetune.engine import build_mts_downstream_model
 from src.training.pretrain.config import parse_arguments
 from src.training.pretrain.engine import MIPSPretrainContainer, _build_b0_model
 
-# Modules actually trained by the B0-v2 objective.  MCL was disabled (frozen)
-# and the MD200 residual is fold-seeded downstream, so neither is transferred.
+# Modules actually trained by the B0-v2 objective.  The MD200 residual is
+# fold-seeded downstream, so it is not transferred.
 _TRAINED_TOPOLOGY_PREFIXES = (
     "encoders.graph.encoder.atom_embedding.",
     "encoders.graph.encoder.spd_embedding.",

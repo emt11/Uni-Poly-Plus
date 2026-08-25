@@ -1,0 +1,29 @@
+{
+  "schema": "mts-glt-graphgate-v1-downstream",
+  "experiment": "mts-glt-graphgate-encoder-freeze-factorial-20k-v1",
+  "checkpoint": "pretrained_models/mts_glt_graphgate_v1/mts_glt_graphgate_v1.pth",
+  "tasks": ["xc", "ei", "egc"],
+  "folds": [0, 1, 2],
+  "seed": 42,
+  "stage1_epochs": 5,
+  "stage2_conditions": {
+    "F0": "both_frozen",
+    "F1": "o8_only",
+    "F2": "glt_query_only",
+    "F3": "joint"
+  },
+  "epochs": 100,
+  "patience": 10,
+  "train_batch_size": 32,
+  "eval_batch_size": 64,
+  "workers": 2,
+  "precision": "fp32",
+  "loss": "huber",
+  "huber_beta": 0.5,
+  "initial_alpha": 0.05,
+  "o8_lr": 1e-5,
+  "glt_query_lr": 1e-5,
+  "fusion_head_lr": 1e-4,
+  "evaluation_protocol": "historical_shared5",
+  "f3_reuse_root": "results/mts_glt_graphgate_v1/fusion_realization_v1/folds"
+}

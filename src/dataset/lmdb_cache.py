@@ -29,10 +29,8 @@ from rdkit import Chem, rdBase
 from torch_geometric.data import Data
 from .mips_trimer_contract import (
     CACHE_LAYOUT_SCHEMA,
-    CACHE_MCL_THRESHOLD_SCHEMA,
     TRIMER_LMDB_SCHEMA as CONTRACT_TRIMER_LMDB_SCHEMA,
     TOPOLOGY_LMDB_SCHEMA as CONTRACT_TOPOLOGY_LMDB_SCHEMA,
-    TOPOLOGY_EXPLICIT,
 )
 
 
@@ -41,7 +39,6 @@ TOPOLOGY_LMDB_SCHEMA = CONTRACT_TOPOLOGY_LMDB_SCHEMA
 TRIMER_LMDB_SCHEMA = CONTRACT_TRIMER_LMDB_SCHEMA
 MD200_LMDB_SCHEMA = "mips-trimer-scage-md200-lmdb-v1"
 MD200_ARRAY_SCHEMA = "mips-trimer-scage-md200-array-v1"
-MCL_THRESHOLDS_ARRAY_SCHEMA = CACHE_MCL_THRESHOLD_SCHEMA
 COHORT_SCHEMA = "mips-trimer-scage-cohort-v1"
 COHORT_INTEGRITY_SCHEMA = "mips-trimer-scage-cohort-manifest-v2"
 
@@ -149,49 +146,6 @@ def _validate_trimer_placeholder_override(
                 f"(sample_key={key_hex})"
             )
     return True
-
-
-def _expand_explicit_trimer_mapping(topology, name, value, *, sample_key):
-    """Lift one canonical Trimer mapping onto every explicit RU copy.
-
-    Frozen Trimer records are keyed by canonical RU identity and therefore
-    contain exactly one mapping entry per canonical atom.  The corrected
-    explicit topology stores ``k`` copies of those atoms.  Expansion is
-    consequently an identity lookup through ``canonical_ru_atom_index``; the
-    copy index is intentionally irrelevant and is never interpreted as a
-    Trimer ``ru_offset``.
-    """
-
-    representation = str(getattr(
-        topology, "topology_representation",
-        getattr(topology, "mts_topology_representation", ""),
-    ))
-    if representation != TOPOLOGY_EXPLICIT or name not in {
-        "mips_to_trimer_central_index",
-    }:
-        return value
-    mapping = torch.as_tensor(value).long()
-    canonical_index = torch.as_tensor(
-        getattr(topology, "canonical_ru_atom_index", torch.empty(0))
-    ).long()
-    key_hex = bytes(sample_key).hex()[:16]
-    if mapping.ndim != 1 or canonical_index.ndim != 1:
-        raise RuntimeError(
-            f"invalid explicit {name} rank (sample_key={key_hex})"
-        )
-    if canonical_index.numel() != int(topology.x.size(0)):
-        raise RuntimeError(
-            f"explicit canonical identity length mismatch (sample_key={key_hex})"
-        )
-    if canonical_index.numel() and (
-        bool((canonical_index < 0).any())
-        or int(canonical_index.max()) >= int(mapping.numel())
-    ):
-        raise RuntimeError(
-            f"explicit canonical identity is out of mapping range "
-            f"(sample_key={key_hex})"
-        )
-    return mapping[canonical_index]
 
 
 def _json_digest(value) -> str:
@@ -1293,175 +1247,6 @@ def materialize_md200_array(cohort, descriptor_store, output_dir):
     return str(values_path), str(valid_path), metadata
 
 
-def compute_mcl_thresholds(data):
-    """Compute the two immutable Trimer hard-mask thresholds for one record.
-
-    The result is deliberately a tiny ``float32[2]`` value.  Invalid or
-    non-3-D records receive NaNs and remain exact O8 fallbacks; no distance
-    matrix is retained in the cache.
-    """
-    invalid = np.full((2,), np.nan, dtype=np.float32)
-    try:
-        if not bool(getattr(data, "trimer_geometry_valid", False)):
-            return invalid
-        if not bool(getattr(data, "trimer_geometry_is_3d", False)):
-            return invalid
-        if bool(getattr(data, "trimer_2d_fallback", False)):
-            return invalid
-        positions = torch.as_tensor(getattr(data, "trimer_pos"))
-        if positions.ndim != 2 or positions.size(-1) != 3:
-            return invalid
-        positions = positions.float()
-        if positions.size(0) < 2 or not bool(torch.isfinite(positions).all()):
-            return invalid
-        distances = torch.pdist(positions)
-        if not distances.numel() or not bool(torch.isfinite(distances).all()):
-            return invalid
-        values = torch.quantile(
-            distances, distances.new_tensor((0.20, 0.50))
-        ).cpu().numpy().astype(np.float32, copy=False)
-        return values if np.isfinite(values).all() else invalid
-    except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
-        return invalid
-
-
-def _mcl_threshold_expected(cohort, trimer_root, shape):
-    """Return the content-bound metadata fields for a ``[N,2]`` threshold array.
-
-    The same contract is shared by the in-memory materialisation path, the
-    streamed mmap finalizer and the resume check, so the bound fields can
-    never drift between them.
-    """
-    done_path = Path(trimer_root) / ".done"
-    if not done_path.is_file():
-        raise RuntimeError("cannot materialize MCL thresholds without Trimer .done")
-    trimer_artifact_hash = done_path.read_text(encoding="utf-8").strip()
-    trimer_done_file_sha256 = _sha256_file(done_path)
-    trimer_metadata_path = Path(trimer_root) / "metadata.json"
-    trimer_contract_hash = None
-    if trimer_metadata_path.is_file():
-        try:
-            trimer_contract_hash = json.loads(
-                trimer_metadata_path.read_text(encoding="utf-8")
-            ).get("feature_config_hash")
-        except (OSError, ValueError, json.JSONDecodeError):
-            trimer_contract_hash = None
-    return {
-        "schema": MCL_THRESHOLDS_ARRAY_SCHEMA,
-        "cohort_hash": cohort["manifest"]["cohort_hash"],
-        "ordered_sample_key_hash": cohort["manifest"]["ordered_sample_key_hash"],
-        "trimer_artifact_hash": trimer_artifact_hash,
-        "trimer_done_artifact_id": trimer_artifact_hash,
-        "trimer_done_file_sha256": trimer_done_file_sha256,
-        "trimer_contract_hash": trimer_contract_hash,
-        "shape": list(shape),
-        "dtype": "float32",
-    }
-
-
-def mcl_thresholds_cached(cohort, trimer_root, shape):
-    """Return ``(path, metadata)`` if a persisted array already binds the
-    current Trimer artifact and cohort identity, else ``None``.
-
-    This is the resume check used before any streaming computation: a valid
-    existing array is content-bound to the same artifact, so recomputation
-    would be wasted work (Plan.MD §8.2).
-    """
-    cohort_root = Path(cohort["root"])
-    values_path = cohort_root / "mcl_thresholds.npy"
-    metadata_path = cohort_root / "mcl_thresholds_metadata.json"
-    if not (values_path.is_file() and metadata_path.is_file()):
-        return None
-    try:
-        expected = _mcl_threshold_expected(cohort, trimer_root, list(shape))
-    except RuntimeError:
-        return None
-    try:
-        observed = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    if {key: observed.get(key) for key in expected} != expected:
-        return None
-    try:
-        loaded = np.load(values_path, mmap_mode="r")
-    except (OSError, ValueError):
-        return None
-    if tuple(loaded.shape) != tuple(shape):
-        return None
-    return str(values_path), observed
-
-
-def finalize_mcl_threshold_mmap(cohort, trimer_root, tmp_path):
-    """Hash and atomically publish a streamed ``[N,2]`` thresholds tmp file.
-
-    The caller owns the pre-allocated ``.tmp`` mmap and must have flushed it.
-    This finalizer validates the shape, hashes the bytes, renames over the
-    final path, then writes the content-bound metadata (Plan.MD §5.4).
-    """
-    cohort_root = Path(cohort["root"])
-    values_path = cohort_root / "mcl_thresholds.npy"
-    metadata_path = cohort_root / "mcl_thresholds_metadata.json"
-    tmp_path = Path(tmp_path)
-    array = np.load(tmp_path, mmap_mode="r")
-    shape = tuple(array.shape)
-    del array
-    if len(shape) != 2 or shape[1] != 2:
-        raise ValueError("MCL thresholds must have shape [N,2]")
-    expected = _mcl_threshold_expected(cohort, trimer_root, list(shape))
-    values_sha256 = _sha256_file(tmp_path)
-    cohort_root.mkdir(parents=True, exist_ok=True)
-    os.replace(tmp_path, values_path)
-    metadata = {
-        **expected,
-        "values_sha256": values_sha256,
-        "created_at": time.time(),
-    }
-    _atomic_json(metadata_path, metadata)
-    return str(values_path), metadata
-
-
-def materialize_mcl_threshold_array(cohort, thresholds, trimer_root):
-    """Atomically persist ``[N,2]`` thresholds in cohort order.
-
-    This is a derived accelerator, not a replacement for the Trimer LMDB.  It
-    is content-bound to the ordered cohort and Trimer ``.done`` artifact so a
-    stale array is ignored by readers and rejected by validation.
-    """
-    cohort_root = Path(cohort["root"])
-    values_path = cohort_root / "mcl_thresholds.npy"
-    metadata_path = cohort_root / "mcl_thresholds_metadata.json"
-    thresholds = np.asarray(thresholds, dtype=np.float32)
-    if thresholds.ndim != 2 or thresholds.shape[1] != 2:
-        raise ValueError("MCL thresholds must have shape [N,2]")
-    expected = _mcl_threshold_expected(cohort, trimer_root, list(thresholds.shape))
-    if values_path.is_file() and metadata_path.is_file():
-        try:
-            observed = json.loads(metadata_path.read_text(encoding="utf-8"))
-            stable = {key: observed.get(key) for key in expected}
-            if stable == expected:
-                loaded = np.load(values_path, mmap_mode="r")
-                if tuple(loaded.shape) == tuple(thresholds.shape):
-                    return str(values_path), observed
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
-    cohort_root.mkdir(parents=True, exist_ok=True)
-    temporary = values_path.with_suffix(values_path.suffix + ".tmp")
-    array = np.lib.format.open_memmap(
-        temporary, mode="w+", dtype=np.float32, shape=thresholds.shape
-    )
-    array[:] = thresholds
-    array.flush()
-    del array
-    os.replace(temporary, values_path)
-    metadata = {
-        **expected,
-        "values_sha256": _sha256_file(values_path),
-        "created_at": time.time(),
-    }
-    _atomic_json(metadata_path, metadata)
-    return str(values_path), metadata
-
-
 class LmdbFeatureStore:
     """Compose O8, optional Trimer, and mmap'ed MD200 by content key."""
 
@@ -1475,7 +1260,6 @@ class LmdbFeatureStore:
         trimer_root=None,
         md200_path=None,
         md200_valid_path=None,
-        angle_cache_root=None,
     ):
         self.roots = {"topology": str(topology_root)}
         self.topology = LmdbLayerStore(topology_root)
@@ -1485,47 +1269,6 @@ class LmdbFeatureStore:
             self.trimer = LmdbLayerStore(trimer_root)
         self.cohort = cohort
         self.keys = cohort["keys_array"]
-        self.mcl_thresholds = None
-        self.mcl_thresholds_path = None
-        # Read-side memoization for the two MCL hard-mask thresholds.  A
-        # finalized Stage-3 cohort can use the persisted mmap below; the
-        # graph-only stages use this bounded fallback without changing the
-        # immutable LMDB records.
-        # Thresholds are a derived read-side memo, not cache content.  Keep a
-        # bounded LRU so a million-row pretraining cohort cannot accumulate a
-        # million Python dictionary entries in every DDP rank.
-        self._mcl_threshold_cache = OrderedDict()
-        self._mcl_threshold_cache_limit = 4096
-        threshold_path = Path(cohort["root"]) / "mcl_thresholds.npy"
-        threshold_meta_path = Path(cohort["root"]) / "mcl_thresholds_metadata.json"
-        # Thresholds are an independent, read-only Trimer artifact.  Stage 2
-        # does not load MD200, but it must still use this mmap; coupling the
-        # threshold lookup to ``md200_path`` silently caused an expensive
-        # pdist/quantile recomputation for every Stage-2 sample.
-        if (
-            threshold_path.is_file()
-            and threshold_meta_path.is_file()
-            and self.trimer is not None
-        ):
-            try:
-                threshold_meta = json.loads(
-                    threshold_meta_path.read_text(encoding="utf-8")
-                )
-                if (
-                    threshold_meta.get("schema") == MCL_THRESHOLDS_ARRAY_SCHEMA
-                    and threshold_meta.get("cohort_hash")
-                    == cohort["manifest"]["cohort_hash"]
-                    and threshold_meta.get("ordered_sample_key_hash")
-                    == cohort["manifest"]["ordered_sample_key_hash"]
-                    and tuple(threshold_meta.get("shape", ()))
-                    == (len(self.keys), 2)
-                ):
-                    candidate = np.load(threshold_path, mmap_mode="r")
-                    if tuple(candidate.shape) == (len(self.keys), 2):
-                        self.mcl_thresholds = candidate
-                        self.mcl_thresholds_path = str(threshold_path)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                self.mcl_thresholds = None
         self.md200_path = md200_path
         self.md200_valid_path = md200_valid_path
         self.md200 = (
@@ -1535,112 +1278,6 @@ class LmdbFeatureStore:
             np.load(md200_valid_path, mmap_mode="r")
             if md200_valid_path is not None else None
         )
-        self.angle_cache_root = str(angle_cache_root) if angle_cache_root is not None else None
-        self.angle_offsets = None
-        self.angle_indices = None
-        self.angle_bins = None
-        self.angle_cos = None
-        self.angle_valid = None
-        self.angle_class_counts = None
-        self.angle_validation_mask = None
-        self.angle_cache_metadata = None
-        self.angle_cache_artifact_hash = None
-        if self.angle_cache_root is not None:
-            angle_root = Path(self.angle_cache_root)
-            metadata_path = angle_root / "metadata.json"
-            try:
-                if metadata_path.is_file():
-                    angle_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
-                    done_path = angle_root / ".done"
-                    frozen_path = angle_root / ".frozen"
-                    angle_schema = angle_meta.get("schema")
-                    if (
-                        angle_schema
-                        not in {
-                            "mts-trimer-bond-angle-cache-v1",
-                            "mts-trimer-bond-angle-cache-v2",
-                            "mts-angle-continuous-cache-v1",
-                        }
-                        or not done_path.is_file()
-                        or not frozen_path.is_file()
-                    ):
-                        raise RuntimeError("MTS angle cache is not frozen")
-                    expected = {
-                        "cohort_hash": cohort["manifest"]["cohort_hash"],
-                        "ordered_sample_key_hash": cohort["manifest"]["ordered_sample_key_hash"],
-                    }
-                    if all(angle_meta.get(key) == value for key, value in expected.items()):
-                        self.angle_offsets = np.load(angle_root / "angle_offsets.npy", mmap_mode="r")
-                        self.angle_indices = np.load(angle_root / "angle_indices.npy", mmap_mode="r")
-                        if angle_schema in {
-                            "mts-trimer-bond-angle-cache-v1",
-                            "mts-trimer-bond-angle-cache-v2",
-                        }:
-                            self.angle_bins = np.load(
-                                angle_root / "angle_bins.npy", mmap_mode="r"
-                            )
-                            self.angle_valid = np.load(
-                                angle_root / "angle_valid.npy", mmap_mode="r"
-                            )
-                            counts_path = angle_root / "angle_class_counts.npy"
-                            if counts_path.is_file():
-                                self.angle_class_counts = np.load(
-                                    counts_path, mmap_mode="r"
-                                )
-                        else:
-                            self.angle_cos = np.load(
-                                angle_root / "angle_cos.npy", mmap_mode="r"
-                            )
-                            # The validation mask controls pretraining model
-                            # selection, not geometric validity.  A record is
-                            # angle-valid when the frozen cache contains at
-                            # least one true-bond triplet; MCL validity is
-                            # checked independently by the collator/model.
-                            self.angle_valid = np.asarray(
-                                self.angle_offsets[1:] > self.angle_offsets[:-1],
-                                dtype=np.bool_,
-                            )
-                            self.angle_validation_mask = np.load(
-                                angle_root / "validation_mask.npy", mmap_mode="r"
-                            )
-                        common_invalid = (
-                            self.angle_offsets.shape != (len(self.keys) + 1,)
-                            or self.angle_indices.ndim != 2
-                            or self.angle_indices.shape[1] != 3
-                            or self.angle_valid.shape != (len(self.keys),)
-                        )
-                        categorical_invalid = (
-                            angle_schema
-                            in {"mts-trimer-bond-angle-cache-v1", "mts-trimer-bond-angle-cache-v2"}
-                            and (
-                                self.angle_bins.shape
-                                != (self.angle_indices.shape[0],)
-                                or self.angle_class_counts is None
-                                or self.angle_class_counts.shape != (20,)
-                                or self.angle_class_counts.dtype != np.int64
-                            )
-                        )
-                        continuous_invalid = (
-                            angle_schema == "mts-angle-continuous-cache-v1"
-                            and (
-                                self.angle_cos.shape
-                                != (self.angle_indices.shape[0],)
-                                or self.angle_cos.dtype != np.float32
-                            )
-                        )
-                        if common_invalid or categorical_invalid or continuous_invalid:
-                            raise RuntimeError("MTS angle cache shape mismatch")
-                        self.angle_cache_metadata = angle_meta
-                        self.angle_cache_artifact_hash = None
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                self.angle_offsets = None
-                self.angle_indices = None
-                self.angle_bins = None
-                self.angle_cos = None
-                self.angle_valid = None
-                self.angle_class_counts = None
-                self.angle_validation_mask = None
-                self.angle_cache_artifact_hash = None
         if self.md200 is not None:
             if self.md200.ndim != 2 or self.md200.shape[1] != 200:
                 raise RuntimeError("MD200 mmap must have shape [N,200]")
@@ -1660,8 +1297,6 @@ class LmdbFeatureStore:
         if (
             self.md200 is not None
             or self.md200_valid is not None
-            or self.mcl_thresholds is not None
-            or self.angle_offsets is not None
         ):
             key_view = np.asarray(self.keys, dtype=np.uint8).view("S32").reshape(-1)
             self._sorted_key_order = np.argsort(key_view, kind="mergesort")
@@ -1677,15 +1312,6 @@ class LmdbFeatureStore:
         # NumPy memmaps close when their backing mmap objects are collected.
         self.md200 = None
         self.md200_valid = None
-        self.mcl_thresholds = None
-        self.angle_offsets = None
-        self.angle_indices = None
-        self.angle_bins = None
-        self.angle_cos = None
-        self.angle_valid = None
-        self.angle_class_counts = None
-        self.angle_validation_mask = None
-        self.angle_cache_artifact_hash = None
 
     def __del__(self):
         try:
@@ -1721,9 +1347,7 @@ class LmdbFeatureStore:
         if self.trimer is not None:
             layer = self.trimer[key]
             for name in layer.keys():
-                layer_value = _expand_explicit_trimer_mapping(
-                    merged, name, layer[name], sample_key=key
-                )
+                layer_value = layer[name]
                 if name in merged:
                     # Plan §5: only the exact allowlisted mapping placeholder
                     # may override an all-minus-one topology placeholder, and
@@ -1749,35 +1373,6 @@ class LmdbFeatureStore:
                         f"(sample_key={bytes(key).hex()[:16]})"
                     )
                 merged[name] = layer_value
-            if not hasattr(merged, "trimer_mcl_thresholds"):
-                row = self._row_for_key(key) if self.mcl_thresholds is not None else None
-                if row is not None:
-                    thresholds = torch.from_numpy(
-                        np.asarray(self.mcl_thresholds[row]).copy()
-                    ).float()
-                else:
-                    cache_key = bytes(key)
-                    thresholds = self._mcl_threshold_cache.get(cache_key)
-                if thresholds is None:
-                    positions = getattr(merged, "trimer_pos", None)
-                    if positions is not None and torch.as_tensor(positions).ndim == 2:
-                        positions = torch.as_tensor(positions).float()
-                        if positions.size(0) >= 2 and bool(torch.isfinite(positions).all()):
-                            distances = torch.pdist(positions)
-                            thresholds = torch.quantile(
-                                distances,
-                                distances.new_tensor((0.20, 0.50)),
-                            ).cpu()
-                        else:
-                            thresholds = torch.full((2,), float("nan"))
-                    else:
-                        thresholds = torch.full((2,), float("nan"))
-                    self._mcl_threshold_cache[cache_key] = thresholds
-                elif row is None:
-                    self._mcl_threshold_cache.move_to_end(cache_key)
-                while len(self._mcl_threshold_cache) > self._mcl_threshold_cache_limit:
-                    self._mcl_threshold_cache.popitem(last=False)
-                merged.trimer_mcl_thresholds = thresholds.clone()
         if self.md200 is not None:
             row = self._row_for_key(key)
             if row is None:
@@ -1791,30 +1386,6 @@ class LmdbFeatureStore:
             merged.mips_descriptor_schema_version = 5
             merged.descriptor_failure_code = (
                 "" if merged.mips_md_valid else "md200_content_cache_invalid"
-            )
-        if self.angle_offsets is not None:
-            row = self._row_for_key(key)
-            if row is None:
-                raise KeyError(key.hex())
-            start = int(self.angle_offsets[row])
-            end = int(self.angle_offsets[row + 1])
-            merged.trimer_angle_index = torch.from_numpy(
-                np.asarray(self.angle_indices[start:end], dtype=np.int64).copy()
-            )
-            if self.angle_bins is not None:
-                merged.trimer_angle_bins = torch.from_numpy(
-                    np.asarray(self.angle_bins[start:end], dtype=np.int64).copy()
-                )
-            if self.angle_cos is not None:
-                merged.trimer_angle_cos = torch.from_numpy(
-                    np.asarray(self.angle_cos[start:end], dtype=np.float32).copy()
-                )
-            merged.trimer_angle_valid = bool(self.angle_valid[row])
-            merged.trimer_angle_cache_schema = str(
-                self.angle_cache_metadata.get("schema", "")
-            )
-            merged.trimer_angle_cache_artifact_hash = str(
-                self.angle_cache_metadata.get("trimer_artifact_hash", "")
             )
         return merged
 

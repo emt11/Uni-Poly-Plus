@@ -6,7 +6,7 @@ cd "$PROJECT_DIR"
 PYTHON_BIN=${PYTHON_BIN:-/opt/conda/envs/MTS/bin/python}
 
 if [[ -z "${EXPERIMENT_CONFIG:-}" ]]; then
-  echo "MTS B0-v2 requires EXPERIMENT_CONFIG pointing to an mts-b0-v2 JSON file." >&2
+  echo "MTS requires EXPERIMENT_CONFIG pointing to an active experiment JSON file." >&2
   exit 2
 fi
 if [[ ! -f "$EXPERIMENT_CONFIG" ]]; then
@@ -22,4 +22,4 @@ export CUDA_VISIBLE_DEVICES=1,2,3
 # alter the resolved experiment identity.
 # shellcheck disable=SC2086
 exec "$TORCHRUN_BIN" --standalone --nproc_per_node=3 \
-  scripts/pretrain.py --b0_config "$RESOLVED_INPUT" ${EXTRA_ARGS:-}
+  scripts/pretrain.py --experiment_config "$RESOLVED_INPUT" ${EXTRA_ARGS:-}

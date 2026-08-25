@@ -86,8 +86,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     gpu_ids = [value for value in args.gpu_ids.split(",") if value]
-    if len(gpu_ids) != 4 or len(set(gpu_ids)) != 4:
-        raise SystemExit("MTS finetune scheduler requires four unique GPU ids")
+    if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids):
+        raise SystemExit("MTS finetune scheduler requires one or more unique GPU ids")
     task_order = (
         args.task_order.split(",")
         if args.schedule == "lpt_v1" and args.task_order else None

@@ -119,9 +119,11 @@ def get_data_loader(
     random_conformer=None, num_workers=0, pin_memory=None, persistent_workers=None,
     sampler=None, generator=None, prefetch_factor=2,
 ):
-    if indices is None:
-        indices = range(len(dataset))
-    subset_dataset = Subset(dataset, [int(index) for index in indices])
+    loader_dataset = (
+        dataset
+        if indices is None
+        else Subset(dataset, [int(index) for index in indices])
+    )
     if random_conformer is None:
         random_conformer = bool(shuffle)
 
@@ -135,7 +137,7 @@ def get_data_loader(
         else partial(custom_collate, random_conformer=random_conformer)
     )
     loader_kwargs = dict(
-        dataset=subset_dataset,
+        dataset=loader_dataset,
         batch_size=batch_size,
         collate_fn=collate,
         shuffle=bool(shuffle and sampler is None),
@@ -153,7 +155,7 @@ def get_data_loader(
         loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
     loader = DataLoader(**loader_kwargs)
 
-    print(f"Created dataloader with {len(subset_dataset)} samples")
+    print(f"Created dataloader with {len(loader_dataset)} samples")
     return loader
 
 
@@ -230,8 +232,16 @@ def train_epoch(
     pcgrad=False,
     amp_dtype='fp32',
     return_timing=False,
+    mts_glt_frozen_encoders_eval=False,
+    mts_glt_frozen_encoder_policy=None,
 ):
     model.train()
+    if mts_glt_frozen_encoder_policy is not None:
+        _set_mts_glt_frozen_encoders_eval(
+            model, mts_glt_frozen_encoder_policy
+        )
+    elif mts_glt_frozen_encoders_eval:
+        _set_mts_glt_frozen_encoders_eval(model)
     epoch_started = time.perf_counter()
     optimizer_steps = 0
     legacy_sync = os.environ.get('MTS_BENCHMARK_LEGACY_SYNC', '0') == '1'
@@ -553,6 +563,312 @@ def _base_model(model):
     return model.module if isinstance(model, nn.DataParallel) else model
 
 
+def _mts_glt_encoder(model):
+    """Return the optional MTS-GLT graph encoder without changing forward."""
+    base = _base_model(model)
+    encoders = getattr(base, 'encoders', {})
+    graph = encoders['graph'] if 'graph' in encoders else None
+    encoder = getattr(graph, 'encoder', None)
+    if getattr(encoder, 'downstream_mode', None) != 'o8_glt':
+        return None
+    if not callable(getattr(encoder, 'encode_views', None)):
+        return None
+    return encoder
+
+
+def _mts_glt_fusion_components(model):
+    """Return the concrete modules used by either supported GLT fusion path."""
+    base = _base_model(model)
+    encoders = getattr(base, 'encoders', {})
+    graph = encoders['graph'] if 'graph' in encoders else None
+    encoder = getattr(graph, 'encoder', None)
+    mode = getattr(encoder, 'downstream_mode', None)
+    if mode == 'o8_glt' and callable(getattr(encoder, 'encode_views', None)):
+        return {
+            'kind': 'scalar', 'base': base, 'graph': graph, 'encoder': encoder,
+            'o8': encoder.o8, 'glt': encoder.glt,
+            'fusion_norm': encoder.glt_fusion_norm,
+            'fusion_projection': encoder.glt_fusion_projection,
+            'gate': encoder.glt_gate, 'md_residual': encoder.o8.md_residual,
+        }
+    if (
+        mode == 'o8_glt_graph'
+        and getattr(encoder, 'architecture_name', '') == 'MTS-GLT-GraphGate-v1'
+        and callable(getattr(encoder, 'encode_views', None))
+    ):
+        return {
+            'kind': 'channel', 'base': base, 'graph': graph,
+            'encoder': encoder, 'o8': encoder.o8_encoder,
+            'glt': encoder.glt_line_encoder,
+            'fusion_norm': encoder.fusion_norm,
+            'fusion_projection': encoder.fusion_projection,
+            'gate': encoder.channel_gate,
+            'md_residual': encoder.o8_encoder.md_residual,
+        }
+    return None
+
+
+def _mts_glt_gate_summary(components):
+    gate = components['gate'].detach().float().cpu()
+    alpha = torch.tanh(gate)
+    absolute = alpha.abs()
+    summary = {
+        'mean_abs': float(absolute.mean()),
+        'median_abs': float(absolute.median()),
+        'p10': float(torch.quantile(alpha.flatten(), 0.10)),
+        'p90': float(torch.quantile(alpha.flatten(), 0.90)),
+        'fraction_abs_lt_0_01': float((absolute < 0.01).float().mean()),
+        'fraction_positive': float((alpha > 0).float().mean()),
+        'fraction_negative': float((alpha < 0).float().mean()),
+    }
+    if gate.numel() == 1:
+        summary.update({
+            'gate': float(gate), 'tanh_gate': float(alpha),
+        })
+    return summary
+
+
+def _mts_glt_trajectory_fields(audit):
+    alpha = audit['alpha']
+    fields = {
+        'rho_mean': audit['rho']['mean'],
+        'rho_median': audit['rho']['median'],
+        'rho_p10': audit['rho']['p10'],
+        'rho_p90': audit['rho']['p90'],
+        'alpha_mean_abs': alpha['mean_abs'],
+        'alpha_median_abs': alpha['median_abs'],
+        'alpha_p10': alpha['p10'],
+        'alpha_p90': alpha['p90'],
+        'alpha_fraction_abs_lt_0_01': alpha['fraction_abs_lt_0_01'],
+        'alpha_fraction_positive': alpha['fraction_positive'],
+        'alpha_fraction_negative': alpha['fraction_negative'],
+    }
+    if 'gate' in alpha:
+        fields.update({'gate': alpha['gate'], 'tanh_gate': alpha['tanh_gate']})
+    return fields
+
+
+def initialize_mts_glt_fusion_warm(model, initial_alpha=0.1):
+    """Set scalar or channel-wise fusion strength after strict checkpoint load."""
+    components = _mts_glt_fusion_components(model)
+    if components is None:
+        raise ValueError('FusionWarm requires o8_glt or o8_glt_graph mode')
+    alpha = float(initial_alpha)
+    if not 0.0 < alpha < 1.0:
+        raise ValueError('FusionWarm initial alpha must be between 0 and 1')
+    with torch.no_grad():
+        components['gate'].fill_(float(np.arctanh(alpha)))
+    return float(torch.tanh(components['gate'].detach()).mean().cpu())
+
+
+_MTS_GLT_STAGE2_TRAINABILITY = {
+    'both_frozen', 'o8_only', 'glt_query_only', 'joint',
+}
+
+
+def _configure_mts_glt_fusion_stage(
+    model, stage, stage2_trainability='joint',
+):
+    """Apply the exact trainability split for one FusionWarm stage."""
+    stage = str(stage)
+    if stage not in {'warm', 'joint'}:
+        raise ValueError('FusionWarm stage must be warm or joint')
+    components = _mts_glt_fusion_components(model)
+    if components is None:
+        raise ValueError('FusionWarm requires o8_glt or o8_glt_graph mode')
+    encoder = components['encoder']
+    base = components['base']
+    graph_module = components['graph']
+    stage2_trainability = str(stage2_trainability)
+    if stage2_trainability not in _MTS_GLT_STAGE2_TRAINABILITY:
+        raise ValueError(
+            'unsupported FusionWarm Stage 2 trainability: '
+            f'{stage2_trainability}'
+        )
+    if stage == 'joint':
+        _configure_mts_trainability(model)
+        if stage2_trainability in {'both_frozen', 'glt_query_only'}:
+            for name, parameter in components['o8'].named_parameters():
+                if not name.startswith('md_residual.'):
+                    parameter.requires_grad = False
+        if stage2_trainability in {'both_frozen', 'o8_only'}:
+            for parameter in components['glt'].parameters():
+                parameter.requires_grad = False
+        return encoder
+
+    for parameter in base.parameters():
+        parameter.requires_grad = False
+    for module in (
+        components['fusion_norm'],
+        components['fusion_projection'],
+        components['md_residual'],
+        graph_module.norm,
+        graph_module.projection,
+        base.mlp,
+    ):
+        _set_module_trainable(module, True)
+    components['gate'].requires_grad = True
+    return encoder
+
+
+def _set_mts_glt_frozen_encoders_eval(model, policy='both_frozen'):
+    """Keep frozen pretrained branches deterministic after top-level train()."""
+    components = _mts_glt_fusion_components(model)
+    if components is None:
+        raise ValueError('FusionWarm requires o8_glt or o8_glt_graph mode')
+    policy = str(policy)
+    if policy not in _MTS_GLT_STAGE2_TRAINABILITY:
+        raise ValueError(f'unsupported frozen-encoder policy: {policy}')
+    if policy in {'both_frozen', 'glt_query_only'}:
+        components['o8'].eval()
+    if policy in {'both_frozen', 'o8_only'}:
+        components['glt'].eval()
+    # The MD200 residual belongs to the downstream adapter, not the frozen O8
+    # body, and must remain in training mode during Stage 1.
+    components['md_residual'].train()
+
+
+def _finite_distribution(values):
+    values = torch.cat(values) if values else torch.empty(0)
+    values = values[torch.isfinite(values)]
+    if not values.numel():
+        return {
+            'mean': None, 'median': None, 'p10': None, 'p90': None,
+            'count': 0,
+        }
+    return {
+        'mean': float(values.mean()),
+        'median': float(values.median()),
+        'p10': float(torch.quantile(values, 0.10)),
+        'p90': float(torch.quantile(values, 0.90)),
+        'count': int(values.numel()),
+    }
+
+
+def collect_mts_glt_fusion_audit(model, data_loader, device):
+    """Measure the best-state GLT residual on one deterministic loader."""
+    components = _mts_glt_fusion_components(model)
+    if components is None:
+        raise ValueError('fusion audit requires o8_glt or o8_glt_graph mode')
+    encoder = components['encoder']
+    model.eval()
+    o8_norms, projected_norms, delta_norms, rhos, cosines = [], [], [], [], []
+    valid_count = 0
+    with torch.inference_mode():
+        for batch in data_loader:
+            batch = batch.to(device, non_blocking=True)
+            views = encoder.encode_views(batch)
+            valid = views['valid_3d']
+            if not bool(valid.any()):
+                continue
+            z_o8 = views['z_o8'][valid].float()
+            projected = views['projected_z_glt'][valid].float()
+            delta = views['delta_z_3d'][valid].float()
+            finite = (
+                torch.isfinite(z_o8).all(dim=-1)
+                & torch.isfinite(projected).all(dim=-1)
+                & torch.isfinite(delta).all(dim=-1)
+            )
+            if not bool(finite.any()):
+                continue
+            z_o8, projected, delta = z_o8[finite], projected[finite], delta[finite]
+            o8_norm = torch.linalg.vector_norm(z_o8, dim=-1)
+            projected_norm = torch.linalg.vector_norm(projected, dim=-1)
+            delta_norm = torch.linalg.vector_norm(delta, dim=-1)
+            denom = o8_norm * delta_norm
+            cosine_valid = denom > 1e-12
+            if bool(cosine_valid.any()):
+                cosines.append(
+                    ((z_o8[cosine_valid] * delta[cosine_valid]).sum(dim=-1)
+                     / denom[cosine_valid]).detach().cpu()
+                )
+            o8_norms.append(o8_norm.detach().cpu())
+            projected_norms.append(projected_norm.detach().cpu())
+            delta_norms.append(delta_norm.detach().cpu())
+            rhos.append((delta_norm / (o8_norm + 1e-8)).detach().cpu())
+            valid_count += int(finite.sum())
+    if not valid_count:
+        raise RuntimeError('fusion audit found no finite GLT-valid samples')
+    cosine = _finite_distribution(cosines)
+    return {
+        'valid_count': valid_count,
+        'o8_norm': _finite_distribution(o8_norms),
+        'projected_glt_norm': _finite_distribution(projected_norms),
+        'delta_3d_norm': _finite_distribution(delta_norms),
+        'rho': _finite_distribution(rhos),
+        'cosine_o8_delta': cosine,
+        'alpha': _mts_glt_gate_summary(components),
+    }
+
+
+def collect_mts_graphgate_audit(model, data_loader, device):
+    """Collect required channel-gate and residual statistics at the best state."""
+    base = _base_model(model)
+    graph = base.encoders['graph'] if 'graph' in getattr(base, 'encoders', {}) else None
+    encoder = getattr(graph, 'encoder', None)
+    if getattr(encoder, 'architecture_name', '') != 'MTS-GLT-GraphGate-v1':
+        return None
+    if getattr(encoder, 'downstream_mode', None) != 'o8_glt_graph':
+        return None
+    model.eval()
+    rhos = []
+    valid_count = 0
+    with torch.inference_mode():
+        for batch in data_loader:
+            batch = batch.to(device, non_blocking=True)
+            views = encoder.encode_views(batch)
+            valid = views['valid_3d'].bool()
+            if not bool(valid.any()):
+                continue
+            o8 = views['z_o8'][valid].float()
+            delta = views['delta_z_3d'][valid].float()
+            finite = torch.isfinite(o8).all(-1) & torch.isfinite(delta).all(-1)
+            if bool(finite.any()):
+                rhos.append((
+                    torch.linalg.vector_norm(delta[finite], dim=-1)
+                    / torch.linalg.vector_norm(o8[finite], dim=-1).clamp_min(1e-8)
+                ).cpu())
+                valid_count += int(finite.sum())
+    alpha = torch.tanh(encoder.channel_gate.detach().float()).cpu()
+    alpha_abs = alpha.abs()
+    return {
+        'valid_count': valid_count,
+        'rho': _finite_distribution(rhos),
+        'alpha': {
+            'mean_abs': float(alpha_abs.mean()),
+            'median_abs': float(alpha_abs.median()),
+            'p10': float(torch.quantile(alpha, 0.10)),
+            'p90': float(torch.quantile(alpha, 0.90)),
+            'fraction_abs_lt_0_01': float((alpha_abs < 0.01).float().mean()),
+            'fraction_positive': float((alpha > 0).float().mean()),
+            'fraction_negative': float((alpha < 0).float().mean()),
+        },
+    }
+
+
+def collect_mts_glt_initial_fusion_audit(model, data_loader, device):
+    """Collect epoch-0 fusion statistics without advancing experiment RNG."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    cpu_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    generator = getattr(data_loader, 'generator', None)
+    generator_state = generator.get_state() if generator is not None else None
+    training_modes = [(module, bool(module.training)) for module in model.modules()]
+    try:
+        return collect_mts_glt_fusion_audit(model, data_loader, device)
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+        if generator is not None and generator_state is not None:
+            generator.set_state(generator_state)
+        for module, training in training_modes:
+            module.training = training
+
+
 class _CpuStateAverager:
     """Incrementally average epoch checkpoints without duplicating the GPU model."""
 
@@ -639,10 +955,36 @@ def _configure_mts_trainability(model):
             _set_module_trainable(
                 getattr(mts_encoder, "star_distance_bias", None), False
             )
-        if not bool(getattr(mts_encoder, "use_mcl", True)):
-            _set_module_trainable(
-                getattr(mts_encoder, "trimer_mcl", None), False
-            )
+    if getattr(mts_encoder, "downstream_mode", None) == "o8_only":
+        _set_module_trainable(getattr(mts_encoder, "glt", None), False)
+        _set_module_trainable(getattr(mts_encoder, "glt_fusion_norm", None), False)
+        _set_module_trainable(getattr(mts_encoder, "glt_fusion_projection", None), False)
+        _set_module_trainable(getattr(mts_encoder, "atom_fusion_norm", None), False)
+        _set_module_trainable(getattr(mts_encoder, "atom_fusion_projection", None), False)
+        _set_module_trainable(getattr(mts_encoder, "compact19_residual", None), False)
+        gate = getattr(mts_encoder, "glt_gate", None)
+        if gate is not None:
+            gate.requires_grad = False
+        channel_gate = getattr(mts_encoder, "atom_channel_gate", None)
+        if channel_gate is not None:
+            channel_gate.requires_grad = False
+        _set_module_trainable(getattr(mts_encoder, "glt_line_encoder", None), False)
+        _set_module_trainable(getattr(mts_encoder, "fusion_norm", None), False)
+        _set_module_trainable(getattr(mts_encoder, "fusion_projection", None), False)
+        graph_gate = getattr(mts_encoder, "channel_gate", None)
+        if graph_gate is not None:
+            graph_gate.requires_grad = False
+    if getattr(mts_encoder, "downstream_mode", None) in {
+        "o8_only", "o8_glt", "o8_glt_atom", "o8_glt_atom_desc", "o8_glt_graph"
+    }:
+        _set_module_trainable(
+            getattr(getattr(mts_encoder, "o8", None), "star_distance_bias", None),
+            False,
+        )
+        _set_module_trainable(
+            getattr(getattr(mts_encoder, "o8_encoder", None), "star_distance_bias", None),
+            False,
+        )
 
     for module in (
         getattr(base, 'mlp', None),
@@ -682,16 +1024,19 @@ def _is_mts_model(model):
         return False
     encoders = getattr(base, 'encoders', {})
     graph_module = encoders['graph'] if 'graph' in encoders else None
-    return (
-        graph_module is not None
-        and getattr(graph_module.encoder, 'architecture_name', '')
-        == 'MIPS-Trimer-SCAGE'
-    )
+    return graph_module is not None and getattr(
+        graph_module.encoder, 'architecture_name', ''
+    ) in {
+        'MIPS-Trimer-SCAGE',
+        'MIPS-Trimer-GLT-v2',
+        'MTS-GLT-GraphGate-v1',
+    }
 
 
 def _build_downstream_optimizer(
     model, smiles_lr, graph_lr, geom_lr, fp_lr, fusion_lr, head_lr, weight_decay,
     mts_o8_lr=5e-6, mts_geometry_lr=1e-5, mts_adapter_lr=5e-5,
+    mts_glt_fusion_stage=None,
 ):
     base = _base_model(model)
     groups = []
@@ -702,7 +1047,7 @@ def _build_downstream_optimizer(
             return
         decay, no_decay = [], []
         for parameter_name, param in module.named_parameters():
-            if id(param) in used:
+            if not param.requires_grad or id(param) in used:
                 continue
             used.add(id(param))
             normalized_name = parameter_name.lower()
@@ -769,6 +1114,100 @@ def _build_downstream_optimizer(
             })
 
         graph_module = encoders['graph'] if 'graph' in encoders else None
+        if mts_glt_fusion_stage is not None:
+            stage = str(mts_glt_fusion_stage)
+            if stage not in {'warm', 'joint'}:
+                raise ValueError('mts_glt_fusion_stage must be warm or joint')
+            components = _mts_glt_fusion_components(model)
+            if components is None or graph_module is None:
+                raise ValueError('FusionWarm optimizer requires O8+GLT graph mode')
+            encoder = components['encoder']
+
+            def add_named_parameters(named_parameters, lr, name):
+                decay, no_decay = [], []
+                for parameter_name, parameter in named_parameters:
+                    if not parameter.requires_grad or id(parameter) in used:
+                        continue
+                    used.add(id(parameter))
+                    normalized = str(parameter_name).lower()
+                    target = (
+                        no_decay if (
+                            parameter.ndim <= 1
+                            or normalized.endswith('bias')
+                            or 'norm' in normalized
+                            or 'gate' in normalized
+                        ) else decay
+                    )
+                    target.append(parameter)
+                if decay:
+                    groups.append({
+                        'params': decay, 'lr': float(lr),
+                        'weight_decay': float(weight_decay),
+                        'name': f'{name}/decay',
+                    })
+                if no_decay:
+                    groups.append({
+                        'params': no_decay, 'lr': float(lr),
+                        'weight_decay': 0.0,
+                        'name': f'{name}/no_decay',
+                    })
+
+            if stage == 'joint':
+                o8_lr = (
+                    float(mts_o8_lr)
+                    if components['kind'] == 'channel' else float(graph_lr)
+                )
+                glt_lr = (
+                    float(mts_geometry_lr)
+                    if components['kind'] == 'channel' else float(graph_lr)
+                )
+                add_named_parameters(
+                    (
+                        (name, parameter)
+                        for name, parameter in components['o8'].named_parameters()
+                        if not name.startswith('md_residual.')
+                    ),
+                    o8_lr, 'o8_encoder',
+                )
+                add_named_parameters(
+                    components['glt'].named_parameters(), glt_lr, 'glt_encoder'
+                )
+            fusion_prefix = (
+                'graphgate_fusion'
+                if components['kind'] == 'channel' else 'glt_fusion'
+            )
+            add_group(
+                components['fusion_norm'], fusion_lr, f'{fusion_prefix}_norm'
+            )
+            add_group(
+                components['fusion_projection'], fusion_lr,
+                f'{fusion_prefix}_projection',
+            )
+            gate_group = (
+                'graphgate_channel_gate'
+                if components['kind'] == 'channel' else 'glt_gate'
+            )
+            add_named_parameters(
+                [('gate', components['gate'])], fusion_lr,
+                gate_group,
+            )
+            add_group(components['md_residual'], fusion_lr, 'md200_residual')
+            add_group(
+                nn.ModuleList([graph_module.norm, graph_module.projection]),
+                head_lr, 'graph_output_adapter',
+            )
+            add_group(base.mlp, head_lr, 'regression_head')
+            remaining = [
+                name for name, parameter in base.named_parameters()
+                if parameter.requires_grad and id(parameter) not in used
+            ]
+            if remaining:
+                raise RuntimeError(
+                    'FusionWarm optimizer omitted trainable parameters: '
+                    + ', '.join(remaining[:10])
+                )
+            return torch.optim.AdamW(groups)
+
         if graph_module is not None:
             add_mts_group(graph_module, graph_lr, 'graph')
 
@@ -934,13 +1373,51 @@ def train_and_evaluate(
     mts_adapter_lr=5e-5,
     pcgrad=False,
     amp_dtype='fp32',
+    mts_glt_postmortem=False,
+    mts_glt_fusion_strategy='legacy_zero',
+    mts_glt_fusion_warm_epochs=5,
+    mts_glt_initial_alpha=0.1,
+    mts_glt_fusion_stage2_trainability='joint',
 ):
     # Define loss function and optimizer
     criterion = nn.SmoothL1Loss(beta=float(huber_beta)) if regression_loss == 'huber' else nn.MSELoss()
     base = _base_model(model)
     if not _is_mts_model(base):
         raise ValueError('MTS training requires an MTS graph model')
-    _configure_mts_trainability(model)
+    fusion_strategy = str(mts_glt_fusion_strategy)
+    if fusion_strategy not in {'legacy_zero', 'fusion_warm'}:
+        raise ValueError('unsupported MTS-GLT fusion strategy')
+    fusion_warm = fusion_strategy == 'fusion_warm'
+    fusion_warm_epochs = int(mts_glt_fusion_warm_epochs)
+    stage2_trainability = str(mts_glt_fusion_stage2_trainability)
+    if stage2_trainability not in _MTS_GLT_STAGE2_TRAINABILITY:
+        raise ValueError(
+            'unsupported FusionWarm Stage 2 trainability: '
+            f'{stage2_trainability}'
+        )
+    if fusion_warm:
+        if not 0 <= fusion_warm_epochs < int(num_epochs):
+            raise ValueError(
+                'FusionWarm epochs must be non-negative and smaller than num_epochs'
+            )
+        if int(swa_start_epoch) >= 0:
+            raise ValueError('FusionWarm does not use SWA')
+        _configure_mts_glt_fusion_stage(model, 'warm')
+        warm_components = _mts_glt_fusion_components(model)
+        expected_alpha = float(mts_glt_initial_alpha)
+        observed_alpha = torch.tanh(warm_components['gate'].detach()).float()
+        if not bool(torch.allclose(
+            observed_alpha,
+            torch.full_like(observed_alpha, expected_alpha),
+            atol=1e-7, rtol=0.0,
+        )):
+            raise ValueError(
+                'FusionWarm gate must be initialized after checkpoint load: '
+                f'expected alpha={expected_alpha}, '
+                f'observed mean={float(observed_alpha.mean())}'
+            )
+    else:
+        _configure_mts_trainability(model)
     if str(amp_dtype) not in {'fp32', 'bf16'}:
         raise ValueError("amp_dtype must be fp32 or bf16")
     if str(amp_dtype) == 'bf16':
@@ -956,15 +1433,57 @@ def train_and_evaluate(
         weight_decay, mts_o8_lr=mts_o8_lr,
         mts_geometry_lr=mts_geometry_lr,
         mts_adapter_lr=mts_adapter_lr,
+        mts_glt_fusion_stage='warm' if fusion_warm else None,
     )
-    total_steps = max(1, len(train_loader) * num_epochs)
-    warmup_steps = min(total_steps - 1, max(0, int(warmup_epochs) * len(train_loader)))
-    def lr_lambda(step):
-        if warmup_steps and step < warmup_steps:
-            return float(step + 1) / float(warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + np.cos(np.pi * min(1.0, max(0.0, progress))))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    postmortem_components = (
+        _mts_glt_fusion_components(model) if mts_glt_postmortem else None
+    )
+    postmortem_encoder = (
+        postmortem_components['encoder']
+        if postmortem_components is not None else None
+    )
+    if mts_glt_postmortem and postmortem_components is None:
+        raise ValueError(
+            'MTS-GLT postmortem requires o8_glt or o8_glt_graph mode'
+        )
+    initial_fusion_weight = (
+        postmortem_components['fusion_projection'].weight.detach().cpu().clone()
+        if postmortem_components is not None else None
+    )
+    gate_trajectory = []
+    initial_fusion_audit = None
+    if fusion_warm:
+        if postmortem_encoder is None:
+            raise ValueError('FusionWarm requires fusion audit output')
+        initial_fusion_audit = collect_mts_glt_initial_fusion_audit(
+            model, val_loader, device
+        )
+        initial_row = {
+            'epoch': 0,
+            'stage': 'initial',
+            'validation_r2': None,
+            'is_best': False,
+        }
+        initial_row.update(_mts_glt_trajectory_fields(initial_fusion_audit))
+        gate_trajectory.append(initial_row)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda _step: 1.0
+        )
+    else:
+        total_steps = max(1, len(train_loader) * num_epochs)
+        warmup_steps = min(
+            total_steps - 1, max(0, int(warmup_epochs) * len(train_loader))
+        )
+
+        def lr_lambda(step):
+            if warmup_steps and step < warmup_steps:
+                return float(step + 1) / float(warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (
+                1.0 + np.cos(np.pi * min(1.0, max(0.0, progress)))
+            )
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     best_val_r2 = -float('inf')
     best_val_rmse = float('inf')
@@ -976,6 +1495,42 @@ def train_and_evaluate(
     training_timing = []
 
     for epoch in range(num_epochs):
+        if fusion_warm and epoch == fusion_warm_epochs:
+            _configure_mts_glt_fusion_stage(
+                model, 'joint', stage2_trainability
+            )
+            optimizer = _build_downstream_optimizer(
+                model, smiles_lr, graph_lr, geom_lr, fp_lr,
+                fusion_lr, head_lr, weight_decay,
+                mts_o8_lr=mts_o8_lr,
+                mts_geometry_lr=mts_geometry_lr,
+                mts_adapter_lr=mts_adapter_lr,
+                mts_glt_fusion_stage='joint',
+            )
+            joint_steps = max(
+                1, len(train_loader) * (int(num_epochs) - fusion_warm_epochs)
+            )
+
+            def joint_lr_lambda(step):
+                progress = float(step) / float(max(1, joint_steps - 1))
+                return 0.5 * (
+                    1.0 + np.cos(np.pi * min(1.0, max(0.0, progress)))
+                )
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, joint_lr_lambda
+            )
+            epochs_no_improve = 0
+            print(
+                f'FusionWarm Stage 2 begins at epoch {epoch + 1}: '
+                f'trainability={stage2_trainability}; optimizer and cosine '
+                'scheduler rebuilt.'
+            )
+        epoch_stage = (
+            'fusion_warm'
+            if fusion_warm and epoch < fusion_warm_epochs
+            else ('joint_finetune' if fusion_warm else 'legacy')
+        )
         # Training phase
         (
             avg_train_loss, train_r2, avg_fused_loss,
@@ -997,6 +1552,16 @@ def train_and_evaluate(
             pcgrad=pcgrad,
             amp_dtype=amp_dtype,
             return_timing=True,
+            mts_glt_frozen_encoders_eval=(epoch_stage == 'fusion_warm'),
+            mts_glt_frozen_encoder_policy=(
+                'both_frozen'
+                if epoch_stage == 'fusion_warm'
+                else (
+                    stage2_trainability
+                    if fusion_warm and stage2_trainability != 'joint'
+                    else None
+                )
+            ),
         )
         training_timing.append(epoch_timing)
 
@@ -1013,8 +1578,13 @@ def train_and_evaluate(
         val_rmse = float(np.sqrt(metrics.mean_squared_error(
             val_true_raw, val_pred_raw
         )))
+        epoch_audit = (
+            collect_mts_glt_fusion_audit(model, val_loader, device)
+            if fusion_warm else None
+        )
         # Early stopping
-        if val_r2 > best_val_r2:
+        is_best = bool(val_r2 > best_val_r2)
+        if is_best:
             best_val_r2 = val_r2
             best_val_rmse = val_rmse
             best_epoch = epoch + 1
@@ -1022,10 +1592,27 @@ def train_and_evaluate(
             epochs_no_improve = 0
             print(f"Epoch {epoch+1}: Validation R2 improved to {val_r2:.4f}.")
         else:
-            epochs_no_improve += 1
-            print(f"Epoch {epoch+1}: No improvement in Validation R2 for {epochs_no_improve} epoch(s).")
+            if epoch_stage == 'fusion_warm':
+                print(
+                    f"Epoch {epoch+1}: No validation improvement; "
+                    "FusionWarm does not consume early-stopping patience."
+                )
+            else:
+                epochs_no_improve += 1
+                print(f"Epoch {epoch+1}: No improvement in Validation R2 for {epochs_no_improve} epoch(s).")
 
-        if epochs_no_improve >= patience:
+        if postmortem_encoder is not None:
+            row = {
+                'epoch': int(epoch + 1),
+                'stage': epoch_stage,
+                'validation_r2': float(val_r2),
+                'is_best': is_best,
+            }
+            if epoch_audit is not None:
+                row.update(_mts_glt_trajectory_fields(epoch_audit))
+            gate_trajectory.append(row)
+
+        if epoch_stage != 'fusion_warm' and epochs_no_improve >= patience:
             print(f"Early stopping after {patience} epochs with no improvement.")
             break
 
@@ -1085,6 +1672,38 @@ def train_and_evaluate(
         best_model_state = copy.deepcopy(model.state_dict())
     model.load_state_dict(best_model_state)
 
+    postmortem = None
+    if postmortem_components is not None:
+        # load_state_dict updates the same encoder object in place.
+        best_weight = (
+            postmortem_components['fusion_projection'].weight.detach().cpu()
+        )
+        projection_relative_change = float(
+            torch.linalg.vector_norm(best_weight - initial_fusion_weight)
+            / (torch.linalg.vector_norm(initial_fusion_weight) + 1e-8)
+        )
+        final_alpha = _mts_glt_gate_summary(postmortem_components)
+        postmortem = {
+            'fusion_strategy': fusion_strategy,
+            'fusion_kind': postmortem_components['kind'],
+            'fusion_warm_epochs': fusion_warm_epochs if fusion_warm else 0,
+            'stage2_trainability': stage2_trainability,
+            'initial_alpha': float(mts_glt_initial_alpha) if fusion_warm else 0.0,
+            'initial_validation': initial_fusion_audit,
+            'gate_trajectory': gate_trajectory,
+            'final_alpha': final_alpha,
+            'projection_relative_change': projection_relative_change,
+            'validation': collect_mts_glt_fusion_audit(
+                model, val_loader, device
+            ),
+            'test': collect_mts_glt_fusion_audit(model, test_loader, device),
+        }
+        if 'gate' in final_alpha:
+            postmortem.update({
+                'final_gate': final_alpha['gate'],
+                'final_tanh_gate': final_alpha['tanh_gate'],
+            })
+
     # In refit mode, defer the only outer-test evaluation until after refitting.
     test_metrics = (
         test_model(
@@ -1113,6 +1732,14 @@ def train_and_evaluate(
         ),
         'training_epoch_timing': training_timing,
     })
+    if postmortem is not None:
+        test_metrics['_mts_glt_postmortem'] = postmortem
+    graphgate_validation = collect_mts_graphgate_audit(model, val_loader, device)
+    if graphgate_validation is not None:
+        test_metrics['_mts_glt_graphgate_audit'] = {
+            'validation': graphgate_validation,
+            'test': collect_mts_graphgate_audit(model, test_loader, device),
+        }
     return test_metrics
 
 

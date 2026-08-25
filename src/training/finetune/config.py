@@ -43,7 +43,7 @@ def parse_modality(value):
         )
     return value
 
-def parse_arguments():
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description="Train UniEncoderAttention Model")
     parser.add_argument('--experiment_id', default='manual')
     parser.add_argument('--predictions_dir', default='')
@@ -368,41 +368,75 @@ def parse_arguments():
     )
     parser.add_argument(
         '--topology_attention_variant',
-        choices=['o8', 'msta_last2'],
-        default='msta_last2',
-        help='Topology attention variant retained as a generic model option.',
+        choices=['o8'],
+        default='o8',
+        help='B0-v2 uses the original O8 attention stack.',
     )
-    parser.add_argument('--msta_layer_indices', nargs=2, type=int, default=[4, 5])
-    parser.add_argument('--msta_local_spd', nargs='+', type=int, default=[0, 1])
-    parser.add_argument('--msta_context_spd', nargs='+', type=int, default=[0, 1, 2])
-    parser.add_argument(
-        '--msta_share_relation_dropout',
-        action=argparse.BooleanOptionalAction, default=True,
-    )
-    parser.add_argument(
-        '--msta_local_output_bias',
-        action=argparse.BooleanOptionalAction, default=False,
-    )
-    parser.add_argument('--msta_local_output_init', choices=['zero'], default='zero')
     parser.add_argument('--star_rbf_upper', type=float, default=3.0)
     parser.add_argument('--star_rbf_v2_sidecar', default=None)
+    parser.add_argument('--periodic_line_glt_sidecar', default=None)
+    parser.add_argument(
+        '--mts_glt_mode',
+        choices=['none', 'o8_only', 'o8_glt', 'o8_glt_atom', 'o8_glt_atom_desc', 'o8_glt_graph'],
+        default='none',
+    )
+    parser.add_argument('--mts_glt_version', choices=['v1', 'v2', 'graphgate_v1'], default='v1')
+    parser.add_argument('--mts_glt_geometry_mode', choices=['full', 'off'], default='full')
+    parser.add_argument('--mts_glt_layers', type=int, choices=[6, 12], default=6)
+    parser.add_argument(
+        '--mts_glt_attention_variant', choices=['mips', 'paper'], default='mips'
+    )
+    parser.add_argument('--mts_glt_use_compact19', action='store_true')
+    parser.add_argument(
+        '--mts_glt_postmortem_dir', default='',
+        help=(
+            'Optional isolated directory for MTS-GLT fusion diagnostics. '
+            'Empty keeps the production fine-tune path unchanged.'
+        ),
+    )
+    parser.add_argument(
+        '--mts_glt_fusion_strategy',
+        choices=['legacy_zero', 'fusion_warm'],
+        default='legacy_zero',
+        help='Downstream GLT fusion schedule. legacy_zero preserves MTS-GLT-v1.',
+    )
+    parser.add_argument(
+        '--mts_glt_fusion_warm_epochs', type=int, default=5,
+        help=(
+            'Constant-LR fusion-only epochs before joint GLT/O8 fine-tuning; '
+            'zero starts joint fine-tuning at the first optimizer step.'
+        ),
+    )
+    parser.add_argument(
+        '--mts_glt_initial_alpha', type=float, default=0.1,
+        help='Initial tanh(gate) value for fusion_warm after checkpoint loading.',
+    )
+    parser.add_argument(
+        '--mts_glt_fusion_warm_dir', default='',
+        help='Isolated per-fold FusionWarm audit output directory.',
+    )
+    parser.add_argument(
+        '--mts_glt_fusion_stage2_trainability',
+        choices=['both_frozen', 'o8_only', 'glt_query_only', 'joint'],
+        default='joint',
+        help=(
+            'Encoder trainability during FusionWarm Stage 2. The default '
+            'joint preserves the established FusionWarm behavior.'
+        ),
+    )
     parser.add_argument(
         '--use_star_rbf', action=argparse.BooleanOptionalAction, default=True,
     )
     parser.add_argument(
-        '--use_mcl', action=argparse.BooleanOptionalAction, default=True,
+        '--use_mcl', action=argparse.BooleanOptionalAction, default=False,
     )
     parser.add_argument(
         '--use_md200', action=argparse.BooleanOptionalAction, default=True,
     )
     parser.add_argument(
         '--topology_representation',
-        choices=['canonical_lifted', 'explicit_k_ru'],
+        choices=['canonical_lifted'],
         default='canonical_lifted',
-    )
-    parser.add_argument(
-        '--mcl_distance_percentiles', nargs=2, type=float,
-        default=[0.20, 0.50],
     )
     parser.add_argument('--trimer_num_candidates', type=int, default=4)
     parser.add_argument('--trimer_max_heavy_atoms', type=int, default=384)
@@ -532,9 +566,30 @@ def parse_arguments():
         default='full',
         help='Conformer search budget. Must match the profile used to build the feature cache.'
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if int(args.eval_batch_size) < int(args.batch_size):
         raise ValueError("--eval_batch_size must be >= --batch_size")
+    if args.mts_glt_fusion_strategy == 'fusion_warm':
+        if args.mts_glt_mode not in {'o8_glt', 'o8_glt_graph'}:
+            parser.error(
+                '--mts_glt_fusion_strategy=fusion_warm requires '
+                '--mts_glt_mode=o8_glt or o8_glt_graph'
+            )
+        if (
+            args.mts_glt_mode == 'o8_glt_graph'
+            and args.mts_glt_version != 'graphgate_v1'
+        ):
+            parser.error(
+                '--mts_glt_mode=o8_glt_graph requires '
+                '--mts_glt_version=graphgate_v1'
+            )
+        if int(args.mts_glt_fusion_warm_epochs) < 0:
+            parser.error('--mts_glt_fusion_warm_epochs must be non-negative')
+        if not 0.0 < float(args.mts_glt_initial_alpha) < 1.0:
+            parser.error('--mts_glt_initial_alpha must be strictly between 0 and 1')
+        # FusionWarm owns its two-stage LR schedule: constant Stage 1 and a
+        # fresh no-warmup cosine schedule after the Stage 2 optimizer rebuild.
+        args.warmup_epochs = 0
     # These are fixed MTS topology values, not user-selectable route
     # parameters. Retired geometry and staged-finetuning controls are
     # intentionally absent from the runtime namespace.

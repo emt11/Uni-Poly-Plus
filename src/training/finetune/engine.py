@@ -23,8 +23,6 @@ from src.dataset.mips_trimer_contract import (
     CACHE_BUNDLE_SCHEMA as MIPS_TRIMER_CACHE_BUNDLE_SCHEMA,
     TOPOLOGY_LMDB_SCHEMA as MIPS_TRIMER_TOPOLOGY_SCHEMA,
     CHECKPOINT_SCHEMA as MIPS_TRIMER_CHECKPOINT_SCHEMA,
-    EXPLICIT_TOPOLOGY_LMDB_SCHEMA as MIPS_EXPLICIT_TOPOLOGY_SCHEMA,
-    TOPOLOGY_EXPLICIT,
     ROUTE_INTERNAL as MTS_ROUTE_INTERNAL,
     ROUTE_NAME as MTS_ROUTE_NAME,
     ROUTE_SHORT_NAME as MTS_ROUTE_SHORT_NAME,
@@ -220,8 +218,8 @@ def select_mts_checkpoint_transfer_keys(
 
     Stage-3 fine-tuning deliberately reinitializes the MD200 residual,
     graph projection/norm and regression head.  Every other common
-    ``encoders.graph.encoder`` tensor is part of the learned topology state,
-    including the retained MSTA topology parameters.  Keeping the selection
+    ``encoders.graph.encoder`` tensor is part of the learned B0-v2 topology
+    state. Keeping the selection
     in one small, testable function prevents a descriptive log line from
     becoming a weaker loading contract.
     """
@@ -260,7 +258,7 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
     """
     from src.modules import UniEncoderAttention
 
-    return UniEncoderAttention(
+    model = UniEncoderAttention(
         joint_embedding_dim=args.joint_embedding_dim,
         smiles_model_name=args.smiles_model_name,
         gnn_model_name="",
@@ -296,7 +294,6 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
         mips_use_descriptors=args.mips_use_descriptors,
         spatial_mode=args.spatial_mode,
         graph_geometry_mode=args.graph_geometry_mode,
-        mcl_distance_percentiles=args.mcl_distance_percentiles,
         trimer_num_candidates=args.trimer_num_candidates,
         trimer_max_heavy_atoms=args.trimer_max_heavy_atoms,
         mips_variant=args.mips_variant,
@@ -321,15 +318,9 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
         mips_mask_policy=args.mips_mask_policy,
         mips_masked_loss_reduction=args.mips_masked_loss_reduction,
         topology_attention_variant=args.topology_attention_variant,
-        msta_layer_indices=args.msta_layer_indices,
-        msta_local_spd=args.msta_local_spd,
-        msta_context_spd=args.msta_context_spd,
-        msta_share_relation_dropout=args.msta_share_relation_dropout,
-        msta_local_output_bias=args.msta_local_output_bias,
-        msta_local_output_init=args.msta_local_output_init,
         star_rbf_upper=args.star_rbf_upper,
         use_star_rbf=bool(getattr(args, 'use_star_rbf', True)),
-        use_mcl=bool(getattr(args, 'use_mcl', True)),
+        use_mcl=bool(getattr(args, 'use_mcl', False)),
         fusion_type=args.fusion_type,
         fp_mode=args.fp_mode,
         fusion_dropout=args.fusion_dropout,
@@ -343,6 +334,62 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
             'graph': args.graph_modality_dropout,
         },
     )
+    glt_mode = str(getattr(args, "mts_glt_mode", "none"))
+    if glt_mode != "none":
+        if tuple(args.modalities) != ("graph",):
+            raise ValueError("MTS-GLT downstream supports graph-only mode")
+        if bool(getattr(args, "use_star_rbf", False)):
+            raise ValueError("MTS-GLT downstream requires Star-RBF off")
+        glt_version = str(getattr(args, "mts_glt_version", "v1"))
+        if glt_version == "graphgate_v1":
+            if glt_mode not in {"o8_only", "o8_glt_graph"}:
+                raise ValueError("GraphGate supports only o8_only/o8_glt_graph")
+            from src.modules import MTSGraphGateModel
+            encoder = MTSGraphGateModel(layers=6)
+            encoder.glt_geometry_mode = str(args.mts_glt_geometry_mode)
+        elif glt_version == "v2":
+            from src.modules import MTSGraphLineModelV2
+            encoder = MTSGraphLineModelV2(
+                glt_layers=int(args.mts_glt_layers),
+                glt_attention_variant=str(args.mts_glt_attention_variant),
+                use_compact19=bool(args.mts_glt_use_compact19),
+            )
+        else:
+            from src.modules import MTSGraphLineModel
+            encoder = MTSGraphLineModel()
+        encoder.downstream_mode = glt_mode
+        model.encoders["graph"].encoder = encoder
+    return model
+
+
+def select_mts_glt_graph_state(model_state, checkpoint_state, *, graphgate=False):
+    """Map a GLT pretrain container into the exact downstream graph module."""
+    graph_prefix = 'encoders.graph.encoder.'
+    mapped = {
+        graph_prefix + str(key)[len('model.'):]: value
+        for key, value in checkpoint_state.items()
+        if str(key).startswith('model.')
+    }
+    expected = {key for key in model_state if key.startswith(graph_prefix)}
+    if graphgate:
+        expected = {
+            key for key in expected
+            if (
+                key.startswith(graph_prefix + "o8_encoder.")
+                and not key.startswith(graph_prefix + "o8_encoder.md_residual.")
+                and not key.startswith(graph_prefix + "o8_encoder.star_distance_bias.")
+            )
+            or key.startswith(graph_prefix + "glt_line_encoder.")
+        }
+    if set(mapped) != expected:
+        missing = sorted(expected - set(mapped))
+        unexpected = sorted(set(mapped) - expected)
+        raise RuntimeError(
+            'MTS-GLT graph checkpoint mismatch; missing='
+            + ','.join(missing[:10]) + ' unexpected='
+            + ','.join(unexpected[:10])
+        )
+    return mapped
 
 
 def run_finetune_job(config=None, task=None, seed=None, fold=None):
@@ -421,7 +468,6 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             spatial_mode=args.spatial_mode,
             graph_geometry_mode=args.graph_geometry_mode,
             topology_representation=args.topology_representation,
-            mcl_distance_percentiles=args.mcl_distance_percentiles,
             trimer_num_candidates=args.trimer_num_candidates,
             trimer_max_heavy_atoms=args.trimer_max_heavy_atoms,
             mips_variant=args.mips_variant,
@@ -433,6 +479,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             feature_config_hash="manual",
             modalities=args.modalities,
             star_rbf_v2_sidecar=args.star_rbf_v2_sidecar,
+            periodic_line_glt_sidecar=args.periodic_line_glt_sidecar,
         )
         for dataset_name in dataset_name_list
     ]
@@ -455,43 +502,6 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             raise RuntimeError(
                 f"{MTS_ROUTE_NAME} training requires frozen cache artifacts: "
                 + ", ".join(unfrozen)
-            )
-    # Runtime fine-tuning only needs the angle sidecar's local schema/files.
-    # Full artifact/.done digests remain available to explicit offline audits,
-    # but are intentionally not part of the production reader startup path.
-    pretraining_cohort_hash = (
-        _cohort_hash_from_current_manifest(args.root, args.checkpoint_pretraining_dataset)
-        if args.graph_encoder_type == "mips_trimer_scage"
-        else None
-    )
-    angle_cache_available = True
-    if args.graph_encoder_type == "mips_trimer_scage" and not args.cache_only:
-        cache_specs = dataset_list[0]._lmdb_cache_specs({})
-        trimer_root = Path(cache_specs["trimer"]["root"])
-        angle_dir = trimer_root / "derived" / "bond_angle" / str(
-            pretraining_cohort_hash or ""
-        )
-        angle_metadata = angle_dir / "metadata.json"
-        # The canonical categorical sidecar stores ragged offsets/indices and
-        # uses ``angle_bins.npy``/``angle_valid.npy``; older continuous
-        # sidecars use ``angle_cos.npy``/``validation_mask.npy``.  Both are
-        # valid local reader contracts.  Do not require the retired generic
-        # ``values.npy``/``valid.npy`` names.
-        common = (
-            angle_metadata,
-            angle_dir / "angle_offsets.npy",
-            angle_dir / "angle_indices.npy",
-        )
-        categorical = (angle_dir / "angle_bins.npy", angle_dir / "angle_valid.npy")
-        continuous = (angle_dir / "angle_cos.npy", angle_dir / "validation_mask.npy")
-        angle_cache_available = all(path.is_file() for path in common) and (
-            all(path.is_file() for path in categorical)
-            or all(path.is_file() for path in continuous)
-        )
-        if not angle_cache_available:
-            raise RuntimeError(
-                "MTS property fine-tuning requires a readable bond-angle "
-                "sidecar (metadata.json plus canonical angle arrays)"
             )
     if args.cache_only:
         print(
@@ -802,6 +812,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             )
             if (
                 args.graph_encoder_type == MTS_ROUTE_INTERNAL
+                and bool(getattr(args, "use_star_rbf", False))
                 and getattr(args, "star_rbf_upper", None) is not None
             ):
                 star_bias = model.encoders["graph"].encoder.star_distance_bias
@@ -837,6 +848,9 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                     )
             if pretrained_model_path:
                 checkpoint = torch.load(pretrained_model_path, map_location='cpu')
+                graphgate_checkpoint = (
+                    str(getattr(args, 'mts_glt_version', 'v1')) == 'graphgate_v1'
+                )
                 if args.graph_encoder_type == 'mips_trimer_scage':
                     # Metadata is historical provenance only.  The active
                     # compatibility contract is the real state-dict key/shape
@@ -845,7 +859,21 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                     # minimal final ``{"state_dict": ...}`` payload.
                     if not isinstance(checkpoint, dict):
                         raise RuntimeError("MTS checkpoint must be a mapping")
-                    checkpoint_state = checkpoint.get("state_dict", checkpoint)
+                    if graphgate_checkpoint:
+                        if checkpoint.get("schema") != "mts-glt-graphgate-v1-probe-v1":
+                            raise RuntimeError("GraphGate downstream requires a GraphGate probe checkpoint")
+                        namespaces = checkpoint.get("namespaces")
+                        if not isinstance(namespaces, dict):
+                            raise RuntimeError("GraphGate checkpoint namespaces are missing")
+                        checkpoint_state = {}
+                        for key, value in namespaces.get("o8_encoder", {}).items():
+                            checkpoint_state["model.o8_encoder." + str(key)] = value
+                        for key, value in namespaces.get("glt_line_encoder", {}).items():
+                            checkpoint_state["model.glt_line_encoder." + str(key)] = value
+                        for key, value in namespaces.get("query_pool", {}).items():
+                            checkpoint_state["model.glt_line_encoder.query_pool." + str(key)] = value
+                    else:
+                        checkpoint_state = checkpoint.get("state_dict", checkpoint)
                     if not isinstance(checkpoint_state, dict):
                         raise RuntimeError("MTS checkpoint does not contain a state_dict mapping")
                     checkpoint_meta = (
@@ -853,15 +881,19 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                         if isinstance(checkpoint.get("meta"), dict) else {}
                     )
                     expected_stage = MTS_STAGE1_ID
-                    checkpoint_state = checkpoint['state_dict']
+                    if not graphgate_checkpoint:
+                        checkpoint_state = checkpoint['state_dict']
                     # B0's DDP-visible pretraining container stores the
                     # UniEncoder under ``model.`` and keeps its two pretext
                     # heads alongside it.  Downstream consumes only the
                     # strict UniEncoder state; discard heads and normalize
                     # the prefix before the existing compatibility audit.
-                    if checkpoint_state and any(
-                        str(key).startswith("model.")
-                        for key in checkpoint_state
+                    if (
+                        str(getattr(args, 'mts_glt_mode', 'none')) == 'none'
+                        and checkpoint_state and any(
+                            str(key).startswith("model.")
+                            for key in checkpoint_state
+                        )
                     ):
                         checkpoint_state = {
                             str(key)[len("model."):]: value
@@ -875,7 +907,10 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 missing = sorted(model_keys - checkpoint_keys)
                 unexpected = sorted(checkpoint_keys - model_keys)
                 allowed_transfer_missing = set()
-                if args.graph_encoder_type == 'mips_trimer_scage':
+                if (
+                    args.graph_encoder_type == 'mips_trimer_scage'
+                    and str(getattr(args, 'mts_glt_mode', 'none')) == 'none'
+                ):
                     missing, unexpected, incompatible = (
                         _scage_checkpoint_key_compatibility(
                             model_keys,
@@ -886,27 +921,6 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                         )
                     )
                     if incompatible:
-                        if "mcl_rbf" in str(args.graph_geometry_mode):
-                            # The completed immutable joint checkpoint predates
-                            # the optional MCL-v2 continuous-distance channel.
-                            # Permit only newly introduced, deterministically
-                            # initialized MCL-v2 tensors to be absent.  An
-                            # unexpected checkpoint tensor remains an error.
-                            allowed_mcl_v2_missing = {
-                                key for key in missing
-                                if key.startswith(
-                                    "encoders.graph.encoder.trimer_mcl.layers."
-                                ) and (
-                                    ".distance_projection." in key
-                                    or key.endswith(".distance_centers")
-                                )
-                            }
-                            allowed_transfer_missing = set(allowed_mcl_v2_missing)
-                            incompatible = [
-                                key for key in incompatible
-                                if key not in allowed_mcl_v2_missing
-                            ]
-                    if incompatible:
                         raise RuntimeError(
                             f"{args.graph_encoder_type.upper()} {expected_stage} checkpoint mismatch. "
                             "Re-run MTS Joint Pretraining "
@@ -914,7 +928,22 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                             + ", ".join(incompatible[:10])
                         )
                 merged_state = model.state_dict()
-                if args.graph_encoder_type == 'mips_trimer_scage':
+                if (
+                    args.graph_encoder_type == 'mips_trimer_scage'
+                    and str(getattr(args, 'mts_glt_mode', 'none')) != 'none'
+                ):
+                    glt_state = select_mts_glt_graph_state(
+                        merged_state, checkpoint_state,
+                        graphgate=graphgate_checkpoint,
+                    )
+                    merged_state.update(glt_state)
+                    missing = sorted(set(merged_state) - set(glt_state))
+                    unexpected = []
+                    print(
+                        f'MTS-GLT checkpoint load: strictly loaded '
+                        f'{len(glt_state)} graph tensors for {args.mts_glt_mode}.'
+                    )
+                elif args.graph_encoder_type == 'mips_trimer_scage':
                     # Joint pretraining intentionally exports a complete model
                     # container, but Stage 3 migrates only learned structural
                     # modules.  MD200, graph norm/projection and regression
@@ -929,8 +958,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                     }
                     merged_state.update(transferred)
                     print(
-                        'MTS checkpoint migration: loaded topology encoder '
-                        '(including MSTA/G-family geometry parameters when present) '
+                        'B0-v2 checkpoint load: loaded O8/Star topology encoder '
                         f'({len(transferred)} tensors); '
                         'MD200/projection/head reinitialized by fold seed.'
                     )
@@ -942,6 +970,15 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 model.load_state_dict(merged_state, strict=True)
                 print(f"Loaded pretrained model from {pretrained_model_path}")
                 print(f"Checkpoint load: {len(missing)} missing keys, {len(unexpected)} unexpected keys")
+                if str(args.mts_glt_fusion_strategy) == 'fusion_warm':
+                    from src.utils import initialize_mts_glt_fusion_warm
+                    observed_alpha = initialize_mts_glt_fusion_warm(
+                        model, args.mts_glt_initial_alpha
+                    )
+                    print(
+                        'Initialized MTS-GLT FusionWarm after strict checkpoint '
+                        f'load: alpha={observed_alpha:.9f}'
+                    )
             initial_model_state = {
                 key: value.detach().cpu().clone()
                 for key, value in model.state_dict().items()
@@ -981,8 +1018,84 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 mts_adapter_lr=args.mts_adapter_lr,
                 pcgrad=args.finetune_mode == 'multitask_pcgrad',
                 amp_dtype=args.amp_dtype,
+                mts_glt_postmortem=bool(
+                    args.mts_glt_postmortem_dir
+                    or args.mts_glt_fusion_warm_dir
+                ),
+                mts_glt_fusion_strategy=args.mts_glt_fusion_strategy,
+                mts_glt_fusion_warm_epochs=args.mts_glt_fusion_warm_epochs,
+                mts_glt_initial_alpha=args.mts_glt_initial_alpha,
+                mts_glt_fusion_stage2_trainability=(
+                    args.mts_glt_fusion_stage2_trainability
+                ),
                 context=fold_context,
             )
+            postmortem = metrics.pop('_mts_glt_postmortem', None)
+            graphgate_audit = metrics.pop('_mts_glt_graphgate_audit', None)
+            if graphgate_audit is not None:
+                graphgate_audit.update({
+                    'task': str(task), 'fold': int(fold), 'seed': int(args.seed),
+                    'fold_seed': int(fold_seed),
+                    'best_epoch': int(metrics.get('best_epoch', -1)),
+                    'test_r2': float(metrics.get('test_r2', float('nan'))),
+                })
+                # Scheduler units pass a concrete ``.../shards/.../fold_N.csv``
+                # path.  Keep diagnostics beside the shard tree instead of
+                # accidentally turning that CSV path into a directory.
+                audit_root = Path(task_result_output)
+                while audit_root.name != 'shards' and audit_root != audit_root.parent:
+                    audit_root = audit_root.parent
+                if audit_root.name == 'shards':
+                    audit_root = audit_root.parent
+                else:
+                    audit_root = Path(task_result_output).parent
+                audit_path = audit_root / 'fusion_audit_units' / str(task) / f'fold_{int(fold)}.json'
+                audit_path.parent.mkdir(parents=True, exist_ok=True)
+                audit_tmp = audit_path.with_name(audit_path.name + f'.tmp.{os.getpid()}')
+                try:
+                    audit_tmp.write_text(json.dumps(graphgate_audit, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+                    os.replace(audit_tmp, audit_path)
+                finally:
+                    if audit_tmp.exists():
+                        audit_tmp.unlink()
+            if postmortem is not None:
+                postmortem.update({
+                    'task': str(task),
+                    'fold': int(fold),
+                    'seed': int(args.seed),
+                    'fold_seed': int(fold_seed),
+                    'best_epoch': int(metrics.get('best_epoch', -1)),
+                    'rerun_fused_r2': float(metrics.get('test_r2', float('nan'))),
+                })
+                audit_root = Path(
+                    args.mts_glt_fusion_warm_dir
+                    or args.mts_glt_postmortem_dir
+                )
+                postmortem.update({
+                    'fusion_strategy': str(args.mts_glt_fusion_strategy),
+                    'fusion_warm_epochs': int(args.mts_glt_fusion_warm_epochs),
+                    'initial_alpha': float(args.mts_glt_initial_alpha),
+                    'stage2_trainability': str(
+                        args.mts_glt_fusion_stage2_trainability
+                    ),
+                })
+                unit_path = (
+                    audit_root / 'fusion_audit_units'
+                    / str(task) / f'fold_{int(fold)}.json'
+                )
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_tmp = unit_path.with_name(
+                    unit_path.name + f'.tmp.{os.getpid()}'
+                )
+                try:
+                    unit_tmp.write_text(
+                        json.dumps(postmortem, indent=2, sort_keys=True) + '\n',
+                        encoding='utf-8',
+                    )
+                    os.replace(unit_tmp, unit_path)
+                finally:
+                    if unit_tmp.exists():
+                        unit_tmp.unlink()
             # The speed benchmark can request several evaluation batch sizes
             # after training has selected the fold's best model.  All of these
             # evaluations therefore use the exact same in-memory model state,
@@ -1333,15 +1446,19 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 if args.graph_encoder_type == 'mips_trimer_scage' else None
             ),
             'topology_attention_variant': args.topology_attention_variant,
+            'mts_glt_mode': args.mts_glt_mode,
+            'mts_glt_geometry_mode': args.mts_glt_geometry_mode,
+            'mts_glt_fusion_strategy': args.mts_glt_fusion_strategy,
+            'mts_glt_fusion_warm_epochs': int(args.mts_glt_fusion_warm_epochs),
+            'mts_glt_initial_alpha': float(args.mts_glt_initial_alpha),
+            'mts_glt_fusion_stage2_trainability': (
+                args.mts_glt_fusion_stage2_trainability
+            ),
             'star_rbf_upper': getattr(args, 'star_rbf_upper', None),
             'star_rbf_v2_sidecar': getattr(args, 'star_rbf_v2_sidecar', None),
             'feature_cohort': getattr(dataset, 'feature_cohort_name', None),
             'feature_cache_item_timeout': int(
                 args.feature_cache_item_timeout
-            ),
-            'mcl_distance_percentiles': (
-                list(args.mcl_distance_percentiles)
-                if args.graph_encoder_type == 'mips_trimer_scage' else []
             ),
             'evaluation_protocol': args.evaluation_protocol,
             'mips_fusion_mode': args.mips_fusion_mode,
@@ -1447,11 +1564,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 if args.graph_encoder_type == 'mips_trimer_scage' else None
             ),
             'topology_lmdb_schema': (
-                (
-                    MIPS_EXPLICIT_TOPOLOGY_SCHEMA
-                    if args.topology_representation == TOPOLOGY_EXPLICIT
-                    else MIPS_TRIMER_TOPOLOGY_SCHEMA
-                )
+                MIPS_TRIMER_TOPOLOGY_SCHEMA
                 if args.graph_encoder_type == 'mips_trimer_scage' else None
             ),
             'pretraining_dataset': (
