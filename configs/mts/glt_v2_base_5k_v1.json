@@ -1,0 +1,120 @@
+{
+  "schema": "mts-glt-v2-baseline-snapshot-v1",
+  "baseline_name": "MTS-GLT-v2-Base-5k",
+  "baseline_version": "mts_glt_v2_base_5k_v1",
+  "status": "current_formal_baseline",
+  "pretrained_checkpoint": "results/mts_glt_v2/formal/a6_h_w1_20k/mts_glt_v2_probe_005k.pth",
+  "checkpoint_step": 5000,
+  "pretraining_trajectory_end_step": 20000,
+  "model": {
+    "o8": {
+      "encoder": "MIPS O8",
+      "layers": 6,
+      "hidden_size": 512,
+      "heads": 8,
+      "max_hops": 2,
+      "inputs": ["MIPS137 atom features", "backbone embedding", "SPD bias", "single-path-node bias"],
+      "use_star_rbf": false,
+      "use_mcl": false,
+      "use_3d_attention_bias": false
+    },
+    "glt": {
+      "version": "v2",
+      "layers": 6,
+      "hidden_size": 512,
+      "heads": 8,
+      "head_dim": 64,
+      "attention_variant": "mips",
+      "attention_direction": "target-Q/source-K",
+      "attention_scale": "1/sqrt(64)",
+      "neighborhood": "strict real-bond line 1-hop",
+      "bond_type_input": false,
+      "distance_basis": 256,
+      "distance_upper_angstrom": 3.75,
+      "angle_basis": 128,
+      "geometry_aggregation": "encode each observation, then mean and population variance",
+      "token_features": ["symmetric endpoint atom embedding", "distance encoded mean", "distance encoded population variance", "observation-count embedding", "absolute-shift embedding"],
+      "angle_relation_features": ["angle encoded mean", "angle encoded population variance", "observation-count embedding", "relation-multiplicity embedding"],
+      "self_relation": "dynamic identity self relation with independent per-head bias"
+    },
+    "line_to_atom": {
+      "level": "canonical atom",
+      "procedure": ["incidence projection of final line state", "absolute-shift incidence embedding", "scatter to both canonical endpoints", "incident-line mean", "atom output norm"],
+      "signed_shift_embedding": false
+    },
+    "fusion": {
+      "mode": "o8_glt_atom",
+      "level": "canonical atom",
+      "type": "512-channel gated additive residual",
+      "initial_alpha": 0.05,
+      "invalid_geometry_fallback": "exact O8 pathway"
+    },
+    "graph_readout": {
+      "pooling": "canonical atom mean",
+      "use_md200": true,
+      "graph_output_adapter": true,
+      "use_compact19": false,
+      "use_graphgate_query": false
+    }
+  },
+  "pretraining": {
+    "dataset": "PI1M_v2",
+    "objectives": {
+      "masked_atom": {"enabled": true, "mask_ratio": 0.3, "loss_weight": 1.0},
+      "masked_line": {"enabled": true, "mask_ratio": 0.4, "loss_weight": 1.0},
+      "bidirectional_o8_glt_infonce": {"enabled": true, "temperature": 0.1, "loss_weight": 1.0}
+    },
+    "global_batch_size": 1008,
+    "precision": "BF16",
+    "learning_rate": 0.0002,
+    "warmup_optimizer_steps": 2000,
+    "seed": 42,
+    "selected_checkpoint_step": 5000,
+    "trajectory_end_step": 20000
+  },
+  "downstream": {
+    "schedule": "Warm0",
+    "encoder_freeze_warm_epochs": 0,
+    "lr_warmup_epochs": 5,
+    "total_epochs": 100,
+    "early_stopping_patience": 10,
+    "learning_rates": {"o8": 0.00001, "glt": 0.00001, "atom_fusion": 0.00001, "md200": 0.00001, "graph_adapter": 0.00001, "regression_head": 0.0001},
+    "loss": "Huber",
+    "huber_beta": 0.5,
+    "gradient_clip": 1.0,
+    "head_dropout": 0.25,
+    "precision": "FP32",
+    "train_batch_size": 32,
+    "eval_batch_size": 64,
+    "workers": 2,
+    "evaluation_protocol": "historical_shared5",
+    "tasks": ["eat", "eea", "egb", "egc", "ei", "eps", "nc", "xc"],
+    "folds": [0, 1, 2, 3, 4],
+    "seed": 42
+  },
+  "formal_results": {
+    "fused_macro8": 0.843635832229652,
+    "o8_only_macro8": 0.8407410869015635,
+    "descriptive_fused_increment": 0.0028947453280885205,
+    "median_task_increment": 0.0024453124104787394,
+    "positive_fused_tasks": 7,
+    "task_fused_mean_r2": {"eat": 0.9841012151277303, "eea": 0.9224317091438129, "egb": 0.9413819710792231, "egc": 0.9193243129997077, "ei": 0.8282843229899948, "eps": 0.8188120747353121, "nc": 0.8713848696554845, "xc": 0.46336618210595065},
+    "warm5_macro8": 0.8413621650729006,
+    "warm5_minus_warm0": -0.0022736671567513706,
+    "warm5_decision": "FAIL",
+    "independent_blind_test": false
+  },
+  "formal_result_paths": {
+    "final_report": "results/mts_glt_v2/final_report.json",
+    "formal_pretrain_config": "configs/mts/glt_v2_formal_a6_h_w1_20k.json",
+    "resolved_pretrain_input": "results/mts_glt_v2/formal/a6_h_w1_20k/resolved_input.json",
+    "trajectory_selection": "results/mts_glt_v2/formal/trajectory_selection.json",
+    "paired_downstream_summary": "results/mts_glt_v2/downstream/formal/a6_h_w1_20k_probe_005k/paired_summary.json",
+    "warm5_ablation_summary": "results/mts_glt_v2/fusionwarm_vs_nowarm_formal5k/eight_task_fold01234/glt_v2_warm5_vs_warm0_summary.json"
+  },
+  "future_experiment_rule": {
+    "parent": "MTS-GLT-v2-Base-5k",
+    "primary_scientific_variables_per_experiment": 1,
+    "factorial_exception_requires_explicit_design": true
+  }
+}
