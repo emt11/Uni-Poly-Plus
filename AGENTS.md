@@ -6,7 +6,7 @@
 - Markdown 块级公式使用 `$$...$$`。
 - 用户当前明确要求优先于项目文档和历史计划。
 - `TODO.md` 仅供用户个人记录，不作为任务授权、计划或验收依据。
-- 明确区分：静态审查、计划、实现、测试、smoke、screening、消融和正式实验。
+- 明确区分：静态审查、计划、实现、测试、smoke、消融和正式实验。
 
 发生冲突时按以下优先级判断：
 
@@ -38,8 +38,6 @@
 ---
 
 ## 3. 协作方式
-
-同一活动范围同一时间只能有一个生产执行者。
 
 ### Codex
 
@@ -118,8 +116,7 @@ Codex 制定计划，Claude Code 执行，Codex 最终审查；Claude Code 不�
 
 - `fused - baseline` 不能自动称为 interaction。
 - 改变 encoder 输入语义时，优先使用 matched pretraining / matched training。
-- screening 只用于决定是否值得继续，不自动替换正式 baseline。
-- 部分 task/fold/epoch 或小样本结果只能称为 smoke、screening 或消融。
+- 部分 task/fold/epoch 或小样本结果只能称为 smoke，不作为正式实验结论。
 - 已参与模型开发的共享 validation/test fold 不是独立盲测。
 - `results/best_result.csv` 的宏平均只是逐任务最优包络，不代表任何单模型。
 - 候选未完成正式复评前，不宣称已超过 baseline。
@@ -128,6 +125,8 @@ Codex 制定计划，Claude Code 执行，Codex 最终审查；Claude Code 不�
 ---
 
 ## 5. 验证与汇报
+
+除必要的局部单元测试外，后续模型、数据与训练验证只进行 smoke；不主动扩大 task、fold、epoch 或样本范围。正式实验须由用户明确授权。
 
 只验证本次修改可能破坏的行为：
 
@@ -146,6 +145,6 @@ Codex 制定计划，Claude Code 执行，Codex 最终审查；Claude Code 不�
 3. 运行了什么测试/实验及结果；
 4. 尚未执行什么；
 5. 长任务的 tmux/日志（如有）；
-6. 结论属于测试、smoke、screening、消融还是正式实验。
+6. 结论属于测试、smoke、消融还是正式实验。
 
 不得用 `py_compile`、单元测试或短 smoke 宣称模型性能提升。

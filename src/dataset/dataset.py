@@ -94,6 +94,7 @@ from .periodic_line_glt_central import (
     PeriodicLineGLTCentralSidecar,
     SIDECAR_SCHEMA as CENTRAL_GLT_SIDECAR_SCHEMA,
 )
+from .periodic_spatial_contact import PeriodicSpatialContactSidecar
 from .mts_target_contract import make_target_contract
 from rdkit.Chem import rdFingerprintGenerator
 
@@ -2173,6 +2174,7 @@ class UniDataset(Dataset):
         periodic_line_glt_sidecar=None,
         periodic_line_torsion=False,
         periodic_line_joint_ra=False,
+        periodic_spatial_contact_sidecar=None,
     ):
         self.dataset = dataset
         self.star_rbf_v2_sidecar_root = (
@@ -2185,6 +2187,11 @@ class UniDataset(Dataset):
         self._periodic_line_glt_sidecar = None
         self.periodic_line_torsion = bool(periodic_line_torsion)
         self.periodic_line_joint_ra = bool(periodic_line_joint_ra)
+        self.periodic_spatial_contact_sidecar_root = (
+            str(periodic_spatial_contact_sidecar)
+            if periodic_spatial_contact_sidecar else None
+        )
+        self._periodic_spatial_contact_sidecar = None
         self.root = root
         self.transform = transform
         self.pre_transform = pre_transform
@@ -2435,6 +2442,17 @@ class UniDataset(Dataset):
             self._periodic_line_glt_sidecar = reader(self.periodic_line_glt_sidecar_root)
             if self._cohort_row_mode and len(self._periodic_line_glt_sidecar) != len(self.data_list):
                 raise RuntimeError("periodic line GLT sidecar record count does not match Dataset")
+        if self.periodic_spatial_contact_sidecar_root is not None:
+            self._periodic_spatial_contact_sidecar = PeriodicSpatialContactSidecar(
+                self.periodic_spatial_contact_sidecar_root
+            )
+            if (
+                self._cohort_row_mode
+                and len(self._periodic_spatial_contact_sidecar) != len(self.data_list)
+            ):
+                raise RuntimeError(
+                    "periodic spatial contact sidecar record count does not match Dataset"
+                )
 
     # ------------------------------------------------------------------
     # Legacy path (--disable_feature_cache)
@@ -5169,6 +5187,48 @@ class UniDataset(Dataset):
                 data.glt_relation_source_cross_ru = torch.as_tensor(
                     paired["source_cross_ru"], dtype=torch.bool
                 )
+        if self._periodic_spatial_contact_sidecar is not None:
+            row_hint = int(idx) if self._cohort_row_mode else None
+            spatial_record = self._periodic_spatial_contact_sidecar.model_row(
+                self._periodic_spatial_contact_sidecar.index_for_key(
+                    lookup_key_for_hash, row_hint=row_hint
+                )
+            )
+            spatial_row = spatial_record["pairs"]
+            data.spatial_pair_index = torch.stack(
+                [
+                    torch.from_numpy(np.array(
+                        spatial_row["pair_atom_a"], copy=True
+                    )).long(),
+                    torch.from_numpy(np.array(
+                        spatial_row["pair_atom_b"], copy=True
+                    )).long(),
+                ],
+                dim=0,
+            )
+            data.spatial_pair_shift = torch.from_numpy(np.array(
+                spatial_row["pair_shift"], copy=True
+            )).long()
+            data.spatial_obs_distances = torch.from_numpy(np.array(
+                spatial_row["pair_observation_distances"], copy=True
+            )).float()
+            data.spatial_obs_mask = torch.from_numpy(np.array(
+                spatial_row["pair_observation_valid"], copy=True
+            )).bool()
+            data.spatial_obs_count = torch.from_numpy(np.array(
+                spatial_row["pair_observation_count"], copy=True
+            )).long()
+            data.spatial_shell_id = torch.from_numpy(np.array(
+                spatial_row["pair_shell_id"], copy=True
+            )).long()
+            data.spatial_periodic_self = torch.from_numpy(np.array(
+                spatial_row["pair_periodic_self"], copy=True
+            )).bool()
+            data.spatial_pair_valid = torch.from_numpy(np.array(
+                spatial_row["pair_valid"], copy=True
+            )).bool()
+            data.spatial_graph_valid = bool(spatial_record["graph_valid"])
+        if self._periodic_line_glt_sidecar is not None:
             if hasattr(data, "glt_token_runtime_valid"):
                 data.glt_token_valid = data.glt_token_runtime_valid
             if hasattr(data, "glt_relation_runtime_valid"):

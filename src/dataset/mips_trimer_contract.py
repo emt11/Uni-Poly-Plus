@@ -204,6 +204,7 @@ def validate_runtime_args(args) -> None:
             "o8_glt_atom_torsion_count", "o8_glt_atom_torsion",
             "o8_glt_atom_sbf_angle_control",
             "o8_glt_atom_sbf_radial_angle",
+            "o8_glt_atom_spatial",
         }:
             raise ValueError("MTS-GLT-v2 downstream mode is invalid")
     elif is_glt and getattr(args, "mts_glt_mode", None) not in {"o8_only", "o8_glt"}:

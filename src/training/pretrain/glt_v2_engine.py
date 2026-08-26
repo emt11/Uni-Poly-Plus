@@ -12,6 +12,7 @@ import time
 import torch
 import torch.distributed as dist
 from torch import nn
+import math
 
 
 class MTSGLTV2PretrainContainer(nn.Module):
@@ -25,6 +26,16 @@ class MTSGLTV2PretrainContainer(nn.Module):
         self.line_head = line_head
         self.o8_projection = o8_projection
         self.glt_projection = glt_projection
+        if bool(getattr(model, "use_spatial_contact", False)):
+            self.spatial_nce_norm = nn.LayerNorm(512)
+            self.spatial_nce_projection = nn.Linear(512, 512)
+            self.spatial_nce_gate = nn.Parameter(
+                torch.full((512,), math.atanh(0.05))
+            )
+        else:
+            self.spatial_nce_norm = None
+            self.spatial_nce_projection = None
+            self.register_parameter("spatial_nce_gate", None)
         self.register_buffer(
             "line_label_frequencies", line_label_frequencies.long(), persistent=True
         )
@@ -65,13 +76,18 @@ class MTSGLTV2PretrainContainer(nn.Module):
             output["line_states"], data.glt_token_label,
             line_inputs["selected"], self.line_head,
         )
+        z_3d = output["z_glt"]
+        if self.spatial_nce_projection is not None:
+            z_3d = z_3d + torch.tanh(self.spatial_nce_gate) * self.spatial_nce_projection(
+                self.spatial_nce_norm(output["graph_spatial"])
+            )
         contrastive, pool_size = distributed_bidirectional_infonce(
             self.o8_projection(output["z_o8"]),
-            self.glt_projection(output["z_glt"]),
+            self.glt_projection(z_3d),
             data.glt_geometry_valid,
             temperature=float(args.glt_infonce_temperature),
         )
-        return {
+        result = {
             "atom_sum": atom_sum,
             "atom_detached": atom_detached,
             "atom_count": atom_count,
@@ -83,9 +99,42 @@ class MTSGLTV2PretrainContainer(nn.Module):
             "infonce_pool_size": pool_size,
             "valid_graphs": int(data.glt_geometry_valid.sum()),
         }
+        if self.spatial_nce_projection is not None:
+            spatial_atom = output["atom_spatial_states"]
+            o8_atom = output["atom_states"]
+            downstream_residual = torch.tanh(
+                self.model.spatial_channel_gate
+            ) * spatial_atom
+            result.update({
+                "spatial_residual_norm": float(
+                    downstream_residual.detach().float().norm(dim=-1).mean()
+                ),
+                "spatial_to_o8_ratio": float(
+                    downstream_residual.detach().float().norm(dim=-1).mean()
+                    / o8_atom.detach().float().norm(dim=-1).mean().clamp_min(1e-8)
+                ),
+                "spatial_core_norm": float(
+                    output["spatial_core_states"].detach().float().norm(dim=-1).mean()
+                ),
+                "spatial_outer_norm": float(
+                    output["spatial_outer_states"].detach().float().norm(dim=-1).mean()
+                ),
+                "spatial_nce_gate_mean_abs": float(
+                    torch.tanh(self.spatial_nce_gate.detach()).abs().mean()
+                ),
+                "spatial_downstream_gate_mean_abs": float(
+                    torch.tanh(
+                        self.model.spatial_channel_gate.detach()
+                    ).abs().mean()
+                ),
+            })
+        return result
 
 
-def _checkpoint_payload(container, optimizer, scheduler, step, args, world_size):
+def _checkpoint_payload(
+    container, optimizer, scheduler, step, args, world_size,
+    *, sampler_epoch=0, batches_in_epoch=0,
+):
     return {
         "schema": "mts-glt-v2-train-state-v1",
         "model_state": {
@@ -100,6 +149,10 @@ def _checkpoint_payload(container, optimizer, scheduler, step, args, world_size)
         "glt_layers": int(args.glt_layers),
         "glt_attention_variant": str(args.glt_attention_variant),
         "glt_metadata_mode": str(getattr(args, "glt_metadata_mode", "full")),
+        "use_spatial_contact": bool(getattr(args, "use_spatial_contact", False)),
+        "spatial_shell_mode": str(getattr(args, "spatial_shell_mode", "s4")),
+        "sampler_epoch": int(sampler_epoch),
+        "batches_in_epoch": int(batches_in_epoch),
     }
 
 
@@ -110,6 +163,22 @@ def _projection(output_dim):
         nn.GELU(),
         nn.Linear(512, int(output_dim)),
     )
+
+
+def _probe_state_dict(container):
+    """Publish trained pretrain namespaces, excluding downstream-only modules."""
+    downstream_only_prefixes = (
+        "model.atom_fusion_norm.",
+        "model.atom_fusion_projection.",
+        "model.compact19_residual.",
+        "model.o8.md_residual.",
+    )
+    return {
+        key: value
+        for key, value in container.state_dict().items()
+        if key not in {"model.atom_channel_gate", "model.spatial_channel_gate"}
+        and not key.startswith(downstream_only_prefixes)
+    }
 
 
 def run_glt_v2_pretrain(args):
@@ -149,6 +218,10 @@ def run_glt_v2_pretrain(args):
             raise RuntimeError(f"MTS-GLT-v2 requires full PI1M_v2, got {len(dataset)}")
         if getattr(dataset, "_periodic_line_glt_sidecar", None) is None:
             raise RuntimeError("MTS-GLT-v2 requires the periodic line sidecar")
+        if bool(getattr(args, "use_spatial_contact", False)) and getattr(
+            dataset, "_periodic_spatial_contact_sidecar", None
+        ) is None:
+            raise RuntimeError("MSContact requires the periodic spatial sidecar")
         effective_batch = (
             int(args.batch_size) * world_size * int(args.gradient_accumulation_steps)
         )
@@ -181,6 +254,10 @@ def run_glt_v2_pretrain(args):
                 glt_attention_variant=str(args.glt_attention_variant),
                 glt_metadata_mode=str(metadata_mode),
                 use_compact19=False,
+                use_spatial_contact=bool(
+                    getattr(args, "use_spatial_contact", False)
+                ),
+                spatial_shell_mode=str(getattr(args, "spatial_shell_mode", "s4")),
             )
             # These branches are downstream-only.  Atom incidence remains
             # trainable because it defines the GLT graph representation used
@@ -192,6 +269,8 @@ def run_glt_v2_pretrain(args):
                 for parameter in module.parameters():
                     parameter.requires_grad = False
             model.atom_channel_gate.requires_grad = False
+            if model.spatial_channel_gate is not None:
+                model.spatial_channel_gate.requires_grad = False
             return MTSGLTV2PretrainContainer(
                 model,
                 nn.Linear(512, int(model.o8.masked_atom_classes)),
@@ -261,6 +340,8 @@ def run_glt_v2_pretrain(args):
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_scale)
         optimizer_step = 0
+        resume_epoch = 0
+        resume_batches_in_epoch = 0
         if args.resume_state:
             payload = torch.load(args.resume_state, map_location="cpu", weights_only=False)
             if payload.get("schema") != "mts-glt-v2-train-state-v1":
@@ -277,35 +358,65 @@ def run_glt_v2_pretrain(args):
                 getattr(args, "glt_metadata_mode", "full")
             ):
                 raise RuntimeError("MTS-GLT-v2 resume metadata mode mismatch")
+            if bool(payload.get("use_spatial_contact", False)) != bool(
+                getattr(args, "use_spatial_contact", False)
+            ):
+                raise RuntimeError("MTS-GLT-v2 resume spatial switch mismatch")
+            if str(payload.get("spatial_shell_mode", "s4")) != str(
+                getattr(args, "spatial_shell_mode", "s4")
+            ):
+                raise RuntimeError("MTS-GLT-v2 resume spatial shell mismatch")
             container.load_state_dict(payload["model_state"], strict=True)
             optimizer.load_state_dict(payload["optimizer"])
             scheduler.load_state_dict(payload["scheduler"])
             optimizer_step = int(payload["optimizer_steps_completed"])
+            resume_epoch = int(payload.get("sampler_epoch", 0))
+            resume_batches_in_epoch = int(payload.get("batches_in_epoch", 0))
 
         metrics_path = result_root / "training_metrics.jsonl"
         if rank == 0 and metrics_path.exists() and not args.resume_state:
             raise RuntimeError(f"refusing to append to existing GLT-v2 trajectory: {metrics_path}")
-        epoch = 0
+        epoch = resume_epoch
+        batches_in_epoch = 0
         if sampler is not None:
             sampler.set_epoch(epoch)
         iterator = iter(loader)
+        for _ in range(resume_batches_in_epoch):
+            try:
+                next(iterator)
+            except StopIteration as error:
+                raise RuntimeError(
+                    "MTS-GLT-v2 resume batch position exceeds sampler epoch"
+                ) from error
+        batches_in_epoch = resume_batches_in_epoch
 
         def next_batch():
-            nonlocal iterator, epoch
+            nonlocal iterator, epoch, batches_in_epoch
             try:
-                return next(iterator)
+                batch = next(iterator)
+                batches_in_epoch += 1
+                return batch
             except StopIteration:
                 epoch += 1
+                batches_in_epoch = 0
                 if sampler is not None:
                     sampler.set_epoch(epoch)
                 iterator = iter(loader)
-                return next(iterator)
+                batch = next(iterator)
+                batches_in_epoch += 1
+                return batch
 
         run_steps = int(args.glt_stop_after_steps)
         while optimizer_step < run_steps:
             started = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             sums = {"atom": 0.0, "line": 0.0, "infonce": 0.0}
+            spatial_sums = {
+                "spatial_residual_norm": 0.0, "spatial_to_o8_ratio": 0.0,
+                "spatial_core_norm": 0.0, "spatial_outer_norm": 0.0,
+                "spatial_nce_gate_mean_abs": 0.0,
+                "spatial_downstream_gate_mean_abs": 0.0,
+            }
             counts = {"atom": 0, "line": 0, "pool": 0, "valid": 0}
             for accumulation_index in range(int(args.gradient_accumulation_steps)):
                 data = next_batch().to(device, non_blocking=True)
@@ -348,6 +459,8 @@ def run_glt_v2_pretrain(args):
                 counts["line"] += int(line_count)
                 counts["pool"] += int(output["infonce_pool_size"])
                 counts["valid"] += int(output["valid_graphs"])
+                for name in spatial_sums:
+                    spatial_sums[name] += float(output.get(name, 0.0))
             if float(args.max_grad_norm) > 0:
                 torch.nn.utils.clip_grad_norm_(parameters, float(args.max_grad_norm))
             optimizer.step()
@@ -368,6 +481,11 @@ def run_glt_v2_pretrain(args):
                 "lr": optimizer.param_groups[0]["lr"],
                 "peak_memory_bytes": torch.cuda.max_memory_allocated(device),
             }
+            if bool(getattr(args, "use_spatial_contact", False)):
+                record.update({
+                    name: value / int(args.gradient_accumulation_steps)
+                    for name, value in spatial_sums.items()
+                })
             if rank == 0:
                 with metrics_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -382,7 +500,9 @@ def run_glt_v2_pretrain(args):
                 if checkpoint_boundary or optimizer_step == run_steps:
                     _atomic_torch_save(
                         _checkpoint_payload(
-                            container, optimizer, scheduler, optimizer_step, args, world_size
+                            container, optimizer, scheduler, optimizer_step,
+                            args, world_size, sampler_epoch=epoch,
+                            batches_in_epoch=batches_in_epoch,
                         ),
                         str(args.save_path) + ".last.pt",
                     )
@@ -390,7 +510,7 @@ def run_glt_v2_pretrain(args):
                     _atomic_torch_save(
                         {
                             "schema": "mts-glt-v2-probe-v1",
-                            "state_dict": container.state_dict(),
+                            "state_dict": _probe_state_dict(container),
                             "step": optimizer_step,
                             "glt_layers": int(args.glt_layers),
                             "glt_attention_variant": str(args.glt_attention_variant),
@@ -398,6 +518,17 @@ def run_glt_v2_pretrain(args):
                                 getattr(args, "glt_metadata_mode", "full")
                             ),
                             "infonce_weight": float(args.glt_infonce_loss_weight),
+                            "use_spatial_contact": bool(
+                                getattr(args, "use_spatial_contact", False)
+                            ),
+                            "spatial_shell_mode": str(
+                                getattr(args, "spatial_shell_mode", "s4")
+                            ),
+                            "spatial_sidecar_schema": (
+                                "mts-periodic-spatial-contact-v1"
+                                if bool(getattr(args, "use_spatial_contact", False))
+                                else None
+                            ),
                         },
                         result_root / f"mts_glt_v2_probe_{optimizer_step // 1000:03d}k.pth",
                     )

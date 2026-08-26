@@ -17,6 +17,7 @@ class ModeSpec:
     needs_bond_type: bool = False
     needs_x2l: bool = False
     needs_x2a: bool = False
+    needs_spatial: bool = False
     required_batch_fields: tuple[str, ...] = ()
     trainable_optional_modules: tuple[str, ...] = ()
 
@@ -42,12 +43,23 @@ _JOINT_RA_FIELDS = (
     "glt_relation_source_cross_ru",
 )
 
+_SPATIAL_FIELDS = (
+    "spatial_pair_index", "spatial_pair_shift", "spatial_obs_distances",
+    "spatial_obs_mask", "spatial_obs_count", "spatial_shell_id",
+    "spatial_periodic_self", "spatial_pair_valid", "spatial_graph_valid",
+)
+
 MODE_SPECS = {
     "none": ModeSpec(),
     "o8_only": ModeSpec(),
     "o8_glt": ModeSpec(needs_glt=True, required_batch_fields=_GLT_FIELDS),
     "o8_glt_atom": ModeSpec(needs_glt=True, required_batch_fields=_GLT_FIELDS),
     "o8_glt_atom_desc": ModeSpec(needs_glt=True, required_batch_fields=_GLT_FIELDS),
+    "o8_glt_atom_spatial": ModeSpec(
+        needs_glt=True, needs_spatial=True,
+        required_batch_fields=_GLT_FIELDS + _SPATIAL_FIELDS,
+        trainable_optional_modules=("spatial_contact",),
+    ),
     "o8_glt_graph": ModeSpec(needs_glt=True, required_batch_fields=_GLT_FIELDS),
     "o8_glt_graph_mean": ModeSpec(needs_glt=True, required_batch_fields=_GLT_FIELDS),
     "o8_glt_atom_central": ModeSpec(needs_glt=True, required_batch_fields=_GLT_FIELDS),

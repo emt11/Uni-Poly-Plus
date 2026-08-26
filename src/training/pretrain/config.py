@@ -86,6 +86,9 @@ def dataset_kwargs_from_args(args):
         feature_config_hash="manual",
         star_rbf_v2_sidecar=args.star_rbf_v2_sidecar,
         periodic_line_glt_sidecar=getattr(args, "periodic_line_glt_sidecar", None),
+        periodic_spatial_contact_sidecar=getattr(
+            args, "periodic_spatial_contact_sidecar", None
+        ),
     )
 SUPPORTED_MODALITIES = ('graph', 'smiles', 'fp')
 
@@ -133,7 +136,8 @@ _GLT_V2_REQUIRED = _GLT_REQUIRED | {
 }
 _GLT_V2_ALLOWED = _GLT_V2_REQUIRED | {
     "source_config", "project_root", "glt_geometry_mode", "initial_state_path",
-    "glt_metadata_mode",
+    "glt_metadata_mode", "spatial_contact_sidecar", "use_spatial_contact",
+    "spatial_shell_mode",
 }
 
 
@@ -359,6 +363,15 @@ def _apply_glt_v2_config(args, config_path):
     metadata_mode = str(payload.get("glt_metadata_mode", "full"))
     if metadata_mode not in {"full", "dedup"}:
         raise ValueError("MTS-GLT-v2 glt_metadata_mode must be full or dedup")
+    use_spatial_contact = bool(payload.get("use_spatial_contact", False))
+    spatial_shell_mode = str(payload.get("spatial_shell_mode", "s4"))
+    if spatial_shell_mode not in {"s4", "ms45", "c5_mixed"}:
+        raise ValueError(
+            "MTS-GLT-v2 spatial_shell_mode must be s4, ms45, or c5_mixed"
+        )
+    spatial_sidecar = payload.get("spatial_contact_sidecar")
+    if use_spatial_contact and not spatial_sidecar:
+        raise ValueError("spatial contact mode requires spatial_contact_sidecar")
     if abs(float(payload["atom_mask_ratio"]) - 0.30) > 1e-12:
         raise ValueError("MTS-GLT-v2 atom_mask_ratio is fixed at 0.30")
     if abs(float(payload["line_mask_ratio"]) - 0.40) > 1e-12:
@@ -406,6 +419,11 @@ def _apply_glt_v2_config(args, config_path):
     args.glt_attention_variant = str(payload["glt_attention_variant"])
     args.glt_geometry_mode = geometry_mode
     args.glt_metadata_mode = metadata_mode
+    args.use_spatial_contact = use_spatial_contact
+    args.spatial_shell_mode = spatial_shell_mode
+    args.periodic_spatial_contact_sidecar = (
+        str(spatial_sidecar) if spatial_sidecar else None
+    )
     args.glt_initial_state = payload.get("initial_state_path")
     args.glt_stop_after_steps = stop_after
     args.batch_size = int(payload["batch_size"])

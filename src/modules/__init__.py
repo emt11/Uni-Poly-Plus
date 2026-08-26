@@ -10,6 +10,7 @@ from .periodic_line_glt_v2 import (
     LocalPeriodicGraphLineTransformerV2,
 )
 from .mts_glt_v2 import MTSGraphLineModelV2
+from .periodic_spatial_contact import PeriodicSpatialContactEncoder
 from .periodic_line_glt_graphgate import (
     GLTMaskedLineHeadGraphGate,
     LocalPeriodicGraphLineTransformerGraphGate,
@@ -27,6 +28,7 @@ __all__ = [
     "LearnedGaussianMoments",
     "LocalPeriodicGraphLineTransformerV2",
     "MTSGraphLineModelV2",
+    "PeriodicSpatialContactEncoder",
     "GLTMaskedLineHeadGraphGate",
     "LocalPeriodicGraphLineTransformerGraphGate",
     "MTSGraphGateModel",

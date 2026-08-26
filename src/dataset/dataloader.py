@@ -87,6 +87,13 @@ def mips_trimer_collate(data_list):
     glt_torsion_values, glt_torsion_relations = [], []
     glt_torsion_counts, glt_torsion_covered = [], []
     glt_torsion_source_cross, glt_graph_torsion_covered = [], []
+    spatial_fields_present = all(
+        hasattr(item, "spatial_pair_index") for item in data_list
+    )
+    spatial_pair_index, spatial_pair_shift = [], []
+    spatial_obs_distances, spatial_obs_mask, spatial_obs_count = [], [], []
+    spatial_shell_id, spatial_periodic_self, spatial_pair_valid = [], [], []
+    spatial_pair_batch, spatial_graph_valid = [], []
     star_v2_pair_keys_present = all(
         all(hasattr(item, name) for name in (
             "mts_star_v2_pair_key_src", "mts_star_v2_pair_key_dst",
@@ -309,6 +316,39 @@ def mips_trimer_collate(data_list):
             glt_token_offset += token_count
             glt_relation_offset += relation_count
 
+        if spatial_fields_present:
+            spatial_index = item.spatial_pair_index.long()
+            if spatial_index.ndim != 2 or int(spatial_index.size(0)) != 2:
+                raise ValueError("spatial_pair_index must have shape [2,E]")
+            spatial_count = int(spatial_index.size(1))
+            if spatial_count and (
+                int(spatial_index.min()) < 0
+                or int(spatial_index.max()) >= num_nodes
+            ):
+                raise ValueError("spatial contact endpoint out of canonical bounds")
+            for name in (
+                "spatial_pair_shift", "spatial_obs_count", "spatial_shell_id",
+                "spatial_periodic_self", "spatial_pair_valid",
+            ):
+                if int(getattr(item, name).numel()) != spatial_count:
+                    raise ValueError(f"spatial contact length mismatch: {name}")
+            if tuple(item.spatial_obs_distances.shape) != (spatial_count, 3):
+                raise ValueError("spatial observation distance shape mismatch")
+            if tuple(item.spatial_obs_mask.shape) != (spatial_count, 3):
+                raise ValueError("spatial observation mask shape mismatch")
+            spatial_pair_index.append(spatial_index + canonical_offset)
+            spatial_pair_shift.append(item.spatial_pair_shift.long())
+            spatial_obs_distances.append(item.spatial_obs_distances.float())
+            spatial_obs_mask.append(item.spatial_obs_mask.bool())
+            spatial_obs_count.append(item.spatial_obs_count.long())
+            spatial_shell_id.append(item.spatial_shell_id.long())
+            spatial_periodic_self.append(item.spatial_periodic_self.bool())
+            spatial_pair_valid.append(item.spatial_pair_valid.bool())
+            spatial_pair_batch.append(
+                torch.full((spatial_count,), graph_id, dtype=torch.long)
+            )
+            spatial_graph_valid.append(bool(item.spatial_graph_valid))
+
         lga_relation_offset += int(item.lga_edge_index.size(1))
 
         if canonical_periodic_batch:
@@ -496,6 +536,19 @@ def mips_trimer_collate(data_list):
             batch.glt_relation_source_cross_ru = torch.cat(
                 glt_relation_source_cross_ru
             )
+    if spatial_fields_present:
+        batch.spatial_pair_index = torch.cat(spatial_pair_index, dim=1)
+        batch.spatial_pair_shift = torch.cat(spatial_pair_shift)
+        batch.spatial_obs_distances = torch.cat(spatial_obs_distances)
+        batch.spatial_obs_mask = torch.cat(spatial_obs_mask)
+        batch.spatial_obs_count = torch.cat(spatial_obs_count)
+        batch.spatial_shell_id = torch.cat(spatial_shell_id)
+        batch.spatial_periodic_self = torch.cat(spatial_periodic_self)
+        batch.spatial_pair_valid = torch.cat(spatial_pair_valid)
+        batch.spatial_pair_batch = torch.cat(spatial_pair_batch)
+        batch.spatial_graph_valid = torch.tensor(
+            spatial_graph_valid, dtype=torch.bool
+        )
     batch.canonical_ru_atom_index = torch.cat(canonical_parts, dim=0)
     if canonical_periodic_batch:
         batch.canonical_atom_id = torch.cat(canonical_id_parts, dim=0)

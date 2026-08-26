@@ -812,6 +812,8 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
                     getattr(args, "mts_glt_metadata_mode", "full")
                 ),
                 o8_bond_bias_mode=str(args.mts_o8_bond_bias_mode),
+                use_spatial_contact=(glt_mode == "o8_glt_atom_spatial"),
+                spatial_shell_mode=str(args.mts_spatial_shell_mode),
             )
         else:
             from src.modules import MTSGraphLineModel
@@ -830,10 +832,16 @@ def select_mts_glt_graph_state(model_state, checkpoint_state, *, graphgate=False
         if str(key).startswith('model.')
     }
     expected = {key for key in model_state if key.startswith(graph_prefix)}
-    downstream_only = {
+    optionally_pretrained_downstream = {
         key for key in expected
         if (
             key.startswith(graph_prefix + 'interaction_update.')
+            or key == graph_prefix + 'spatial_channel_gate'
+            or key == graph_prefix + 'atom_channel_gate'
+            or key.startswith(graph_prefix + 'atom_fusion_norm.')
+            or key.startswith(graph_prefix + 'atom_fusion_projection.')
+            or key.startswith(graph_prefix + 'compact19_residual.')
+            or key.startswith(graph_prefix + 'o8.md_residual.')
             or key.startswith(graph_prefix + 'o8.direct_bond_bias.')
             or key.startswith(graph_prefix + 'glt.line_conditioning_projection.')
             or key.startswith(graph_prefix + 'glt.attention_conditioning_projection.')
@@ -841,7 +849,11 @@ def select_mts_glt_graph_state(model_state, checkpoint_state, *, graphgate=False
             or key.startswith(graph_prefix + 'glt.joint_basis_bias.')
         )
     }
-    expected -= downstream_only
+    # Historical probes contain several frozen downstream tensors. Preserve
+    # their existing load behavior, while allowing new probes to omit them.
+    expected -= {
+        key for key in optionally_pretrained_downstream if key not in mapped
+    }
     if graphgate:
         expected = {
             key for key in expected
@@ -951,6 +963,10 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             modalities=args.modalities,
             star_rbf_v2_sidecar=args.star_rbf_v2_sidecar,
             periodic_line_glt_sidecar=args.periodic_line_glt_sidecar,
+            periodic_spatial_contact_sidecar=(
+                args.periodic_spatial_contact_sidecar
+                if str(args.mts_glt_mode) == "o8_glt_atom_spatial" else None
+            ),
             periodic_line_torsion=str(args.mts_glt_mode) in {
                 'o8_glt_atom_torsion_count', 'o8_glt_atom_torsion',
             },

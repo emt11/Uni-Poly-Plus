@@ -10,6 +10,7 @@ from torch_scatter import scatter
 
 from .mips_local_graph import MIPSLocalGraphEncoder
 from .periodic_line_glt_v2 import LocalPeriodicGraphLineTransformerV2
+from .periodic_spatial_contact import PeriodicSpatialContactEncoder
 
 
 class CompactTrimerDescriptorResidual(nn.Module):
@@ -74,6 +75,8 @@ class MTSGraphLineModelV2(nn.Module):
         o8_bond_bias_mode="none",
         joint_basis_mode="none",
         glt_metadata_mode="full",
+        use_spatial_contact=False,
+        spatial_shell_mode="s4",
     ):
         super().__init__()
         if int(hidden_size) != 512:
@@ -104,6 +107,22 @@ class MTSGraphLineModelV2(nn.Module):
             joint_basis_mode=joint_basis_mode,
             metadata_mode=glt_metadata_mode,
         )
+        self.use_spatial_contact = bool(use_spatial_contact)
+        if spatial_shell_mode not in {"s4", "ms45", "c5_mixed"}:
+            raise ValueError("spatial_shell_mode must be s4, ms45, or c5_mixed")
+        self.spatial_shell_mode = str(spatial_shell_mode)
+        self.spatial_encoder = (
+            PeriodicSpatialContactEncoder(
+                hidden_size=hidden_size, dropout=dropout
+            )
+            if self.use_spatial_contact else None
+        )
+        if self.use_spatial_contact:
+            self.spatial_channel_gate = nn.Parameter(
+                torch.full((hidden_size,), math.atanh(0.05))
+            )
+        else:
+            self.register_parameter("spatial_channel_gate", None)
         self.atom_fusion_norm = nn.LayerNorm(hidden_size)
         self.atom_fusion_projection = nn.Linear(hidden_size, hidden_size)
         self.atom_channel_gate = nn.Parameter(
@@ -159,12 +178,17 @@ class MTSGraphLineModelV2(nn.Module):
             observation_counts=line_observation_counts,
             token_shifts=line_token_shifts,
         )
-        return {
+        output = {
             "z_o8": z_o8,
             "z_glt": glt["graph_geometry"],
             "atom_states": atom_states,
             **glt,
         }
+        if self.use_spatial_contact:
+            output.update(
+                self.spatial_encoder(data, shell_mode=self.spatial_shell_mode)
+            )
+        return output
 
     def _o8_canonical_states(self, data):
         z_o8, node_states = self.o8._forward_impl(data, use_star=False, use_md=False)
@@ -211,6 +235,7 @@ class MTSGraphLineModelV2(nn.Module):
             "o8_glt_atom_torsion_count", "o8_glt_atom_torsion",
             "o8_glt_atom_sbf_angle_control",
             "o8_glt_atom_sbf_radial_angle",
+            "o8_glt_atom_spatial",
         }
         if mode not in valid_modes:
             raise ValueError("MTS-GLT-v2 downstream mode is invalid")
@@ -226,6 +251,18 @@ class MTSGraphLineModelV2(nn.Module):
             )
             valid = glt["atom_geometry_valid"].to(update.dtype).unsqueeze(-1)
             fused = canonical_states + valid * torch.tanh(self.atom_channel_gate) * update
+            if mode == "o8_glt_atom_spatial":
+                if self.spatial_encoder is None:
+                    raise ValueError(
+                        "spatial downstream mode requires use_spatial_contact"
+                    )
+                spatial = self.spatial_encoder(
+                    data, shell_mode=self.spatial_shell_mode
+                )
+                spatial_valid = spatial["atom_spatial_valid"].to(fused.dtype).unsqueeze(-1)
+                fused = fused + spatial_valid * torch.tanh(
+                    self.spatial_channel_gate
+                ) * spatial["atom_spatial_states"]
             graph = self._pool_canonical(data, fused)
         graph = self.o8.md_residual(graph, data)
         if mode == "o8_glt_atom_desc":

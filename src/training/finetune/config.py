@@ -387,6 +387,12 @@ def parse_arguments(argv=None):
     parser.add_argument('--star_rbf_upper', type=float, default=3.0)
     parser.add_argument('--star_rbf_v2_sidecar', default=None)
     parser.add_argument('--periodic_line_glt_sidecar', default=None)
+    parser.add_argument('--periodic_spatial_contact_sidecar', default=None)
+    parser.add_argument(
+        '--mts_spatial_shell_mode',
+        choices=['s4', 'ms45', 'c5_mixed'],
+        default='s4',
+    )
     parser.add_argument(
         '--mts_glt_mode',
         choices=sorted(MODE_SPECS),
@@ -598,10 +604,19 @@ def parse_arguments(argv=None):
     args = parser.parse_args(argv)
     if int(args.eval_batch_size) < int(args.batch_size):
         raise ValueError("--eval_batch_size must be >= --batch_size")
+    if args.mts_glt_mode == 'o8_glt_atom_spatial':
+        if args.mts_glt_version != 'v2':
+            parser.error('spatial contact mode requires --mts_glt_version=v2')
+        if not args.periodic_spatial_contact_sidecar:
+            parser.error(
+                'spatial contact mode requires '
+                '--periodic_spatial_contact_sidecar'
+            )
     if args.mts_glt_fusion_strategy == 'fusion_warm':
         if args.mts_glt_mode not in {
             'o8_glt', 'o8_glt_graph', 'o8_glt_graph_mean',
             'o8_glt_atom_central', 'o8_glt_atom',
+            'o8_glt_atom_spatial',
         }:
             parser.error(
                 '--mts_glt_fusion_strategy=fusion_warm requires '
@@ -619,7 +634,7 @@ def parse_arguments(argv=None):
                 '--mts_glt_version=graphgate_v1'
             )
         if (
-            args.mts_glt_mode == 'o8_glt_atom'
+            args.mts_glt_mode in {'o8_glt_atom', 'o8_glt_atom_spatial'}
             and args.mts_glt_version != 'v2'
         ):
             parser.error(
@@ -633,7 +648,7 @@ def parse_arguments(argv=None):
         # GLT-v2 is a schedule-matched ablation: it preserves the formal
         # 5-epoch LR warmup and changes only encoder trainability in epochs 1-5.
         if not (
-            args.mts_glt_mode == 'o8_glt_atom'
+            args.mts_glt_mode in {'o8_glt_atom', 'o8_glt_atom_spatial'}
             and args.mts_glt_version == 'v2'
         ):
             args.warmup_epochs = 0

@@ -648,11 +648,11 @@ def _mts_glt_fusion_components(model):
             'md_residual': encoder.o8_encoder.md_residual,
         }
     if (
-        mode == 'o8_glt_atom'
+        mode in {'o8_glt_atom', 'o8_glt_atom_spatial'}
         and getattr(encoder, 'architecture_name', '') == 'MIPS-Trimer-GLT-v2'
         and callable(getattr(encoder, 'encode_views', None))
     ):
-        return {
+        components = {
             'kind': 'atom_channel', 'base': base, 'graph': graph,
             'encoder': encoder, 'o8': encoder.o8, 'glt': encoder.glt,
             'fusion_norm': encoder.atom_fusion_norm,
@@ -660,6 +660,12 @@ def _mts_glt_fusion_components(model):
             'gate': encoder.atom_channel_gate,
             'md_residual': encoder.o8.md_residual,
         }
+        if mode == 'o8_glt_atom_spatial':
+            components.update({
+                'spatial': encoder.spatial_encoder,
+                'spatial_gate': encoder.spatial_channel_gate,
+            })
+        return components
     return None
 
 
@@ -767,6 +773,8 @@ def _configure_mts_glt_fusion_stage(
     ):
         _set_module_trainable(module, True)
     components['gate'].requires_grad = True
+    if components.get('spatial_gate') is not None:
+        components['spatial_gate'].requires_grad = True
     return encoder
 
 
@@ -782,6 +790,8 @@ def _set_mts_glt_frozen_encoders_eval(model, policy='both_frozen'):
         components['o8'].eval()
     if policy in {'both_frozen', 'o8_only'}:
         components['glt'].eval()
+    if components.get('spatial') is not None:
+        components['spatial'].eval()
     # The MD200 residual belongs to the downstream adapter, not the frozen O8
     # body, and must remain in training mode during Stage 1.
     components['md_residual'].train()
@@ -1043,6 +1053,7 @@ def _configure_mts_trainability(model):
         "o8_glt_atom_torsion_count", "o8_glt_atom_torsion",
         "o8_glt_atom_sbf_angle_control",
         "o8_glt_atom_sbf_radial_angle",
+        "o8_glt_atom_spatial",
         "o8_glt_graph", "o8_glt_graph_mean", "o8_glt_atom_central",
     }:
         _set_module_trainable(
@@ -1247,6 +1258,11 @@ def _build_downstream_optimizer(
                 add_named_parameters(
                     components['glt'].named_parameters(), glt_lr, 'glt_encoder'
                 )
+                if components.get('spatial') is not None:
+                    add_named_parameters(
+                        components['spatial'].named_parameters(),
+                        float(graph_lr), 'spatial_encoder',
+                    )
             fusion_prefix = (
                 'graphgate_fusion'
                 if components['kind'] == 'channel' else 'glt_fusion'
@@ -1266,6 +1282,11 @@ def _build_downstream_optimizer(
                 [('gate', components['gate'])], fusion_lr,
                 gate_group,
             )
+            if components.get('spatial_gate') is not None:
+                add_named_parameters(
+                    [('spatial_gate', components['spatial_gate'])],
+                    fusion_lr, 'spatial_channel_gate',
+                )
             add_group(components['md_residual'], fusion_lr, 'md200_residual')
             add_group(
                 nn.ModuleList([graph_module.norm, graph_module.projection]),
