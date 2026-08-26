@@ -189,14 +189,21 @@ def validate_runtime_args(args) -> None:
                 "mts_glt_version=graphgate_v1"
             )
         if getattr(args, "mts_glt_mode", None) not in {
-            "o8_only", "o8_glt_graph"
+            "o8_only", "o8_glt_graph", "o8_glt_graph_mean",
+            "o8_glt_atom_central",
         }:
             raise ValueError("MTS-GLT-GraphGate-v1 downstream mode is invalid")
     elif is_glt_v2:
         if getattr(args, "mts_glt_version", None) != "v2":
             raise ValueError("MTS-GLT-v2 schema requires mts_glt_version=v2")
         if getattr(args, "mts_glt_mode", None) not in {
-            "o8_only", "o8_glt_atom", "o8_glt_atom_desc"
+            "o8_only", "o8_glt_atom", "o8_glt_atom_desc",
+            "o8_glt_atom_self3d", "o8_glt_atom_x23",
+            "o8_glt_atom_line_self", "o8_glt_atom_line_x2l",
+            "o8_glt_atom_attn_self", "o8_glt_atom_attn_x2a",
+            "o8_glt_atom_torsion_count", "o8_glt_atom_torsion",
+            "o8_glt_atom_sbf_angle_control",
+            "o8_glt_atom_sbf_radial_angle",
         }:
             raise ValueError("MTS-GLT-v2 downstream mode is invalid")
     elif is_glt and getattr(args, "mts_glt_mode", None) not in {"o8_only", "o8_glt"}:

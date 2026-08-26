@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import argparse
 
 from src.dataset.mips_trimer_contract import ROUTE_INTERNAL as MTS_ROUTE_INTERNAL
+from src.training.finetune.mode_specs import MODE_SPECS
 
 SUPPORTED_MODALITIES = ('graph', 'smiles', 'fp')
 SUPPORTED_FUSION_TYPES = ('none', 'zero_gated_residual')
@@ -47,6 +48,14 @@ def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description="Train UniEncoderAttention Model")
     parser.add_argument('--experiment_id', default='manual')
     parser.add_argument('--predictions_dir', default='')
+    parser.add_argument(
+        '--resolved_config_path', default='',
+        help='Scheduler-written resolved scientific configuration for this unit.',
+    )
+    parser.add_argument(
+        '--resolved_command_path', default='',
+        help='Scheduler-written final subprocess command for this unit.',
+    )
     parser.add_argument(
         '--checkpoint_seed', type=int, default=None,
         help='Pretraining seed recorded by the checkpoint; independent of the fine-tuning seed.',
@@ -176,6 +185,9 @@ def parse_arguments(argv=None):
     parser.add_argument('--fp_lr', type=float, default=1e-4)
     parser.add_argument('--fusion_lr', type=float, default=1e-4)
     parser.add_argument('--head_lr', type=float, default=1e-4)
+    parser.add_argument('--mts_o8_lr', type=float, default=1e-5)
+    parser.add_argument('--mts_geometry_lr', type=float, default=1e-5)
+    parser.add_argument('--mts_adapter_lr', type=float, default=1e-5)
     parser.add_argument('--weight_decay', type=float, default=0.02)
     parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument(
@@ -377,16 +389,33 @@ def parse_arguments(argv=None):
     parser.add_argument('--periodic_line_glt_sidecar', default=None)
     parser.add_argument(
         '--mts_glt_mode',
-        choices=['none', 'o8_only', 'o8_glt', 'o8_glt_atom', 'o8_glt_atom_desc', 'o8_glt_graph'],
+        choices=sorted(MODE_SPECS),
         default='none',
     )
     parser.add_argument('--mts_glt_version', choices=['v1', 'v2', 'graphgate_v1'], default='v1')
     parser.add_argument('--mts_glt_geometry_mode', choices=['full', 'off'], default='full')
+    parser.add_argument(
+        '--mts_glt_metadata_mode', choices=['full', 'dedup'], default='full'
+    )
     parser.add_argument('--mts_glt_layers', type=int, choices=[6, 12], default=6)
     parser.add_argument(
         '--mts_glt_attention_variant', choices=['mips', 'paper'], default='mips'
     )
     parser.add_argument('--mts_glt_use_compact19', action='store_true')
+    parser.add_argument(
+        '--mts_o8_bond_bias_mode',
+        choices=['none', 'control', 'type'],
+        default='none',
+        help='Optional zero-initialized direct chemical-bond attention bias.',
+    )
+    parser.add_argument(
+        '--save_best_checkpoint', action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument('--best_checkpoint_dir', default='')
+    parser.add_argument('--mts_glt_interaction_diagnostics_dir', default='')
+    parser.add_argument('--mts_o8_bond_diagnostics_dir', default='')
+    parser.add_argument('--mts_glt_joint_basis_diagnostics_dir', default='')
     parser.add_argument(
         '--mts_glt_postmortem_dir', default='',
         help=(
@@ -570,26 +599,44 @@ def parse_arguments(argv=None):
     if int(args.eval_batch_size) < int(args.batch_size):
         raise ValueError("--eval_batch_size must be >= --batch_size")
     if args.mts_glt_fusion_strategy == 'fusion_warm':
-        if args.mts_glt_mode not in {'o8_glt', 'o8_glt_graph'}:
+        if args.mts_glt_mode not in {
+            'o8_glt', 'o8_glt_graph', 'o8_glt_graph_mean',
+            'o8_glt_atom_central', 'o8_glt_atom',
+        }:
             parser.error(
                 '--mts_glt_fusion_strategy=fusion_warm requires '
-                '--mts_glt_mode=o8_glt or o8_glt_graph'
+                '--mts_glt_mode must select an O8+GLT fusion mode'
             )
         if (
-            args.mts_glt_mode == 'o8_glt_graph'
+            args.mts_glt_mode in {
+                'o8_glt_graph', 'o8_glt_graph_mean',
+                'o8_glt_atom_central',
+            }
             and args.mts_glt_version != 'graphgate_v1'
         ):
             parser.error(
-                '--mts_glt_mode=o8_glt_graph requires '
+                'GraphGate readout modes require '
                 '--mts_glt_version=graphgate_v1'
+            )
+        if (
+            args.mts_glt_mode == 'o8_glt_atom'
+            and args.mts_glt_version != 'v2'
+        ):
+            parser.error(
+                'o8_glt_atom FusionWarm requires --mts_glt_version=v2'
             )
         if int(args.mts_glt_fusion_warm_epochs) < 0:
             parser.error('--mts_glt_fusion_warm_epochs must be non-negative')
         if not 0.0 < float(args.mts_glt_initial_alpha) < 1.0:
             parser.error('--mts_glt_initial_alpha must be strictly between 0 and 1')
-        # FusionWarm owns its two-stage LR schedule: constant Stage 1 and a
-        # fresh no-warmup cosine schedule after the Stage 2 optimizer rebuild.
-        args.warmup_epochs = 0
+        # Legacy/GraphGate FusionWarm owns a distinct two-stage LR schedule.
+        # GLT-v2 is a schedule-matched ablation: it preserves the formal
+        # 5-epoch LR warmup and changes only encoder trainability in epochs 1-5.
+        if not (
+            args.mts_glt_mode == 'o8_glt_atom'
+            and args.mts_glt_version == 'v2'
+        ):
+            args.warmup_epochs = 0
     # These are fixed MTS topology values, not user-selectable route
     # parameters. Retired geometry and staged-finetuning controls are
     # intentionally absent from the runtime namespace.
@@ -601,9 +648,6 @@ def parse_arguments(argv=None):
     # user-selectable geometry learning-rate controls: the complete MTS
     # graph wrapper always uses graph_lr=1e-5.
     args.geom_lr = 1e-5
-    args.mts_o8_lr = 1e-5
-    args.mts_geometry_lr = 1e-5
-    args.mts_adapter_lr = 1e-5
     args.freeze_smiles_epochs = 0
     args.deep_unfreeze_epoch = 0
     args.fp_unfreeze_epoch = -1

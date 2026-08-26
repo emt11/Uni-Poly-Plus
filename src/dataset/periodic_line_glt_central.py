@@ -314,7 +314,7 @@ class PeriodicLineGLTCentralSidecar:
         index = int(index)
         ts, te = (int(self.arrays["sample_token_offsets"][index + i]) for i in (0, 1))
         rs, re = (int(self.arrays["sample_relation_offsets"][index + i]) for i in (0, 1))
-        token_names = tuple(name for name in ARRAY_NAMES if name.startswith("token_") and name != "token_bond_type")
+        token_names = tuple(name for name in ARRAY_NAMES if name.startswith("token_"))
         relation_names = tuple(name for name in ARRAY_NAMES if name.startswith("relation_"))
         return {
             "geometry_valid": bool(self.arrays["graph_runtime_valid"][index]),
@@ -325,10 +325,7 @@ class PeriodicLineGLTCentralSidecar:
         }
 
     def qc_row(self, index):
-        row = self.model_row(index)
-        ts, te = (int(self.arrays["sample_token_offsets"][int(index) + i]) for i in (0, 1))
-        row["tokens"]["token_bond_type"] = np.asarray(self.arrays["token_bond_type"][ts:te])
-        return row
+        return self.model_row(index)
 
 
 __all__ = [

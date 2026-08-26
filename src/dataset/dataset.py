@@ -85,13 +85,16 @@ from .trimer_mcl import (
 )
 from .mips_cache_validation import validate_mcl_record
 from .mts_star_rbf_v2 import StarRBFV2Sidecar
-from .periodic_line_glt import PeriodicLineGLTSidecar
+from .periodic_line_glt import (
+    PeriodicLineGLTSidecar,
+    derive_relation_source_distance_observations,
+)
+from .periodic_line_torsion import build_periodic_torsion_fields
 from .periodic_line_glt_central import (
     PeriodicLineGLTCentralSidecar,
     SIDECAR_SCHEMA as CENTRAL_GLT_SIDECAR_SCHEMA,
 )
 from .mts_target_contract import make_target_contract
-from transformers import AutoTokenizer
 from rdkit.Chem import rdFingerprintGenerator
 
 
@@ -639,10 +642,16 @@ def _feature_cache_timeout_handler(_signum, _frame):
     raise _FeatureCacheItemTimeout("feature_cache_item_timeout")
 
 
+def _load_auto_tokenizer(smiles_model_name):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(smiles_model_name)
+
+
 def _get_worker_tokenizer(smiles_model_name):
     global _WORKER_TOKENIZER, _WORKER_TOKENIZER_NAME
     if _WORKER_TOKENIZER is None or _WORKER_TOKENIZER_NAME != smiles_model_name:
-        _WORKER_TOKENIZER = AutoTokenizer.from_pretrained(smiles_model_name)
+        _WORKER_TOKENIZER = _load_auto_tokenizer(smiles_model_name)
         _WORKER_TOKENIZER_NAME = smiles_model_name
     return _WORKER_TOKENIZER
 
@@ -2162,6 +2171,8 @@ class UniDataset(Dataset):
         pre_transform=None,
         star_rbf_v2_sidecar=None,
         periodic_line_glt_sidecar=None,
+        periodic_line_torsion=False,
+        periodic_line_joint_ra=False,
     ):
         self.dataset = dataset
         self.star_rbf_v2_sidecar_root = (
@@ -2172,6 +2183,8 @@ class UniDataset(Dataset):
             str(periodic_line_glt_sidecar) if periodic_line_glt_sidecar else None
         )
         self._periodic_line_glt_sidecar = None
+        self.periodic_line_torsion = bool(periodic_line_torsion)
+        self.periodic_line_joint_ra = bool(periodic_line_joint_ra)
         self.root = root
         self.transform = transform
         self.pre_transform = pre_transform
@@ -2336,7 +2349,7 @@ class UniDataset(Dataset):
         self.smiles_tokenizer = (
             None
             if not self.mts_use_smiles and self.graph_encoder_type == "mips_trimer_scage"
-            else AutoTokenizer.from_pretrained(smiles_model_name)
+            else _load_auto_tokenizer(smiles_model_name)
         )
 
         # No parallel geometry encoder is instantiated in the production
@@ -5140,10 +5153,28 @@ class UniDataset(Dataset):
                     f"glt_{name}",
                     torch.as_tensor(np.array(value, copy=True), dtype=dtype),
                 )
+            if self.periodic_line_joint_ra:
+                paired = derive_relation_source_distance_observations(
+                    tokens, relations
+                )
+                data.glt_relation_source_distances = torch.as_tensor(
+                    paired["source_distances"], dtype=torch.float32
+                )
+                data.glt_relation_source_distance_valid = torch.as_tensor(
+                    paired["observation_valid"], dtype=torch.bool
+                )
+                data.glt_relation_source_distance_slot = torch.as_tensor(
+                    paired["source_slots"], dtype=torch.long
+                )
+                data.glt_relation_source_cross_ru = torch.as_tensor(
+                    paired["source_cross_ru"], dtype=torch.bool
+                )
             if hasattr(data, "glt_token_runtime_valid"):
                 data.glt_token_valid = data.glt_token_runtime_valid
             if hasattr(data, "glt_relation_runtime_valid"):
                 data.glt_relation_valid = data.glt_relation_runtime_valid
+            if self.periodic_line_torsion:
+                build_periodic_torsion_fields(data)
         if getattr(self, "_mts_input_ids", None) is not None:
             data.input_ids_smiles = torch.from_numpy(
                 np.array(self._mts_input_ids[int(idx)], dtype=np.int64, copy=True)

@@ -53,6 +53,7 @@ def main(argv=None):
         "--seeds", "42",
         "--checkpoint", str(checkpoint),
         "--checkpoint-seed", "42",
+        "--checkpoint-tier", "1m",
         "--pretrain-dataset", "PI1M_v2",
         "--finetune-epochs", str(args.epochs),
         "--finetune-patience", str(args.patience),
@@ -71,6 +72,19 @@ def main(argv=None):
         "--mts_glt_attention_variant", args.attention_variant,
         "--mts_glt_mode", args.mode,
         "--periodic_line_glt_sidecar", str(sidecar),
+        "--target_transform", "recommended",
+        "--regression_loss", "huber",
+        "--huber_beta", "0.5",
+        "--max_grad_norm", "1.0",
+        "--weight_decay", "0.02",
+        "--warmup_epochs", "5",
+        "--head_dropout", "0.25",
+        "--mts_o8_lr", "1e-5",
+        "--mts_geometry_lr", "1e-5",
+        "--mts_adapter_lr", "1e-5",
+        "--graph_lr", "1e-5",
+        "--fusion_lr", "1e-4",
+        "--head_lr", "1e-4",
     ]
     if args.mode == "o8_glt_atom_desc":
         command.append("--mts_glt_use_compact19")

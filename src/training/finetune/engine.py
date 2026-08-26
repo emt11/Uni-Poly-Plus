@@ -31,6 +31,7 @@ from src.dataset.mips_trimer_contract import (
 )
 from src.dataset.lmdb_cache import sample_key_from_smiles
 from src.training.finetune.config import parse_arguments
+from src.training.finetune.mode_specs import missing_batch_fields
 
 
 class SingleFoldContext:
@@ -55,6 +56,494 @@ def run_single_fold(train_and_evaluate, *args, context: SingleFoldContext, **kwa
     """Compatibility boundary for callers that already own the fold loop."""
     context.validate()
     return train_and_evaluate(*args, **kwargs)
+
+
+def _capture_initial_model_state(model, enabled):
+    """Snapshot the fold initialization only when full-train refit needs it."""
+    if not enabled:
+        return None
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def _atomic_save_best_checkpoint(model, path, metadata):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + f'.tmp.{os.getpid()}')
+    payload = {
+        'state_dict': {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        },
+        **dict(metadata),
+    }
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+@torch.no_grad()
+def _collect_interaction_diagnostics(model, loader, device):
+    base = model.module if hasattr(model, 'module') else model
+    encoder = base.encoders['graph'].encoder
+    if getattr(encoder, 'interaction_update', None) is None:
+        return None
+    was_training = bool(model.training)
+    model.eval()
+    ratios = []
+    cosines = []
+    valid_count = 0
+    for batch in loader:
+        batch = batch.to(device, non_blocking=True)
+        views = encoder.interaction_views(batch)
+        valid = views['valid'].bool()
+        finite = (
+            torch.isfinite(views['h3']).all(dim=-1)
+            & torch.isfinite(views['h3_new']).all(dim=-1)
+            & torch.isfinite(views['delta3']).all(dim=-1)
+        )
+        keep = valid & finite
+        if not bool(keep.any()):
+            continue
+        h3 = views['h3'][keep]
+        h3_new = views['h3_new'][keep]
+        delta = views['delta3'][keep]
+        ratios.append(
+            torch.linalg.vector_norm(delta, dim=-1)
+            / (torch.linalg.vector_norm(h3, dim=-1) + 1e-8)
+        )
+        cosines.append(torch.nn.functional.cosine_similarity(h3, h3_new, dim=-1))
+        valid_count += int(keep.sum())
+    if was_training:
+        model.train()
+    if not ratios:
+        raise RuntimeError('interaction diagnostics found no finite valid atoms')
+    ratio = torch.cat(ratios).float().cpu()
+    cosine = torch.cat(cosines).float().cpu()
+    return {
+        'mean_abs_tanh_g23': float(
+            torch.tanh(encoder.interaction_update.gate.detach()).abs().mean()
+        ),
+        'mean_update_norm_ratio': float(ratio.mean()),
+        'median_update_norm_ratio': float(ratio.median()),
+        'p25_update_norm_ratio': float(torch.quantile(ratio, 0.25)),
+        'p75_update_norm_ratio': float(torch.quantile(ratio, 0.75)),
+        'mean_h3_h3_new_cosine': float(cosine.mean()),
+        'valid_atom_count': int(valid_count),
+    }
+
+
+@torch.no_grad()
+def _collect_line_conditioning_diagnostics(model, loader, device):
+    base = model.module if hasattr(model, 'module') else model
+    encoder = base.encoders['graph'].encoder
+    projection = getattr(
+        getattr(encoder, 'glt', None), 'line_conditioning_projection', None
+    )
+    if projection is None:
+        return None
+    was_training = bool(model.training)
+    model.eval()
+    absolute_modulation = []
+    relative_change = []
+    cosine = []
+    internal = []
+    cross_ru = []
+    valid_count = 0
+    for batch in loader:
+        batch = batch.to(device, non_blocking=True)
+        views = encoder.line_conditioning_views(batch)
+        valid = views['line_valid'].bool()
+        h0 = views['line_input']
+        hnew = views['conditioned_line_input']
+        modulation = views['line_modulation']
+        finite = (
+            torch.isfinite(h0).all(dim=-1)
+            & torch.isfinite(hnew).all(dim=-1)
+            & torch.isfinite(modulation).all(dim=-1)
+        )
+        keep = valid & finite
+        if not bool(keep.any()):
+            continue
+        per_line_abs = modulation[keep].abs().mean(dim=-1)
+        absolute_modulation.append(per_line_abs)
+        relative_change.append(
+            torch.linalg.vector_norm(hnew[keep] - h0[keep], dim=-1)
+            / (torch.linalg.vector_norm(h0[keep], dim=-1) + 1e-8)
+        )
+        cosine.append(torch.nn.functional.cosine_similarity(h0[keep], hnew[keep], dim=-1))
+        shift = views['line_shift'][keep].abs()
+        if bool((shift == 0).any()):
+            internal.append(per_line_abs[shift == 0])
+        if bool((shift != 0).any()):
+            cross_ru.append(per_line_abs[shift != 0])
+        valid_count += int(keep.sum())
+    if was_training:
+        model.train()
+    if not absolute_modulation:
+        raise RuntimeError('line diagnostics found no finite valid tokens')
+    values = torch.cat(absolute_modulation).float().cpu()
+    ratio = torch.cat(relative_change).float().cpu()
+    cos = torch.cat(cosine).float().cpu()
+    return {
+        'mean_abs_modulation': float(values.mean()),
+        'median_abs_modulation': float(values.median()),
+        'p25_abs_modulation': float(torch.quantile(values, 0.25)),
+        'p75_abs_modulation': float(torch.quantile(values, 0.75)),
+        'p95_abs_modulation': float(torch.quantile(values, 0.95)),
+        'mean_relative_token_change': float(ratio.mean()),
+        'median_relative_token_change': float(ratio.median()),
+        'mean_h0_hnew_cosine': float(cos.mean()),
+        'valid_line_count': int(valid_count),
+        'internal_line_mean_abs_modulation': (
+            float(torch.cat(internal).mean()) if internal else float('nan')
+        ),
+        'cross_ru_line_mean_abs_modulation': (
+            float(torch.cat(cross_ru).mean()) if cross_ru else float('nan')
+        ),
+    }
+
+
+def _finite_distribution(values):
+    values = torch.cat(values).detach().float().cpu()
+    if values.numel() == 0 or not bool(torch.isfinite(values).all()):
+        raise RuntimeError('bond-bias diagnostics require finite observations')
+    return {
+        'count': int(values.numel()),
+        'mean': float(values.mean()),
+        'median': float(values.median()),
+        'p25': float(torch.quantile(values, 0.25)),
+        'p75': float(torch.quantile(values, 0.75)),
+        'p95': float(torch.quantile(values, 0.95)),
+    }
+
+
+@torch.no_grad()
+def _collect_o8_bond_bias_diagnostics(model, loader, device):
+    """Audit the exact fold-best BC/BT bias on canonical test bonds."""
+    base = model.module if hasattr(model, 'module') else model
+    encoder = base.encoders['graph'].encoder
+    module = getattr(getattr(encoder, 'o8', None), 'direct_bond_bias', None)
+    if module is None:
+        return None
+    was_training = bool(model.training)
+    model.eval()
+    all_abs, internal_abs, cross_abs = [], [], []
+    category_abs = {index: [] for index in range(module.num_categories)}
+    category_count = {index: 0 for index in range(module.num_categories)}
+    for batch in loader:
+        batch = batch.to(device, non_blocking=True)
+        categories = batch.glt_token_bond_type.long().reshape(-1)
+        shifts = batch.glt_token_shift.long().reshape(-1).abs()
+        if categories.numel() != shifts.numel():
+            raise ValueError('bond diagnostic token field length mismatch')
+        bias = module.category_bias(categories)
+        if not bool(torch.isfinite(bias).all()):
+            raise RuntimeError('bond bias contains NaN/Inf')
+        per_token = bias.abs().mean(dim=-1)
+        all_abs.append(per_token)
+        if bool((shifts == 0).any()):
+            internal_abs.append(per_token[shifts == 0])
+        if bool((shifts != 0).any()):
+            cross_abs.append(per_token[shifts != 0])
+        for category in range(module.num_categories):
+            selected = categories == category
+            if bool(selected.any()):
+                category_abs[category].append(per_token[selected])
+                category_count[category] += int(selected.sum())
+    if was_training:
+        model.train()
+    if not all_abs:
+        raise RuntimeError('bond-bias diagnostics found no test bonds')
+    category_vectors = module.category_bias(
+        torch.arange(module.num_categories, device=device)
+    ).detach().float().cpu()
+    return {
+        'mode': str(module.mode),
+        'num_categories': int(module.num_categories),
+        'new_parameter_count': int(sum(p.numel() for p in module.parameters())),
+        'absolute_bias': _finite_distribution(all_abs),
+        'internal_absolute_bias': _finite_distribution(internal_abs),
+        'cross_ru_absolute_bias': _finite_distribution(cross_abs),
+        'category_count': {str(k): int(v) for k, v in category_count.items()},
+        'category_mean_absolute_bias': {
+            str(k): (
+                float(torch.cat(v).mean().cpu()) if v else None
+            ) for k, v in category_abs.items()
+        },
+        'category_per_head_bias': {
+            str(k): [float(x) for x in category_vectors[k].tolist()]
+            for k in range(module.num_categories)
+        },
+    }
+
+
+@torch.no_grad()
+def _collect_attention_routing_diagnostics(model, loader, device):
+    from torch_scatter import scatter
+
+    base = model.module if hasattr(model, 'module') else model
+    encoder = base.encoders['graph'].encoder
+    projection = getattr(
+        getattr(encoder, 'glt', None), 'attention_conditioning_projection', None
+    )
+    if projection is None:
+        return None
+    was_training = bool(model.training)
+    model.eval()
+    gammas, entropy0, entropy1, changes, kls = [], [], [], [], []
+    internal_gamma, cross_gamma = [], []
+    internal_change, cross_change = [], []
+    valid_count = 0
+    for batch in loader:
+        batch = batch.to(device, non_blocking=True)
+        views = encoder.attention_conditioning_views(batch)
+        gamma = views['gamma']
+        valid = views['token_valid'].bool() & torch.isfinite(gamma).all(dim=-1)
+        if bool(valid.any()):
+            per_line = gamma[valid].abs().mean(dim=-1)
+            gammas.append(per_line)
+            shifts = views['token_shift'][valid].abs()
+            if bool((shifts == 0).any()):
+                internal_gamma.append(per_line[shifts == 0])
+            if bool((shifts != 0).any()):
+                cross_gamma.append(per_line[shifts != 0])
+            valid_count += int(valid.sum())
+        w0 = views['baseline_attention'].float().clamp_min(1e-12)
+        w1 = views['conditioned_attention'].float().clamp_min(1e-12)
+        target = views['target'].long()
+        token_count = int(gamma.size(0))
+        h0 = scatter(-(w0 * w0.log()), target, dim=0, dim_size=token_count, reduce='sum')
+        h1 = scatter(-(w1 * w1.log()), target, dim=0, dim_size=token_count, reduce='sum')
+        kl = scatter(w1 * (w1.log() - w0.log()), target, dim=0, dim_size=token_count, reduce='sum')
+        entropy0.append(h0[valid].reshape(-1))
+        entropy1.append(h1[valid].reshape(-1))
+        kls.append(kl[valid].reshape(-1))
+        per_relation_change = (w1 - w0).abs().mean(dim=-1)
+        changes.append(per_relation_change)
+        source_shift = views['token_shift'][views['source'].long()].abs()
+        target_shift = views['token_shift'][target].abs()
+        cross_relation = (source_shift != 0) | (target_shift != 0)
+        if bool((~cross_relation).any()):
+            internal_change.append(per_relation_change[~cross_relation])
+        if bool(cross_relation.any()):
+            cross_change.append(per_relation_change[cross_relation])
+        if not torch.equal(views['baseline_value'], views['conditioned_value']):
+            raise RuntimeError('attention routing changed the V tensor')
+    if was_training:
+        model.train()
+    if not gammas:
+        raise RuntimeError('attention diagnostics found no finite valid lines')
+    gamma = torch.cat(gammas).cpu()
+    base_entropy = torch.cat(entropy0).cpu()
+    conditioned_entropy = torch.cat(entropy1).cpu()
+    return {
+        'mean_abs_gamma': float(gamma.mean()),
+        'median_abs_gamma': float(gamma.median()),
+        'p25_abs_gamma': float(torch.quantile(gamma, 0.25)),
+        'p75_abs_gamma': float(torch.quantile(gamma, 0.75)),
+        'p95_abs_gamma': float(torch.quantile(gamma, 0.95)),
+        'baseline_attention_entropy_mean': float(base_entropy.mean()),
+        'conditioned_attention_entropy_mean': float(conditioned_entropy.mean()),
+        'conditioned_attention_entropy_median': float(conditioned_entropy.median()),
+        'attention_entropy_delta': float((conditioned_entropy - base_entropy).mean()),
+        'mean_attention_probability_change': float(torch.cat(changes).mean()),
+        'mean_attention_kl': float(torch.cat(kls).mean()),
+        'internal_line_mean_abs_gamma': (
+            float(torch.cat(internal_gamma).mean())
+            if internal_gamma else float('nan')
+        ),
+        'cross_ru_line_mean_abs_gamma': (
+            float(torch.cat(cross_gamma).mean())
+            if cross_gamma else float('nan')
+        ),
+        'internal_relation_attention_change': (
+            float(torch.cat(internal_change).mean())
+            if internal_change else float('nan')
+        ),
+        'cross_ru_relation_attention_change': (
+            float(torch.cat(cross_change).mean())
+            if cross_change else float('nan')
+        ),
+        'valid_line_count': int(valid_count),
+        'value_path_unchanged': True,
+    }
+
+
+@torch.no_grad()
+def _collect_torsion_diagnostics(model, loader, device):
+    base = model.module if hasattr(model, 'module') else model
+    encoder = base.encoders['graph'].encoder
+    if getattr(getattr(encoder, 'glt', None), 'torsion_bias', None) is None:
+        return None
+    was_training = bool(model.training)
+    model.eval()
+    torsion_values, angle_values = [], []
+    internal_values, cross_values = [], []
+    counts = []
+    relation_total = relation_covered = graph_total = graph_covered = 0
+    internal_total = internal_covered = cross_total = cross_covered = 0
+    for batch in loader:
+        batch = batch.to(device, non_blocking=True)
+        views = encoder.torsion_views(batch)
+        real = views['real_relation_mask'].bool()
+        covered = views['torsion_covered'][real]
+        relation_total += int(real.sum())
+        relation_covered += int(covered.sum())
+        graph_total += int(batch.glt_graph_torsion_covered.numel())
+        graph_covered += int(batch.glt_graph_torsion_covered.sum())
+        relation_counts = views['torsion_count'][real][covered]
+        if relation_counts.numel():
+            counts.append(relation_counts.float())
+        torsion = views['torsion_bias_real'].float()
+        angle = views['angle_bias'].float()
+        if covered.any():
+            torsion_values.append(torsion[covered].abs().reshape(-1))
+            angle_values.append(angle[covered].abs().reshape(-1))
+        source_cross = views['torsion_source_cross_ru'][real]
+        internal = ~source_cross
+        internal_total += int(internal.sum())
+        internal_covered += int((internal & covered).sum())
+        cross_total += int(source_cross.sum())
+        cross_covered += int((source_cross & covered).sum())
+        if (internal & covered).any():
+            internal_values.append(torsion[internal & covered].abs().reshape(-1))
+        if (source_cross & covered).any():
+            cross_values.append(torsion[source_cross & covered].abs().reshape(-1))
+    if was_training:
+        model.train()
+    if relation_covered == 0 or not counts:
+        raise RuntimeError('torsion diagnostics found no covered relations')
+    count_values = torch.cat(counts).cpu()
+    torsion_abs = torch.cat(torsion_values).cpu()
+    angle_abs = torch.cat(angle_values).cpu()
+    mean_torsion = float(torsion_abs.mean())
+    mean_angle = float(angle_abs.mean())
+    return {
+        'relation_total': relation_total,
+        'relation_covered': relation_covered,
+        'torsion_relation_coverage': relation_covered / max(relation_total, 1),
+        'graph_total': graph_total,
+        'graph_covered': graph_covered,
+        'torsion_graph_coverage': graph_covered / max(graph_total, 1),
+        'mean_torsion_observations': float(count_values.mean()),
+        'median_torsion_observations': float(count_values.median()),
+        'p25_torsion_observations': float(torch.quantile(count_values, 0.25)),
+        'p75_torsion_observations': float(torch.quantile(count_values, 0.75)),
+        'max_torsion_observations': float(count_values.max()),
+        'internal_torsion_coverage': internal_covered / max(internal_total, 1),
+        'cross_ru_torsion_coverage': cross_covered / max(cross_total, 1),
+        'mean_abs_torsion_bias': mean_torsion,
+        'median_abs_torsion_bias': float(torsion_abs.median()),
+        'p25_abs_torsion_bias': float(torch.quantile(torsion_abs, 0.25)),
+        'p75_abs_torsion_bias': float(torch.quantile(torsion_abs, 0.75)),
+        'p95_abs_torsion_bias': float(torch.quantile(torsion_abs, 0.95)),
+        'mean_abs_angle_bias': mean_angle,
+        'torsion_angle_bias_ratio': mean_torsion / (mean_angle + 1e-8),
+        'internal_mean_abs_torsion_bias': (
+            float(torch.cat(internal_values).mean())
+            if internal_values else float('nan')
+        ),
+        'cross_ru_mean_abs_torsion_bias': (
+            float(torch.cat(cross_values).mean())
+            if cross_values else float('nan')
+        ),
+    }
+
+
+@torch.no_grad()
+def _collect_joint_basis_diagnostics(model, loader, device):
+    """Measure the restored fold-best AC/RA relation-bias utilization."""
+    base = model.module if hasattr(model, 'module') else model
+    encoder = base.encoders['graph'].encoder
+    branch = getattr(getattr(encoder, 'glt', None), 'joint_basis_bias', None)
+    if branch is None:
+        return None
+    was_training = bool(model.training)
+    model.eval()
+    joint_abs, angle_abs, distances, angles, observation_bias = [], [], [], [], []
+    internal_abs, cross_abs = [], []
+    for batch in loader:
+        batch = batch.to(device, non_blocking=True)
+        views = encoder.joint_basis_views(batch)
+        active = views['active_relation'].bool()
+        joint = views['joint_bias'].float()
+        real = views['real_relation_mask'].bool()
+        angle = views['angle_bias'].float()
+        if active.any():
+            values = joint[active].abs().reshape(-1)
+            joint_abs.append(values.cpu())
+            cross = views['source_cross_ru'].bool()[active]
+            per_relation = joint[active].norm(dim=-1)
+            if (~cross).any():
+                internal_abs.append(per_relation[~cross].cpu())
+            if cross.any():
+                cross_abs.append(per_relation[cross].cpu())
+        real_active = active[real]
+        if real_active.any():
+            angle_abs.append(angle[real_active].abs().reshape(-1).cpu())
+        relation_index = views['observation_relation'].long()
+        if relation_index.numel():
+            distances.append(views['observation_distance'].float().cpu())
+            angles.append(views['observation_angle'].float().cpu())
+            observation_bias.append(joint[relation_index].norm(dim=-1).cpu())
+    if was_training:
+        model.train()
+    if not joint_abs or not distances:
+        raise RuntimeError('joint-basis diagnostics found no active observations')
+
+    def distribution(values):
+        values = torch.cat(values).float()
+        return {
+            'mean': float(values.mean()), 'median': float(values.median()),
+            'p25': float(torch.quantile(values, 0.25)),
+            'p75': float(torch.quantile(values, 0.75)),
+            'p95': float(torch.quantile(values, 0.95)),
+            'count': int(values.numel()),
+        }
+
+    distance = torch.cat(distances).numpy()
+    theta = torch.cat(angles).numpy()
+    response = torch.cat(observation_bias).numpy()
+    from scipy.stats import spearmanr
+    distance_correlation = float(spearmanr(distance, response).statistic)
+    angle_correlation = float(spearmanr(theta, response).statistic)
+    quartile_edges = torch.quantile(torch.from_numpy(distance), torch.linspace(0, 1, 5))
+    quartile_response = []
+    distance_tensor = torch.from_numpy(distance)
+    response_tensor = torch.from_numpy(response)
+    for index in range(4):
+        selected = ((distance_tensor >= quartile_edges[index])
+                    & ((distance_tensor <= quartile_edges[index + 1]) if index == 3
+                       else (distance_tensor < quartile_edges[index + 1])))
+        quartile_response.append({
+            'quartile': index + 1,
+            'lower': float(quartile_edges[index]),
+            'upper': float(quartile_edges[index + 1]),
+            'count': int(selected.sum()),
+            'mean_bias_norm': float(response_tensor[selected].mean()),
+        })
+    joint_distribution = distribution(joint_abs)
+    angle_distribution = distribution(angle_abs)
+    return {
+        'mode': str(branch.mode),
+        'new_parameter_count': int(sum(p.numel() for p in branch.parameters() if p.requires_grad)),
+        'joint_bias_abs': joint_distribution,
+        'existing_angle_bias_abs': angle_distribution,
+        'mean_joint_to_angle_ratio': (
+            joint_distribution['mean'] / max(angle_distribution['mean'], 1e-12)
+        ),
+        'internal_relation_bias_norm': distribution(internal_abs) if internal_abs else None,
+        'cross_ru_relation_bias_norm': distribution(cross_abs) if cross_abs else None,
+        'source_distance_quartiles': quartile_response,
+        'spearman_source_distance_bias_norm': distance_correlation,
+        'spearman_angle_bias_norm': angle_correlation,
+    }
 
 
 def _cohort_hash_from_current_manifest(root, dataset_name):
@@ -98,68 +587,6 @@ class _MTSMultiTaskFoldDataset(TorchDataset):
         data.y = torch.tensor([float(target)], dtype=torch.float)
         data.mts_task_index = torch.tensor(int(task_index), dtype=torch.long)
         return data
-
-
-
-
-def collect_attention_pooling_weights(model, data_loader, device):
-    """Collect final attention/gate weights over the whole test set."""
-    model.eval()
-    attention_batches = []
-    attention_labels = None
-    named_batches = {}
-    named_labels = {}
-
-    with torch.no_grad():
-        for batch in data_loader:
-            batch = batch.to(device)
-            model(batch)
-            attention_weights = model.attention_visual_weights.detach().cpu().numpy()
-            if attention_weights.ndim != 2:
-                raise ValueError(
-                    "Expected attention/gate weights with shape "
-                    f"[batch_size, num_inputs], got {attention_weights.shape}"
-                )
-            batch_labels = list(getattr(model, 'attention_visual_labels', model.modality_list))
-            if attention_labels is None:
-                attention_labels = batch_labels
-            elif attention_labels != batch_labels:
-                raise ValueError(f"Attention labels changed across batches: {attention_labels} vs {batch_labels}")
-            attention_batches.append(attention_weights)
-
-            for name, value in getattr(model, 'fusion_visual_weights', {}).items():
-                weights, labels = value
-                if weights is None or weights.numel() == 0:
-                    continue
-                labels = list(labels)
-                if name in named_labels and named_labels[name] != labels:
-                    raise ValueError(f"Fusion labels changed for {name}: {named_labels[name]} vs {labels}")
-                named_labels[name] = labels
-                named_batches.setdefault(name, []).append(weights.detach().cpu().numpy())
-
-    if not attention_batches:
-        raise ValueError("Cannot compute attention statistics from an empty data loader.")
-
-    all_attention = np.concatenate(attention_batches, axis=0)
-    fold_attention = all_attention.mean(axis=0)
-    named_means = {}
-    for name, batches in named_batches.items():
-        values = np.concatenate(batches, axis=0).mean(axis=0)
-        named_means[name] = (values, named_labels[name])
-    return fold_attention, all_attention.shape, attention_labels, named_means
-
-
-def format_attention_weights(modalities, attention_weights):
-    if len(modalities) != len(attention_weights):
-        raise ValueError(
-            f"Modalities length ({len(modalities)}) does not match attention length "
-            f"({len(attention_weights)})."
-        )
-    return ";".join(
-        f"{modality}:{float(weight):.6f}"
-        for modality, weight in zip(modalities, attention_weights)
-    )
-
 
 def _scage_checkpoint_key_compatibility(
     model_keys,
@@ -342,17 +769,49 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
             raise ValueError("MTS-GLT downstream requires Star-RBF off")
         glt_version = str(getattr(args, "mts_glt_version", "v1"))
         if glt_version == "graphgate_v1":
-            if glt_mode not in {"o8_only", "o8_glt_graph"}:
-                raise ValueError("GraphGate supports only o8_only/o8_glt_graph")
+            if glt_mode not in {
+                "o8_only", "o8_glt_graph", "o8_glt_graph_mean",
+                "o8_glt_atom_central",
+            }:
+                raise ValueError("unsupported GraphGate downstream readout")
             from src.modules import MTSGraphGateModel
             encoder = MTSGraphGateModel(layers=6)
             encoder.glt_geometry_mode = str(args.mts_glt_geometry_mode)
         elif glt_version == "v2":
             from src.modules import MTSGraphLineModelV2
+            interaction_mode = {
+                "o8_glt_atom_self3d": "self3d",
+                "o8_glt_atom_x23": "x23",
+            }.get(glt_mode, "none")
+            line_conditioning_mode = {
+                "o8_glt_atom_line_self": "self",
+                "o8_glt_atom_line_x2l": "x2l",
+            }.get(glt_mode, "none")
+            attention_conditioning_mode = {
+                "o8_glt_atom_attn_self": "self",
+                "o8_glt_atom_attn_x2a": "x2a",
+            }.get(glt_mode, "none")
+            torsion_mode = {
+                "o8_glt_atom_torsion_count": "count",
+                "o8_glt_atom_torsion": "full",
+            }.get(glt_mode, "none")
+            joint_basis_mode = {
+                "o8_glt_atom_sbf_angle_control": "control",
+                "o8_glt_atom_sbf_radial_angle": "radial",
+            }.get(glt_mode, "none")
             encoder = MTSGraphLineModelV2(
                 glt_layers=int(args.mts_glt_layers),
                 glt_attention_variant=str(args.mts_glt_attention_variant),
                 use_compact19=bool(args.mts_glt_use_compact19),
+                interaction_mode=interaction_mode,
+                line_conditioning_mode=line_conditioning_mode,
+                attention_conditioning_mode=attention_conditioning_mode,
+                torsion_mode=torsion_mode,
+                joint_basis_mode=joint_basis_mode,
+                glt_metadata_mode=str(
+                    getattr(args, "mts_glt_metadata_mode", "full")
+                ),
+                o8_bond_bias_mode=str(args.mts_o8_bond_bias_mode),
             )
         else:
             from src.modules import MTSGraphLineModel
@@ -371,6 +830,18 @@ def select_mts_glt_graph_state(model_state, checkpoint_state, *, graphgate=False
         if str(key).startswith('model.')
     }
     expected = {key for key in model_state if key.startswith(graph_prefix)}
+    downstream_only = {
+        key for key in expected
+        if (
+            key.startswith(graph_prefix + 'interaction_update.')
+            or key.startswith(graph_prefix + 'o8.direct_bond_bias.')
+            or key.startswith(graph_prefix + 'glt.line_conditioning_projection.')
+            or key.startswith(graph_prefix + 'glt.attention_conditioning_projection.')
+            or key.startswith(graph_prefix + 'glt.torsion_bias.')
+            or key.startswith(graph_prefix + 'glt.joint_basis_bias.')
+        )
+    }
+    expected -= downstream_only
     if graphgate:
         expected = {
             key for key in expected
@@ -480,6 +951,13 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             modalities=args.modalities,
             star_rbf_v2_sidecar=args.star_rbf_v2_sidecar,
             periodic_line_glt_sidecar=args.periodic_line_glt_sidecar,
+            periodic_line_torsion=str(args.mts_glt_mode) in {
+                'o8_glt_atom_torsion_count', 'o8_glt_atom_torsion',
+            },
+            periodic_line_joint_ra=str(args.mts_glt_mode) in {
+                'o8_glt_atom_sbf_angle_control',
+                'o8_glt_atom_sbf_radial_angle',
+            },
         )
         for dataset_name in dataset_name_list
     ]
@@ -712,14 +1190,13 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 )
             )
         fold_metrics = []
-        fold_attention_weights = []
-        fold_named_attention_weights = {}
         best_fold_val_r2 = -float('inf')
         best_model_state = None
 
         selected_folds = set(args.fold_ids)
         if not selected_folds or any(fold < 0 or fold >= 5 for fold in selected_folds):
             raise ValueError("--fold_ids must contain one or more values from 0 to 4")
+        validated_mode_batch = False
         for fold, (train_indices, test_indices) in enumerate(splits):
             if fold not in selected_folds:
                 continue
@@ -806,6 +1283,15 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 pin_memory=True,
                 persistent_workers=args.loader_workers > 0,
             )
+            if not validated_mode_batch and str(args.mts_glt_mode) != "none":
+                validation_batch = next(iter(val_loader))
+                missing = missing_batch_fields(args.mts_glt_mode, validation_batch)
+                if missing:
+                    raise RuntimeError(
+                        f"MTS mode {args.mts_glt_mode} missing required batch fields: "
+                        + ", ".join(missing)
+                    )
+                validated_mode_batch = True
 
             model = build_mts_downstream_model(
                 args, auxiliary_tasks=auxiliary_tasks,
@@ -979,10 +1465,9 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                         'Initialized MTS-GLT FusionWarm after strict checkpoint '
                         f'load: alpha={observed_alpha:.9f}'
                     )
-            initial_model_state = {
-                key: value.detach().cpu().clone()
-                for key, value in model.state_dict().items()
-            }
+            initial_model_state = _capture_initial_model_state(
+                model, bool(args.refit_full_train)
+            )
 
             model.to(device)
             print("Using GPU for model training." if torch.cuda.is_available() else "Using CPU for model training.")
@@ -1030,6 +1515,220 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 ),
                 context=fold_context,
             )
+            interaction_diagnostics = _collect_interaction_diagnostics(
+                model, test_loader, device
+            )
+            line_diagnostics = _collect_line_conditioning_diagnostics(
+                model, test_loader, device
+            )
+            attention_diagnostics = _collect_attention_routing_diagnostics(
+                model, test_loader, device
+            )
+            torsion_diagnostics = _collect_torsion_diagnostics(
+                model, test_loader, device
+            )
+            joint_basis_diagnostics = _collect_joint_basis_diagnostics(
+                model, test_loader, device
+            )
+            bond_bias_diagnostics = _collect_o8_bond_bias_diagnostics(
+                model, test_loader, device
+            )
+            if bool(args.save_best_checkpoint):
+                if not str(args.best_checkpoint_dir):
+                    raise ValueError(
+                        '--best_checkpoint_dir is required when '
+                        '--save_best_checkpoint is enabled'
+                    )
+                best_path = (
+                    Path(args.best_checkpoint_dir) / str(task)
+                    / f'fold_{int(fold)}.pth'
+                )
+                _atomic_save_best_checkpoint(model, best_path, {
+                    'schema': 'mts-glt-v2-downstream-fold-best-v1',
+                    'task': str(task), 'fold': int(fold),
+                    'seed': int(args.seed), 'fold_seed': int(fold_seed),
+                    'mts_glt_mode': str(args.mts_glt_mode),
+                    'mts_o8_bond_bias_mode': str(args.mts_o8_bond_bias_mode),
+                    'pretrained_checkpoint': str(pretrained_model_path),
+                    'best_epoch': int(metrics.get('best_epoch', -1)),
+                    'test_r2': float(metrics.get('test_r2', float('nan'))),
+                })
+            if bond_bias_diagnostics is not None:
+                if not str(args.mts_o8_bond_diagnostics_dir):
+                    raise ValueError(
+                        'O8 bond-bias modes require '
+                        '--mts_o8_bond_diagnostics_dir'
+                    )
+                bond_bias_diagnostics.update({
+                    'task': str(task), 'fold': int(fold),
+                    'seed': int(args.seed), 'fold_seed': int(fold_seed),
+                    'mts_glt_mode': str(args.mts_glt_mode),
+                    'mts_o8_bond_bias_mode': str(args.mts_o8_bond_bias_mode),
+                    'best_epoch': int(metrics.get('best_epoch', -1)),
+                    'test_r2': float(metrics.get('test_r2', float('nan'))),
+                })
+                unit_path = (
+                    Path(args.mts_o8_bond_diagnostics_dir)
+                    / str(task) / f'fold_{int(fold)}.json'
+                )
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_tmp = unit_path.with_name(
+                    unit_path.name + f'.tmp.{os.getpid()}'
+                )
+                try:
+                    unit_tmp.write_text(
+                        json.dumps(
+                            bond_bias_diagnostics, indent=2, sort_keys=True
+                        ) + '\n', encoding='utf-8'
+                    )
+                    os.replace(unit_tmp, unit_path)
+                finally:
+                    if unit_tmp.exists():
+                        unit_tmp.unlink()
+            if interaction_diagnostics is not None:
+                if not str(args.mts_glt_interaction_diagnostics_dir):
+                    raise ValueError(
+                        'interaction modes require '
+                        '--mts_glt_interaction_diagnostics_dir'
+                    )
+                interaction_diagnostics.update({
+                    'task': str(task), 'fold': int(fold),
+                    'seed': int(args.seed), 'fold_seed': int(fold_seed),
+                    'mts_glt_mode': str(args.mts_glt_mode),
+                    'best_epoch': int(metrics.get('best_epoch', -1)),
+                    'test_r2': float(metrics.get('test_r2', float('nan'))),
+                })
+                unit_path = (
+                    Path(args.mts_glt_interaction_diagnostics_dir)
+                    / str(task) / f'fold_{int(fold)}.json'
+                )
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_tmp = unit_path.with_name(
+                    unit_path.name + f'.tmp.{os.getpid()}'
+                )
+                try:
+                    unit_tmp.write_text(
+                        json.dumps(interaction_diagnostics, indent=2, sort_keys=True)
+                        + '\n', encoding='utf-8'
+                    )
+                    os.replace(unit_tmp, unit_path)
+                finally:
+                    if unit_tmp.exists():
+                        unit_tmp.unlink()
+            if line_diagnostics is not None:
+                if not str(args.mts_glt_interaction_diagnostics_dir):
+                    raise ValueError(
+                        'line conditioning modes require '
+                        '--mts_glt_interaction_diagnostics_dir'
+                    )
+                line_diagnostics.update({
+                    'task': str(task), 'fold': int(fold),
+                    'seed': int(args.seed), 'fold_seed': int(fold_seed),
+                    'mts_glt_mode': str(args.mts_glt_mode),
+                    'best_epoch': int(metrics.get('best_epoch', -1)),
+                    'test_r2': float(metrics.get('test_r2', float('nan'))),
+                })
+                unit_path = (
+                    Path(args.mts_glt_interaction_diagnostics_dir)
+                    / str(task) / f'fold_{int(fold)}.json'
+                )
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_tmp = unit_path.with_name(
+                    unit_path.name + f'.tmp.{os.getpid()}'
+                )
+                try:
+                    unit_tmp.write_text(
+                        json.dumps(line_diagnostics, indent=2, sort_keys=True)
+                        + '\n', encoding='utf-8'
+                    )
+                    os.replace(unit_tmp, unit_path)
+                finally:
+                    if unit_tmp.exists():
+                        unit_tmp.unlink()
+            if attention_diagnostics is not None:
+                if not str(args.mts_glt_interaction_diagnostics_dir):
+                    raise ValueError(
+                        'attention routing modes require '
+                        '--mts_glt_interaction_diagnostics_dir'
+                    )
+                attention_diagnostics.update({
+                    'task': str(task), 'fold': int(fold),
+                    'seed': int(args.seed), 'fold_seed': int(fold_seed),
+                    'mts_glt_mode': str(args.mts_glt_mode),
+                    'best_epoch': int(metrics.get('best_epoch', -1)),
+                    'test_r2': float(metrics.get('test_r2', float('nan'))),
+                })
+                unit_path = (
+                    Path(args.mts_glt_interaction_diagnostics_dir)
+                    / str(task) / f'fold_{int(fold)}.json'
+                )
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_tmp = unit_path.with_name(unit_path.name + f'.tmp.{os.getpid()}')
+                try:
+                    unit_tmp.write_text(
+                        json.dumps(attention_diagnostics, indent=2, sort_keys=True)
+                        + '\n', encoding='utf-8'
+                    )
+                    os.replace(unit_tmp, unit_path)
+                finally:
+                    if unit_tmp.exists():
+                        unit_tmp.unlink()
+            if torsion_diagnostics is not None:
+                if not str(args.mts_glt_interaction_diagnostics_dir):
+                    raise ValueError(
+                        'torsion modes require '
+                        '--mts_glt_interaction_diagnostics_dir'
+                    )
+                torsion_diagnostics.update({
+                    'task': str(task), 'fold': int(fold),
+                    'seed': int(args.seed), 'fold_seed': int(fold_seed),
+                    'mts_glt_mode': str(args.mts_glt_mode),
+                    'best_epoch': int(metrics.get('best_epoch', -1)),
+                    'test_r2': float(metrics.get('test_r2', float('nan'))),
+                })
+                unit_path = (
+                    Path(args.mts_glt_interaction_diagnostics_dir)
+                    / str(task) / f'fold_{int(fold)}.json'
+                )
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_tmp = unit_path.with_name(unit_path.name + f'.tmp.{os.getpid()}')
+                try:
+                    unit_tmp.write_text(
+                        json.dumps(torsion_diagnostics, indent=2, sort_keys=True)
+                        + '\n', encoding='utf-8'
+                    )
+                    os.replace(unit_tmp, unit_path)
+                finally:
+                    if unit_tmp.exists():
+                        unit_tmp.unlink()
+            if joint_basis_diagnostics is not None:
+                if not str(args.mts_glt_joint_basis_diagnostics_dir):
+                    raise ValueError(
+                        'joint SBF modes require '
+                        '--mts_glt_joint_basis_diagnostics_dir'
+                    )
+                joint_basis_diagnostics.update({
+                    'task': str(task), 'fold': int(fold),
+                    'seed': int(args.seed), 'fold_seed': int(fold_seed),
+                    'mts_glt_mode': str(args.mts_glt_mode),
+                    'best_epoch': int(metrics.get('best_epoch', -1)),
+                    'test_r2': float(metrics.get('test_r2', float('nan'))),
+                })
+                unit_path = (
+                    Path(args.mts_glt_joint_basis_diagnostics_dir)
+                    / str(task) / f'fold_{int(fold)}.json'
+                )
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_tmp = unit_path.with_name(unit_path.name + f'.tmp.{os.getpid()}')
+                try:
+                    unit_tmp.write_text(
+                        json.dumps(joint_basis_diagnostics, indent=2, sort_keys=True)
+                        + '\n', encoding='utf-8'
+                    )
+                    os.replace(unit_tmp, unit_path)
+                finally:
+                    if unit_tmp.exists():
+                        unit_tmp.unlink()
             postmortem = metrics.pop('_mts_glt_postmortem', None)
             graphgate_audit = metrics.pop('_mts_glt_graphgate_audit', None)
             if graphgate_audit is not None:
@@ -1204,6 +1903,10 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                     })
                 metrics['benchmark_eval_batch_records'] = benchmark_eval_records
             if args.refit_full_train:
+                if initial_model_state is None:
+                    raise RuntimeError(
+                        'Full-train refit requires the captured fold initialization.'
+                    )
                 refit_epochs = int(metrics.get('best_epoch', -1))
                 if refit_epochs <= 0:
                     raise RuntimeError(
@@ -1341,6 +2044,8 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                     'train_batch_size': int(args.batch_size),
                     'eval_batch_size': int(args.eval_batch_size),
                     'physical_gpu_id': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
+                    'resolved_config_path': args.resolved_config_path,
+                    'resolved_command_path': args.resolved_command_path,
                 }
                 try:
                     with prediction_tmp.open('wb') as handle:
@@ -1361,27 +2066,17 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 time.monotonic() - fold_started
             )
             metrics["fold"] = int(fold)
-            fold_attention, attention_shape, attention_labels, fold_named_attention = collect_attention_pooling_weights(model, test_loader, device)
-            fold_attention_weights.append(fold_attention)
-            for name, (weights, labels) in fold_named_attention.items():
-                fold_named_attention_weights.setdefault(name, {'labels': labels, 'weights': []})
-                fold_named_attention_weights[name]['weights'].append(weights)
 
             fold_metrics.append(metrics)
             print(
                 f"Fold {fold + 1} Test R2: {metrics['test_r2']:.3f}, "
                 f"MAE: {metrics['test_mae']:.3f}, RMSE: {metrics['test_rmse']:.3f}"
             )
-            print(f"Fold {fold + 1} attention shape: {attention_shape}")
-            print(f"Fold {fold + 1} mean attention: {format_attention_weights(attention_labels, fold_attention)}")
-
             if best_model_state is None or metrics['best_val_r2'] > best_fold_val_r2:
                 best_fold_val_r2 = metrics['best_val_r2']
                 best_model_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
             torch.cuda.empty_cache()
-
-        cv_attention = np.mean(np.stack(fold_attention_weights, axis=0), axis=0)
 
         avg_test_r2 = np.mean([metric['test_r2'] for metric in fold_metrics])
         std_test_r2 = np.std([metric['test_r2'] for metric in fold_metrics])
@@ -1400,7 +2095,6 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
         print(f"Standard Deviation of Test MAE = {std_test_mae:.3f}")
         print(f"Standard Deviation of Test RMSE = {std_test_rmse:.3f}")
         print(f"Best Validation R2 = {avg_val_r2:.3f} +/- {std_val_r2:.3f}")
-        print(f"5-fold mean attention: {format_attention_weights(attention_labels, cv_attention)}")
 
         # Downstream model persistence is intentionally disabled. The best
         # fold state remains in memory for evaluation, but saved_models is not
@@ -1423,6 +2117,13 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             'eval_batch_size': int(args.eval_batch_size),
             'physical_gpu_id': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
             'checkpoint_path': str(pretrained_model_path) if pretrained_model_path else None,
+            'resolved_config_path': args.resolved_config_path,
+            'resolved_command_path': args.resolved_command_path,
+            'resolved_config': (
+                Path(args.resolved_config_path).read_text(encoding='utf-8')
+                if args.resolved_config_path and Path(args.resolved_config_path).is_file()
+                else None
+            ),
             'model_modality_list': model_modality_list,
             'fusion_type': args.fusion_type,
             'fp_mode': args.fp_mode,
@@ -1447,7 +2148,9 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             ),
             'topology_attention_variant': args.topology_attention_variant,
             'mts_glt_mode': args.mts_glt_mode,
+            'mts_o8_bond_bias_mode': args.mts_o8_bond_bias_mode,
             'mts_glt_geometry_mode': args.mts_glt_geometry_mode,
+            'mts_glt_metadata_mode': getattr(args, 'mts_glt_metadata_mode', 'full'),
             'mts_glt_fusion_strategy': args.mts_glt_fusion_strategy,
             'mts_glt_fusion_warm_epochs': int(args.mts_glt_fusion_warm_epochs),
             'mts_glt_initial_alpha': float(args.mts_glt_initial_alpha),
@@ -1534,7 +2237,6 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 metric.get("fold_wall_seconds", 0.0)
                 for metric in fold_metrics
             ) / 3600.0),
-            'fusion_inputs': attention_labels,
             'graph_input': args.graph_input,
             'geom_input': args.geom_input,
             'graph_encoder_type': args.graph_encoder_type,
@@ -1579,7 +2281,6 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             'avg_test_rmse': float(avg_test_rmse),
             'std_test_rmse': float(std_test_rmse),
             'per_fold_metrics': json.dumps(fold_metrics, sort_keys=True),
-            'attention': format_attention_weights(attention_labels, cv_attention),
         }
 
         # Save to CSV.  Stage-3 campaign units write exactly one fold per

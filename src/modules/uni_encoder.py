@@ -3,8 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
-from transformers import RobertaModel
-from transformers.utils import logging as transformers_logging
 from src.dataset.mips_trimer_contract import ROUTE_INTERNAL, ROUTE_NAME
 
 from .mips_local_graph import MIPSLocalGraphEncoder
@@ -30,6 +28,9 @@ def _model_load_log(message):
 
 def _load_roberta_encoder(model_name):
     """Load the encoder without repeating expected MLM-head diagnostics."""
+
+    from transformers import RobertaModel
+    from transformers.utils import logging as transformers_logging
 
     if _model_load_log_mode() == "verbose":
         return RobertaModel.from_pretrained(model_name)

@@ -195,7 +195,7 @@ class LocalPeriodicGraphLineTransformerGraphGate(nn.Module):
         bias = torch.cat([bias, self.self_bias.to(dtype).expand(token_count, -1)], dim=0)
         return source, target, bias
 
-    def forward(self, data, line_inputs=None, geometry_mode="full"):
+    def encode_lines(self, data, line_inputs=None, geometry_mode="full"):
         geometry_mode = self._validate_geometry_mode(geometry_mode)
         states = (
             self.clean_line_inputs(data, geometry_mode=geometry_mode)
@@ -208,9 +208,21 @@ class LocalPeriodicGraphLineTransformerGraphGate(nn.Module):
             states = layer(states, source, target, bias)
         states = self.final_norm(states)
         query_valid = data.glt_query_valid.bool()
+        return {
+            "line_states": states,
+            "query_valid": query_valid,
+            "relation_source": source,
+            "relation_target": target,
+        }
+
+    def forward(self, data, line_inputs=None, geometry_mode="full"):
+        encoded = self.encode_lines(
+            data, line_inputs=line_inputs, geometry_mode=geometry_mode
+        )
+        states = encoded["line_states"]
+        query_valid = encoded["query_valid"]
         graph = self.query_pool(states, data.glt_token_batch, data.glt_token_valid, query_valid)
-        return {"line_states": states, "graph_geometry": graph, "query_valid": query_valid,
-                "relation_source": source, "relation_target": target}
+        return {**encoded, "graph_geometry": graph}
 
 
 class GLTMaskedLineHeadGraphGate(nn.Module):

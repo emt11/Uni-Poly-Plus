@@ -244,6 +244,18 @@ def train_epoch(
         _set_mts_glt_frozen_encoders_eval(model)
     epoch_started = time.perf_counter()
     optimizer_steps = 0
+    profile_breakdown = os.environ.get('MTS_PROFILE_BREAKDOWN', '0') == '1'
+    profile_max_steps = int(os.environ.get('MTS_PROFILE_MAX_STEPS', '0') or 0)
+    profile_times = {
+        'data_wait_seconds': 0.0, 'host_to_device_seconds': 0.0,
+        'forward_loss_seconds': 0.0, 'backward_seconds': 0.0,
+        'optimizer_seconds': 0.0,
+    }
+    if profile_breakdown and device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+    def profile_sync():
+        if profile_breakdown and device.type == 'cuda':
+            torch.cuda.synchronize(device)
     legacy_sync = os.environ.get('MTS_BENCHMARK_LEGACY_SYNC', '0') == '1'
     train_losses = []
     fused_losses = []
@@ -254,8 +266,16 @@ def train_epoch(
     train_targets = []
 
     progress_bar = tqdm(train_loader, desc="Training")
+    previous_end = time.perf_counter()
     for batch in progress_bar:
+        profile_sync()
+        now = time.perf_counter()
+        profile_times['data_wait_seconds'] += now - previous_end
+        transfer_started = now
         batch = batch.to(device, non_blocking=True)
+        profile_sync()
+        forward_started = time.perf_counter()
+        profile_times['host_to_device_seconds'] += forward_started - transfer_started
         optimizer.zero_grad(set_to_none=True)
 
         with _autocast_context(device, amp_dtype):
@@ -403,13 +423,22 @@ def train_epoch(
                             a - coefficient * b for a, b in
                             zip(projected[left], task_gradients[right])
                         ]
+        profile_sync()
+        backward_started = time.perf_counter()
+        profile_times['forward_loss_seconds'] += backward_started - forward_started
         loss.backward()
         if projected is not None:
             for parameter, gradients in zip(shared_parameters, zip(*projected)):
                 parameter.grad = torch.stack(list(gradients), dim=0).mean(dim=0)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        profile_sync()
+        optimizer_started = time.perf_counter()
+        profile_times['backward_seconds'] += optimizer_started - backward_started
         optimizer.step()
         scheduler.step()
+        profile_sync()
+        optimizer_ended = time.perf_counter()
+        profile_times['optimizer_seconds'] += optimizer_ended - optimizer_started
         optimizer_steps += 1
         if legacy_sync:
             train_losses.append(loss.item())
@@ -427,6 +456,9 @@ def train_epoch(
             cross_task_aux_losses.append(cross_task_aux_loss.detach())
             train_preds.append(outputs.detach().float())
             train_targets.append(batch.y.detach().float())
+        previous_end = time.perf_counter()
+        if profile_max_steps and optimizer_steps >= profile_max_steps:
+            break
 
     if legacy_sync:
         avg_train_loss = float(np.mean(train_losses))
@@ -465,6 +497,16 @@ def train_epoch(
             float(optimizer_steps / elapsed) if elapsed > 0 else 0.0
         ),
     }
+    if profile_breakdown:
+        timing.update(profile_times)
+        timing['peak_allocated_vram_bytes'] = (
+            int(torch.cuda.max_memory_allocated(device))
+            if device.type == 'cuda' else 0
+        )
+        timing['peak_reserved_vram_bytes'] = (
+            int(torch.cuda.max_memory_reserved(device))
+            if device.type == 'cuda' else 0
+        )
     return result + (timing,)
 
 def evaluate(model, data_loader, criterion, device, scaler=None, amp_dtype='fp32'):
@@ -592,7 +634,7 @@ def _mts_glt_fusion_components(model):
             'gate': encoder.glt_gate, 'md_residual': encoder.o8.md_residual,
         }
     if (
-        mode == 'o8_glt_graph'
+        mode in {'o8_glt_graph', 'o8_glt_graph_mean', 'o8_glt_atom_central'}
         and getattr(encoder, 'architecture_name', '') == 'MTS-GLT-GraphGate-v1'
         and callable(getattr(encoder, 'encode_views', None))
     ):
@@ -604,6 +646,19 @@ def _mts_glt_fusion_components(model):
             'fusion_projection': encoder.fusion_projection,
             'gate': encoder.channel_gate,
             'md_residual': encoder.o8_encoder.md_residual,
+        }
+    if (
+        mode == 'o8_glt_atom'
+        and getattr(encoder, 'architecture_name', '') == 'MIPS-Trimer-GLT-v2'
+        and callable(getattr(encoder, 'encode_views', None))
+    ):
+        return {
+            'kind': 'atom_channel', 'base': base, 'graph': graph,
+            'encoder': encoder, 'o8': encoder.o8, 'glt': encoder.glt,
+            'fusion_norm': encoder.atom_fusion_norm,
+            'fusion_projection': encoder.atom_fusion_projection,
+            'gate': encoder.atom_channel_gate,
+            'md_residual': encoder.o8.md_residual,
         }
     return None
 
@@ -687,6 +742,10 @@ def _configure_mts_glt_fusion_stage(
         )
     if stage == 'joint':
         _configure_mts_trainability(model)
+        if getattr(encoder, 'downstream_mode', None) in {
+            'o8_glt_graph_mean', 'o8_glt_atom_central',
+        }:
+            _set_module_trainable(getattr(components['glt'], 'query_pool', None), False)
         if stage2_trainability in {'both_frozen', 'glt_query_only'}:
             for name, parameter in components['o8'].named_parameters():
                 if not name.startswith('md_residual.'):
@@ -808,7 +867,9 @@ def collect_mts_graphgate_audit(model, data_loader, device):
     encoder = getattr(graph, 'encoder', None)
     if getattr(encoder, 'architecture_name', '') != 'MTS-GLT-GraphGate-v1':
         return None
-    if getattr(encoder, 'downstream_mode', None) != 'o8_glt_graph':
+    if getattr(encoder, 'downstream_mode', None) not in {
+        'o8_glt_graph', 'o8_glt_graph_mean', 'o8_glt_atom_central',
+    }:
         return None
     model.eval()
     rhos = []
@@ -975,7 +1036,14 @@ def _configure_mts_trainability(model):
         if graph_gate is not None:
             graph_gate.requires_grad = False
     if getattr(mts_encoder, "downstream_mode", None) in {
-        "o8_only", "o8_glt", "o8_glt_atom", "o8_glt_atom_desc", "o8_glt_graph"
+        "o8_only", "o8_glt", "o8_glt_atom", "o8_glt_atom_desc",
+        "o8_glt_atom_self3d", "o8_glt_atom_x23",
+        "o8_glt_atom_line_self", "o8_glt_atom_line_x2l",
+        "o8_glt_atom_attn_self", "o8_glt_atom_attn_x2a",
+        "o8_glt_atom_torsion_count", "o8_glt_atom_torsion",
+        "o8_glt_atom_sbf_angle_control",
+        "o8_glt_atom_sbf_radial_angle",
+        "o8_glt_graph", "o8_glt_graph_mean", "o8_glt_atom_central",
     }:
         _set_module_trainable(
             getattr(getattr(mts_encoder, "o8", None), "star_distance_bias", None),
@@ -984,6 +1052,13 @@ def _configure_mts_trainability(model):
         _set_module_trainable(
             getattr(getattr(mts_encoder, "o8_encoder", None), "star_distance_bias", None),
             False,
+        )
+    if (
+        getattr(mts_encoder, 'architecture_name', '') == 'MIPS-Trimer-GLT-v2'
+        and not bool(getattr(mts_encoder, 'use_compact19', False))
+    ):
+        _set_module_trainable(
+            getattr(mts_encoder, 'compact19_residual', None), False
         )
 
     for module in (
@@ -1395,6 +1470,12 @@ def train_and_evaluate(
             'unsupported FusionWarm Stage 2 trainability: '
             f'{stage2_trainability}'
         )
+    fusion_components = _mts_glt_fusion_components(model) if fusion_warm else None
+    preserve_formal_schedule = bool(
+        fusion_warm
+        and fusion_components is not None
+        and fusion_components['kind'] == 'atom_channel'
+    )
     if fusion_warm:
         if not 0 <= fusion_warm_epochs < int(num_epochs):
             raise ValueError(
@@ -1402,7 +1483,15 @@ def train_and_evaluate(
             )
         if int(swa_start_epoch) >= 0:
             raise ValueError('FusionWarm does not use SWA')
-        _configure_mts_glt_fusion_stage(model, 'warm')
+        if preserve_formal_schedule:
+            # Build the exact formal GLT-v2 optimizer before freezing the
+            # representation stack. Frozen parameters remain in their formal
+            # optimizer groups without gradients during epochs 1..N; epoch
+            # N+1 only restores trainability. This keeps LR, scheduler state,
+            # optimizer state and early-stopping budget matched to Warm0.
+            _configure_mts_trainability(model)
+        else:
+            _configure_mts_glt_fusion_stage(model, 'warm')
         warm_components = _mts_glt_fusion_components(model)
         expected_alpha = float(mts_glt_initial_alpha)
         observed_alpha = torch.tanh(warm_components['gate'].detach()).float()
@@ -1433,8 +1522,13 @@ def train_and_evaluate(
         weight_decay, mts_o8_lr=mts_o8_lr,
         mts_geometry_lr=mts_geometry_lr,
         mts_adapter_lr=mts_adapter_lr,
-        mts_glt_fusion_stage='warm' if fusion_warm else None,
+        mts_glt_fusion_stage=(
+            None if preserve_formal_schedule
+            else ('warm' if fusion_warm else None)
+        ),
     )
+    if preserve_formal_schedule:
+        _configure_mts_glt_fusion_stage(model, 'warm')
     postmortem_components = (
         _mts_glt_fusion_components(model) if mts_glt_postmortem else None
     )
@@ -1466,10 +1560,11 @@ def train_and_evaluate(
         }
         initial_row.update(_mts_glt_trajectory_fields(initial_fusion_audit))
         gate_trajectory.append(initial_row)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lambda _step: 1.0
-        )
-    else:
+        if not preserve_formal_schedule:
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lambda _step: 1.0
+            )
+    if not fusion_warm or preserve_formal_schedule:
         total_steps = max(1, len(train_loader) * num_epochs)
         warmup_steps = min(
             total_steps - 1, max(0, int(warmup_epochs) * len(train_loader))
@@ -1499,33 +1594,40 @@ def train_and_evaluate(
             _configure_mts_glt_fusion_stage(
                 model, 'joint', stage2_trainability
             )
-            optimizer = _build_downstream_optimizer(
-                model, smiles_lr, graph_lr, geom_lr, fp_lr,
-                fusion_lr, head_lr, weight_decay,
-                mts_o8_lr=mts_o8_lr,
-                mts_geometry_lr=mts_geometry_lr,
-                mts_adapter_lr=mts_adapter_lr,
-                mts_glt_fusion_stage='joint',
-            )
-            joint_steps = max(
-                1, len(train_loader) * (int(num_epochs) - fusion_warm_epochs)
-            )
-
-            def joint_lr_lambda(step):
-                progress = float(step) / float(max(1, joint_steps - 1))
-                return 0.5 * (
-                    1.0 + np.cos(np.pi * min(1.0, max(0.0, progress)))
+            if preserve_formal_schedule:
+                print(
+                    f'GLT-v2 FusionWarm Stage 2 begins at epoch {epoch + 1}: '
+                    'encoder trainability restored; formal optimizer, LR '
+                    'scheduler and early-stopping state preserved.'
+                )
+            else:
+                optimizer = _build_downstream_optimizer(
+                    model, smiles_lr, graph_lr, geom_lr, fp_lr,
+                    fusion_lr, head_lr, weight_decay,
+                    mts_o8_lr=mts_o8_lr,
+                    mts_geometry_lr=mts_geometry_lr,
+                    mts_adapter_lr=mts_adapter_lr,
+                    mts_glt_fusion_stage='joint',
+                )
+                joint_steps = max(
+                    1, len(train_loader) * (int(num_epochs) - fusion_warm_epochs)
                 )
 
-            scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, joint_lr_lambda
-            )
-            epochs_no_improve = 0
-            print(
-                f'FusionWarm Stage 2 begins at epoch {epoch + 1}: '
-                f'trainability={stage2_trainability}; optimizer and cosine '
-                'scheduler rebuilt.'
-            )
+                def joint_lr_lambda(step):
+                    progress = float(step) / float(max(1, joint_steps - 1))
+                    return 0.5 * (
+                        1.0 + np.cos(np.pi * min(1.0, max(0.0, progress)))
+                    )
+
+                scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    optimizer, joint_lr_lambda
+                )
+                epochs_no_improve = 0
+                print(
+                    f'FusionWarm Stage 2 begins at epoch {epoch + 1}: '
+                    f'trainability={stage2_trainability}; optimizer and cosine '
+                    'scheduler rebuilt.'
+                )
         epoch_stage = (
             'fusion_warm'
             if fusion_warm and epoch < fusion_warm_epochs
@@ -1592,7 +1694,7 @@ def train_and_evaluate(
             epochs_no_improve = 0
             print(f"Epoch {epoch+1}: Validation R2 improved to {val_r2:.4f}.")
         else:
-            if epoch_stage == 'fusion_warm':
+            if epoch_stage == 'fusion_warm' and not preserve_formal_schedule:
                 print(
                     f"Epoch {epoch+1}: No validation improvement; "
                     "FusionWarm does not consume early-stopping patience."
@@ -1612,7 +1714,10 @@ def train_and_evaluate(
                 row.update(_mts_glt_trajectory_fields(epoch_audit))
             gate_trajectory.append(row)
 
-        if epoch_stage != 'fusion_warm' and epochs_no_improve >= patience:
+        if (
+            (epoch_stage != 'fusion_warm' or preserve_formal_schedule)
+            and epochs_no_improve >= patience
+        ):
             print(f"Early stopping after {patience} epochs with no improvement.")
             break
 

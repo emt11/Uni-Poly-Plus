@@ -1,8 +1,10 @@
 """Fixed graph core for the ``MIPS-Trimer-SCAGE`` (MTS) route."""
 
 import os
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import global_mean_pool
 from torch_geometric.utils import softmax
 from torch_scatter import scatter
@@ -56,6 +58,143 @@ class MIPSSinglePathNodeBias(nn.Module):
                     / denominator[selected].unsqueeze(-1)
                 )
         return output
+
+
+class MIPSDirectBondTypeBias(nn.Module):
+    """Zero-initialized direct-bond bias from existing periodic line labels.
+
+    ``control`` gives every real chemical bond the same normalized K-vector;
+    ``type`` uses the stored categorical identity.  Both arms therefore own
+    exactly the same ``Linear(K, heads, bias=False)`` parameters.
+    """
+
+    VALID_MODES = {"control", "type"}
+
+    def __init__(self, num_heads=8, num_categories=6, mode="type"):
+        super().__init__()
+        if str(mode) not in self.VALID_MODES:
+            raise ValueError(f"unsupported direct-bond bias mode: {mode}")
+        self.mode = str(mode)
+        self.num_categories = int(num_categories)
+        self.projection = nn.Linear(
+            self.num_categories, int(num_heads), bias=False
+        )
+        nn.init.zeros_(self.projection.weight)
+
+    @staticmethod
+    def _canonical_relation_keys(data):
+        edge = data.lga_edge_index.long()
+        source, target = edge[0], edge[1]
+        shift = data.lga_source_image_shift.long().reshape(-1)
+        if shift.numel() != source.numel():
+            raise ValueError("direct-bond relation shift length mismatch")
+        # Relation r=(target, source, shift), canonicalized together with its
+        # inverse (source, target, -shift), exactly like canonical_line_token.
+        use_direct = (target < source) | ((target == source) & (shift <= 0))
+        atom_a = torch.where(use_direct, target, source)
+        atom_b = torch.where(use_direct, source, target)
+        canonical_shift = torch.where(use_direct, shift, -shift)
+        return atom_a, atom_b, canonical_shift
+
+    @staticmethod
+    def _pack_keys(atom_a, atom_b, shift, *, atom_radix, shift_radius):
+        if shift.numel() and bool((shift.abs() > int(shift_radius)).any()):
+            raise ValueError("direct-bond key shift is outside the packed range")
+        shift_radix = 2 * int(shift_radius) + 1
+        return (
+            (atom_a.long() * int(atom_radix) + atom_b.long()) * shift_radix
+            + shift.long() + int(shift_radius)
+        )
+
+    def relation_categories(self, data):
+        required = (
+            "glt_token_atom_a", "glt_token_atom_b", "glt_token_shift",
+            "glt_token_bond_type", "lga_edge_index", "lga_spd",
+            "lga_source_image_shift",
+        )
+        missing = [name for name in required if not hasattr(data, name)]
+        if missing:
+            raise ValueError(
+                "direct-bond bias requires existing GLT bond fields: "
+                + ", ".join(missing)
+            )
+        token_a = data.glt_token_atom_a.long().reshape(-1)
+        token_b = data.glt_token_atom_b.long().reshape(-1)
+        token_shift = data.glt_token_shift.long().reshape(-1)
+        token_type = data.glt_token_bond_type.long().reshape(-1)
+        if not (
+            token_a.numel() == token_b.numel() == token_shift.numel()
+            == token_type.numel()
+        ):
+            raise ValueError("direct-bond token field length mismatch")
+        if token_type.numel() and bool(
+            ((token_type < 0) | (token_type >= self.num_categories)).any()
+        ):
+            raise ValueError("direct-bond category is outside the stored vocabulary")
+
+        relation_a, relation_b, relation_shift = self._canonical_relation_keys(data)
+        relation_count = int(relation_a.numel())
+        categories = relation_a.new_full((relation_count,), -1)
+        direct = data.lga_spd.long().reshape(-1) == 1
+        if not bool(direct.any()):
+            return categories
+        if token_a.numel() == 0:
+            raise ValueError("SPD=1 relations exist without periodic line tokens")
+        maximum_atom = torch.stack((
+            token_a.max(), token_b.max(), relation_a.max(), relation_b.max()
+        )).max()
+        atom_radix = int(maximum_atom.item()) + 1
+        shift_radius = int(torch.stack((
+            token_shift.abs().max(), relation_shift.abs().max()
+        )).max().item())
+        token_key = self._pack_keys(
+            token_a, token_b, token_shift,
+            atom_radix=atom_radix, shift_radius=shift_radius,
+        )
+        relation_key = self._pack_keys(
+            relation_a[direct], relation_b[direct], relation_shift[direct],
+            atom_radix=atom_radix, shift_radius=shift_radius,
+        )
+        sorted_key, order = torch.sort(token_key)
+        if sorted_key.numel() > 1 and bool((sorted_key[1:] == sorted_key[:-1]).any()):
+            raise ValueError("periodic line token keys are not unique")
+        position = torch.searchsorted(sorted_key, relation_key)
+        matched = position < sorted_key.numel()
+        safe_position = position.clamp_max(sorted_key.numel() - 1)
+        matched &= sorted_key[safe_position] == relation_key
+        if not bool(matched.all()):
+            raise ValueError("SPD=1 relation has no matching chemical-bond token")
+        categories[direct] = token_type[order[safe_position]]
+        return categories
+
+    def category_bias(self, categories):
+        categories = torch.as_tensor(
+            categories, device=self.projection.weight.device, dtype=torch.long
+        ).reshape(-1)
+        if categories.numel() and bool(
+            ((categories < 0) | (categories >= self.num_categories)).any()
+        ):
+            raise ValueError("direct-bond category is outside the stored vocabulary")
+        if self.mode == "control":
+            inputs = self.projection.weight.new_full(
+                (categories.numel(), self.num_categories),
+                1.0 / math.sqrt(self.num_categories),
+            )
+        else:
+            inputs = F.one_hot(
+                categories, num_classes=self.num_categories
+            ).to(self.projection.weight.dtype)
+        return self.projection(inputs)
+
+    def forward(self, data, dtype=None):
+        categories = self.relation_categories(data)
+        output = self.projection.weight.new_zeros(
+            (categories.numel(), self.projection.out_features)
+        )
+        direct = categories >= 0
+        if bool(direct.any()):
+            output[direct] = self.category_bias(categories[direct])
+        return output if dtype is None else output.to(dtype)
 
 
 class SymmetricStarDistanceBias(nn.Module):
@@ -275,6 +414,7 @@ class MIPSLocalGraphEncoder(nn.Module):
         star_rbf_upper=3.0,
         use_mcl=False,
         topology_attention_variant="o8",
+        direct_bond_bias_mode="none",
         **retired,
     ):
         super().__init__()
@@ -349,6 +489,10 @@ class MIPSLocalGraphEncoder(nn.Module):
         self.descriptor_components = "md200"
         self.use_star_rbf = bool(use_star_rbf)
         self.use_mcl = False
+        direct_bond_bias_mode = str(direct_bond_bias_mode)
+        if direct_bond_bias_mode not in {"none", "control", "type"}:
+            raise ValueError("invalid O8 direct-bond bias mode")
+        self.direct_bond_bias_mode = direct_bond_bias_mode
         if str(mask_policy) != "canonical_exact":
             raise ValueError(
                 "all canonical-equivalent O8 copies must be masked together"
@@ -363,6 +507,12 @@ class MIPSLocalGraphEncoder(nn.Module):
         nn.init.zeros_(self.spd_embedding.weight)
         self.path_bias = MIPSSinglePathNodeBias(
             self.emb_dim, self.num_heads, self.max_hops
+        )
+        self.direct_bond_bias = (
+            MIPSDirectBondTypeBias(
+                self.num_heads, num_categories=6, mode=direct_bond_bias_mode
+            )
+            if direct_bond_bias_mode != "none" else None
         )
         self.star_distance_bias = SymmetricStarDistanceBias(
             self.num_heads, upper=float(star_rbf_upper)
@@ -417,6 +567,11 @@ class MIPSLocalGraphEncoder(nn.Module):
                 )
         if require_md:
             required += ("mips_md", "mips_md_valid")
+        if self.direct_bond_bias is not None:
+            required += (
+                "glt_token_atom_a", "glt_token_atom_b", "glt_token_shift",
+                "glt_token_bond_type",
+            )
         missing = [name for name in required if not hasattr(data, name)]
         if missing:
             raise ValueError(
@@ -482,17 +637,21 @@ class MIPSLocalGraphEncoder(nn.Module):
         spd_bias = self.spd_embedding(data.lga_spd.long())
         path_bias = self.path_bias(initial, data)
         star_bias = torch.zeros_like(spd_bias)
+        bond_bias = torch.zeros_like(spd_bias)
         if use_star:
             star_bias = self.star_distance_bias.forward_periodic_relation_v2(
                 data, initial.dtype
             )
+        if self.direct_bond_bias is not None:
+            bond_bias = self.direct_bond_bias(data, dtype=initial.dtype)
         relation_mask = getattr(data, "lga_relation_mask", None)
         if relation_mask is not None:
             keep = (~relation_mask.bool()).unsqueeze(-1).to(initial.dtype)
             spd_bias = spd_bias * keep
             path_bias = path_bias * keep
             star_bias = star_bias * keep
-        attention_bias = spd_bias + path_bias + star_bias
+            bond_bias = bond_bias * keep
+        attention_bias = spd_bias + path_bias + star_bias + bond_bias
         x = initial
         for layer in self.layers:
             x = layer(x, data.lga_edge_index.long(), attention_bias)

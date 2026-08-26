@@ -99,6 +99,7 @@ def _checkpoint_payload(container, optimizer, scheduler, step, args, world_size)
         "world_size": int(world_size),
         "glt_layers": int(args.glt_layers),
         "glt_attention_variant": str(args.glt_attention_variant),
+        "glt_metadata_mode": str(getattr(args, "glt_metadata_mode", "full")),
     }
 
 
@@ -118,6 +119,9 @@ def run_glt_v2_pretrain(args):
     from src.training.pretrain.config import dataset_kwargs_from_args
     from src.training.pretrain.engine import _atomic_torch_save, _b0_differentiable_mean
     from src.training.pretrain.glt_v2_objectives import load_line_label_counts
+    from src.training.pretrain.metadata_dedup import (
+        build_matched_pretrain_containers,
+    )
     from src.utils import get_data_loader, set_global_seed
 
     if str(args.config_schema) != "mts-glt-v2":
@@ -168,31 +172,71 @@ def run_glt_v2_pretrain(args):
             prefetch_factor=int(args.loader_prefetch_factor),
         )
 
-        model = MTSGraphLineModelV2(
-            glt_layers=int(args.glt_layers),
-            glt_attention_variant=str(args.glt_attention_variant),
-            use_compact19=False,
-        )
-        # These branches are downstream-only.  Atom incidence remains trainable
-        # because it defines the GLT graph representation used by InfoNCE.
-        for module in (
-            model.atom_fusion_norm, model.atom_fusion_projection,
-            model.compact19_residual, model.o8.md_residual,
-        ):
-            for parameter in module.parameters():
-                parameter.requires_grad = False
-        model.atom_channel_gate.requires_grad = False
         frequencies = load_line_label_counts(
             args.glt_line_label_counts, label_count=NUM_LINE_LABELS
         )
-        container = MTSGLTV2PretrainContainer(
-            model,
-            nn.Linear(512, int(model.o8.masked_atom_classes)),
-            GLTMaskedLineHeadV2(512),
-            _projection(args.glt_projection_dim),
-            _projection(args.glt_projection_dim),
-            frequencies,
-        ).to(device)
+        def make_container(metadata_mode):
+            model = MTSGraphLineModelV2(
+                glt_layers=int(args.glt_layers),
+                glt_attention_variant=str(args.glt_attention_variant),
+                glt_metadata_mode=str(metadata_mode),
+                use_compact19=False,
+            )
+            # These branches are downstream-only.  Atom incidence remains
+            # trainable because it defines the GLT graph representation used
+            # by InfoNCE.
+            for module in (
+                model.atom_fusion_norm, model.atom_fusion_projection,
+                model.compact19_residual, model.o8.md_residual,
+            ):
+                for parameter in module.parameters():
+                    parameter.requires_grad = False
+            model.atom_channel_gate.requires_grad = False
+            return MTSGLTV2PretrainContainer(
+                model,
+                nn.Linear(512, int(model.o8.masked_atom_classes)),
+                GLTMaskedLineHeadV2(512),
+                _projection(args.glt_projection_dim),
+                _projection(args.glt_projection_dim),
+                frequencies,
+            )
+
+        loader_generator_state_before_init = loader_generator.get_state()
+        cuda_rng_before_init = [
+            state.cpu().clone() for state in torch.cuda.get_rng_state_all()
+        ]
+        container, reference_container, matched_init_report = (
+            build_matched_pretrain_containers(
+                make_container,
+                str(getattr(args, "glt_metadata_mode", "full")),
+                seed=int(args.seed),
+            )
+        )
+        loader_generator_unchanged = torch.equal(
+            loader_generator_state_before_init, loader_generator.get_state()
+        )
+        cuda_rng_unchanged = all(
+            torch.equal(before, after.cpu())
+            for before, after in zip(
+                cuda_rng_before_init, torch.cuda.get_rng_state_all()
+            )
+        )
+        matched_init_report.update({
+            "loader_generator_unchanged": bool(loader_generator_unchanged),
+            "cuda_rng_unchanged": bool(cuda_rng_unchanged),
+            "rank": int(rank),
+            "world_size": int(world_size),
+            "step": 0,
+        })
+        del reference_container
+        container = container.to(device)
+        result_root = Path(args.glt_result_root)
+        result_root.mkdir(parents=True, exist_ok=True)
+        if rank == 0:
+            (result_root / "step0_matched_init.json").write_text(
+                json.dumps(matched_init_report, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         train_module = container
         if distributed:
             from torch.nn.parallel import DistributedDataParallel
@@ -229,13 +273,15 @@ def run_glt_v2_pretrain(args):
                 raise RuntimeError("MTS-GLT-v2 resume layer mismatch")
             if str(payload["glt_attention_variant"]) != str(args.glt_attention_variant):
                 raise RuntimeError("MTS-GLT-v2 resume attention mismatch")
+            if str(payload.get("glt_metadata_mode", "full")) != str(
+                getattr(args, "glt_metadata_mode", "full")
+            ):
+                raise RuntimeError("MTS-GLT-v2 resume metadata mode mismatch")
             container.load_state_dict(payload["model_state"], strict=True)
             optimizer.load_state_dict(payload["optimizer"])
             scheduler.load_state_dict(payload["scheduler"])
             optimizer_step = int(payload["optimizer_steps_completed"])
 
-        result_root = Path(args.glt_result_root)
-        result_root.mkdir(parents=True, exist_ok=True)
         metrics_path = result_root / "training_metrics.jsonl"
         if rank == 0 and metrics_path.exists() and not args.resume_state:
             raise RuntimeError(f"refusing to append to existing GLT-v2 trajectory: {metrics_path}")
@@ -348,6 +394,9 @@ def run_glt_v2_pretrain(args):
                             "step": optimizer_step,
                             "glt_layers": int(args.glt_layers),
                             "glt_attention_variant": str(args.glt_attention_variant),
+                            "glt_metadata_mode": str(
+                                getattr(args, "glt_metadata_mode", "full")
+                            ),
                             "infonce_weight": float(args.glt_infonce_loss_weight),
                         },
                         result_root / f"mts_glt_v2_probe_{optimizer_step // 1000:03d}k.pth",

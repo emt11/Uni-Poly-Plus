@@ -159,6 +159,158 @@ def _token_instances(token):
     ]
 
 
+def derive_relation_source_distance_observations(tokens, relations):
+    """Recover occurrence-matched source-line distances for each relation.
+
+    The frozen v1 sidecar stores token distances and angle observations in the
+    deterministic builder order, but does not duplicate the source distance on
+    every directed relation.  This reconstructs the builder's combinatorial
+    occurrence order from canonical token metadata only; it never reparses a
+    molecule or guesses from numerical distance/angle values.
+    """
+    token_a = np.asarray(tokens["token_atom_a"], dtype=np.int64)
+    token_b = np.asarray(tokens["token_atom_b"], dtype=np.int64)
+    token_shift = np.asarray(tokens["token_shift"], dtype=np.int64)
+    token_distances = np.asarray(
+        tokens["token_observation_distances"], dtype=np.float32
+    ).reshape(-1, 3)
+    token_counts = np.asarray(tokens["token_observation_count"], dtype=np.int64)
+    token_valid = np.asarray(tokens["token_valid"], dtype=bool)
+    token_count = int(token_a.size)
+    if not (
+        token_b.size == token_shift.size == token_counts.size
+        == token_valid.size == token_count
+        and token_distances.shape == (token_count, 3)
+    ):
+        raise ValueError("invalid token arrays for relation-distance pairing")
+
+    # Preserve the exact insertion order used by build_periodic_line_sample.
+    incident = {}
+    for token_id, (u, v, shift) in enumerate(
+        zip(token_a.tolist(), token_b.tolist(), token_shift.tolist())
+    ):
+        instances = _token_instances((u, v, shift))
+        for slot, (left, q_left, right, q_right) in enumerate(instances):
+            incident.setdefault((left, q_left), []).append(
+                (token_id, right, q_right, slot)
+            )
+            incident.setdefault((right, q_right), []).append(
+                (token_id, left, q_left, slot)
+            )
+
+    grouped = defaultdict(list)
+    for (center, q_center), members in incident.items():
+        for left_index in range(len(members)):
+            for right_index in range(left_index + 1, len(members)):
+                src, outer_a, q_a, src_slot = members[left_index]
+                dst, outer_b, q_b, dst_slot = members[right_index]
+                normalized = (
+                    outer_a, q_a - q_center, center,
+                    outer_b, q_b - q_center,
+                )
+                inverse = (
+                    outer_b, q_b - q_center, center,
+                    outer_a, q_a - q_center,
+                )
+                geometry_key = min(normalized, inverse)
+                key = (min(src, dst), max(src, dst), geometry_key)
+                grouped[key].append((src, src_slot, dst, dst_slot))
+
+    descriptors = []
+    real_neighbors = set()
+    for (low, high, geometry_key), observations in sorted(grouped.items()):
+        span = max(geometry_key[1], 0, geometry_key[4]) - min(
+            geometry_key[1], 0, geometry_key[4]
+        )
+        expected = 3 - span
+        if not (0 <= span <= 2) or len(observations) != expected:
+            raise ValueError("reconstructed relation multiplicity mismatch")
+        directions = [(low, high)] if low == high else [(low, high), (high, low)]
+        for source, target in directions:
+            slots = []
+            for first, first_slot, second, second_slot in observations:
+                if first == source:
+                    slots.append(first_slot)
+                elif second == source:
+                    slots.append(second_slot)
+                else:
+                    raise ValueError("source token absent from reconstructed occurrence")
+            descriptors.append({
+                "source": source,
+                "target": target,
+                "center": int(geometry_key[2]),
+                "multiplicity": expected,
+                "fallback": False,
+                "source_slots": slots,
+            })
+            real_neighbors.add(source)
+    for token_id in range(token_count):
+        if token_id not in real_neighbors:
+            descriptors.append({
+                "source": token_id, "target": token_id, "center": -1,
+                "multiplicity": 1, "fallback": True, "source_slots": [],
+            })
+    descriptors.sort(key=lambda item: (
+        item["target"], item["source"], item["center"], item["fallback"]
+    ))
+
+    relation_source = np.asarray(relations["relation_source"], dtype=np.int64)
+    relation_target = np.asarray(relations["relation_target"], dtype=np.int64)
+    relation_center = np.asarray(relations["relation_center_atom"], dtype=np.int64)
+    relation_multiplicity = np.asarray(
+        relations["relation_multiplicity"], dtype=np.int64
+    )
+    relation_counts = np.asarray(
+        relations["relation_observation_count"], dtype=np.int64
+    )
+    relation_valid = np.asarray(relations["relation_valid"], dtype=bool)
+    relation_fallback = np.asarray(
+        relations["relation_is_fallback"], dtype=bool
+    )
+    relation_count = int(relation_source.size)
+    if len(descriptors) != relation_count:
+        raise ValueError("reconstructed relation count mismatch")
+    values = np.zeros((relation_count, 3), dtype=np.float32)
+    observation_valid = np.zeros((relation_count, 3), dtype=bool)
+    source_cross_ru = np.zeros((relation_count,), dtype=bool)
+    source_slots = np.full((relation_count, 3), -1, dtype=np.int8)
+    for index, descriptor in enumerate(descriptors):
+        observed_contract = (
+            int(relation_source[index]), int(relation_target[index]),
+            int(relation_center[index]), int(relation_multiplicity[index]),
+            bool(relation_fallback[index]),
+        )
+        expected_contract = (
+            descriptor["source"], descriptor["target"], descriptor["center"],
+            descriptor["multiplicity"], descriptor["fallback"],
+        )
+        if observed_contract != expected_contract:
+            raise ValueError(
+                "frozen relation order differs from reconstructed builder order"
+            )
+        source = descriptor["source"]
+        source_cross_ru[index] = abs(int(token_shift[source])) == 1
+        slots = descriptor["source_slots"]
+        if slots:
+            source_slots[index, :len(slots)] = np.asarray(slots, dtype=np.int8)
+        if (
+            descriptor["fallback"] or not relation_valid[index]
+            or not token_valid[source] or relation_counts[index] != len(slots)
+        ):
+            continue
+        selected = token_distances[source, np.asarray(slots, dtype=np.int64)]
+        if not np.all(np.isfinite(selected) & (selected > 0.0)):
+            continue
+        values[index, :len(slots)] = selected
+        observation_valid[index, :len(slots)] = True
+    return {
+        "source_distances": values,
+        "observation_valid": observation_valid,
+        "source_slots": source_slots,
+        "source_cross_ru": source_cross_ru,
+    }
+
+
 def build_periodic_line_sample(key: bytes, topology, trimer):
     """Build one periodic bond-token graph and its Trimer observations."""
     prepared, topology_reason = prepare_topology(topology)
@@ -361,7 +513,7 @@ class PeriodicLineGLTSidecar:
         rs, re = (int(self.arrays["sample_relation_offsets"][index + i]) for i in (0, 1))
         token_names = (
             "token_atom_a", "token_atom_b", "token_shift",
-            "token_endpoint_z_a", "token_endpoint_z_b", "token_label",
+            "token_endpoint_z_a", "token_endpoint_z_b", "token_bond_type", "token_label",
             "token_observation_distances", "token_observation_count", "token_valid",
         )
         relation_names = (
@@ -376,16 +528,12 @@ class PeriodicLineGLTSidecar:
         }
 
     def qc_row(self, index):
-        row = self.model_row(index)
-        ts, te = (int(self.arrays["sample_token_offsets"][int(index) + i]) for i in (0, 1))
-        row["tokens"]["token_bond_type"] = np.asarray(
-            self.arrays["token_bond_type"][ts:te]
-        )
-        return row
+        return self.model_row(index)
 
 
 __all__ = [
     "ARRAY_DTYPES", "ARRAY_NAMES", "BUILDER_VERSION", "SIDECAR_SCHEMA",
     "NUM_BOND_TYPES", "MAX_ATOMIC_NUMBER", "PeriodicLineGLTSidecar",
     "build_periodic_line_sample", "canonical_line_token", "masked_line_label",
+    "derive_relation_source_distance_observations",
 ]

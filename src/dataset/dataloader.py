@@ -69,7 +69,7 @@ def mips_trimer_collate(data_list):
     star_v2_uppers = set()
     glt_fields_present = all(hasattr(item, "glt_token_atom_a") for item in data_list)
     glt_token_atom_a, glt_token_atom_b, glt_token_shift = [], [], []
-    glt_token_z_a, glt_token_z_b, glt_token_label = [], [], []
+    glt_token_z_a, glt_token_z_b, glt_token_bond_type, glt_token_label = [], [], [], []
     glt_token_distances, glt_token_counts, glt_token_valid = [], [], []
     glt_token_batch = []
     glt_relation_source, glt_relation_target, glt_relation_center = [], [], []
@@ -82,6 +82,11 @@ def mips_trimer_collate(data_list):
     glt_relation_outer_offset_a, glt_relation_outer_offset_b = [], []
     glt_relation_span = []
     glt_relation_observation_valid, glt_relation_observation_translation = [], []
+    glt_relation_source_distances, glt_relation_source_distance_valid = [], []
+    glt_relation_source_distance_slot, glt_relation_source_cross_ru = [], []
+    glt_torsion_values, glt_torsion_relations = [], []
+    glt_torsion_counts, glt_torsion_covered = [], []
+    glt_torsion_source_cross, glt_graph_torsion_covered = [], []
     star_v2_pair_keys_present = all(
         all(hasattr(item, name) for name in (
             "mts_star_v2_pair_key_src", "mts_star_v2_pair_key_dst",
@@ -113,6 +118,7 @@ def mips_trimer_collate(data_list):
     lga_relation_offset = 0
     star_v2_pair_offset = 0
     glt_token_offset = 0
+    glt_relation_offset = 0
 
     for graph_id, item in enumerate(data_list):
         # A legacy single-node canonical placeholder carries a one-column path
@@ -209,7 +215,7 @@ def mips_trimer_collate(data_list):
             relation_count = int(item.glt_relation_source.numel())
             for name in (
                 "glt_token_atom_b", "glt_token_shift", "glt_token_endpoint_z_a",
-                "glt_token_endpoint_z_b", "glt_token_label",
+                "glt_token_endpoint_z_b", "glt_token_bond_type", "glt_token_label",
                 "glt_token_observation_count", "glt_token_valid",
             ):
                 if int(getattr(item, name).numel()) != token_count:
@@ -237,6 +243,7 @@ def mips_trimer_collate(data_list):
             glt_token_shift.append(item.glt_token_shift.long())
             glt_token_z_a.append(item.glt_token_endpoint_z_a.long())
             glt_token_z_b.append(item.glt_token_endpoint_z_b.long())
+            glt_token_bond_type.append(item.glt_token_bond_type.long())
             glt_token_label.append(item.glt_token_label.long())
             glt_token_distances.append(item.glt_token_observation_distances.float())
             glt_token_counts.append(item.glt_token_observation_count.long())
@@ -264,7 +271,43 @@ def mips_trimer_collate(data_list):
                 glt_relation_span.append(item.glt_relation_span.long())
                 glt_relation_observation_valid.append(item.glt_relation_observation_valid.bool())
                 glt_relation_observation_translation.append(item.glt_relation_observation_translation.long())
+            if hasattr(item, "glt_relation_torsion_count"):
+                glt_torsion_values.append(item.glt_torsion_observation_value.float())
+                glt_torsion_relations.append(
+                    item.glt_torsion_observation_relation.long()
+                    + glt_relation_offset
+                )
+                glt_torsion_counts.append(item.glt_relation_torsion_count.long())
+                glt_torsion_covered.append(item.glt_relation_torsion_covered.bool())
+                glt_torsion_source_cross.append(
+                    item.glt_relation_torsion_source_cross_ru.bool()
+                )
+                glt_graph_torsion_covered.append(
+                    bool(item.glt_graph_torsion_covered)
+                )
+            if hasattr(item, "glt_relation_source_distances"):
+                if tuple(item.glt_relation_source_distances.shape) != (relation_count, 3):
+                    raise ValueError("joint radial relation-distance shape mismatch")
+                if tuple(item.glt_relation_source_distance_valid.shape) != (relation_count, 3):
+                    raise ValueError("joint radial relation-valid shape mismatch")
+                if tuple(item.glt_relation_source_distance_slot.shape) != (relation_count, 3):
+                    raise ValueError("joint radial relation-slot shape mismatch")
+                if int(item.glt_relation_source_cross_ru.numel()) != relation_count:
+                    raise ValueError("joint radial source-shift length mismatch")
+                glt_relation_source_distances.append(
+                    item.glt_relation_source_distances.float()
+                )
+                glt_relation_source_distance_valid.append(
+                    item.glt_relation_source_distance_valid.bool()
+                )
+                glt_relation_source_distance_slot.append(
+                    item.glt_relation_source_distance_slot.long()
+                )
+                glt_relation_source_cross_ru.append(
+                    item.glt_relation_source_cross_ru.bool()
+                )
             glt_token_offset += token_count
+            glt_relation_offset += relation_count
 
         lga_relation_offset += int(item.lga_edge_index.size(1))
 
@@ -403,6 +446,7 @@ def mips_trimer_collate(data_list):
         batch.glt_token_shift = torch.cat(glt_token_shift)
         batch.glt_token_endpoint_z_a = torch.cat(glt_token_z_a)
         batch.glt_token_endpoint_z_b = torch.cat(glt_token_z_b)
+        batch.glt_token_bond_type = torch.cat(glt_token_bond_type)
         batch.glt_token_label = torch.cat(glt_token_label)
         batch.glt_token_observation_distances = torch.cat(glt_token_distances)
         batch.glt_token_observation_count = torch.cat(glt_token_counts)
@@ -428,6 +472,30 @@ def mips_trimer_collate(data_list):
             batch.glt_relation_span = torch.cat(glt_relation_span)
             batch.glt_relation_observation_valid = torch.cat(glt_relation_observation_valid)
             batch.glt_relation_observation_translation = torch.cat(glt_relation_observation_translation)
+        if glt_torsion_counts:
+            batch.glt_torsion_observation_value = torch.cat(glt_torsion_values)
+            batch.glt_torsion_observation_relation = torch.cat(glt_torsion_relations)
+            batch.glt_relation_torsion_count = torch.cat(glt_torsion_counts)
+            batch.glt_relation_torsion_covered = torch.cat(glt_torsion_covered)
+            batch.glt_relation_torsion_source_cross_ru = torch.cat(glt_torsion_source_cross)
+            batch.glt_graph_torsion_covered = torch.tensor(
+                glt_graph_torsion_covered, dtype=torch.bool
+            )
+        if glt_relation_source_distances:
+            if len(glt_relation_source_distances) != len(data_list):
+                raise ValueError("joint radial fields must be present for the full batch")
+            batch.glt_relation_source_distances = torch.cat(
+                glt_relation_source_distances
+            )
+            batch.glt_relation_source_distance_valid = torch.cat(
+                glt_relation_source_distance_valid
+            )
+            batch.glt_relation_source_distance_slot = torch.cat(
+                glt_relation_source_distance_slot
+            )
+            batch.glt_relation_source_cross_ru = torch.cat(
+                glt_relation_source_cross_ru
+            )
     batch.canonical_ru_atom_index = torch.cat(canonical_parts, dim=0)
     if canonical_periodic_batch:
         batch.canonical_atom_id = torch.cat(canonical_id_parts, dim=0)

@@ -19,6 +19,7 @@ from src.utils import (
     initialize_mts_glt_fusion_warm,
     train_and_evaluate,
 )
+from src.training.finetune.engine import _capture_initial_model_state
 
 
 class _DummyGraphEncoder(nn.Module):
@@ -58,6 +59,7 @@ class _DummyGLTBranch(nn.Module):
     def __init__(self):
         super().__init__()
         self.layer = nn.Linear(2, 2)
+        self.query_pool = nn.Linear(2, 2)
 
 
 class _DummyFusionO8(_DummyGLTBranch):
@@ -198,6 +200,75 @@ class _DummyGraphGateMTS(nn.Module):
         return self.mlp(graph), graph.unsqueeze(1)
 
 
+class _DummyV2Encoder(nn.Module):
+    architecture_name = "MIPS-Trimer-GLT-v2"
+    downstream_mode = "o8_glt_atom"
+
+    def __init__(self):
+        super().__init__()
+        self.o8 = _DummyFusionO8()
+        self.glt = _DummyGLTBranch()
+        self.atom_fusion_norm = nn.LayerNorm(2)
+        self.atom_fusion_projection = nn.Linear(2, 2)
+        self.atom_channel_gate = nn.Parameter(torch.zeros(2))
+        self.compact19_residual = nn.Linear(2, 2)
+        self.use_compact19 = False
+
+    def encode_views(self, batch):
+        z_o8 = self.o8.layer(batch.values)
+        z_glt = self.glt.layer(batch.values)
+        projected = self.atom_fusion_projection(
+            self.atom_fusion_norm(z_glt)
+        )
+        valid = batch.valid.bool()
+        delta = (
+            valid.to(projected.dtype).unsqueeze(-1)
+            * torch.tanh(self.atom_channel_gate)
+            * projected
+        )
+        return {
+            "z_o8": z_o8, "z_glt": z_glt,
+            "projected_z_glt": projected, "delta_z_3d": delta,
+            "valid_3d": valid,
+        }
+
+
+class _DummyV2GraphModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = _DummyV2Encoder()
+        self.norm = nn.LayerNorm(2)
+        self.projection = nn.Linear(2, 2)
+
+
+class _DummyV2MTS(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.modality_list = ("graph",)
+        self.encoders = nn.ModuleDict({"graph": _DummyV2GraphModule()})
+        self.mlp = nn.Linear(2, 1)
+        self.modality_heads = nn.ModuleDict()
+        self.cross_task_aux_heads = nn.ModuleDict()
+        self.residual_modality_gates = nn.ParameterDict()
+        self.branch_mode_history = []
+
+    def forward(self, batch):
+        encoder = self.encoders["graph"].encoder
+        if self.training:
+            self.branch_mode_history.append((
+                bool(encoder.o8.training), bool(encoder.glt.training),
+                bool(encoder.o8.md_residual.training),
+            ))
+        views = encoder.encode_views(batch)
+        graph = encoder.o8.md_residual(
+            views["z_o8"] + views["delta_z_3d"]
+        )
+        graph = self.encoders["graph"].projection(
+            self.encoders["graph"].norm(graph)
+        )
+        return self.mlp(graph), graph.unsqueeze(1)
+
+
 class _AuditBatch:
     def __init__(self):
         self.values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
@@ -210,6 +281,24 @@ class _AuditBatch:
 
 def _trainable(module):
     return any(parameter.requires_grad for parameter in module.parameters())
+
+
+def test_initial_model_state_is_captured_only_for_refit():
+    model = nn.Linear(3, 2)
+    assert _capture_initial_model_state(model, False) is None
+
+    captured = _capture_initial_model_state(model, True)
+    assert captured is not None
+    expected = {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+    with torch.no_grad():
+        model.weight.add_(1.0)
+        model.bias.sub_(2.0)
+    model.load_state_dict(captured, strict=True)
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, expected[key])
 
 
 def test_mts_trainability_trains_complete_graph_from_epoch_zero():
@@ -470,6 +559,29 @@ def test_graphgate_stage2_encoder_trainability_factorial():
         assert len(parameter_ids) == len(set(parameter_ids))
 
 
+def test_graphgate_nonquery_readouts_keep_query_frozen_in_joint_stage():
+    for mode in ("o8_glt_graph_mean", "o8_glt_atom_central"):
+        model = _DummyGraphGateMTS()
+        encoder = model.encoders["graph"].encoder
+        encoder.downstream_mode = mode
+        _configure_mts_glt_fusion_stage(model, "joint")
+        assert _trainable(encoder.glt_line_encoder.layer)
+        assert not _trainable(encoder.glt_line_encoder.query_pool)
+        optimizer = _build_downstream_optimizer(
+            model, 1e-5, 1e-5, 1e-5, 1e-5, 1e-4, 1e-4, 0.02,
+            mts_o8_lr=1e-5, mts_geometry_lr=1e-5,
+            mts_glt_fusion_stage="joint",
+        )
+        optimized = {
+            id(parameter)
+            for group in optimizer.param_groups for parameter in group["params"]
+        }
+        assert all(
+            id(parameter) not in optimized
+            for parameter in encoder.glt_line_encoder.query_pool.parameters()
+        )
+
+
 def test_graphgate_fusion_warm_two_epoch_smoke_crosses_stage_boundary():
     model = _DummyGraphGateMTS()
     initialize_mts_glt_fusion_warm(model, 0.05)
@@ -531,6 +643,37 @@ def test_graphgate_fusion_warm_zero_starts_joint_at_first_step():
     ]
 
 
+def test_glt_v2_fusion_warm_preserves_formal_optimizer_and_schedule():
+    model = _DummyV2MTS()
+    initialize_mts_glt_fusion_warm(model, 0.05)
+
+    class _IdentityScaler:
+        @staticmethod
+        def inverse_transform(values):
+            return np.asarray(values)
+
+    metrics = train_and_evaluate(
+        model, _IdentityScaler(), [_AuditBatch()], [_AuditBatch()],
+        [_AuditBatch()], torch.device("cpu"), num_epochs=2, patience=10,
+        graph_lr=1e-5, fusion_lr=1e-4, head_lr=1e-4,
+        weight_decay=0.02, warmup_epochs=1, regression_loss="huber",
+        mts_o8_lr=1e-5, mts_geometry_lr=1e-5,
+        mts_glt_postmortem=True,
+        mts_glt_fusion_strategy="fusion_warm",
+        mts_glt_fusion_warm_epochs=1,
+        mts_glt_initial_alpha=0.05,
+    )
+    result = metrics["_mts_glt_postmortem"]
+    assert result["fusion_kind"] == "atom_channel"
+    assert [row["stage"] for row in result["gate_trajectory"]] == [
+        "initial", "fusion_warm", "joint_finetune",
+    ]
+    assert model.branch_mode_history[:2] == [
+        (False, False, True), (True, True, True),
+    ]
+    assert not _trainable(model.encoders["graph"].encoder.compact19_residual)
+
+
 def test_prediction_ensemble_and_three_decimal_sample_std(tmp_path):
     root = tmp_path / "results"
     best = tmp_path / "best.csv"
@@ -567,7 +710,7 @@ def test_prediction_ensemble_and_three_decimal_sample_std(tmp_path):
                 "split_manifest_hash": "split", "prediction_sha256": pred_sha,
                 "per_fold_metrics": json.dumps([{"fold": fold}]),
             }]).to_csv(shard_dir / f"fold_{fold}.csv", index=False)
-        
+
     # The symmetric seed offsets cancel, so the ensemble shift is fold*0.02.
     for fold in range(5):
         prediction = truths + fold * 0.02

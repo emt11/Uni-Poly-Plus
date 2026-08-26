@@ -57,10 +57,11 @@ def resolve(source: Path) -> tuple[Path, dict]:
     )
     if not required:
         raise ValueError(f"unsupported MTS schema: {schema}")
-    optional = (
-        {"glt_geometry_mode", "initial_state_path"}
-        if schema == "mts-glt-graphgate-v1" else set()
-    )
+    optional = set()
+    if schema == "mts-glt-graphgate-v1":
+        optional |= {"glt_geometry_mode", "initial_state_path"}
+    if schema in {"mts-glt-v2", "mts-glt-graphgate-v1"}:
+        optional.add("glt_metadata_mode")
     unknown = sorted(set(payload) - required - optional)
     missing = sorted(required - set(payload))
     if unknown:
@@ -94,6 +95,8 @@ def resolve(source: Path) -> tuple[Path, dict]:
                 raise ValueError("GLT-v2 layers must be 6 or 12")
             if payload["glt_attention_variant"] not in {"mips", "paper"}:
                 raise ValueError("GLT-v2 attention variant is invalid")
+            if payload.get("glt_metadata_mode", "full") not in {"full", "dedup"}:
+                raise ValueError("GLT-v2 metadata mode must be full or dedup")
             if float(payload["infonce_loss_weight"]) not in {0.0, 0.25, 1.0}:
                 raise ValueError("GLT-v2 InfoNCE weight must be 0, 0.25, or 1")
             if schema == "mts-glt-graphgate-v1" and (

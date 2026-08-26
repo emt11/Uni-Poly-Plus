@@ -133,6 +133,7 @@ _GLT_V2_REQUIRED = _GLT_REQUIRED | {
 }
 _GLT_V2_ALLOWED = _GLT_V2_REQUIRED | {
     "source_config", "project_root", "glt_geometry_mode", "initial_state_path",
+    "glt_metadata_mode",
 }
 
 
@@ -355,6 +356,9 @@ def _apply_glt_v2_config(args, config_path):
         raise ValueError("GraphGate-v1 glt_geometry_mode must be full or off")
     if not graphgate and geometry_mode != "full":
         raise ValueError("glt_geometry_mode is only configurable for GraphGate-v1")
+    metadata_mode = str(payload.get("glt_metadata_mode", "full"))
+    if metadata_mode not in {"full", "dedup"}:
+        raise ValueError("MTS-GLT-v2 glt_metadata_mode must be full or dedup")
     if abs(float(payload["atom_mask_ratio"]) - 0.30) > 1e-12:
         raise ValueError("MTS-GLT-v2 atom_mask_ratio is fixed at 0.30")
     if abs(float(payload["line_mask_ratio"]) - 0.40) > 1e-12:
@@ -401,6 +405,7 @@ def _apply_glt_v2_config(args, config_path):
     args.glt_layers = int(payload["glt_layers"])
     args.glt_attention_variant = str(payload["glt_attention_variant"])
     args.glt_geometry_mode = geometry_mode
+    args.glt_metadata_mode = metadata_mode
     args.glt_initial_state = payload.get("initial_state_path")
     args.glt_stop_after_steps = stop_after
     args.batch_size = int(payload["batch_size"])

@@ -1,32 +1,23 @@
-# Basic dependencies
-numpy>=1.19.2
-pandas>=1.2.4
-scipy>=1.6.2
-scikit-learn>=0.24.2
+# Validated runtime: Python 3.11, PyTorch 2.8, CUDA 12.8.
+# Install torch and torch-scatter wheels built for the same PyTorch/CUDA pair.
 
-# Deep Learning
-torch>=1.9.0
-torch-geometric>=2.0.0
-torch-scatter>=2.0.8
-torch-sparse>=0.6.12
-torch-cluster>=1.6.0
+# Numerical and data processing
+numpy>=2.2,<2.3
+pandas>=2.3,<2.4
+scipy>=1.15,<1.16
+scikit-learn>=1.7,<1.8
 
-# Chemistry and Molecular Processing
-rdkit>=2022.03.1
-mordred>=1.2.0
+# Deep learning
+torch>=2.8,<2.9
+torch-geometric>=2.7,<2.8
+torch-scatter>=2.1,<2.2
 
-# Visualization and Notebooks
-matplotlib>=3.4.2
-seaborn>=0.11.1
-jupyter>=1.0.0
-notebook>=6.4.0
+# Chemistry and molecular processing
+rdkit>=2026.3,<2027
 
-# NLP and Text Processing
-transformers>=4.5.1
-nltk>=3.6.2
+# Optional SMILES route; imported only when that route is constructed
+transformers>=5.8,<5.9
 
-# Utilities
-tqdm>=4.61.0
-pyyaml>=5.4.1
-tensorboard>=2.5.0
-lmdb>=1.4.1
+# Runtime utilities
+tqdm>=4.67,<5
+lmdb>=2.3,<3

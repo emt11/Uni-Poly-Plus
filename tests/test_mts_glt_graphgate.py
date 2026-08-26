@@ -34,7 +34,8 @@ def _attach(data, record):
     token_fields = {
         "token_atom_a": ("atom_a", torch.long), "token_atom_b": ("atom_b", torch.long),
         "token_shift": ("shift", torch.long), "token_endpoint_z_a": ("z_a", torch.long),
-        "token_endpoint_z_b": ("z_b", torch.long), "token_label": ("label", torch.long),
+        "token_endpoint_z_b": ("z_b", torch.long), "token_bond_type": ("bond_type", torch.long),
+        "token_label": ("label", torch.long),
         "token_observation_count": ("observation_count", torch.long),
         "token_valid": ("runtime_valid", torch.bool),
     }
@@ -126,9 +127,68 @@ def test_graphgate_invalid_fusion_is_exact_o8():
     model = MTSGraphGateModel(layers=1).eval()
     with torch.no_grad():
         o8 = model.forward_downstream(batch, "o8_only")
-        fused = model.forward_downstream(batch, "o8_glt_graph")
-    assert torch.equal(o8[1], fused[1])
-    assert not torch.equal(o8[0], fused[0])
+        outputs = {
+            mode: model.forward_downstream(batch, mode)
+            for mode in (
+                "o8_glt_graph", "o8_glt_graph_mean",
+                "o8_glt_atom_central",
+            )
+        }
+    for fused in outputs.values():
+        assert torch.equal(o8[1], fused[1])
+        assert not torch.equal(o8[0], fused[0])
+
+
+def test_graphgate_readout_modes_use_mean_and_endpoint_incidence():
+    first, second = _sample("*CCO*"), _sample("*COC*")
+    records = [
+        build_periodic_line_central_sample(
+            sample_key_from_smiles(smiles), data, data
+        )
+        for smiles, data in (("*CCO*", first), ("*COC*", second))
+    ]
+    batch = mips_trimer_collate([
+        _attach(first, records[0]), _attach(second, records[1])
+    ])
+    model = MTSGraphGateModel(layers=1).eval()
+    with torch.no_grad():
+        encoded = model.glt_line_encoder.encode_lines(batch)
+        mean = model._mean_line_readout(
+            encoded["line_states"], batch, encoded["query_valid"]
+        )
+        atom, atom_valid = model._central_atom_readout(
+            encoded["line_states"], batch, encoded["query_valid"],
+            batch.canonical_graph_index.numel(),
+        )
+        graph_mean = model._readout_views(batch, "o8_glt_graph_mean")
+        atom_central = model._readout_views(batch, "o8_glt_atom_central")
+
+    torch.testing.assert_close(graph_mean[1], mean)
+    torch.testing.assert_close(
+        atom_central[1], model._canonical_graph_pool(atom, batch)
+    )
+    expected_counts = torch.bincount(
+        torch.cat([batch.glt_token_atom_a, batch.glt_token_atom_b]),
+        minlength=batch.canonical_graph_index.numel(),
+    )
+    assert torch.equal(atom_valid, expected_counts > 0)
+
+
+def test_graphgate_query_readout_forward_is_unchanged_by_line_encoder_split():
+    sample = _sample("*CCO*")
+    record = build_periodic_line_central_sample(
+        sample_key_from_smiles("*CCO*"), sample, sample
+    )
+    batch = mips_trimer_collate([_attach(sample, record)])
+    encoder = LocalPeriodicGraphLineTransformerGraphGate(layers=1).eval()
+    with torch.no_grad():
+        encoded = encoder.encode_lines(batch)
+        expected = encoder.query_pool(
+            encoded["line_states"], batch.glt_token_batch,
+            batch.glt_token_valid, encoded["query_valid"],
+        )
+        observed = encoder(batch)
+    torch.testing.assert_close(observed["graph_geometry"], expected)
 
 
 def test_trimer_validation_metrics_are_rigid_invariant():

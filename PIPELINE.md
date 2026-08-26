@@ -136,3 +136,20 @@ MTS / O8
 新的 MTS-GLT 主实验默认 parent 为 `MTS-GLT-v2-Base-5k`，默认采用 `Base + exactly one primary scientific change`。除非明确设计 factorial，不同时改变 checkpoint step、Warm schedule、fusion、geometry 和 pretraining objective。
 
 历史 checkpoint、报告、sidecar 和配置继续保留。新实验必须使用显式配置和独立产物路径，不能覆盖当前 baseline。
+
+## 10. Frozen / do-not-repeat directions
+
+以下实现已按对应 screening 合同完成并停止；除非提出新的、参数匹配的科学假设，不重复相同实验：
+
+```text
+Warm schedule search
+X23 post-GLT conditioning
+X2L current additive implementation
+X2A attention routing
+torsion additive bias
+explicit O8 bond-type bias
+joint radial-angular additive SBF
+Compact19 downstream residual
+```
+
+`non-bonded spatial contact`、metadata deduplication 和 Gaussian-basis compression 尚未完成相应模型实验，不列为 STOP。本阶段只允许先做只读信息审计，不自动启动模型训练。

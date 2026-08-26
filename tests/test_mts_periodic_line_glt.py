@@ -18,6 +18,7 @@ from src.dataset.trimer_mcl import attach_finite_trimer_mcl
 from src.modules.periodic_line_glt import LocalPeriodicGraphLineTransformer
 from src.modules.mts_glt import MTSGraphLineModel
 from src.modules.mts_glt_v2 import MTSGraphLineModelV2
+from src.modules.mips_local_graph import MIPSDirectBondTypeBias
 from src.modules.compact_trimer_descriptors import compact_trimer_descriptors
 from src.modules.periodic_line_glt_v2 import (
     LearnedGaussianMoments,
@@ -51,6 +52,7 @@ def _attach(data, record):
         "token_shift": [item["shift"] for item in tokens],
         "token_endpoint_z_a": [item["z_a"] for item in tokens],
         "token_endpoint_z_b": [item["z_b"] for item in tokens],
+        "token_bond_type": [item["bond_type"] for item in tokens],
         "token_label": [item["label"] for item in tokens],
         "token_observation_count": [item["observation_count"] for item in tokens],
         "token_valid": [item["valid"] for item in tokens],
@@ -141,6 +143,51 @@ def test_collate_offsets_and_glt_forward_do_not_consume_bond_type():
     assert torch.equal(states, changed_states)
     assert int(batch.glt_relation_source.max()) < int(batch.glt_token_label.numel())
     assert masked_line_label(6, 1, 8) != masked_line_label(6, 2, 8)
+
+
+def test_o8_direct_bond_bias_is_symmetric_parameter_matched_and_nonbond_zero():
+    samples = [_sample("*CCO*"), _sample("*C=C*")]
+    records = [
+        build_periodic_line_sample(sample_key_from_smiles(smiles), sample, sample)
+        for smiles, sample in (("*CCO*", samples[0]), ("*C=C*", samples[1]))
+    ]
+    batch = mips_trimer_collate([
+        _attach(samples[0], records[0]), _attach(samples[1], records[1])
+    ])
+    assert hasattr(batch, "glt_token_bond_type")
+    control = MIPSDirectBondTypeBias(mode="control")
+    bond_type = MIPSDirectBondTypeBias(mode="type")
+    assert sum(p.numel() for p in control.parameters()) == 48
+    assert sum(p.numel() for p in bond_type.parameters()) == 48
+    categories = bond_type.relation_categories(batch)
+    direct = batch.lga_spd == 1
+    assert bool((categories[direct] >= 0).all())
+    assert bool((categories[~direct] == -1).all())
+    assert torch.equal(bond_type(batch), torch.zeros_like(bond_type(batch)))
+    with torch.no_grad():
+        control.projection.weight.copy_(torch.arange(48).reshape(8, 6) / 100)
+        bond_type.projection.weight.zero_()
+        bond_type.projection.weight[:, 1] = 0.1
+        bond_type.projection.weight[:, 2] = 0.3
+        assert torch.equal(
+            control.category_bias(torch.tensor([1]))[0],
+            control.category_bias(torch.tensor([2]))[0],
+        )
+        assert not torch.equal(
+            bond_type.category_bias(torch.tensor([1]))[0],
+            bond_type.category_bias(torch.tensor([2]))[0],
+        )
+        bias = bond_type(batch)
+        assert torch.equal(bias[~direct], torch.zeros_like(bias[~direct]))
+        edge = batch.lga_edge_index.long()
+        shifts = batch.lga_source_image_shift.long()
+        lookup = {
+            (int(edge[0, i]), int(edge[1, i]), int(shifts[i])): i
+            for i in torch.nonzero(direct, as_tuple=False).flatten().tolist()
+        }
+        for (source, target, shift), row in lookup.items():
+            inverse = lookup[(target, source, -shift)]
+            assert torch.equal(bias[row], bias[inverse])
 
 
 def test_encode_then_mean_is_not_mean_then_encode():
@@ -253,6 +300,22 @@ def test_fusion_warm_cli_requires_o8_glt_and_parses_fixed_controls():
     assert args.mts_glt_fusion_warm_epochs == 5
     assert np.isclose(args.mts_glt_initial_alpha, 0.1)
     assert args.warmup_epochs == 0
+
+
+def test_graphgate_readout_modes_accept_fusion_warm_contract():
+    from src.training.finetune.config import parse_arguments
+
+    for mode in ("o8_glt_graph_mean", "o8_glt_atom_central"):
+        args = parse_arguments([
+            "--mts_glt_version", "graphgate_v1",
+            "--mts_glt_mode", mode,
+            "--mts_glt_fusion_strategy", "fusion_warm",
+            "--mts_glt_fusion_warm_epochs", "5",
+            "--mts_glt_initial_alpha", "0.05",
+        ])
+        assert args.mts_glt_mode == mode
+        assert args.mts_glt_version == "graphgate_v1"
+        assert args.warmup_epochs == 0
 
 
 def test_residual_probe_uses_cross_fitted_not_in_sample_residuals():
@@ -441,6 +504,24 @@ def test_finetune_builds_glt_v2_atom_modes_and_strictly_maps_probe_state():
     merged = model.state_dict()
     merged.update(mapped)
     model.load_state_dict(merged, strict=True)
+
+
+def test_glt_v2_atom_fusion_warm_preserves_formal_lr_warmup():
+    from src.training.finetune.config import parse_arguments
+
+    args = parse_arguments([
+        "--config_schema", "mts-glt-v2-downstream",
+        "--graph_encoder_type", "mips_trimer_scage",
+        "--mts_glt_version", "v2",
+        "--mts_glt_mode", "o8_glt_atom",
+        "--mts_glt_fusion_strategy", "fusion_warm",
+        "--mts_glt_fusion_warm_epochs", "5",
+        "--mts_glt_initial_alpha", "0.05",
+        "--warmup_epochs", "5",
+    ])
+    assert args.mts_glt_version == "v2"
+    assert args.mts_glt_mode == "o8_glt_atom"
+    assert args.warmup_epochs == 5
 
 
 def test_compact_trimer_descriptor_is_19d_finite_and_invalid_is_zero():
