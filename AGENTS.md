@@ -75,9 +75,9 @@ Codex 与 Luna 不重复执行同一范围。
 
 ### Claude Code
 
-Claude Code 作为独立执行者时使用 `CODEX_CLAUDE_HANDOFF.md`。
+Claude Code 只有在用户明确要求并提供当前 handoff 时才作为独立执行者。
 
-Codex 制定计划，Claude Code 执行，Codex 最终审查；Claude Code 不自行改写计划或宣布最终验收通过。
+Codex 制定计划，Claude Code 执行，Codex 最终审查；Claude Code 不自行改写计划或宣布最终验收通过。项目不保留已完成周期的过期 handoff。
 
 ---
 
