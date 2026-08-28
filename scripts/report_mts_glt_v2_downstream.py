@@ -65,10 +65,7 @@ def main():
     parser.add_argument("--result-base")
     parser.add_argument("--tasks", nargs="+", default=["xc", "ei", "egb"])
     parser.add_argument("--folds", nargs="+", type=int, default=[0])
-    parser.add_argument(
-        "--fused-mode", choices=("o8_glt_atom", "o8_glt_atom_desc", "o8_glt_graph"),
-        default="o8_glt_atom",
-    )
+    parser.add_argument("--fused-mode", choices=("o8_glt_atom",), default="o8_glt_atom")
     parser.add_argument(
         "--base-mode", choices=("o8_only", "o8_glt_atom"), default="o8_only"
     )

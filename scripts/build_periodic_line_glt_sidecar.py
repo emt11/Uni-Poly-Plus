@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build MTS-GLT-v1 periodic line-geometry sidecars from frozen caches."""
+"""Build the MTS-GLT-v2 periodic line-geometry sidecar from frozen caches."""
 
 from __future__ import annotations
 

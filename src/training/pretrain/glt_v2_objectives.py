@@ -11,12 +11,67 @@ import json
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 
 from src.modules.periodic_line_glt_v2 import MASK_ATOMIC_NUMBER, MASK_SHIFT_CLASS
-from src.training.pretrain.glt_objectives import (
-    distributed_bidirectional_infonce,
-    masked_line_loss,
-)
+
+
+def masked_line_loss(line_states, labels, selected, prediction_head):
+    """Compute the summed cross-entropy over the selected line tokens."""
+    indices = torch.nonzero(selected, as_tuple=False).flatten()
+    if not int(indices.numel()):
+        zero = line_states.sum() * 0.0
+        return zero, 0, 0
+    logits = prediction_head(line_states[indices])
+    loss = F.cross_entropy(
+        logits.float(), labels[indices].long(), reduction="sum"
+    )
+    correct = int((logits.detach().argmax(dim=-1) == labels[indices]).sum())
+    return loss, int(indices.numel()), correct
+
+
+def _gather_embeddings_fixed_shape(values):
+    if not (dist.is_available() and dist.is_initialized()):
+        return values
+    from torch.distributed.nn.functional import all_gather
+    return torch.cat(tuple(all_gather(values)), dim=0)
+
+
+@torch.no_grad()
+def _gather_valid_fixed_shape(valid):
+    if not (dist.is_available() and dist.is_initialized()):
+        return valid
+    gathered = [torch.empty_like(valid) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, valid)
+    return torch.cat(gathered, dim=0)
+
+
+def distributed_bidirectional_infonce(z_o8, z_glt, valid, temperature=0.1):
+    """Gather fixed local batches and compute the bidirectional InfoNCE loss."""
+    if z_o8.shape != z_glt.shape or z_o8.ndim != 2:
+        raise ValueError(
+            "InfoNCE branch embeddings must have identical [batch, dim] shape"
+        )
+    valid = valid.bool().reshape(-1)
+    if int(valid.numel()) != int(z_o8.size(0)):
+        raise ValueError("InfoNCE valid mask must match local batch")
+    gathered_o8 = _gather_embeddings_fixed_shape(z_o8)
+    gathered_glt = _gather_embeddings_fixed_shape(z_glt)
+    gathered_valid = _gather_valid_fixed_shape(valid)
+    filtered_o8 = gathered_o8[gathered_valid]
+    filtered_glt = gathered_glt[gathered_valid]
+    pool_size = int(filtered_o8.size(0))
+    if pool_size < 2:
+        return (gathered_o8.sum() + gathered_glt.sum()) * 0.0, pool_size
+    first = F.normalize(filtered_o8.float(), dim=-1)
+    second = F.normalize(filtered_glt.float(), dim=-1)
+    logits = first @ second.T / float(temperature)
+    labels = torch.arange(pool_size, device=logits.device)
+    loss = 0.5 * (
+        F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
+    )
+    return loss, pool_size
 
 
 def load_line_label_counts(path, *, label_count):

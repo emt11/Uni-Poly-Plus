@@ -15,12 +15,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
-        "--mode", choices=("o8_only", "o8_glt_atom", "o8_glt_atom_desc"),
+        "--mode", choices=("o8_only", "o8_glt_atom"),
         required=True,
     )
-    parser.add_argument("--layers", type=int, choices=(6, 12), required=True)
+    parser.add_argument("--layers", type=int, choices=(6,), required=True)
     parser.add_argument(
-        "--attention-variant", choices=("mips", "paper"), required=True
+        "--attention-variant", choices=("mips",), required=True
     )
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--gpu-ids", default="0,1,2,3")
@@ -86,8 +86,6 @@ def main(argv=None):
         "--fusion_lr", "1e-4",
         "--head_lr", "1e-4",
     ]
-    if args.mode == "o8_glt_atom_desc":
-        command.append("--mts_glt_use_compact19")
     return subprocess.call(command, cwd=ROOT)
 
 

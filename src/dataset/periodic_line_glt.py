@@ -1,4 +1,4 @@
-"""Periodic chemical-bond line graph geometry for MTS-GLT-v1.
+"""Periodic chemical-bond line graph geometry for the MTS-GLT-v2 baseline.
 
 The builders in this module are pure: they consume the existing canonical
 Topology and open-Trimer records and never mutate either cache.  A line token
@@ -15,9 +15,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
-from .mts_star_rbf_v2 import prepare_topology, prepare_trimer
-
 
 SIDECAR_SCHEMA = "mts-periodic-line-glt-v1"
 BUILDER_VERSION = 1
@@ -49,6 +46,129 @@ ARRAY_DTYPES = {
     "relation_is_fallback": np.dtype("<?"),
 }
 ARRAY_NAMES = tuple(ARRAY_DTYPES)
+
+
+def _as_bool(value, default=False) -> bool:
+    if value is None:
+        return bool(default)
+    try:
+        return bool(torch.as_tensor(value).reshape(-1)[0].item())
+    except (IndexError, RuntimeError, TypeError, ValueError):
+        return bool(value)
+
+
+def _tensor(value, *, dtype=None):
+    return None if value is None else torch.as_tensor(value, dtype=dtype)
+
+
+def _internal_edges(topology):
+    edge = _tensor(getattr(topology, "ru_edge_index", None), dtype=torch.long)
+    if edge is None or edge.ndim != 2 or edge.size(0) != 2:
+        edge = _tensor(getattr(topology, "edge_index", None), dtype=torch.long)
+    if edge is None or edge.ndim != 2 or edge.size(0) != 2:
+        return None
+    unique = set()
+    for left, right in edge.t().tolist():
+        left, right = int(left), int(right)
+        if left != right:
+            unique.add((min(left, right), max(left, right)))
+    return sorted(unique)
+
+
+def _prepare_topology(topology):
+    edge = _tensor(getattr(topology, "lga_edge_index", None), dtype=torch.long)
+    spd = _tensor(getattr(topology, "lga_spd", None), dtype=torch.long)
+    shift = _tensor(getattr(topology, "lga_source_image_shift", None), dtype=torch.long)
+    z = _tensor(getattr(topology, "atomic_numbers", getattr(topology, "z", None)), dtype=torch.long)
+    left = getattr(topology, "ru_left_boundary", None)
+    right = getattr(topology, "ru_right_boundary", None)
+    internal = _internal_edges(topology)
+    if (
+        edge is None or edge.ndim != 2 or edge.size(0) != 2
+        or spd is None or spd.ndim != 1 or spd.numel() != edge.size(1)
+        or shift is None or shift.numel() != edge.size(1)
+        or z is None or z.ndim != 1 or left is None or right is None
+        or internal is None
+    ):
+        return None, "topology_relation_fields_invalid"
+    if edge.numel() and (int(edge.min()) < 0 or int(edge.max()) >= int(z.numel())):
+        return None, "topology_relation_endpoint_invalid"
+    if int(left) < 0 or int(right) < 0 or int(left) >= int(z.numel()) or int(right) >= int(z.numel()):
+        return None, "topology_relation_endpoint_invalid"
+    return {
+        "edge": edge,
+        "spd": spd,
+        "shift": shift.reshape(-1),
+        "z": z.reshape(-1),
+        "left": int(left),
+        "right": int(right),
+        "internal_edges": internal,
+    }, None
+
+
+def _prepare_trimer(trimer, topology=None):
+    if not _as_bool(getattr(trimer, "trimer_geometry_valid", False)):
+        if _as_bool(getattr(trimer, "trimer_2d_fallback", False)):
+            return None, "2d_fallback"
+        if not _as_bool(getattr(trimer, "trimer_geometry_is_3d", False)):
+            return None, "non_3d_geometry"
+        return None, "geometry_invalid"
+    if not _as_bool(getattr(trimer, "trimer_geometry_is_3d", False)):
+        return None, "non_3d_geometry"
+    if _as_bool(getattr(trimer, "trimer_2d_fallback", False)):
+        return None, "2d_fallback"
+    positions = _tensor(getattr(trimer, "trimer_pos", None))
+    atomic = _tensor(getattr(trimer, "trimer_atomic_number", None), dtype=torch.long)
+    base = _tensor(getattr(trimer, "trimer_base_ru_atom_id", None), dtype=torch.long)
+    offsets = _tensor(getattr(trimer, "trimer_ru_offset", None), dtype=torch.long)
+    central = _tensor(getattr(trimer, "trimer_central_ru_mask", None), dtype=torch.bool)
+    mapping = _tensor(getattr(trimer, "mips_to_trimer_central_index", None), dtype=torch.long)
+    edge = _tensor(getattr(trimer, "trimer_edge_index", None), dtype=torch.long)
+    bond = _tensor(getattr(trimer, "trimer_bond_type", None), dtype=torch.long)
+    if positions is None or positions.ndim != 2 or positions.size(1) != 3:
+        return None, "trimer_identity_missing"
+    if not bool(torch.isfinite(positions).all()):
+        return None, "nonfinite_coordinates"
+    if any(value is None for value in (atomic, base, offsets, central, mapping, edge, bond)):
+        return None, "trimer_identity_missing"
+    if (
+        atomic.ndim != 1 or base.ndim != 1 or offsets.ndim != 1 or central.ndim != 1
+        or atomic.numel() != positions.size(0) or base.numel() != positions.size(0)
+        or offsets.numel() != positions.size(0) or central.numel() != positions.size(0)
+        or mapping.ndim != 1 or bool((mapping < 0).any())
+        or bool((mapping >= positions.size(0)).any())
+        or not bool(central[mapping].all()) or edge.ndim != 2 or edge.size(0) != 2
+        or bond.ndim != 1 or bond.numel() != edge.size(1)
+    ):
+        return None, "mapping_invalid"
+    state_to_local = {}
+    for index in range(int(positions.size(0))):
+        state = (int(base[index]), int(offsets[index]))
+        if state in state_to_local:
+            return None, "trimer_identity_duplicate"
+        state_to_local[state] = index
+    if topology is not None:
+        topology_z = _tensor(getattr(topology, "atomic_numbers", getattr(topology, "z", None)), dtype=torch.long)
+        canonical_to_trimer = _tensor(
+            getattr(topology, "canonical_to_trimer_base_atom_id", getattr(topology, "canonical_to_trimer_base_atom_index", None)),
+            dtype=torch.long,
+        )
+        if topology_z is None or canonical_to_trimer is None or canonical_to_trimer.numel() != topology_z.numel() or mapping.numel() != topology_z.numel():
+            return None, "canonical_trimer_identity_missing"
+        for canonical_id in range(int(topology_z.numel())):
+            base_id = int(canonical_to_trimer[canonical_id])
+            local = state_to_local.get((base_id, 0))
+            if local is None or int(mapping[canonical_id]) != int(local):
+                return None, "canonical_trimer_mapping_mismatch"
+            if int(atomic[local]) != int(topology_z[canonical_id]):
+                return None, "canonical_trimer_atomic_mismatch"
+    bonds = {}
+    for column in range(int(edge.size(1))):
+        left, right = int(edge[0, column]), int(edge[1, column])
+        if left == right or left < 0 or right < 0 or left >= positions.size(0) or right >= positions.size(0):
+            return None, "real_bond_graph_invalid"
+        bonds.setdefault((min(left, right), max(left, right)), set()).add(int(bond[column]))
+    return {"positions": positions.float(), "atomic": atomic.reshape(-1), "state_to_local": state_to_local, "bonds": bonds}, None
 
 
 def canonical_line_token(u: int, q_u: int, v: int, q_v: int):
@@ -313,7 +433,7 @@ def derive_relation_source_distance_observations(tokens, relations):
 
 def build_periodic_line_sample(key: bytes, topology, trimer):
     """Build one periodic bond-token graph and its Trimer observations."""
-    prepared, topology_reason = prepare_topology(topology)
+    prepared, topology_reason = _prepare_topology(topology)
     if prepared is None or topology_reason is not None:
         return {
             "sample_key": bytes(key), "geometry_valid": False,
@@ -331,7 +451,7 @@ def build_periodic_line_sample(key: bytes, topology, trimer):
             raise ValueError(f"duplicate periodic line token: {token}")
         token_specs[token] = bond_type
 
-    trimer_info, _ = prepare_trimer(trimer, topology)
+    trimer_info, _ = _prepare_trimer(trimer, topology)
     geometry_valid = bool(trimer_info is not None)
     tokens = []
     token_index = {token: index for index, token in enumerate(sorted(token_specs))}

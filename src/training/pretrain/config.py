@@ -1,342 +1,59 @@
-"""Runtime configuration extraction for the standalone pretraining loop."""
+"""Configuration for the single retained MTS-GLT-v2 pretraining route."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from dataclasses import dataclass
 
-from src.dataset.mips_trimer_contract import ROUTE_INTERNAL as MTS_ROUTE_INTERNAL
-
-
-@dataclass(frozen=True)
-class PretrainRuntimeConfig:
-    batch_size: int
-    gradient_accumulation_steps: int
-    max_optimizer_steps: int
-    learning_rate: float
-    weight_decay: float
-    warmup_steps: int
-    scheduler: str
-    amp_dtype: str
-    seed: int
-    world_size: int
-
-    @classmethod
-    def from_args(cls, args, *, world_size: int) -> "PretrainRuntimeConfig":
-        return cls(
-            batch_size=int(args.batch_size),
-            gradient_accumulation_steps=int(args.gradient_accumulation_steps),
-            max_optimizer_steps=int(args.max_optimizer_steps),
-            learning_rate=float(args.lr),
-            weight_decay=float(args.weight_decay),
-            warmup_steps=int(args.warmup_steps),
-            scheduler=str(args.mips_scheduler),
-            amp_dtype=str(args.amp_dtype),
-            seed=int(args.seed),
-            world_size=int(world_size),
-        )
+from src.dataset.mips_trimer_contract import (
+    ROUTE_INTERNAL as MTS_ROUTE_INTERNAL,
+)
 
 
-def dataset_kwargs_from_args(args):
-    """Translate parsed CLI values into the Dataset constructor contract."""
-    return dict(
-        root=args.root,
-        dataset=args.dataset_name,
-        smiles_model_name=args.smiles_model_name,
-        graph_encoder_type=args.graph_encoder_type,
-        graph_input=args.graph_input,
-        geom_input=args.geom_input,
-        use_feature_cache=not args.disable_feature_cache,
-        feature_source_dataset=args.feature_source_dataset,
-        rebuild_feature_cache=args.rebuild_feature_cache,
-        max_smiles_length=args.max_smiles_length,
-        max_smiles_length_cap=args.max_smiles_length_cap,
-        fp_mode=args.fp_mode,
-        feature_cache_workers=args.feature_cache_workers,
-        feature_cache_chunksize=args.feature_cache_chunksize,
-        feature_cache_partial_every=args.feature_cache_partial_every,
-        feature_cache_item_timeout=args.feature_cache_item_timeout,
-        cache_layers=args.cache_layers,
-        cache_validate=args.cache_validate,
-        cache_commit_size=args.cache_commit_size,
-        embed_tries_multiplier=args.embed_tries_multiplier,
-        conformer_3d_count=args.conformer_3d_count,
-        conformer_keep_count=args.conformer_keep_count,
-        conformer_profile=args.conformer_profile,
-        scage_distance_mode=args.scage_distance_mode,
-        scage_distance_rbf=args.scage_distance_rbf,
-        scage_distance_cutoff=args.scage_distance_cutoff,
-        mips_core=args.mips_core,
-        mips_max_hops=args.mips_max_hops,
-        mips_use_descriptors=args.mips_use_descriptors,
-        mips_descriptor_protocol=args.mips_descriptor_protocol,
-        spatial_mode=args.spatial_mode,
-        graph_geometry_mode=args.graph_geometry_mode,
-        topology_representation=args.topology_representation,
-        trimer_num_candidates=args.trimer_num_candidates,
-        trimer_max_heavy_atoms=args.trimer_max_heavy_atoms,
-        mips_variant=args.mips_variant,
-        finite_variant=args.finite_variant,
-        conformer_mode=args.conformer_mode,
-        field_layout=args.field_layout,
-        field_channels=args.field_channels,
-        experiment_id=args.experiment_id,
-        feature_config_hash="manual",
-        star_rbf_v2_sidecar=args.star_rbf_v2_sidecar,
-        periodic_line_glt_sidecar=getattr(args, "periodic_line_glt_sidecar", None),
-        periodic_spatial_contact_sidecar=getattr(
-            args, "periodic_spatial_contact_sidecar", None
-        ),
-    )
-SUPPORTED_MODALITIES = ('graph', 'smiles', 'fp')
-
+BASELINE_SCHEMA = "mts-glt-v2"
+SUPPORTED_MODALITIES = ("graph",)
 
 
 def parse_modality(value):
     if value not in SUPPORTED_MODALITIES:
         raise argparse.ArgumentTypeError(
-            f"Unsupported modality: {value}. Current supported modalities are: "
-            f"{', '.join(SUPPORTED_MODALITIES)}."
+            f"unsupported modality: {value}; baseline is graph-only"
         )
     return value
 
 
-_B0_REQUIRED = {
-    "schema", "experiment_id", "dataset_name", "cache_root", "sidecar_root",
-    "result_root", "output_path", "output_kind", "noise_sigma",
-    "coordinate_loss_weight", "masked_atom", "coordinate_denoising",
-    "use_star_rbf", "use_mcl", "use_md200", "topology_attention_variant",
-    "star_rbf_upper", "graph_mask_ratio", "batch_size", "loader_workers",
-    "prefetch_factor", "gradient_accumulation_steps", "global_batch_size",
-    "max_optimizer_steps", "checkpoint_interval_steps", "probe_steps",
-    "amp_dtype", "seed", "lr", "warmup_steps", "end_lr", "weight_decay",
-    "cache_layers",
-}
-_B0_ALLOWED = _B0_REQUIRED | {"source_config", "project_root"}
-_B0_STAR_RBF_UPPER = 3.75
-
 _GLT_REQUIRED = {
-    "schema", "experiment_id", "dataset_name", "cache_root", "line_sidecar_root",
-    "result_root", "output_path", "output_kind", "masked_atom", "masked_line",
-    "infonce", "use_star_rbf", "use_mcl", "use_md200", "coordinate_denoising",
-    "topology_attention_variant", "atom_mask_ratio", "line_mask_ratio",
-    "infonce_temperature", "atom_loss_weight", "line_loss_weight",
-    "infonce_loss_weight", "projection_dim", "batch_size", "loader_workers",
-    "prefetch_factor", "gradient_accumulation_steps", "global_batch_size",
-    "max_optimizer_steps", "checkpoint_interval_steps", "probe_steps",
+    "schema", "experiment_id", "dataset_name", "cache_root",
+    "line_sidecar_root", "line_label_counts", "result_root", "output_path",
+    "output_kind", "masked_atom", "masked_line", "infonce",
+    "use_star_rbf", "use_mcl", "use_md200", "coordinate_denoising",
+    "topology_attention_variant", "glt_layers", "glt_attention_variant",
+    "atom_mask_ratio", "line_mask_ratio", "infonce_temperature",
+    "atom_loss_weight", "line_loss_weight", "infonce_loss_weight",
+    "projection_dim", "batch_size", "loader_workers", "prefetch_factor",
+    "gradient_accumulation_steps", "global_batch_size", "max_optimizer_steps",
+    "stop_after_steps", "checkpoint_interval_steps", "probe_steps",
     "amp_dtype", "seed", "lr", "warmup_steps", "end_lr", "weight_decay",
     "cache_layers",
 }
 _GLT_ALLOWED = _GLT_REQUIRED | {"source_config", "project_root"}
-_GLT_V2_REQUIRED = _GLT_REQUIRED | {
-    "line_label_counts", "glt_layers", "glt_attention_variant",
-    "stop_after_steps",
-}
-_GLT_V2_ALLOWED = _GLT_V2_REQUIRED | {
-    "source_config", "project_root", "glt_geometry_mode", "initial_state_path",
-    "glt_metadata_mode", "spatial_contact_sidecar", "use_spatial_contact",
-    "spatial_shell_mode",
-}
-
-
-def _apply_b0_config(args, config_path):
-    path = Path(config_path).resolve()
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("B0 config must be a JSON object")
-    unknown = sorted(set(payload) - _B0_ALLOWED)
-    missing = sorted(_B0_REQUIRED - set(payload))
-    if unknown:
-        raise ValueError("B0 config has unknown fields: " + ", ".join(unknown))
-    if missing:
-        raise ValueError("B0 config is missing fields: " + ", ".join(missing))
-    if payload["schema"] != "mts-b0-v2":
-        raise ValueError("unsupported B0 config schema")
-    for name in ("masked_atom", "coordinate_denoising", "use_star_rbf", "use_md200"):
-        if payload[name] is not True:
-            raise ValueError(f"B0 scientific switch {name} must be true")
-    if payload["use_mcl"] is not False:
-        raise ValueError("B0 pretraining requires use_mcl=false")
-    if float(payload["noise_sigma"]) <= 0.0:
-        raise ValueError("B0 noise_sigma must be positive")
-    if float(payload["coordinate_loss_weight"]) <= 0.0:
-        raise ValueError("B0 coordinate_loss_weight must be positive")
-    if payload["topology_attention_variant"] != "o8":
-        raise ValueError("B0 requires topology_attention_variant=o8")
-    if abs(float(payload["star_rbf_upper"]) - _B0_STAR_RBF_UPPER) > 1e-9:
-        raise ValueError(
-            f"B0 requires star_rbf_upper={_B0_STAR_RBF_UPPER}, "
-            f"got {payload['star_rbf_upper']}"
-        )
-    if int(payload["checkpoint_interval_steps"]) != 2000:
-        raise ValueError("B0 checkpoint_interval_steps is fixed at 2000")
-    if [int(value) for value in payload["probe_steps"]] != [5000, 10000, 20000]:
-        raise ValueError("B0-v2 probe_steps must be exactly [5000, 10000, 20000]")
-    if int(payload["gradient_accumulation_steps"]) < 1:
-        raise ValueError("B0 gradient_accumulation_steps must be positive")
-    if int(payload["global_batch_size"]) < 1:
-        raise ValueError("B0 global_batch_size must be positive")
-    if str(payload["amp_dtype"]) not in {"fp32", "bf16"}:
-        raise ValueError("B0 amp_dtype must be fp32 or bf16")
-    if payload["output_kind"] != "trajectory":
-        raise ValueError("B0-v2 output_kind must be trajectory")
-    args.config_schema = "mts-b0-v2"
-    args.config_source_schema = "mts-b0-v2"
-    args.experiment_id = str(payload["experiment_id"])
-    args.dataset_name = str(payload["dataset_name"])
-    args.root = str(payload["cache_root"])
-    args.star_rbf_v2_sidecar = str(payload["sidecar_root"])
-    args.save_path = str(payload["output_path"])
-    args.b0_result_root = str(payload["result_root"])
-    args.b0_output_kind = "trajectory"
-    args.b0_noise_sigma = float(payload["noise_sigma"])
-    args.b0_coordinate_loss_weight = float(payload["coordinate_loss_weight"])
-    args.b0_use_star_rbf = bool(payload["use_star_rbf"])
-    args.b0_use_mcl = bool(payload["use_mcl"])
-    args.b0_use_md200 = bool(payload["use_md200"])
-    args.b0_coordinate_denoising = bool(payload["coordinate_denoising"])
-    args.b0_masked_atom = bool(payload["masked_atom"])
-    args.topology_attention_variant = "o8"
-    args.star_rbf_upper = float(payload["star_rbf_upper"])
-    args.graph_mask_ratio = float(payload["graph_mask_ratio"])
-    args.batch_size = int(payload["batch_size"])
-    args.loader_workers = int(payload["loader_workers"])
-    args.loader_prefetch_factor = int(payload["prefetch_factor"])
-    args.gradient_accumulation_steps = int(payload["gradient_accumulation_steps"])
-    args.global_batch_size = int(payload["global_batch_size"])
-    args.max_optimizer_steps = int(payload["max_optimizer_steps"])
-    args.checkpoint_interval_steps = 2000
-    args.b0_probe_steps = tuple(int(value) for value in payload["probe_steps"])
-    args.amp_dtype = str(payload["amp_dtype"])
-    args.seed = int(payload["seed"])
-    args.lr = float(payload["lr"])
-    args.warmup_steps = int(payload["warmup_steps"])
-    args.end_lr = float(payload["end_lr"])
-    args.weight_decay = float(payload["weight_decay"])
-    args.cache_layers = str(payload["cache_layers"])
-    args.pretrain_stage = "b0_periodic_coordinate_denoising"
-    args.graph_encoder_type = MTS_ROUTE_INTERNAL
-    args.graph_input = "star_linking"
-    args.geom_input = "repeat_unit"
-    args.graph_geometry_mode = "trimer_scage_mcl"
-    args.mips_use_descriptors = True
-    args.scage_mips_mask_weight = 1.0
-    args.graph_angle_weight = 0.0
-    args.angle_loss_weight = 0.0
-    args.mips_spd_weight = 0.0
-    args.mips_path_bond_weight = 0.0
-    args.mips_repeat_consistency_weight = 0.0
-    args.mips_distance_weight = 0.0
-    args.mips_conformer_weight = 0.0
-    args.scage_screw_geometry_weight = 0.0
-    args.dynamic_pretrain_loss = False
-    args.rebuild_feature_cache = False
-    args.cache_only = False
-    # Preserve runtime controls supplied after/alongside the config.  In
-    # particular, B0-v2 resume smoke must be able to stop at step 3 and then
-    # continue the same state to step 8.
-    return args
-
-
-def _apply_glt_config(args, config_path):
-    path = Path(config_path).resolve()
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("GLT config must be a JSON object")
-    unknown = sorted(set(payload) - _GLT_ALLOWED)
-    missing = sorted(_GLT_REQUIRED - set(payload))
-    if unknown or missing:
-        raise ValueError(
-            "GLT config fields are invalid; unknown=" + ",".join(unknown)
-            + " missing=" + ",".join(missing)
-        )
-    if payload["schema"] != "mts-glt-v1":
-        raise ValueError("unsupported GLT config schema")
-    for name in ("masked_atom", "masked_line", "infonce"):
-        if payload[name] is not True:
-            raise ValueError(f"MTS-GLT-v1 requires {name}=true")
-    for name in ("use_star_rbf", "use_mcl", "use_md200", "coordinate_denoising"):
-        if payload[name] is not False:
-            raise ValueError(f"MTS-GLT-v1 requires {name}=false")
-    if payload["topology_attention_variant"] != "o8":
-        raise ValueError("MTS-GLT-v1 requires topology_attention_variant=o8")
-    if abs(float(payload["atom_mask_ratio"]) - 0.30) > 1e-12:
-        raise ValueError("MTS-GLT-v1 atom_mask_ratio is fixed at 0.30")
-    if abs(float(payload["line_mask_ratio"]) - 0.40) > 1e-12:
-        raise ValueError("MTS-GLT-v1 line_mask_ratio is fixed at 0.40")
-    if abs(float(payload["infonce_temperature"]) - 0.10) > 1e-12:
-        raise ValueError("MTS-GLT-v1 InfoNCE temperature is fixed at 0.10")
-    if any(abs(float(payload[name]) - 1.0) > 1e-12 for name in (
-        "atom_loss_weight", "line_loss_weight", "infonce_loss_weight"
-    )):
-        raise ValueError("MTS-GLT-v1 loss weights are fixed at 1.0")
-    if int(payload["projection_dim"]) < 1:
-        raise ValueError("MTS-GLT-v1 projection_dim must be positive")
-    if int(payload["gradient_accumulation_steps"]) < 1:
-        raise ValueError("MTS-GLT-v1 accumulation must be positive")
-    if str(payload["amp_dtype"]) not in {"fp32", "bf16"}:
-        raise ValueError("MTS-GLT-v1 amp_dtype must be fp32 or bf16")
-    args.config_schema = "mts-glt-v1"
-    args.config_source_schema = "mts-glt-v1"
-    args.experiment_id = str(payload["experiment_id"])
-    args.dataset_name = str(payload["dataset_name"])
-    args.root = str(payload["cache_root"])
-    args.periodic_line_glt_sidecar = str(payload["line_sidecar_root"])
-    args.star_rbf_v2_sidecar = None
-    args.save_path = str(payload["output_path"])
-    args.glt_result_root = str(payload["result_root"])
-    args.glt_output_kind = str(payload["output_kind"])
-    args.graph_mask_ratio = float(payload["atom_mask_ratio"])
-    args.glt_line_mask_ratio = float(payload["line_mask_ratio"])
-    args.glt_infonce_temperature = float(payload["infonce_temperature"])
-    args.glt_atom_loss_weight = float(payload["atom_loss_weight"])
-    args.glt_line_loss_weight = float(payload["line_loss_weight"])
-    args.glt_infonce_loss_weight = float(payload["infonce_loss_weight"])
-    args.glt_projection_dim = int(payload["projection_dim"])
-    args.batch_size = int(payload["batch_size"])
-    args.loader_workers = int(payload["loader_workers"])
-    args.loader_prefetch_factor = int(payload["prefetch_factor"])
-    args.gradient_accumulation_steps = int(payload["gradient_accumulation_steps"])
-    args.global_batch_size = int(payload["global_batch_size"])
-    args.max_optimizer_steps = int(payload["max_optimizer_steps"])
-    args.checkpoint_interval_steps = int(payload["checkpoint_interval_steps"])
-    args.glt_probe_steps = tuple(int(value) for value in payload["probe_steps"])
-    args.amp_dtype = str(payload["amp_dtype"])
-    args.seed = int(payload["seed"])
-    args.lr = float(payload["lr"])
-    args.warmup_steps = int(payload["warmup_steps"])
-    args.end_lr = float(payload["end_lr"])
-    args.weight_decay = float(payload["weight_decay"])
-    args.cache_layers = str(payload["cache_layers"])
-    args.pretrain_stage = "mts_glt_v1"
-    args.graph_encoder_type = MTS_ROUTE_INTERNAL
-    args.graph_input = "star_linking"
-    args.geom_input = "repeat_unit"
-    args.graph_geometry_mode = "trimer_scage_mcl"
-    args.mips_use_descriptors = True
-    args.topology_attention_variant = "o8"
-    args.rebuild_feature_cache = False
-    args.cache_only = False
-    return args
 
 
 def _apply_glt_v2_config(args, config_path):
     path = Path(config_path).resolve()
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError("GLT-v2 config must be a JSON object")
-    unknown = sorted(set(payload) - _GLT_V2_ALLOWED)
-    missing = sorted(_GLT_V2_REQUIRED - set(payload))
+        raise ValueError("MTS-GLT-v2 config must be a JSON object")
+    unknown = sorted(set(payload) - _GLT_ALLOWED)
+    missing = sorted(_GLT_REQUIRED - set(payload))
     if unknown or missing:
         raise ValueError(
-            "GLT-v2 config fields are invalid; unknown=" + ",".join(unknown)
-            + " missing=" + ",".join(missing)
+            "MTS-GLT-v2 config fields are invalid; "
+            f"unknown={unknown} missing={missing}"
         )
-    graphgate = payload["schema"] == "mts-glt-graphgate-v1"
-    if payload["schema"] not in {"mts-glt-v2", "mts-glt-graphgate-v1"}:
-        raise ValueError("unsupported GLT-v2 config schema")
+    if payload["schema"] != BASELINE_SCHEMA:
+        raise ValueError(f"unsupported pretraining schema: {payload['schema']!r}")
     for name in ("masked_atom", "masked_line", "infonce"):
         if payload[name] is not True:
             raise ValueError(f"MTS-GLT-v2 requires {name}=true")
@@ -345,66 +62,47 @@ def _apply_glt_v2_config(args, config_path):
             raise ValueError(f"MTS-GLT-v2 requires {name}=false")
     if payload["topology_attention_variant"] != "o8":
         raise ValueError("MTS-GLT-v2 requires topology_attention_variant=o8")
-    if int(payload["glt_layers"]) not in {6, 12}:
-        raise ValueError("MTS-GLT-v2 glt_layers must be 6 or 12")
-    if str(payload["glt_attention_variant"]) not in {"mips", "paper"}:
-        raise ValueError("MTS-GLT-v2 attention variant must be mips or paper")
-    if graphgate and (
-        int(payload["glt_layers"]) != 6
-        or str(payload["glt_attention_variant"]) != "mips"
-        or float(payload["infonce_loss_weight"]) != 1.0
-    ):
-        raise ValueError("GraphGate-v1 fixes 6 layers, MIPS attention and InfoNCE weight 1")
-    geometry_mode = str(payload.get("glt_geometry_mode", "full"))
-    if graphgate and geometry_mode not in {"full", "off"}:
-        raise ValueError("GraphGate-v1 glt_geometry_mode must be full or off")
-    if not graphgate and geometry_mode != "full":
-        raise ValueError("glt_geometry_mode is only configurable for GraphGate-v1")
-    metadata_mode = str(payload.get("glt_metadata_mode", "full"))
-    if metadata_mode not in {"full", "dedup"}:
-        raise ValueError("MTS-GLT-v2 glt_metadata_mode must be full or dedup")
-    use_spatial_contact = bool(payload.get("use_spatial_contact", False))
-    spatial_shell_mode = str(payload.get("spatial_shell_mode", "s4"))
-    if spatial_shell_mode not in {"s4", "ms45", "c5_mixed"}:
-        raise ValueError(
-            "MTS-GLT-v2 spatial_shell_mode must be s4, ms45, or c5_mixed"
-        )
-    spatial_sidecar = payload.get("spatial_contact_sidecar")
-    if use_spatial_contact and not spatial_sidecar:
-        raise ValueError("spatial contact mode requires spatial_contact_sidecar")
+    if int(payload["glt_layers"]) != 6:
+        raise ValueError("MTS-GLT-v2 baseline fixes glt_layers=6")
+    if str(payload["glt_attention_variant"]) != "mips":
+        raise ValueError("MTS-GLT-v2 baseline fixes glt_attention_variant=mips")
     if abs(float(payload["atom_mask_ratio"]) - 0.30) > 1e-12:
-        raise ValueError("MTS-GLT-v2 atom_mask_ratio is fixed at 0.30")
+        raise ValueError("MTS-GLT-v2 baseline fixes atom_mask_ratio=0.30")
     if abs(float(payload["line_mask_ratio"]) - 0.40) > 1e-12:
-        raise ValueError("MTS-GLT-v2 line_mask_ratio is fixed at 0.40")
+        raise ValueError("MTS-GLT-v2 baseline fixes line_mask_ratio=0.40")
     if abs(float(payload["infonce_temperature"]) - 0.10) > 1e-12:
-        raise ValueError("MTS-GLT-v2 InfoNCE temperature is fixed at 0.10")
-    if any(abs(float(payload[name]) - 1.0) > 1e-12 for name in (
-        "atom_loss_weight", "line_loss_weight"
-    )):
-        raise ValueError("MTS-GLT-v2 atom/line loss weights are fixed at 1.0")
-    if float(payload["infonce_loss_weight"]) not in {0.0, 0.25, 1.0}:
-        raise ValueError("MTS-GLT-v2 InfoNCE weight must be 0, 0.25, or 1")
+        raise ValueError("MTS-GLT-v2 baseline fixes infonce_temperature=0.10")
+    if any(
+        abs(float(payload[name]) - 1.0) > 1e-12
+        for name in ("atom_loss_weight", "line_loss_weight", "infonce_loss_weight")
+    ):
+        raise ValueError("MTS-GLT-v2 baseline fixes all objective weights at 1.0")
     if int(payload["projection_dim"]) != 256:
-        raise ValueError("MTS-GLT-v2 projection_dim is fixed at 256")
+        raise ValueError("MTS-GLT-v2 baseline fixes projection_dim=256")
     if int(payload["gradient_accumulation_steps"]) < 1:
-        raise ValueError("MTS-GLT-v2 accumulation must be positive")
-    if str(payload["amp_dtype"]) not in {"fp32", "bf16"}:
-        raise ValueError("MTS-GLT-v2 amp_dtype must be fp32 or bf16")
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if int(payload["global_batch_size"]) < 1:
+        raise ValueError("global_batch_size must be positive")
+    if int(payload["checkpoint_interval_steps"]) < 1:
+        raise ValueError("checkpoint_interval_steps must be positive")
+    if str(payload["output_kind"]) != "trajectory":
+        raise ValueError("MTS-GLT-v2 output_kind must be trajectory")
     stop_after = int(payload["stop_after_steps"])
     if stop_after < 1 or stop_after > int(payload["max_optimizer_steps"]):
-        raise ValueError("MTS-GLT-v2 stop_after_steps is invalid")
+        raise ValueError("stop_after_steps must be within max_optimizer_steps")
     probes = tuple(int(value) for value in payload["probe_steps"])
     if not probes or any(value < 1 or value > stop_after for value in probes):
-        raise ValueError("MTS-GLT-v2 probe_steps must fall within the current run")
+        raise ValueError("probe_steps must fall within stop_after_steps")
+    if str(payload["amp_dtype"]) not in {"fp32", "bf16"}:
+        raise ValueError("amp_dtype must be fp32 or bf16")
 
-    args.config_schema = str(payload["schema"])
-    args.config_source_schema = str(payload["schema"])
+    args.config_schema = BASELINE_SCHEMA
+    args.config_source_schema = BASELINE_SCHEMA
     args.experiment_id = str(payload["experiment_id"])
     args.dataset_name = str(payload["dataset_name"])
     args.root = str(payload["cache_root"])
     args.periodic_line_glt_sidecar = str(payload["line_sidecar_root"])
     args.glt_line_label_counts = str(payload["line_label_counts"])
-    args.star_rbf_v2_sidecar = None
     args.save_path = str(payload["output_path"])
     args.glt_result_root = str(payload["result_root"])
     args.glt_output_kind = str(payload["output_kind"])
@@ -417,15 +115,6 @@ def _apply_glt_v2_config(args, config_path):
     args.glt_projection_dim = int(payload["projection_dim"])
     args.glt_layers = int(payload["glt_layers"])
     args.glt_attention_variant = str(payload["glt_attention_variant"])
-    args.glt_geometry_mode = geometry_mode
-    args.glt_metadata_mode = metadata_mode
-    args.use_spatial_contact = use_spatial_contact
-    args.spatial_shell_mode = spatial_shell_mode
-    args.periodic_spatial_contact_sidecar = (
-        str(spatial_sidecar) if spatial_sidecar else None
-    )
-    args.glt_initial_state = payload.get("initial_state_path")
-    args.glt_stop_after_steps = stop_after
     args.batch_size = int(payload["batch_size"])
     args.loader_workers = int(payload["loader_workers"])
     args.loader_prefetch_factor = int(payload["prefetch_factor"])
@@ -434,6 +123,7 @@ def _apply_glt_v2_config(args, config_path):
     args.max_optimizer_steps = int(payload["max_optimizer_steps"])
     args.checkpoint_interval_steps = int(payload["checkpoint_interval_steps"])
     args.glt_probe_steps = probes
+    args.glt_stop_after_steps = stop_after
     args.amp_dtype = str(payload["amp_dtype"])
     args.seed = int(payload["seed"])
     args.lr = float(payload["lr"])
@@ -441,716 +131,118 @@ def _apply_glt_v2_config(args, config_path):
     args.end_lr = float(payload["end_lr"])
     args.weight_decay = float(payload["weight_decay"])
     args.cache_layers = str(payload["cache_layers"])
-    args.pretrain_stage = "mts_glt_graphgate_v1" if graphgate else "mts_glt_v2"
+
+    # Fixed dataset/model contract consumed by UniDataset and the baseline model.
     args.graph_encoder_type = MTS_ROUTE_INTERNAL
     args.graph_input = "star_linking"
     args.geom_input = "repeat_unit"
-    args.graph_geometry_mode = "trimer_scage_mcl"
-    args.mips_use_descriptors = True
-    args.topology_attention_variant = "o8"
+    args.smiles_model_name = ""
+    args.feature_source_dataset = args.dataset_name
+    args.disable_feature_cache = False
     args.rebuild_feature_cache = False
+    args.max_smiles_length = None
+    args.max_smiles_length_cap = 256
+    args.fp_mode = "disabled"
+    args.feature_cache_workers = 0
+    args.feature_cache_chunksize = 4
+    args.feature_cache_partial_every = 200
+    args.feature_cache_item_timeout = 45
+    args.cache_validate = "sample"
+    args.cache_commit_size = 128
+    args.embed_tries_multiplier = 8
+    args.conformer_3d_count = 8
+    args.conformer_keep_count = 4
+    args.conformer_profile = "full"
+    args.scage_distance_mode = "bias"
+    args.scage_distance_rbf = 32
+    args.scage_distance_cutoff = 12.0
+    args.mips_core = "paper_corrected"
+    args.mips_max_hops = 2
+    args.mips_use_descriptors = True
+    args.mips_descriptor_protocol = "source_star_sub"
+    args.spatial_mode = "trimer_scage"
+    args.graph_geometry_mode = "trimer_scage_mcl"
+    args.topology_representation = "canonical_lifted"
+    args.trimer_num_candidates = 4
+    args.trimer_max_heavy_atoms = 384
+    args.mips_variant = "O8"
+    args.finite_variant = "none"
+    args.conformer_mode = "none"
+    args.field_layout = "none"
+    args.field_channels = "none"
+    args.modalities = ["graph"]
+    args.max_grad_norm = 1.0
+    args.resume_state = getattr(args, "resume_state", None)
     args.cache_only = False
     return args
 
 
-def parse_arguments(argv=None):
-    parser = argparse.ArgumentParser(description="Pretrain UniEncoderAttention Model")
-    parser.add_argument('--experiment_id', default='manual')
-    parser.add_argument('--config_schema', default='manual')
-    parser.add_argument('--config_source_schema', default='')
-    parser.add_argument('--b0_config', default=None, help=argparse.SUPPRESS)
-    parser.add_argument('--experiment_config', default=None, help=argparse.SUPPRESS)
-    parser.add_argument(
-        '--modalities',
-        nargs='+',
-        type=parse_modality,
-        default=['graph'],
-        help="MTS pretraining uses the graph modality only."
-    )
+def dataset_kwargs_from_args(args):
+    """Translate the fixed baseline config into the Dataset constructor contract."""
+    return {
+        "root": args.root,
+        "dataset": args.dataset_name,
+        "smiles_model_name": args.smiles_model_name,
+        "graph_encoder_type": args.graph_encoder_type,
+        "graph_input": args.graph_input,
+        "geom_input": args.geom_input,
+        "use_feature_cache": True,
+        "feature_source_dataset": args.feature_source_dataset,
+        "rebuild_feature_cache": False,
+        "max_smiles_length": args.max_smiles_length,
+        "max_smiles_length_cap": args.max_smiles_length_cap,
+        "fp_mode": args.fp_mode,
+        "feature_cache_workers": args.feature_cache_workers,
+        "feature_cache_chunksize": args.feature_cache_chunksize,
+        "feature_cache_partial_every": args.feature_cache_partial_every,
+        "feature_cache_item_timeout": args.feature_cache_item_timeout,
+        "cache_layers": str(args.cache_layers),
+        "cache_validate": args.cache_validate,
+        "cache_commit_size": args.cache_commit_size,
+        "embed_tries_multiplier": args.embed_tries_multiplier,
+        "conformer_3d_count": args.conformer_3d_count,
+        "conformer_keep_count": args.conformer_keep_count,
+        "conformer_profile": args.conformer_profile,
+        "scage_distance_mode": args.scage_distance_mode,
+        "scage_distance_rbf": args.scage_distance_rbf,
+        "scage_distance_cutoff": args.scage_distance_cutoff,
+        "mips_core": args.mips_core,
+        "mips_max_hops": args.mips_max_hops,
+        "mips_use_descriptors": args.mips_use_descriptors,
+        "mips_descriptor_protocol": args.mips_descriptor_protocol,
+        "spatial_mode": args.spatial_mode,
+        "graph_geometry_mode": args.graph_geometry_mode,
+        "topology_representation": args.topology_representation,
+        "trimer_num_candidates": args.trimer_num_candidates,
+        "trimer_max_heavy_atoms": args.trimer_max_heavy_atoms,
+        "mips_variant": args.mips_variant,
+        "finite_variant": args.finite_variant,
+        "conformer_mode": args.conformer_mode,
+        "field_layout": args.field_layout,
+        "field_channels": args.field_channels,
+        "modalities": ("graph",),
+        "experiment_id": args.experiment_id,
+        "feature_config_hash": "manual",
+        "periodic_line_glt_sidecar": args.periodic_line_glt_sidecar,
+    }
 
-    parser.add_argument(
-        '--fusion_type',
-        type=str,
-        choices=['none'],
-        default='none',
-        help="MTS joint pretraining has no multimodal fusion.",
-    )
-    parser.add_argument(
-        '--fp_mode',
-        type=str,
-        choices=['disabled', 'ecfp', 'mixfp', 'attachment_count'],
-        default='ecfp',
-        help="Fingerprint implementation. ecfp keeps the original Morgan/ECFP 1024-bit FP; mixfp uses MACCSKeys + PubChemFingerprints.",
-    )
-    parser.add_argument('--fusion_dropout', type=float, default=0.0, help=argparse.SUPPRESS)
-    # Accepted for the shared launcher COMMON vector; joint pretraining does
-    # not consume per-modality dropout, the defaults mirror train.py.
-    parser.add_argument('--smiles_modality_dropout', type=float, default=0.10, help=argparse.SUPPRESS)
-    parser.add_argument('--fp_modality_dropout', type=float, default=0.25, help=argparse.SUPPRESS)
-    parser.add_argument('--graph_modality_dropout', type=float, default=0.05, help=argparse.SUPPRESS)
-    parser.add_argument(
-        '--mips_fusion_mode',
-        choices=['none'],
-        default='none',
-    )
-    parser.add_argument(
-        '--projection_mode',
-        choices=['plain', 'shared_private'],
-        default='shared_private',
-    )
-    parser.add_argument(
-        '--modality_control',
-        choices=['real', 'batch_shuffled', 'constant_zero'],
-        default='real',
-    )
-    parser.add_argument(
-        '--graph_input',
-        type=str,
-        choices=['repeat_unit', 'star_linking'],
-        default='star_linking',
-        help="Graph input type. 'repeat_unit' keeps the original graph; 'star_linking' removes two attachment atoms and connects their boundary atoms for graph-only topology input."
-    )
-    parser.add_argument(
-        '--smiles_model_name',
-        type=str,
-        default="./pretrained_models/encoders/PubChem10M_SMILES_BPE_450k",
-        help="Pretrained model name or path for SMILES"
-    )
-    parser.add_argument(
-        '--dataset_name',
-        type=str,
-        default='smi_all',
-        help="Name of the dataset for pretraining (unlabeled or labeled, but labels unused here)"
-    )
-    parser.add_argument(
-        '--pretrain_stage',
-        type=str,
-        choices=['mts_joint_pretraining'],
-        default='mts_joint_pretraining',
-        help=(
-            "MTS pretraining uses one joint masked-atom + Trimer bond-angle "
-            "stage; property fine-tuning is handled by train.py."
-        )
-    )
-    parser.add_argument(
-        '--pretrained_model_path',
-        type=str,
-        default='',
-        help="Optional MTS joint-pretraining checkpoint to initialize or resume the fixed topology/Trimer stage."
-    )
-    parser.add_argument(
-        '--root',
-        type=str,
-        default='./data',
-        help="Root directory of the dataset."
-    )
-    parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=32,
-        help="Batch size for pretraining."
-    )
-    parser.add_argument('--loader_workers', type=int, default=4)
-    parser.add_argument('--loader_prefetch_factor', type=int, default=2)
-    parser.add_argument(
-        '--batch_balance', choices=['none', 'cost'], default='none',
-        help='Optional topology cost-balanced distributed batches.',
-    )
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
-    parser.add_argument('--amp_dtype', choices=['fp32', 'bf16'], default='fp32')
-    parser.add_argument('--max_steps', type=int, default=0, help='Optional preflight step limit; 0 disables it.')
-    parser.add_argument(
-        '--max_optimizer_steps', type=int, default=0,
-        help='Exact optimizer-update budget; 0 uses the epoch budget.',
-    )
-    parser.add_argument(
-        '--benchmark_only', action='store_true',
-        help='Run a finite forward/backward throughput benchmark and exit.',
-    )
-    parser.add_argument(
-        '--resume_smoke', action='store_true',
-        help='Test-only short run; never writes a production checkpoint.',
-    )
-    parser.add_argument(
-        '--resume_smoke_stop_steps', type=int, default=0,
-        help='Optional early stop for a resume smoke while preserving the target schedule.',
-    )
-    parser.add_argument('--benchmark_batches', type=int, default=0)
-    parser.add_argument('--seed', type=int, default=42, help='Base random seed for reproducible pretraining.')
-    parser.add_argument(
-        '--epochs',
-        type=int,
-        default=20,
-        help="Number of pretraining epochs."
-    )
-    parser.add_argument(
-        '--lr',
-        type=float,
-        default=1e-4,
-        help="Learning rate for optimizer."
-    )
-    parser.add_argument(
-        '--temperature',
-        type=float,
-        default=0.07,
-        help="Temperature parameter for contrastive loss."
-    )
-    parser.add_argument(
-        '--max_grad_norm',
-        type=float,
-        default=-1.0,
-        help="Maximum gradient norm; values <=0 disable clipping for MTS."
-    )
-    parser.add_argument(
-        '--save_path',
-        type=str,
-        default='./pretrained_models/saved_pretrained_model.pth',
-        help="Path to save the pretrained model."
-    )
-    parser.add_argument(
-        '--resume_state', type=str, default='',
-        help='Optional atomic pretraining train-state checkpoint to resume.'
-    )
-    parser.add_argument(
-        '--checkpoint_interval_steps', type=int, default=2000,
-        help='Optimizer steps between resumable train-state checkpoints.'
-    )
-    parser.add_argument(
-        '--mts_num_layers',
-        type=int,
-        default=6,
-        dest='graph_num_layers',
-        help="Number of O8 MTS topology layers (fixed at 6)."
-    )
-    parser.add_argument(
-        '--mts_hidden_dim',
-        type=int,
-        default=512,
-        dest='graph_emb_dim',
-        help="O8 MTS hidden dimension (fixed at 512)."
-    )
-    parser.add_argument(
-        '--mts_dropout',
-        type=float,
-        default=0.1,
-        dest='graph_dropout',
-        help="O8 MTS attention dropout."
-    )
-    parser.add_argument(
-        '--mts_num_heads',
-        type=int,
-        default=8,
-        dest='scage_num_heads',
-        help="Number of O8 MTS attention heads (fixed at 8)."
-    )
-    parser.add_argument(
-        '--graph_encoder_type',
-        type=str,
-        choices=['mts', 'mips_trimer_scage'],
-        default='mips_trimer_scage',
-        help="Graph encoder backend: the production non-PBC MIPS-Trimer-SCAGE encoder."
-    )
-    parser.add_argument(
-        '--mips_core',
-        choices=['paper_corrected'],
-        default='paper_corrected',
-    )
-    parser.add_argument('--mips_max_hops', type=int, default=None)
-    parser.add_argument('--mips_atom_feature_mode', choices=['mips137'], default='mips137')
-    parser.add_argument('--mips_attention_scale', choices=['head_dim'], default='head_dim')
-    parser.add_argument('--mips_norm_mode', choices=['post'], default='post')
-    parser.add_argument('--mips_activation', choices=['relu'], default='relu')
-    parser.add_argument('--mips_spd_bias_mode', choices=['per_head'], default='per_head')
-    parser.add_argument(
-        '--mips_path_bias_mode',
-        choices=['per_head_single_path_node'],
-        default='per_head_single_path_node',
-    )
-    parser.add_argument(
-        '--mips_multi_scale_hop_gate',
-        action=argparse.BooleanOptionalAction, default=None,
-    )
-    parser.add_argument(
-        '--mips_semantics',
-        choices=['paper_semantic'],
-        default='paper_semantic',
-    )
-    parser.add_argument(
-        '--mips_descriptor_fusion_mode',
-        choices=['graph_md_residual'],
-        default='graph_md_residual',
-    )
-    parser.add_argument(
-        '--mips_descriptor_components',
-        choices=['md200'],
-        default='md200',
-    )
-    parser.add_argument(
-        '--mips_descriptor_protocol',
-        choices=['source_star_sub'],
-        default='source_star_sub',
-    )
-    parser.add_argument('--mips_descriptor_disturbance', type=float, default=0.0)
-    parser.add_argument(
-        '--mips_backbone_mode',
-        choices=['independent'],
-        default='independent',
-    )
-    parser.add_argument(
-        '--mips_input_norm',
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
-        '--mips_mask_mode', choices=['zero'], default='zero',
-    )
-    parser.add_argument(
-        '--mips_mask_policy',
-        choices=['canonical_exact'],
-        default='canonical_exact',
-    )
-    parser.add_argument(
-        '--mips_masked_loss_reduction',
-        choices=['atom_mean'],
-        default='atom_mean',
-    )
-    parser.add_argument(
-        '--mips_use_descriptors',
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        '--spatial_mode',
-        choices=['trimer_scage'],
-        default='trimer_scage',
-    )
-    parser.add_argument(
-        '--graph_geometry_mode',
-        choices=['trimer_scage_mcl'],
-        default='trimer_scage_mcl',
-    )
-    parser.add_argument(
-        '--topology_attention_variant',
-        choices=['o8'],
-        default='o8',
-        help='B0-v2 uses the original O8 attention stack.',
-    )
-    parser.add_argument('--star_rbf_upper', type=float, default=3.0)
-    parser.add_argument('--star_rbf_v2_sidecar', default=None)
-    parser.add_argument('--pretraining_objective', choices=['joint', 'masked_atom_only'], default='joint')
-    parser.add_argument('--angle_loss_weight', type=float, default=0.25)
-    parser.add_argument(
-        '--topology_representation',
-        choices=['canonical_lifted'],
-        default='canonical_lifted',
-    )
-    parser.add_argument('--trimer_num_candidates', type=int, default=4)
-    parser.add_argument('--trimer_max_heavy_atoms', type=int, default=384)
-    parser.set_defaults(
-        finite_variant='none', conformer_mode='none',
-        field_layout='none', field_channels='none',
-    )
-    parser.add_argument(
-        '--mips_variant',
-        choices=['O8'],
-        default='O8',
-    )
-    parser.add_argument(
-        '--scage_dist_bar',
-        nargs='+',
-        type=float,
-        default=[20.0, 50.0],
-        help="SCAGE multi-scale distance percentiles, e.g. 20 50."
-    )
-    parser.add_argument(
-        '--scage_num_heads',
-        type=int,
-        default=16,
-        help="Number of attention heads for SCAGE graph encoder."
-    )
-    parser.add_argument('--scage_ffn_hidden_dim', type=int, default=256)
-    parser.add_argument('--scage_num_kernels', type=int, default=128)
-    parser.add_argument('--scage_attention_dropout', type=float, default=0.1)
-    parser.add_argument(
-        '--scage_use_descriptors',
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help='Inject explicit 3D descriptor tokens into SCAGE. Disabled by default.',
-    )
-    parser.add_argument(
-        '--scage_distance_mode',
-        choices=['bias', 'mask', 'multiscale_bias', 'mips_dual'],
-        default='mips_dual',
-    )
-    parser.add_argument('--scage_distance_rbf', type=int, default=32)
-    parser.add_argument('--scage_distance_cutoff', type=float, default=12.0)
-    parser.add_argument('--scage_distance_scales', nargs='+', type=float, default=[4.0, 8.0, 12.0])
-    parser.add_argument('--scage_distance_taus', nargs='+', type=float, default=[0.5, 1.0, 1.5])
-    parser.add_argument(
-        '--scage_topology_bias', action=argparse.BooleanOptionalAction, default=True,
-        help="Add shortest-path and direct-bond attention bias to every SCAGE layer.",
-    )
-    parser.add_argument('--scage_topology_max_distance', type=int, default=20)
-    parser.add_argument('--scage_topology_locality_mode', choices=['hard', 'soft', 'none'], default='soft')
-    parser.add_argument('--scage_topology_locality_threshold', type=int, default=5)
-    parser.add_argument('--scage_topology_locality_tau', type=float, default=1.0)
-    parser.add_argument(
-        '--joint_embedding_dim',
-        type=int,
-        default=256,
-        help="Shared projection dimension for modality fusion."
-    )
-    parser.add_argument(
-        '--feature_source_dataset',
-        type=str,
-        default=None,
-        help="Dataset used to build the SMILES-level feature cache. Defaults to --dataset_name."
-    )
-    parser.add_argument(
-        '--disable_feature_cache',
-        action='store_true',
-        help="Disable SMILES-level feature cache and use legacy per-dataset caching."
-    )
-    parser.add_argument(
-        '--rebuild_feature_cache',
-        action='store_true',
-        help="Force rebuild the feature cache even if it already exists."
-    )
-    parser.add_argument(
-        '--cache_only',
-        action='store_true',
-        help=(
-            "Build/load and validate the CPU feature cache, then exit before "
-            "CUDA/NCCL/model initialization."
-        ),
-    )
-    parser.add_argument(
-        '--max_smiles_length',
-        type=int,
-        default=None,
-        help="Override SMILES token max length. Computed from feature_source_dataset when not set."
-    )
-    parser.add_argument(
-        '--max_smiles_length_cap',
-        type=int,
-        default=256,
-        help="Cap for auto-computed max SMILES token length (default: 256)."
-    )
-    parser.add_argument(
-        '--feature_cache_workers',
-        type=int,
-        default=0,
-        help="Number of worker processes for feature cache construction. 0 or 1 keeps serial behavior."
-    )
-    parser.add_argument(
-        '--feature_cache_chunksize',
-        type=int,
-        default=4,
-        help="Chunksize for multiprocessing feature cache construction."
-    )
-    parser.add_argument(
-        '--feature_cache_partial_every',
-        type=int,
-        default=200,
-        help="Save feature cache .partial every N successful entries. Set 0 to disable partial writes."
-    )
-    parser.add_argument(
-        '--feature_cache_item_timeout',
-        type=int,
-        default=45,
-        help="Hard wall-clock seconds per cache item before topology-only fallback (0 disables)."
-    )
-    parser.add_argument(
-        '--cache_layers',
-        type=str,
-        default='ru_base,topology,trimer,md200',
-        help=(
-            "Comma-separated MIPS LMDB layers to prepare/read: "
-            "ru_base,topology,trimer,md200."
-        ),
-    )
-    parser.add_argument(
-        '--cache_validate',
-        choices=['sample', 'full'],
-        default='sample',
-        help="Validate 128 records or the complete LMDB cohort after building.",
-    )
-    parser.add_argument(
-        '--cache_commit_size',
-        type=int,
-        default=128,
-        help="Maximum number of generated records per LMDB write transaction.",
-    )
-    parser.add_argument(
-        '--embed_tries_multiplier',
-        type=int,
-        default=8,
-        help="Multiplier for RDKit 3D embedding attempts per requested conformer. Total tries = CONFORMER_3D_COUNT * multiplier."
-    )
-    parser.add_argument(
-        '--conformer_3d_count',
-        type=int,
-        default=8,
-        help='Number of ETKDG conformer candidates before energy ranking.'
-    )
-    parser.add_argument(
-        '--conformer_keep_count',
-        type=int,
-        default=4,
-        help='Number of lowest-energy optimized conformers retained in the feature cache.'
-    )
-    parser.add_argument(
-        '--conformer_profile',
-        choices=['fast', 'full', 'quality'],
-        default='full',
-        help='Conformer search budget. fast uses bounded 100/300 ETKDG and 50-step force-field optimization.'
-    )
-    parser.add_argument(
-        '--geom_denoise_weight',
-        type=float,
-        default=1.0,
-        help="Weight for geometry coordinate denoising pretraining loss."
-    )
-    parser.add_argument(
-        '--geom_noise_std',
-        type=float,
-        default=0.2,
-        help="Fixed Gaussian coordinate noise std for geometry denoising pretraining."
-    )
-    parser.add_argument(
-        '--geom_noise_std_min',
-        type=float,
-        default=None,
-        help="Minimum Gaussian coordinate noise std for random-range geometry denoising. "
-             "When set with --geom_noise_std_max, overrides fixed --geom_noise_std per batch."
-    )
-    parser.add_argument(
-        '--geom_noise_std_max',
-        type=float,
-        default=None,
-        help="Maximum Gaussian coordinate noise std for random-range geometry denoising. "
-             "When set with --geom_noise_std_min, overrides fixed --geom_noise_std per batch."
-    )
-    parser.add_argument(
-        '--graph_pretrain_weight',
-        type=float,
-        default=1.0,
-        help="Weight for graph-specific pretraining losses."
-    )
-    parser.add_argument(
-        '--graph_mask_atom_weight',
-        type=float,
-        default=1.0,
-        help="Weight for masked graph atom-feature reconstruction."
-    )
-    parser.add_argument(
-        '--graph_periodic_aug_weight',
-        type=float,
-        default=0.5,
-        help="Weight for PerioGT-style periodicity augmentation contrastive loss."
-    )
-    parser.add_argument(
-        '--graph_shortest_path_weight',
-        type=float,
-        default=1.0,
-        help="Weight for SCAGE-style graph shortest-path distance prediction."
-    )
-    parser.add_argument(
-        '--graph_angle_weight',
-        type=float,
-        default=0.25,
-        help="Weight for SCAGE-style 3D angle prediction."
-    )
-    parser.add_argument(
-        '--angle_objective',
-        choices=['categorical', 'cosine'],
-        default='categorical',
-        help=(
-            'Trimer angle target. categorical preserves the completed '
-            '20-bin checkpoint; cosine enables the optional Angle-v2 '
-            'SmoothL1 experiment.'
-        ),
-    )
-    parser.add_argument(
-        '--scage_sp_max_distance',
-        type=int,
-        default=20,
-        help="Maximum shortest-path class; larger distances are clipped to this bucket."
-    )
-    parser.add_argument(
-        '--scage_angle_bins',
-        type=int,
-        default=20,
-        help="Number of angle bins for SCAGE-style angle prediction."
-    )
-    parser.add_argument('--scage_mips_mask_weight', type=float, default=1.0)
-    parser.add_argument('--scage_ecfp_weight', type=float, default=0.0)
-    parser.add_argument(
-        '--mips_spd_weight',
-        type=float, default=0.0,
-    )
-    parser.add_argument('--mips_path_bond_weight', type=float, default=0.0)
-    parser.set_defaults(scage_screw_geometry_weight=0.0)
-    parser.set_defaults(
-        mips_repeat_consistency_weight=0.0,
-        mips_distance_weight=0.0,
-        mips_conformer_weight=0.0,
-    )
-    parser.add_argument('--scage_ecfp_effective_max', type=float, default=0.20)
-    parser.add_argument('--scage_sp_max_pairs', type=int, default=256)
-    parser.add_argument('--scage_focal_gamma', type=float, default=2.0)
-    parser.add_argument('--scage_boundary_angle_weight', type=float, default=0.5)
-    parser.add_argument('--scage_boundary_torsion_weight', type=float, default=0.40)
-    parser.add_argument('--scage_torsion_bins', type=int, default=12)
-    parser.add_argument(
-        '--scage_torsion_objective',
-        choices=['circular', 'categorical'],
-        default='circular',
-        help=(
-            "Boundary torsion objective. 'circular' regresses sin/cos and avoids "
-            "bin discontinuities; 'categorical' preserves the legacy binned focal loss."
-        ),
-    )
-    parser.add_argument('--scage_geometry_max_pairs', type=int, default=32)
-    parser.add_argument('--scage_geometry_mask_ratio', type=float, default=0.15)
-    parser.add_argument('--scage_geometry_distance_weight', type=float, default=0.25)
-    parser.add_argument('--scage_geometry_angle_weight', type=float, default=0.35)
-    parser.add_argument('--scage_geometry_screw_weight', type=float, default=0.20)
-    parser.add_argument(
-        '--scage_shift_balance_power', type=float, default=0.5,
-        help=(
-            "Inverse-frequency exponent for periodic image-shift cross entropy. "
-            "Zero disables class balancing; 0.5 uses square-root balancing."
-        ),
-    )
-    parser.add_argument('--repeat_cut_views', type=int, default=2)
-    parser.add_argument('--repeat_cut_projection_dim', type=int, default=256)
-    parser.add_argument(
-        '--repeat_cut_max_mrus',
-        type=int,
-        default=3,
-        help="Maximum MRU multiplier used by periodicity augmentation."
-    )
-    parser.add_argument(
-        '--repeat_cut_retry',
-        type=int,
-        default=5,
-        help="Number of augmentation attempts per SMILES before skipping it."
-    )
-    parser.add_argument(
-        '--repeat_cut_temperature',
-        type=float,
-        default=0.2,
-        help="Temperature for graph periodicity augmentation InfoNCE loss."
-    )
-    parser.add_argument(
-        '--graph_mask_ratio',
-        type=float,
-        default=0.30,
-        help="Node masking ratio for graph atom-feature reconstruction."
-    )
-    parser.add_argument(
-        '--dynamic_pretrain_loss',
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Use SCAGE-style dynamic multi-task loss weighting for enabled "
-            "pretraining losses. Disabled by default; enable explicitly when needed."
-        ),
-    )
-    parser.add_argument(
-        '--dynamic_loss_warmup_steps', type=int, default=200,
-        help='Steps used to collect and then freeze dynamic-loss baselines.',
-    )
-    parser.add_argument('--dynamic_loss_recent_window', type=int, default=20)
-    parser.add_argument('--dynamic_loss_temperature', type=float, default=0.5)
-    parser.add_argument('--pretrain_unique_smiles', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--alignment_projection_dim', type=int, default=256)
-    parser.add_argument('--alignment_fp_drop', type=float, default=0.40)
-    parser.add_argument('--alignment_smiles_drop', type=float, default=0.15)
-    parser.add_argument('--alignment_graph_drop', type=float, default=0.10)
-    parser.add_argument('--alignment_fused_weight', type=float, default=1.0)
-    parser.add_argument('--alignment_graph_smiles_weight', type=float, default=0.5)
-    parser.add_argument('--alignment_graph_fp_weight', type=float, default=0.25)
-    parser.add_argument('--alignment_lomo_weight', type=float, default=0.25)
-    parser.add_argument('--alignment_pooling_kl_weight', type=float, default=0.01)
-    parser.add_argument('--alignment_fused_mask_weight', type=float, default=0.25)
-    parser.add_argument(
-        '--alignment_shared_private_weight', type=float, default=0.01
-    )
-    parser.add_argument('--alignment_graph_lr', type=float, default=1e-5)
-    parser.add_argument('--alignment_smiles_lr', type=float, default=1e-5)
-    parser.add_argument('--alignment_fp_lr', type=float, default=2e-5)
-    parser.add_argument('--alignment_projection_lr', type=float, default=1e-4)
-    parser.add_argument('--alignment_fusion_lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument(
-        '--warmup_ratio', type=float, default=0.10,
-        help='Fraction of optimizer updates used for linear warm-up before cosine decay.',
+
+def parse_arguments(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Pretrain the MTS-GLT-v2 baseline"
     )
-    parser.add_argument('--warmup_steps', type=int, default=2000)
-    parser.add_argument('--scheduler_power', type=float, default=1.0)
-    parser.add_argument('--end_lr', type=float, default=1e-9)
     parser.add_argument(
-        '--mips_scheduler', choices=('polynomial', 'cosine', 'linear'), default='polynomial',
-        help='Learning-rate decay after warm-up. MTS uses polynomial power 1.',
+        "--experiment_config",
+        required=True,
+        help="Path to configs/mts/glt_v2_formal_a6_h_w1_20k.json or smoke config",
     )
+    parser.add_argument("--resume_state", default=None)
     args = parser.parse_args(argv)
-    # Fixed MTS route internals.  Retired geometry and peer-fusion options are
-    # deliberately absent from the public CLI.
-    args.gnn_model_name = ""
-    args.freeze_encoder = False
-    args.geom_input = 'repeat_unit'
-    args.screw_kabsch_rmsd_max = 1.5
-    args.screw_rotation_consistency_deg = 30.0
-    args.screw_translation_relative_max = 0.30
-    args.screw_final_rmsd_max = 1.5
-    args.ff_gradient_rms_max = 0.05
-    args.ff_gradient_max = 0.25
-    args.ff_probe_steps = 20
-    args.ff_probe_energy_delta_per_atom_max = 5e-5
-    args.screw_energy_per_atom_max = 5.0
-    args.screw_center_gradient_rms_max = 10.0
-    args.scage_dist_bar = [20.0, 50.0]
-    args.scage_num_heads = 8
-    args.scage_ffn_hidden_dim = 2048
-    args.scage_num_kernels = 128
-    args.scage_attention_dropout = 0.1
-    args.scage_use_descriptors = False
-    args.scage_distance_mode = 'mips_dual'
-    args.scage_distance_rbf = 32
-    args.scage_distance_cutoff = 12.0
-    args.scage_distance_scales = [4.0, 8.0, 12.0]
-    args.scage_distance_taus = [0.5, 1.0, 1.5]
-    args.scage_topology_bias = True
-    args.scage_topology_max_distance = 20
-    args.scage_topology_locality_mode = 'soft'
-    args.scage_topology_locality_threshold = 5
-    args.scage_topology_locality_tau = 1.0
-    args.scage_periodic_image_mode = 'none'
-    args.scage_periodic_image_cap = 0
-    args.scage_periodic_image_temperature = 0.5
-    args.scage_force_topology_only = True
-    args.scage_use_pbc_distance = False
-    # ``mts`` is the public backend spelling.  Keep the historical internal
-    # selector so Dataset/model code and immutable cache metadata remain
-    # compatible during the naming migration.
-    if args.graph_encoder_type == "mts":
-        args.graph_encoder_type = MTS_ROUTE_INTERNAL
-    if args.b0_config and args.experiment_config:
-        parser.error("use only one of --b0_config and --experiment_config")
-    if args.b0_config:
-        args = _apply_b0_config(args, args.b0_config)
-    elif args.experiment_config:
-        schema = json.loads(Path(args.experiment_config).read_text(encoding="utf-8")).get("schema")
-        if schema == "mts-b0-v2":
-            args = _apply_b0_config(args, args.experiment_config)
-        elif schema == "mts-glt-v1":
-            args = _apply_glt_config(args, args.experiment_config)
-        elif schema == "mts-glt-v2":
-            args = _apply_glt_v2_config(args, args.experiment_config)
-        elif schema == "mts-glt-graphgate-v1":
-            args = _apply_glt_v2_config(args, args.experiment_config)
-        else:
-            raise ValueError(f"unsupported MTS experiment schema: {schema}")
-    return args
+    return _apply_glt_v2_config(args, args.experiment_config)
+
+
+__all__ = [
+    "BASELINE_SCHEMA",
+    "dataset_kwargs_from_args",
+    "parse_arguments",
+]

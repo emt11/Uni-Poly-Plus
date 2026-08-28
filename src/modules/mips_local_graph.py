@@ -4,7 +4,6 @@ import os
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch_geometric.nn import global_mean_pool
 from torch_geometric.utils import softmax
 from torch_scatter import scatter
@@ -58,143 +57,6 @@ class MIPSSinglePathNodeBias(nn.Module):
                     / denominator[selected].unsqueeze(-1)
                 )
         return output
-
-
-class MIPSDirectBondTypeBias(nn.Module):
-    """Zero-initialized direct-bond bias from existing periodic line labels.
-
-    ``control`` gives every real chemical bond the same normalized K-vector;
-    ``type`` uses the stored categorical identity.  Both arms therefore own
-    exactly the same ``Linear(K, heads, bias=False)`` parameters.
-    """
-
-    VALID_MODES = {"control", "type"}
-
-    def __init__(self, num_heads=8, num_categories=6, mode="type"):
-        super().__init__()
-        if str(mode) not in self.VALID_MODES:
-            raise ValueError(f"unsupported direct-bond bias mode: {mode}")
-        self.mode = str(mode)
-        self.num_categories = int(num_categories)
-        self.projection = nn.Linear(
-            self.num_categories, int(num_heads), bias=False
-        )
-        nn.init.zeros_(self.projection.weight)
-
-    @staticmethod
-    def _canonical_relation_keys(data):
-        edge = data.lga_edge_index.long()
-        source, target = edge[0], edge[1]
-        shift = data.lga_source_image_shift.long().reshape(-1)
-        if shift.numel() != source.numel():
-            raise ValueError("direct-bond relation shift length mismatch")
-        # Relation r=(target, source, shift), canonicalized together with its
-        # inverse (source, target, -shift), exactly like canonical_line_token.
-        use_direct = (target < source) | ((target == source) & (shift <= 0))
-        atom_a = torch.where(use_direct, target, source)
-        atom_b = torch.where(use_direct, source, target)
-        canonical_shift = torch.where(use_direct, shift, -shift)
-        return atom_a, atom_b, canonical_shift
-
-    @staticmethod
-    def _pack_keys(atom_a, atom_b, shift, *, atom_radix, shift_radius):
-        if shift.numel() and bool((shift.abs() > int(shift_radius)).any()):
-            raise ValueError("direct-bond key shift is outside the packed range")
-        shift_radix = 2 * int(shift_radius) + 1
-        return (
-            (atom_a.long() * int(atom_radix) + atom_b.long()) * shift_radix
-            + shift.long() + int(shift_radius)
-        )
-
-    def relation_categories(self, data):
-        required = (
-            "glt_token_atom_a", "glt_token_atom_b", "glt_token_shift",
-            "glt_token_bond_type", "lga_edge_index", "lga_spd",
-            "lga_source_image_shift",
-        )
-        missing = [name for name in required if not hasattr(data, name)]
-        if missing:
-            raise ValueError(
-                "direct-bond bias requires existing GLT bond fields: "
-                + ", ".join(missing)
-            )
-        token_a = data.glt_token_atom_a.long().reshape(-1)
-        token_b = data.glt_token_atom_b.long().reshape(-1)
-        token_shift = data.glt_token_shift.long().reshape(-1)
-        token_type = data.glt_token_bond_type.long().reshape(-1)
-        if not (
-            token_a.numel() == token_b.numel() == token_shift.numel()
-            == token_type.numel()
-        ):
-            raise ValueError("direct-bond token field length mismatch")
-        if token_type.numel() and bool(
-            ((token_type < 0) | (token_type >= self.num_categories)).any()
-        ):
-            raise ValueError("direct-bond category is outside the stored vocabulary")
-
-        relation_a, relation_b, relation_shift = self._canonical_relation_keys(data)
-        relation_count = int(relation_a.numel())
-        categories = relation_a.new_full((relation_count,), -1)
-        direct = data.lga_spd.long().reshape(-1) == 1
-        if not bool(direct.any()):
-            return categories
-        if token_a.numel() == 0:
-            raise ValueError("SPD=1 relations exist without periodic line tokens")
-        maximum_atom = torch.stack((
-            token_a.max(), token_b.max(), relation_a.max(), relation_b.max()
-        )).max()
-        atom_radix = int(maximum_atom.item()) + 1
-        shift_radius = int(torch.stack((
-            token_shift.abs().max(), relation_shift.abs().max()
-        )).max().item())
-        token_key = self._pack_keys(
-            token_a, token_b, token_shift,
-            atom_radix=atom_radix, shift_radius=shift_radius,
-        )
-        relation_key = self._pack_keys(
-            relation_a[direct], relation_b[direct], relation_shift[direct],
-            atom_radix=atom_radix, shift_radius=shift_radius,
-        )
-        sorted_key, order = torch.sort(token_key)
-        if sorted_key.numel() > 1 and bool((sorted_key[1:] == sorted_key[:-1]).any()):
-            raise ValueError("periodic line token keys are not unique")
-        position = torch.searchsorted(sorted_key, relation_key)
-        matched = position < sorted_key.numel()
-        safe_position = position.clamp_max(sorted_key.numel() - 1)
-        matched &= sorted_key[safe_position] == relation_key
-        if not bool(matched.all()):
-            raise ValueError("SPD=1 relation has no matching chemical-bond token")
-        categories[direct] = token_type[order[safe_position]]
-        return categories
-
-    def category_bias(self, categories):
-        categories = torch.as_tensor(
-            categories, device=self.projection.weight.device, dtype=torch.long
-        ).reshape(-1)
-        if categories.numel() and bool(
-            ((categories < 0) | (categories >= self.num_categories)).any()
-        ):
-            raise ValueError("direct-bond category is outside the stored vocabulary")
-        if self.mode == "control":
-            inputs = self.projection.weight.new_full(
-                (categories.numel(), self.num_categories),
-                1.0 / math.sqrt(self.num_categories),
-            )
-        else:
-            inputs = F.one_hot(
-                categories, num_classes=self.num_categories
-            ).to(self.projection.weight.dtype)
-        return self.projection(inputs)
-
-    def forward(self, data, dtype=None):
-        categories = self.relation_categories(data)
-        output = self.projection.weight.new_zeros(
-            (categories.numel(), self.projection.out_features)
-        )
-        direct = categories >= 0
-        if bool(direct.any()):
-            output[direct] = self.category_bias(categories[direct])
-        return output if dtype is None else output.to(dtype)
 
 
 class SymmetricStarDistanceBias(nn.Module):
@@ -372,7 +234,7 @@ class MD200GraphResidual(nn.Module):
 
 
 class MIPSLocalGraphEncoder(nn.Module):
-    """B0-v2 O8 topology + symmetric Star-RBF v2 + MD200."""
+    """MTS-GLT-v2 O8 topology encoder with the MD200 residual."""
 
     expects_data = True
     uses_geometry = True
@@ -410,16 +272,15 @@ class MIPSLocalGraphEncoder(nn.Module):
         masked_loss_reduction="atom_mean",
         input_norm=False,
         qk_direction="paper",
-        use_star_rbf=True,
+        use_star_rbf=False,
         star_rbf_upper=3.0,
         use_mcl=False,
         topology_attention_variant="o8",
-        direct_bond_bias_mode="none",
         **retired,
     ):
         super().__init__()
         requested_geometry = str(graph_geometry_mode)
-        if requested_geometry not in {"none", "trimer_scage_mcl"}:
+        if requested_geometry != "trimer_scage_mcl":
             raise ValueError(
                 f"unsupported MTS geometry mode: {requested_geometry}; "
                 "retired experiment modes are unavailable"
@@ -448,7 +309,7 @@ class MIPSLocalGraphEncoder(nn.Module):
             ),
         }
         if int(max_hops) != 2:
-            raise ValueError("B0-v2 requires max_hops=2")
+            raise ValueError("MTS-GLT-v2 requires max_hops=2")
         mismatches = [
             f"{name}={actual!r} (required {expected!r})"
             for name, (actual, expected) in contract.items()
@@ -462,7 +323,7 @@ class MIPSLocalGraphEncoder(nn.Module):
                 + "; ".join(mismatches)
             )
         if not bool(use_descriptors):
-            raise ValueError(f"{ROUTE_NAME} B0-v2 downstream requires MD200")
+            raise ValueError(f"{ROUTE_NAME} MTS-GLT-v2 downstream requires MD200")
         if bool(multi_scale_hop_gate) or bool(input_norm):
             raise ValueError("retired O8 topology options are not supported")
         if abs(float(dropout) - 0.10) > 1e-12:
@@ -471,9 +332,9 @@ class MIPSLocalGraphEncoder(nn.Module):
             raise ValueError("Trimer contract requires 4 candidates/384 atoms")
         topology_attention_variant = str(topology_attention_variant)
         if topology_attention_variant != "o8":
-            raise ValueError("B0-v2 requires topology_attention_variant='o8'")
+            raise ValueError("MTS-GLT-v2 requires topology_attention_variant='o8'")
         if bool(use_mcl):
-            raise ValueError("B0-v2 removed the Trimer-MCL model branch")
+            raise ValueError("MTS-GLT-v2 does not use the MCL model branch")
 
         self.core = "paper_corrected"
         self.variant = "O8"
@@ -487,12 +348,10 @@ class MIPSLocalGraphEncoder(nn.Module):
         self.topology_attention_variant = topology_attention_variant
         self.use_descriptors = bool(use_descriptors)
         self.descriptor_components = "md200"
-        self.use_star_rbf = bool(use_star_rbf)
+        if bool(use_star_rbf):
+            raise ValueError("MTS-GLT-v2 baseline fixes Star-RBF off")
+        self.use_star_rbf = False
         self.use_mcl = False
-        direct_bond_bias_mode = str(direct_bond_bias_mode)
-        if direct_bond_bias_mode not in {"none", "control", "type"}:
-            raise ValueError("invalid O8 direct-bond bias mode")
-        self.direct_bond_bias_mode = direct_bond_bias_mode
         if str(mask_policy) != "canonical_exact":
             raise ValueError(
                 "all canonical-equivalent O8 copies must be masked together"
@@ -507,12 +366,6 @@ class MIPSLocalGraphEncoder(nn.Module):
         nn.init.zeros_(self.spd_embedding.weight)
         self.path_bias = MIPSSinglePathNodeBias(
             self.emb_dim, self.num_heads, self.max_hops
-        )
-        self.direct_bond_bias = (
-            MIPSDirectBondTypeBias(
-                self.num_heads, num_categories=6, mode=direct_bond_bias_mode
-            )
-            if direct_bond_bias_mode != "none" else None
         )
         self.star_distance_bias = SymmetricStarDistanceBias(
             self.num_heads, upper=float(star_rbf_upper)
@@ -540,11 +393,11 @@ class MIPSLocalGraphEncoder(nn.Module):
             TOPOLOGY_CANONICAL if canonical_periodic else "",
         ))
         if representation != TOPOLOGY_CANONICAL:
-            raise ValueError("B0-v2 only supports canonical_lifted topology")
+            raise ValueError("MTS-GLT-v2 only supports canonical_lifted topology")
         if getattr(data, "feature_schema", None) != FEATURE_SCHEMA:
-            raise ValueError("B0-v2 canonical feature schema mismatch")
+            raise ValueError("MTS-GLT-v2 canonical feature schema mismatch")
         if int(getattr(data, "mips_local_lga_schema_version", -1)) != CANONICAL_LGA_SCHEMA_VERSION:
-            raise ValueError("B0-v2 canonical LGA schema mismatch")
+            raise ValueError("MTS-GLT-v2 canonical LGA schema mismatch")
         required = (
             "mips_x", "mips_backbone_mask", "lga_edge_index", "lga_spd",
             "lga_path_index", "lga_path_mask", "lga_star_edge_mask",
@@ -567,11 +420,6 @@ class MIPSLocalGraphEncoder(nn.Module):
                 )
         if require_md:
             required += ("mips_md", "mips_md_valid")
-        if self.direct_bond_bias is not None:
-            required += (
-                "glt_token_atom_a", "glt_token_atom_b", "glt_token_shift",
-                "glt_token_bond_type",
-            )
         missing = [name for name in required if not hasattr(data, name)]
         if missing:
             raise ValueError(
@@ -627,8 +475,10 @@ class MIPSLocalGraphEncoder(nn.Module):
         return graph, canonical_nodes
 
     def _forward_impl(
-        self, data, atom_mask=None, *, use_star=True, use_md=True,
+        self, data, atom_mask=None, *, use_star=False, use_md=True,
     ):
+        if bool(use_star):
+            raise ValueError("MTS-GLT-v2 baseline fixes Star-RBF off")
         self._validate(
             data, require_geometry=use_star,
             require_md=use_md,
@@ -637,21 +487,17 @@ class MIPSLocalGraphEncoder(nn.Module):
         spd_bias = self.spd_embedding(data.lga_spd.long())
         path_bias = self.path_bias(initial, data)
         star_bias = torch.zeros_like(spd_bias)
-        bond_bias = torch.zeros_like(spd_bias)
         if use_star:
             star_bias = self.star_distance_bias.forward_periodic_relation_v2(
                 data, initial.dtype
             )
-        if self.direct_bond_bias is not None:
-            bond_bias = self.direct_bond_bias(data, dtype=initial.dtype)
         relation_mask = getattr(data, "lga_relation_mask", None)
         if relation_mask is not None:
             keep = (~relation_mask.bool()).unsqueeze(-1).to(initial.dtype)
             spd_bias = spd_bias * keep
             path_bias = path_bias * keep
             star_bias = star_bias * keep
-            bond_bias = bond_bias * keep
-        attention_bias = spd_bias + path_bias + star_bias + bond_bias
+        attention_bias = spd_bias + path_bias + star_bias
         x = initial
         for layer in self.layers:
             x = layer(x, data.lga_edge_index.long(), attention_bias)
@@ -687,47 +533,3 @@ class MIPSLocalGraphEncoder(nn.Module):
             use_star=self.use_star_rbf,
             use_md=self.use_descriptors,
         )
-
-    def forward_b0_pretrain(
-        self, data, canonical_atom_mask,
-        noisy_pair_observation_distances=None,
-        noisy_pair_observation_mask=None,
-    ):
-        """Run the B0 masked/dynamic Star-RBF O8 backbone.
-
-        B0 intentionally omits Trimer-MCL and MD200 from the pretext path.
-        Dynamic observation tensors are transient batch values; the frozen
-        sidecar attached to ``data`` remains the clean fallback and is never
-        modified.
-        """
-        mask = torch.as_tensor(
-            canonical_atom_mask, dtype=torch.bool, device=data.mips_x.device
-        ).reshape(-1)
-        if mask.numel() != data.mips_x.size(0):
-            raise ValueError("B0 canonical_atom_mask length mismatch")
-        self._validate(data, require_geometry=self.use_star_rbf, require_md=False)
-        initial = self.atom_embedding(data, atom_mask=mask)
-        spd_bias = self.spd_embedding(data.lga_spd.long())
-        path_bias = self.path_bias(initial, data)
-        star_bias = torch.zeros_like(spd_bias)
-        if self.use_star_rbf:
-            star_bias = self.star_distance_bias.forward_periodic_relation_v2(
-                data, initial.dtype,
-                pair_observation_distances=noisy_pair_observation_distances,
-                pair_observation_mask=noisy_pair_observation_mask,
-            )
-        relation_mask = getattr(data, "lga_relation_mask", None)
-        if relation_mask is not None:
-            keep = (~relation_mask.bool()).unsqueeze(-1).to(initial.dtype)
-            spd_bias, path_bias, star_bias = (
-                value * keep for value in (spd_bias, path_bias, star_bias)
-            )
-        attention_bias = spd_bias + path_bias + star_bias
-        nodes = initial
-        for layer in self.layers:
-            nodes = layer(nodes, data.lga_edge_index.long(), attention_bias)
-        graph_available = data.graph_available.bool().flatten()
-        nodes = nodes * graph_available[data.batch.long()].unsqueeze(-1).to(nodes.dtype)
-        graph, canonical_nodes = self._canonical_pool(nodes, data)
-        graph = graph * graph_available.unsqueeze(-1).to(graph.dtype)
-        return graph, nodes, canonical_nodes

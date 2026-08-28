@@ -14,11 +14,6 @@ parse_arguments = _engine.parse_arguments
 run_pretrain = _engine.run_pretrain
 
 
-def __getattr__(name):
-    """Expose legacy test/tool helpers while keeping one implementation."""
-    return getattr(_engine, name)
-
-
 def main():
     return run_pretrain(parse_arguments())
 

@@ -53,8 +53,7 @@
       "pooling": "canonical atom mean",
       "use_md200": true,
       "graph_output_adapter": true,
-      "use_compact19": false,
-      "use_graphgate_query": false
+      "use_compact19": false
     }
   },
   "pretraining": {
@@ -73,8 +72,7 @@
     "trajectory_end_step": 20000
   },
   "downstream": {
-    "schedule": "Warm0",
-    "encoder_freeze_warm_epochs": 0,
+    "schedule": "direct_joint",
     "lr_warmup_epochs": 5,
     "total_epochs": 100,
     "early_stopping_patience": 10,
@@ -99,22 +97,12 @@
     "median_task_increment": 0.0024453124104787394,
     "positive_fused_tasks": 7,
     "task_fused_mean_r2": {"eat": 0.9841012151277303, "eea": 0.9224317091438129, "egb": 0.9413819710792231, "egc": 0.9193243129997077, "ei": 0.8282843229899948, "eps": 0.8188120747353121, "nc": 0.8713848696554845, "xc": 0.46336618210595065},
-    "warm5_macro8": 0.8413621650729006,
-    "warm5_minus_warm0": -0.0022736671567513706,
-    "warm5_decision": "FAIL",
     "independent_blind_test": false
   },
   "formal_result_paths": {
     "final_report": "results/mts_glt_v2/final_report.json",
     "formal_pretrain_config": "configs/mts/glt_v2_formal_a6_h_w1_20k.json",
     "resolved_pretrain_input": "results/mts_glt_v2/formal/a6_h_w1_20k/resolved_input.json",
-    "trajectory_selection": "results/mts_glt_v2/formal/trajectory_selection.json",
-    "paired_downstream_summary": "results/mts_glt_v2/downstream/formal/a6_h_w1_20k_probe_005k/paired_summary.json",
-    "warm5_ablation_summary": "results/mts_glt_v2/fusionwarm_vs_nowarm_formal5k/eight_task_fold01234/glt_v2_warm5_vs_warm0_summary.json"
-  },
-  "future_experiment_rule": {
-    "parent": "MTS-GLT-v2-Base-5k",
-    "primary_scientific_variables_per_experiment": 1,
-    "factorial_exception_requires_explicit_design": true
+    "paired_downstream_summary": "results/mts_glt_v2/downstream/formal/a6_h_w1_20k_probe_005k/paired_summary.json"
   }
 }

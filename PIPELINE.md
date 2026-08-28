@@ -1,155 +1,121 @@
-# Uni-Poly-Plus 当前流程
+# Uni-Poly-Plus 当前基线流程
 
-本文描述当前正式数据流和模型身份。结果索引见 [`RESULTS.md`](RESULTS.md)，完整基线合同见 [`docs/MTS_GLT_V2_BASELINE.md`](docs/MTS_GLT_V2_BASELINE.md)。
+本文只描述当前保留的 `MTS-GLT-v2-Base-5k` 及其运行依赖。结果索引见 [`RESULTS.md`](RESULTS.md)，可复现合同见 [`configs/mts/glt_v2_base_5k_v1.json`](configs/mts/glt_v2_base_5k_v1.json) 和 [`results/mts_glt_v2/base_5k_v1/baseline_manifest.json`](results/mts_glt_v2/base_5k_v1/baseline_manifest.json)。
 
-## 1. 当前正式基线
+## 1. 基线身份
 
 ```text
 MTS-GLT-v2-Base-5k
-├─ pure-topology MIPS O8，6 layers / hidden 512 / 8 heads / SPD<=2
-├─ Periodic Line GLT-v2，6 layers / hidden 512 / 8 heads / real-bond 1-hop
-├─ line-to-canonical-atom incidence
-├─ atom-level 512-channel gated residual
+├─ MIPS O8 topology branch: 6 layers / hidden 512 / 8 heads / SPD≤2
+├─ periodic line GLT-v2: 6 layers / hidden 512 / 8 heads
+├─ strict real-bond 1-hop line neighborhood
+├─ line-to-canonical-atom incidence projection
+├─ 512-channel gated additive atom residual (initial α=0.05)
 ├─ canonical atom mean pooling
-├─ MD200 residual + graph adapter + regression head
-└─ downstream Warm0
+└─ MD200 residual + graph adapter + regression head
 ```
 
-正式 checkpoint：
+唯一正式预训练 checkpoint：
 
 ```text
 results/mts_glt_v2/formal/a6_h_w1_20k/mts_glt_v2_probe_005k.pth
 ```
 
-预训练轨迹完成到 20k，但下游正式选择 step 5k。当前 baseline 不是 20k checkpoint。
+轨迹运行至 20,000 optimizer steps；下游固定使用 step 5,000 checkpoint。
 
-## 2. 数据流
+## 2. 数据与缓存
 
 ```text
 P-SMILES CSV
-  -> normalized sample key / ordered cohort
-  ├─ RU base LMDB
+  -> ordered sample/cohort manifest
+  ├─ RU-base LMDB
   ├─ canonical lifted topology LMDB
-  ├─ open Trimer coordinates LMDB
+  ├─ open Trimer coordinate LMDB
   ├─ periodic_line_glt_v1 sidecar
-  └─ MD200 mmap
+  └─ MD200 feature cache
         ↓
-pure-topology O8 + periodic GLT-v2
+MIPS O8 + periodic GLT-v2
         ↓
-line-to-atom incidence + atom-level fusion
+line-to-atom incidence + atom residual
         ↓
 canonical atom mean + MD200 + graph adapter + regression head
 ```
 
-Topology、Trimer、periodic line sidecar 和 MD200 按现有冻结产物只读使用。GLT-v2 在运行时从旧 line sidecar 派生 observation moments、identity self relations 和 atom incidence，不重建 Trimer cache。
+上述缓存均为只读输入。GLT-v2 在运行时从保留的 line sidecar 计算 observation moments、identity self relations 和 canonical atom incidence，不重写缓存。缓存的 `.done`、manifest、LMDB 元数据和固定 split 必须存在且匹配；发现不匹配时停止启动。
 
-## 3. Canonical topology 与 O8
+## 3. O8 输入
 
-模型只维护一个 RU 的 canonical atom states。跨 RU 关系由 lifted relation 的 shift/path/SPD 字段表达，不建立 RU-1/RU+1 的独立可训练节点。
+O8 只接收 MIPS137 atom features、backbone embedding、SPD bias 和 single-path-node bias；`max_hops=2`，6 层、512 hidden、8 heads。基线关闭 Star-RBF、MCL 和 O8 的 3D attention bias，因此 O8 是纯拓扑分支。
 
-O8 输入为 MIPS137 atom features、backbone embedding、SPD bias 和 single-path-node bias，固定 `max_hops=2`。当前 baseline 中 Star-RBF、MCL 和 O8 3D attention bias 全部关闭，因此 O8 是纯 2D topology branch。
+canonical lifted topology 只维护一个 RU 的 canonical atom state。跨 RU 关系由 relation shift、path 和 SPD 字段表达，不创建 RU−1/RU+1 的独立可训练节点。
 
-## 4. Periodic GLT-v2
+## 4. GLT-v2 输入与对齐
 
-GLT token 只对应 RU 内部真实化学键或跨 RU 真实聚合连接键；SPD2、Star 和 virtual relation 不进入 line graph。Bond type 只用于 Masked Line label/QC，不进入 token input。
+GLT token 对应 RU 内部真实化学键或跨 RU 的真实聚合连接键；非真实 line relation 不进入 line neighborhood。Bond type 仅作为 masked-line label/QC，不进入 token embedding。
 
-距离 observation 逐个经过端点原子类型条件化的 learned Gaussian basis，再汇总编码 mean 与 population variance，并加入 observation-count 和 absolute-shift embeddings。共享原子的真实 1-hop line relation使用 angle encoded mean/variance、count 和 multiplicity 形成 per-head bias。动态 identity self relation使用独立 self bias。
+每个 distance observation 先经过端点原子类型条件化的 learned Gaussian basis，再计算 mean 与 population variance，并加入 observation-count 和 absolute-shift embedding。共享原子的真实 1-hop line relation使用 angle mean/variance、count 和 relation multiplicity 形成 per-head bias；每个 token 追加动态 identity self relation与独立 self bias。
 
-6 层 target-Q/source-K attention 使用 `1/sqrt(64)`。最终 line state 经 incidence projection 和 absolute-shift incidence embedding scatter 到两个 canonical endpoints，再按 atom 求 incident-line mean 和 output norm。
+attention 使用 target-Q/source-K 和 `1/sqrt(64)`。最终 line state 经 incidence projection 与 absolute-shift incidence embedding scatter 到两个 canonical endpoints，再按 incident line 求 atom mean，并进行 atom output normalization。
 
-## 5. Atom-level fusion 与 readout
+## 5. 3D→2D 融合与 readout
 
-```text
-h_i = h_i_O8
-      + valid_i * tanh(channel_gate[512]) * W(LN(h_i_3D))
-```
+对 canonical atom `i`，基线融合为：
 
-channel gate 初始 alpha 为 0.05；geometry-invalid atom/graph 精确退回 O8。融合后执行 canonical atom mean pooling、MD200 residual、graph output adapter 和 regression head。Compact19 和 GraphGate learned Query 均关闭。
+$$
+h_i = h^{\mathrm{O8}}_i + v_i\,\tanh(g)\odot W\!\left(\operatorname{LN}(h^{\mathrm{GLT}}_i)\right),
+$$
 
-## 6. 预训练与下游
+其中 `g` 为 512 通道 gate、初始 `tanh(g)=0.05`，`v_i` 是 GLT geometry-valid mask。无效 geometry 的 atom/graph 直接保留 O8 pathway；随后执行 canonical atom mean、MD200 residual、graph output adapter 和 regression head。
 
-预训练：
+Compact19、额外模态和其他融合路径不属于基线运行路径。
 
-```text
-PI1M_v2 / seed 42
-Masked Atom 0.30 + Masked Line 0.40 + bidirectional InfoNCE(T=0.10)
-loss weights 1 / 1 / 1
-global batch 1008 / BF16 / LR 2e-4 / warmup 2000 optimizer steps
-trajectory 20k / selected checkpoint 5k
-```
-
-下游 Warm0：
+## 6. 预训练合同
 
 ```text
-encoder-frozen warm epochs  0
-LR warmup epochs            5
-epochs / patience           100 / 10
-O8, GLT, atom fusion, MD200, adapter LR  1e-5
-head LR                     1e-4
-Huber beta / clip / dropout 0.5 / 1.0 / 0.25
-FP32 / train batch 32 / eval batch 64 / workers 2
+dataset                 PI1M_v2
+seed                    42
+masked atom             ratio 0.30, weight 1.0
+masked line             ratio 0.40, weight 1.0
+bidirectional InfoNCE   temperature 0.10, weight 1.0
+global batch            1008
+precision               BF16
+learning rate           2e-4
+optimizer warmup        2000 optimizer steps
+trajectory              20000 optimizer steps
+selected checkpoint     step 5000
 ```
 
-Warm0 表示 epoch 1 起所有正式可训练模块联合优化；不表示取消 5-epoch LR warmup。
+入口配置为 [`configs/mts/glt_v2_formal_a6_h_w1_20k.json`](configs/mts/glt_v2_formal_a6_h_w1_20k.json)，短验证使用 [`configs/mts/glt_v2_ddp_smoke.json`](configs/mts/glt_v2_ddp_smoke.json)。
 
-## 7. 正式结果与产物
-
-正式 seed-42、`historical_shared5` 8×5：
+## 7. 下游合同
 
 ```text
-O8-only macro8      0.840741
-O8+GLT macro8       0.843636
-descriptive delta  +0.002895
-positive tasks      7/8
+route                   graph-only MTS
+schedule                direct_joint
+LR warmup               5 epochs
+epochs / patience       100 / 10
+O8 / GLT / fusion / MD  1e-5
+adapter                 1e-5
+regression head         1e-4
+loss                    Huber (β=0.5)
+gradient clip           1.0
+precision               FP32
+train / eval batch      32 / 64
+workers                 2
+protocol                historical_shared5
+tasks                   eat, eea, egb, egc, ei, eps, nc, xc
+folds                   0, 1, 2, 3, 4
+seed                    42
 ```
 
-评价共享 validation/test fold，不是独立盲测。正式入口：
+`historical_shared5` 使用同一 held-out fold 作为 validation 和 test，不是独立盲测。后续代码验证默认只运行必要的 unit test 和 smoke；扩大任务、fold、epoch 或样本范围须另行授权。
 
-```text
-configs/mts/glt_v2_base_5k_v1.json
-results/mts_glt_v2/base_5k_v1/baseline_manifest.json
-results/mts_glt_v2/final_report.json
-results/mts_glt_v2/downstream/formal/a6_h_w1_20k_probe_005k/paired_summary.json
-```
+## 8. 保留入口与产物
 
-## 8. 路线演化与历史状态
+- 预训练：`scripts/pretrain.py` → `src.training.pretrain`。
+- 下游单 fold：`scripts/train.py` → `src.training.finetune.engine`。
+- 调度：`scripts/run_mts_finetune_scheduler.py`。
+- line sidecar：`scripts/build_periodic_line_glt_sidecar.py`、`scripts/audit_periodic_line_glt_sidecar.py`。
+- cache 合同：`scripts/resolve_mips_trimer_scage.py`、`scripts/audit_mips_trimer_cache.py`、`scripts/validate_mts_cache.py`。
 
-```text
-MTS / O8
-  -> MTS-GLT-v1
-  -> GraphGate-v1
-  -> MTS-GLT-v2
-  -> MTS-GLT-v2-Base-5k (current formal baseline)
-```
-
-- MTS-GLT-v1：historical candidate，图级融合未晋级。
-- GraphGate-v1：historical/mechanism-validation branch；其 learned Query 不属于当前 baseline。
-- GraphGate Warm5、GM/AT readout：historical diagnostics。
-- GLT-v2 Warm5：完整 8×5 为 `0.841362`，相对 Warm0 `-0.002274`，已测试并拒绝作为默认。
-- Compact19：未准入。
-- B0-v2：历史参考，不再是 current baseline。
-
-早期报告中的 `geometry_encoded_but_not_realized` 结论保留在历史报告中，但已被后续 matched geometry experiments supersede；不据此改变当前 baseline。
-
-## 9. 新实验规则
-
-新的 MTS-GLT 主实验默认 parent 为 `MTS-GLT-v2-Base-5k`，默认采用 `Base + exactly one primary scientific change`。除非明确设计 factorial，不同时改变 checkpoint step、Warm schedule、fusion、geometry 和 pretraining objective。
-
-历史 checkpoint、报告、sidecar 和配置继续保留。新实验必须使用显式配置和独立产物路径，不能覆盖当前 baseline。
-
-## 10. Frozen / do-not-repeat directions
-
-以下实现已按对应 screening 合同完成并停止；除非提出新的、参数匹配的科学假设，不重复相同实验：
-
-```text
-Warm schedule search
-X23 post-GLT conditioning
-X2L current additive implementation
-X2A attention routing
-torsion additive bias
-explicit O8 bond-type bias
-joint radial-angular additive SBF
-Compact19 downstream residual
-```
-
-`non-bonded spatial contact`、metadata deduplication 和 Gaussian-basis compression 尚未完成相应模型实验，不列为 STOP。本阶段只允许先做只读信息审计，不自动启动模型训练。
+正式结果、resolved input、训练日志和 checkpoint 的索引集中在 [`RESULTS.md`](RESULTS.md)。所有新产物必须使用独立目录，不覆盖基线文件。

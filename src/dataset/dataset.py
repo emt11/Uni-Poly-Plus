@@ -84,17 +84,9 @@ from .trimer_mcl import (
     attach_unavailable_trimer_mcl,
 )
 from .mips_cache_validation import validate_mcl_record
-from .mts_star_rbf_v2 import StarRBFV2Sidecar
 from .periodic_line_glt import (
     PeriodicLineGLTSidecar,
-    derive_relation_source_distance_observations,
 )
-from .periodic_line_torsion import build_periodic_torsion_fields
-from .periodic_line_glt_central import (
-    PeriodicLineGLTCentralSidecar,
-    SIDECAR_SCHEMA as CENTRAL_GLT_SIDECAR_SCHEMA,
-)
-from .periodic_spatial_contact import PeriodicSpatialContactSidecar
 from .mts_target_contract import make_target_contract
 from rdkit.Chem import rdFingerprintGenerator
 
@@ -1654,7 +1646,7 @@ def _compute_topology_layer_impl(
     topology_representation=TOPOLOGY_CANONICAL,
 ):
     if topology_representation != TOPOLOGY_CANONICAL:
-        raise ValueError("B0-v2 only supports canonical_lifted topology")
+        raise ValueError("MTS-GLT-v2 only supports canonical_lifted topology")
     source_molecule = _mol_from_ru_base(ru_base)
     molecule = source_molecule
     normalized, _ = normalize_polymer_smiles(smiles)
@@ -1833,211 +1825,64 @@ def _compute_lmdb_layers_worker(payload):
 
 
 def _compute_smiles_features_worker(payload):
-    if payload.get("lmdb_required_layers") is not None:
-        try:
-            with rdBase.BlockLogs():
-                return _compute_lmdb_layers_worker(payload)
-        except Exception as exc:
-            # Convert any sample-level failure into placeholder records for
-            # every required layer so the cache build never aborts on a single
-            # problematic SMILES.
-            error_reason = f"{type(exc).__name__}:{exc}"[:500]
-            try:
-                smiles = payload.get("smiles", "")
-                required = set(payload["lmdb_required_layers"])
-                ru_base = _compute_ru_base_layer(smiles)
-                topology = (
-                    _compute_topology_layer(
-                        smiles, ru_base,
-                        max_hops=payload.get("mips_max_hops", 2),
-                        topology_representation=payload.get(
-                            "topology_representation", TOPOLOGY_CANONICAL
-                        ),
-                    )
-                    if "topology" in required else None
-                )
-                trimer = (
-                    _compute_trimer_layer(
-                        smiles, ru_base, topology,
-                        force_unavailable=f"cache_worker_error:{error_reason}"[:240],
-                    )
-                    if "trimer" in required else None
-                )
-                md200 = (
-                    _compute_md200_layer(smiles, ru_base)
-                    if "md200" in required else None
-                )
-                layers = {}
-                for name in required:
-                    if name == "ru_base":
-                        layers[name] = ru_base
-                    elif name == "topology" and topology is not None:
-                        layers[name] = topology
-                    elif name == "trimer" and trimer is not None:
-                        layers[name] = trimer
-                    elif name == "md200" and md200 is not None:
-                        layers[name] = md200
-                return {
-                    "smiles": smiles,
-                    "sample_key": payload.get("sample_key"),
-                    "layer_payloads": {
-                        name: _data_to_pickle_payload(data)
-                        for name, data in layers.items()
-                    },
-                    "ok": True,
-                    "error": error_reason,
-                }
-            except Exception:
-                # If even placeholder construction fails, return no layers —
-                # the sample will be re-processed on the next restart.
-                return {
-                    "smiles": payload.get("smiles", ""),
-                    "sample_key": payload.get("sample_key"),
-                    "layer_payloads": {},
-                    "ok": False,
-                    "error": f"placeholder_construction_failed:{error_reason}"[:500],
-                }
-    smiles = payload["smiles"]
-    feature_started = time.monotonic()
-    timeout_seconds = max(0, int(payload.get("feature_cache_item_timeout", 0)))
-    previous_handler = None
+    if payload.get("lmdb_required_layers") is None:
+        raise ValueError("MTS-GLT-v2 cache workers require LMDB layer requests")
     try:
-        if timeout_seconds > 0:
-            previous_handler = signal.signal(signal.SIGALRM, _feature_cache_timeout_handler)
-            signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-        # Repeated UFF warnings from dozens of workers serialize stderr and
-        # materially slow PI1M cache builds. Failure metadata remains attached
-        # to each sample, so suppress only RDKit's console stream here.
         with rdBase.BlockLogs():
-            data = _compute_smiles_features_from_config(
-                smiles=smiles,
-                smiles_model_name=payload["smiles_model_name"],
-                max_smiles_length=payload["max_smiles_length"],
-                graph_input=payload["graph_input"],
-                geom_input=payload["geom_input"],
-                fp_mode=payload["fp_mode"],
-                embed_tries_multiplier=payload["embed_tries_multiplier"],
-                conformer_3d_count=payload["conformer_3d_count"],
-                conformer_keep_count=payload["conformer_keep_count"],
-                conformer_profile=payload["conformer_profile"],
-                graph_encoder_type=payload["graph_encoder_type"],
-                mips_core=payload.get("mips_core", "topology_plus"),
-                mips_max_hops=payload.get("mips_max_hops"),
-                mips_use_descriptors=payload.get("mips_use_descriptors", False),
-                mips_descriptor_protocol=payload.get(
-                    "mips_descriptor_protocol", "source_star_sub"
-                ),
-                spatial_mode=payload.get("spatial_mode", "none"),
-                finite_variant=payload.get("finite_variant", "none"),
-                conformer_mode=payload.get("conformer_mode", "none"),
-                field_layout=payload.get("field_layout", "none"),
-                field_channels=payload.get("field_channels", "none"),
-                graph_geometry_mode=payload.get(
-                    "graph_geometry_mode", "none"
-                ),
-                topology_representation=payload.get(
-                    "topology_representation", TOPOLOGY_CANONICAL
-                ),
-                trimer_num_candidates=payload.get(
-                    "trimer_num_candidates", 4
-                ),
-                trimer_max_heavy_atoms=payload.get(
-                    "trimer_max_heavy_atoms", 384
-                ),
-            )
-        data.feature_compute_seconds = float(time.monotonic() - feature_started)
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        return {
-            "smiles": smiles,
-            "data_payload": _data_to_pickle_payload(data),
-            "ok": True,
-            "error": "",
-        }
-    except _FeatureCacheItemTimeout:
-        # Preserve topology/SMILES/FP coverage without presenting a timed-out
-        # conformer as valid geometry to SCAGE. The fallback has its own short
-        # deadline so a pathological molecule cannot occupy a worker forever.
-        signal.setitimer(signal.ITIMER_REAL, 30)
-        try:
-            data = _compute_smiles_features_from_config(
-                smiles=smiles,
-                smiles_model_name=payload["smiles_model_name"],
-                max_smiles_length=payload["max_smiles_length"],
-                graph_input=payload["graph_input"],
-                geom_input="repeat_unit",
-                fp_mode=payload["fp_mode"],
-                embed_tries_multiplier=1,
-                conformer_3d_count=1,
-                conformer_keep_count=1,
-                conformer_profile="fast",
-                graph_encoder_type=payload["graph_encoder_type"],
-                mips_core=payload.get("mips_core", "topology_plus"),
-                mips_max_hops=payload.get("mips_max_hops"),
-                mips_use_descriptors=payload.get("mips_use_descriptors", False),
-                mips_descriptor_protocol=payload.get(
-                    "mips_descriptor_protocol", "source_star_sub"
-                ),
-                spatial_mode=payload.get("spatial_mode", "none"),
-                finite_variant=payload.get("finite_variant", "none"),
-                conformer_mode=payload.get("conformer_mode", "none"),
-                field_layout=payload.get("field_layout", "none"),
-                field_channels=payload.get("field_channels", "none"),
-                graph_geometry_mode=(
-                    "trimer_unavailable"
-                    if payload.get("graph_geometry_mode") == "trimer_scage_mcl"
-                    else payload.get("graph_geometry_mode", "none")
-                ),
-                topology_representation=payload.get(
-                    "topology_representation", TOPOLOGY_CANONICAL
-                ),
-                trimer_num_candidates=payload.get(
-                    "trimer_num_candidates", 4
-                ),
-                trimer_max_heavy_atoms=payload.get(
-                    "trimer_max_heavy_atoms", 384
-                ),
-            )
-            data.feature_compute_seconds = float(time.monotonic() - feature_started)
-            data.geom_build_ok = False
-            data.geom_coordinate_ok = False
-            data.geom_input = "repeat_unit_fallback"
-            data.geom_context = "feature_timeout_topology_fallback"
-            data.geom_context_id = 0
-            data.geom_failed_reason = f"feature_cache_item_timeout:{timeout_seconds}s"
-            data.geom_primary_failed_reason = "feature_cache_item_timeout"
-            data.geom_screw_source = "topology_fallback"
-            data.geom_screw_source_id = 0
-            data.geometry_source_id = 0
-            data.screw_valid = False
-            data.smer_valid = False
-            data.polygen_periodic_valid = False
-            data.periodic_valid = False
-            data.periodic_closure_error = float("inf")
-            data.periodic_ru_count = 1
-            data.periodic_cell_length = 0.0
-            data.pbc = torch.tensor([False, False, False], dtype=torch.bool)
-            data.cell = torch.zeros((3, 3), dtype=torch.float)
-            data.feature_timeout_fallback = True
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            return {
-                "smiles": smiles,
-                "data_payload": _data_to_pickle_payload(data),
-                "ok": True,
-                "error": "",
-            }
-        except Exception as exc:
-            return {
-                "smiles": smiles,
-                "data": None,
-                "ok": False,
-                "error": f"feature_timeout_fallback_failed:{str(exc)[:400]}",
-            }
+            return _compute_lmdb_layers_worker(payload)
     except Exception as exc:
-        return {"smiles": smiles, "data": None, "ok": False, "error": str(exc)[:500]}
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        if previous_handler is not None:
-            signal.signal(signal.SIGALRM, previous_handler)
+        # Preserve a cache record for the failing sample so the immutable
+        # cohort remains complete and the next run can reuse all successes.
+        error_reason = f"{type(exc).__name__}:{exc}"[:500]
+        smiles = payload.get("smiles", "")
+        required = set(payload["lmdb_required_layers"])
+        try:
+            ru_base = _compute_ru_base_layer(smiles)
+            topology = (
+                _compute_topology_layer(
+                    smiles, ru_base,
+                    max_hops=payload.get("mips_max_hops", 2),
+                    topology_representation=payload.get(
+                        "topology_representation", TOPOLOGY_CANONICAL
+                    ),
+                )
+                if "topology" in required else None
+            )
+            trimer = (
+                _compute_trimer_layer(
+                    smiles, ru_base, topology,
+                    force_unavailable=f"cache_worker_error:{error_reason}"[:240],
+                )
+                if "trimer" in required else None
+            )
+            md200 = (
+                _compute_md200_layer(smiles, ru_base)
+                if "md200" in required else None
+            )
+            layers = {
+                "ru_base": ru_base,
+                "topology": topology,
+                "trimer": trimer,
+                "md200": md200,
+            }
+            return {
+                "smiles": smiles,
+                "sample_key": payload.get("sample_key"),
+                "layer_payloads": {
+                    name: _data_to_pickle_payload(layers[name])
+                    for name in required if layers.get(name) is not None
+                },
+                "ok": True,
+                "error": error_reason,
+            }
+        except Exception:
+            return {
+                "smiles": smiles,
+                "sample_key": payload.get("sample_key"),
+                "layer_payloads": {},
+                "ok": False,
+                "error": f"placeholder_construction_failed:{error_reason}"[:500],
+            }
 
 
 def _feature_cache_process_loop(connection):
@@ -2170,28 +2015,13 @@ class UniDataset(Dataset):
         feature_config_hash='manual',
         transform=None,
         pre_transform=None,
-        star_rbf_v2_sidecar=None,
         periodic_line_glt_sidecar=None,
-        periodic_line_torsion=False,
-        periodic_line_joint_ra=False,
-        periodic_spatial_contact_sidecar=None,
     ):
         self.dataset = dataset
-        self.star_rbf_v2_sidecar_root = (
-            str(star_rbf_v2_sidecar) if star_rbf_v2_sidecar else None
-        )
-        self._star_rbf_v2_sidecar = None
         self.periodic_line_glt_sidecar_root = (
             str(periodic_line_glt_sidecar) if periodic_line_glt_sidecar else None
         )
         self._periodic_line_glt_sidecar = None
-        self.periodic_line_torsion = bool(periodic_line_torsion)
-        self.periodic_line_joint_ra = bool(periodic_line_joint_ra)
-        self.periodic_spatial_contact_sidecar_root = (
-            str(periodic_spatial_contact_sidecar)
-            if periodic_spatial_contact_sidecar else None
-        )
-        self._periodic_spatial_contact_sidecar = None
         self.root = root
         self.transform = transform
         self.pre_transform = pre_transform
@@ -2202,8 +2032,6 @@ class UniDataset(Dataset):
         # fold.  These arrays are the authoritative per-row target state.
         self._raw_targets = []
         self._target_override = None
-        self._aux_target_overrides = None
-        self._aux_target_masks = None
         self._cohort_row_mode = False
         self.graph_input = str(graph_input).lower()
         if self.graph_input not in {'repeat_unit', 'star_linking'}:
@@ -2215,15 +2043,13 @@ class UniDataset(Dataset):
             )
         self.fp_mode = str(fp_mode).lower()
         self.modalities = tuple(modalities or ("graph",))
-        self.mts_use_smiles = "smiles" in self.modalities
-        self.mts_use_fp = "fp" in self.modalities
-        if self.fp_mode not in FP_MODE_DIMS:
-            raise ValueError(
-                "fp_mode must be disabled, ecfp, mixfp, or attachment_count"
-            )
-        self.fp_dim = FP_MODE_DIMS[self.fp_mode]
-        if self.fp_mode == "mixfp":
-            self._validate_pubchem_backend()
+        if self.modalities != ("graph",):
+            raise ValueError("MTS-GLT-v2-Base-5k supports graph modality only")
+        if self.fp_mode != "disabled":
+            raise ValueError("MTS-GLT-v2-Base-5k disables fingerprints")
+        self.mts_use_smiles = False
+        self.mts_use_fp = False
+        self.fp_dim = 0
         self.feature_cache_workers = max(0, int(feature_cache_workers))
         self.feature_cache_chunksize = max(1, int(feature_cache_chunksize))
         self.feature_cache_partial_every = max(0, int(feature_cache_partial_every))
@@ -2298,7 +2124,7 @@ class UniDataset(Dataset):
         self.topology_representation = str(topology_representation)
         if self.topology_representation not in TOPOLOGY_REPRESENTATIONS:
             raise ValueError(
-                "B0-v2 only supports topology_representation=canonical_lifted"
+                "MTS-GLT-v2 only supports topology_representation=canonical_lifted"
             )
         self.mips_core = str(mips_core)
         if self.mips_core != "paper_corrected":
@@ -2323,20 +2149,19 @@ class UniDataset(Dataset):
         self.field_layout = "none"
         self.field_channels = "none"
         self.graph_geometry_mode = str(graph_geometry_mode)
-        if self.graph_geometry_mode not in {"none", "trimer_scage_mcl"}:
+        if self.graph_geometry_mode != "trimer_scage_mcl":
             raise ValueError(
-                "graph_geometry_mode must be none or trimer_scage_mcl; "
-                "retired experiment modes are unavailable"
+                "MTS-GLT-v2 requires graph_geometry_mode=trimer_scage_mcl"
             )
         self.trimer_num_candidates = int(trimer_num_candidates)
         self.trimer_max_heavy_atoms = int(trimer_max_heavy_atoms)
         if self.graph_geometry_mode == "trimer_scage_mcl":
             if self.graph_encoder_type != "mips_trimer_scage":
-                raise ValueError("Trimer geometry is only valid for the B0-v2 route")
+                raise ValueError("Trimer geometry is only valid for the MTS-GLT-v2 route")
             if self.trimer_num_candidates != 4:
-                raise ValueError("B0-v2 Trimer requires 4 candidates")
+                raise ValueError("MTS-GLT-v2 Trimer requires 4 candidates")
             if self.trimer_max_heavy_atoms != 384:
-                raise ValueError("B0-v2 Trimer requires max 384 heavy atoms")
+                raise ValueError("MTS-GLT-v2 Trimer requires max 384 heavy atoms")
         self.mips_variant = "O8"
         if self.graph_encoder_type == "mips_trimer_scage":
             if self.graph_geometry_mode != "trimer_scage_mcl":
@@ -2349,15 +2174,8 @@ class UniDataset(Dataset):
         self.feature_config_hash = str(feature_config_hash)
         self.smiles_model_name = smiles_model_name
         self.is_mts_route = self.graph_encoder_type == "mips_trimer_scage"
-        self.is_graph_only_mips_route = (
-            self.is_mts_route
-            and self.modalities == ("graph",)
-        )
-        self.smiles_tokenizer = (
-            None
-            if not self.mts_use_smiles and self.graph_encoder_type == "mips_trimer_scage"
-            else _load_auto_tokenizer(smiles_model_name)
-        )
+        self.is_graph_only_mips_route = self.is_mts_route
+        self.smiles_tokenizer = None
 
         # No parallel geometry encoder is instantiated in the production
         # route.  Keep a stable metadata value even when an old direct Python
@@ -2383,11 +2201,9 @@ class UniDataset(Dataset):
             )
 
         self.use_feature_cache = bool(use_feature_cache)
-        if self.is_mts_route and not self.use_feature_cache:
+        if not self.use_feature_cache:
             raise ValueError(
-                "MIPS-Trimer-SCAGE production requires the canonical periodic "
-                "LMDB topology; the retired explicit monolithic cache is not "
-                "a production fallback"
+                "MTS-GLT-v2-Base-5k requires the immutable LMDB feature cache"
             )
 
         if self.geom_input == "periodic_pbc":
@@ -2407,177 +2223,25 @@ class UniDataset(Dataset):
         )
         fp_tag = f"fp-{self.fp_mode}"
 
-        if self.use_feature_cache:
-            self._init_with_feature_cache(
-                processed_dir=processed_dir,
-                graph_tag=graph_tag,
-                geom_tag=geom_tag,
-                fp_tag=fp_tag,
-                max_smiles_length=max_smiles_length,
-                max_smiles_length_cap=max_smiles_length_cap,
-                feature_source_dataset=feature_source_dataset,
-                rebuild_feature_cache=rebuild_feature_cache,
-            )
-        else:
-            self._init_legacy(processed_dir=processed_dir, graph_tag=f"{graph_tag}_{geom_tag}_{fp_tag}")
-        if self.star_rbf_v2_sidecar_root is not None:
-            self._star_rbf_v2_sidecar = StarRBFV2Sidecar(
-                self.star_rbf_v2_sidecar_root,
-            )
-            # The pretraining PI1M_v2 reader is row-aligned with the full
-            # cohort and therefore keeps a strict length check.  Downstream
-            # task datasets are smaller labelled subsets; they resolve the
-            # same immutable full-cohort sidecar by sample key in
-            # ``__getitem__`` instead of by task-row position.
-            if self._cohort_row_mode and len(self._star_rbf_v2_sidecar) != len(self.data_list):
-                raise RuntimeError("Star-RBF v2 sidecar record count does not match Dataset")
+        self._init_with_feature_cache(
+            processed_dir=processed_dir,
+            graph_tag=graph_tag,
+            geom_tag=geom_tag,
+            fp_tag=fp_tag,
+            max_smiles_length=max_smiles_length,
+            max_smiles_length_cap=max_smiles_length_cap,
+            feature_source_dataset=feature_source_dataset,
+            rebuild_feature_cache=rebuild_feature_cache,
+        )
         if self.periodic_line_glt_sidecar_root is not None:
-            metadata_path = Path(self.periodic_line_glt_sidecar_root) / "metadata.json"
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            reader = (
-                PeriodicLineGLTCentralSidecar
-                if metadata.get("schema") == CENTRAL_GLT_SIDECAR_SCHEMA
-                else PeriodicLineGLTSidecar
+            self._periodic_line_glt_sidecar = PeriodicLineGLTSidecar(
+                self.periodic_line_glt_sidecar_root
             )
-            self._periodic_line_glt_sidecar = reader(self.periodic_line_glt_sidecar_root)
             if self._cohort_row_mode and len(self._periodic_line_glt_sidecar) != len(self.data_list):
                 raise RuntimeError("periodic line GLT sidecar record count does not match Dataset")
-        if self.periodic_spatial_contact_sidecar_root is not None:
-            self._periodic_spatial_contact_sidecar = PeriodicSpatialContactSidecar(
-                self.periodic_spatial_contact_sidecar_root
-            )
-            if (
-                self._cohort_row_mode
-                and len(self._periodic_spatial_contact_sidecar) != len(self.data_list)
-            ):
-                raise RuntimeError(
-                    "periodic spatial contact sidecar record count does not match Dataset"
-                )
 
     # ------------------------------------------------------------------
-    # Legacy path (--disable_feature_cache)
-    # ------------------------------------------------------------------
-    def _init_legacy(self, processed_dir, graph_tag):
-        self.processed_file = os.path.join(processed_dir, f"{self.dataset}_{graph_tag}.pt")
-
-        if os.path.exists(self.processed_file):
-            self.data_list = torch.load(self.processed_file, weights_only=False)
-            print(f"loaded {self.processed_file} with {len(self.data_list)} samples")
-        else:
-            csv_path = f"{self.root}/raw/{self.dataset}.csv"
-            self.max_length_smiles = self._compute_max_token_length_for_file(csv_path)
-            self.process()
-            torch.save(self.data_list, self.processed_file)
-            print(f"processed and saved {self.processed_file} with {len(self.data_list)} samples")
-
-    def process(self):
-        """Legacy per-dataset processing (used when use_feature_cache=False)."""
-        csv_path = f"{self.root}/raw/{self.dataset}.csv"
-        df = pd.read_csv(csv_path)
-        for i, row in tqdm(df.iterrows(), total=len(df), desc="Processing dataset"):
-            smiles = row[0]
-            property = row[1]
-            if self.graph_encoder_type == "mips_trimer_scage":
-                # The legacy monolithic ``.pt`` path must not resurrect the
-                # retired finite-copy builder.  Keep it as a compatibility
-                # fallback only for non-MTS routes; MTS records use the same
-                # canonical topology/Trimer layers as the LMDB path.
-                try:
-                    data = self._compute_smiles_features(str(smiles))
-                except Exception as exc:
-                    print(exc)
-                    print(f"Failed to build canonical MTS features for {smiles}")
-                    continue
-                data.y = torch.tensor([property], dtype=torch.float)
-                data.smiles = str(smiles)
-                self.data_list.append(data)
-                continue
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                continue
-            fp_mol = Chem.Mol(mol)
-            for atom in fp_mol.GetAtoms():
-                if atom.GetAtomicNum() == 0:
-                    atom.SetAtomicNum(1)
-
-            geom_optimizer = "auto"
-            graph_smiles = (
-                Chem.MolToSmiles(mol, canonical=True)
-                if self.graph_encoder_type == "mips_trimer_scage" else smiles
-            )
-            geom_data = (
-                _topology_geometry_placeholder(mol)
-                if self.graph_encoder_type == "mips_trimer_scage"
-                else _geometry_for_mode(mol, self.geom_input, geom_optimizer)
-            )
-            structure = _structure_for_encoder(
-                graph_smiles, self.graph_input, self.geom_input, geom_data,
-                self.graph_encoder_type,
-                mips_core=self.mips_core,
-                mips_max_hops=self.mips_max_hops,
-            )
-            if self.graph_encoder_type == "mips_trimer_scage":
-                geom_data = _topology_geometry_placeholder(
-                    structure["structure_mol"]
-                )
-            data = build_mips_data_object(
-                structure["structure_mol"], backbone_info=structure.get("backbone_info")
-            )
-            annotate_structure_fields(data, structure, prefix="graph")
-            if self.graph_encoder_type == "mips_trimer_scage":
-                attach_mips_local_lga(
-                    data, structure,
-                    config=MIPSLocalConfig(max_hops=self.mips_max_hops),
-                )
-                attach_polymerized_mips_atom_features(data, graph_smiles)
-
-            # Labels
-            data.y = torch.tensor([property], dtype=torch.float)
-            data.smiles = smiles
-
-            # Tokenize with dynamic max_length
-            tokenizer_output = self.smiles_tokenizer(
-                smiles,
-                return_tensors='pt',
-                max_length=self.max_length_smiles + 5,
-                padding='max_length',
-                truncation=True
-            )
-            data.input_ids_smiles = tokenizer_output.input_ids
-            data.attention_mask_smiles = tokenizer_output.attention_mask
-
-            data.fp = self._compute_fingerprint(
-                fp_mol, original_mol=mol
-            ).unsqueeze(0)
-            _attach_polymer_ecfp_target(data, smiles)
-            try:
-                _attach_geometry_data(
-                    data, geom_data, smiles, self.geom_input, geom_optimizer
-                )
-                if self.graph_encoder_type == "mips_trimer_scage":
-                    _attach_mips_descriptors(
-                        data, mol, protocol=self.mips_descriptor_protocol
-                    )
-                    attach_finite_trimer_mcl(
-                        data, graph_smiles,
-                        num_candidates=self.trimer_num_candidates,
-                        max_heavy_atoms=self.trimer_max_heavy_atoms,
-                    )
-                    data = _prune_nonpbc_mips_data(data)
-                elif self.graph_encoder_type == "mips":
-                    _attach_mips_descriptors(
-                        data, mol, protocol=self.mips_descriptor_protocol
-                    )
-            except Exception as e:
-                print(e)
-                print(f"Failed to generate 3D coordinates for {smiles}")
-                continue
-            self.data_list.append(data)
-
-        print("Dataset processed. Total samples:", len(self.data_list))
-
-    # ------------------------------------------------------------------
-    # Feature cache path
+    # Immutable LMDB feature-cache path
     # ------------------------------------------------------------------
     def _init_with_feature_cache(
         self,
@@ -2591,186 +2255,15 @@ class UniDataset(Dataset):
         rebuild_feature_cache,
     ):
         self.feature_source_dataset = feature_source_dataset or self.dataset
-        max_smiles_length_cap = int(max_smiles_length_cap)
-
-        if self.is_mts_route:
-            # All MTS variants use the frozen LMDB graph cache.  Experimental
-            # SMILES/CountFP data live in an independent downstream sidecar;
-            # they must never fall through to the legacy monolithic .pt cache
-            # or trigger a whole-source token-length scan.
-            if self.is_graph_only_mips_route and self.smiles_tokenizer is not None:
-                raise RuntimeError("graph-only MIPS route unexpectedly loaded a tokenizer")
-            self.max_smiles_length = 256 if self.mts_use_smiles else 0
-            return self._init_with_lmdb_feature_cache(
-                processed_dir=processed_dir,
-                graph_tag=graph_tag,
-                geom_tag=geom_tag,
-                fp_tag=fp_tag,
-                rebuild_feature_cache=bool(rebuild_feature_cache),
-            )
-
-        # Determine global max_smiles_length
-        if max_smiles_length is not None:
-            self.max_smiles_length = int(max_smiles_length)
-        else:
-            source_csv = f"{self.root}/raw/{self.feature_source_dataset}.csv"
-            raw_max = self._compute_max_token_length_for_file(source_csv)
-            self.max_smiles_length = min(raw_max + 5, max_smiles_length_cap)
-            if raw_max + 5 > max_smiles_length_cap:
-                print(
-                    f"[token] max_length capped at {max_smiles_length_cap} "
-                    f"(raw max + 5 = {raw_max + 5})"
-                )
-
-        # Feature cache file path
-        self.feature_cache_path = os.path.join(
-            processed_dir,
-            (
-                f"feature_cache_{self.feature_source_dataset}_{graph_tag}_{geom_tag}_"
-                f"{fp_tag}_tok{self.max_smiles_length}_"
-                f"{self.feature_config_hash[:16]}.pt"
-            ),
+        self.max_smiles_length = 0
+        self.feature_source_dataset = feature_source_dataset or self.dataset
+        return self._init_with_lmdb_feature_cache(
+            processed_dir=processed_dir,
+            graph_tag=graph_tag,
+            geom_tag=geom_tag,
+            fp_tag=fp_tag,
+            rebuild_feature_cache=bool(rebuild_feature_cache),
         )
-        self.use_sharded_feature_cache = (
-            self.graph_encoder_type == "mips_trimer_scage"
-            and self.feature_source_dataset.startswith("PI1M")
-        )
-        self.feature_shard_root = f"{self.feature_cache_path}.shards"
-        if (
-            rebuild_feature_cache
-            and os.path.isdir(self.feature_shard_root)
-            and self.feature_shard_root.endswith(".pt.shards")
-        ):
-            shutil.rmtree(self.feature_shard_root)
-
-        # Build or load feature cache
-        cache_was_built = rebuild_feature_cache or not os.path.exists(
-            self.feature_cache_path
-        )
-        if cache_was_built:
-            print(f"building feature cache from {self.feature_source_dataset} ...")
-            feature_cache = self._build_feature_cache()
-            torch.save(feature_cache, self.feature_cache_path)
-            print(f"saved feature cache to {self.feature_cache_path}")
-        else:
-            # Feature tensors are immutable dataset inputs. Private mmap avoids
-            # eagerly copying the multi-GB tensor storages into every DDP rank;
-            # PyTorch still unpickles independent Data objects and any accidental
-            # write is copy-on-write rather than modifying the cache file.
-            feature_cache = torch.load(
-                self.feature_cache_path,
-                weights_only=False,
-                mmap=True,
-            )
-            if (
-                self.use_sharded_feature_cache
-                and not isinstance(
-                    feature_cache.get("features"),
-                    (ShardedFeatureStore, LayeredFeatureStore),
-                )
-            ):
-                raise RuntimeError(
-                    "PI1M MIPS cache must use the v2 layered/sharded lazy store. "
-                    "Rebuild the feature cache."
-                )
-            if self.graph_encoder_type == "mips":
-                cache_meta = feature_cache.get("meta", {})
-                if (
-                    cache_meta.get("mips_input_schema_version") != 3
-                    or cache_meta.get("mips_descriptor_schema_version") != 4
-                ):
-                    raise RuntimeError(
-                        "The existing MIPS feature cache predates the paper-aligned "
-                        "short-RU/backbone/descriptor implementation. Re-run with "
-                        "--rebuild_feature_cache."
-                    )
-            elif self.graph_encoder_type == "mips_trimer_scage":
-                cache_meta = feature_cache.get("meta", {})
-                if not _scage_cache_metadata_compatible(
-                    cache_meta,
-                    mips_core=self.mips_core,
-                    mips_max_hops=self.mips_max_hops,
-                    spatial_mode=self.spatial_mode,
-                    feature_config_hash=self.feature_config_hash,
-                ):
-                    raise RuntimeError(
-                        "The existing SCAGE cache is incompatible with the non-PBC "
-                        "MIPS experiment route. Re-run with --rebuild_feature_cache."
-                    )
-            print(
-                f"loaded feature cache {self.feature_cache_path} "
-                f"with {len(feature_cache['features'])} entries"
-            )
-
-        self.topology_cache_hash = None
-        self.topology_cache_artifact_hash = None
-        self.topology_cache_hash = stores["topology"].meta.get(
-            "feature_config_hash"
-        ) if "topology" in stores else None
-        self.topology_cache_artifact_hash = None
-        if "topology" in stores:
-            with open(
-                os.path.join(specs["topology"]["root"], ".done"),
-                encoding="utf-8",
-            ) as handle:
-                self.topology_cache_artifact_hash = handle.read().strip()
-        self.trimer_cache_hash = None
-        self.trimer_cache_artifact_hash = None
-        features = feature_cache.get("features")
-        if isinstance(features, (LayeredFeatureStore, LmdbFeatureStore)):
-            topology_root = features.roots.get("topology")
-            if topology_root:
-                topology_done = os.path.join(topology_root, ".done")
-                if not os.path.isfile(topology_done):
-                    raise RuntimeError("Topology cache is missing its .done hash")
-                with open(topology_done, encoding="utf-8") as handle:
-                    self.topology_cache_artifact_hash = handle.read().strip()
-                if len(self.topology_cache_artifact_hash) != 64:
-                    raise RuntimeError("invalid Topology cache manifest hash")
-                topology_store = getattr(features, "topology", None)
-                if topology_store is None:
-                    topology_store = getattr(features, "stores", {}).get(
-                        "topology"
-                    )
-                if topology_store is not None:
-                    self.topology_cache_hash = topology_store.meta.get(
-                        "feature_config_hash"
-                    )
-            trimer_root = features.roots.get("trimer")
-            if trimer_root:
-                done_path = os.path.join(trimer_root, ".done")
-                if not os.path.isfile(done_path):
-                    raise RuntimeError("Trimer cache is missing its .done hash")
-                with open(done_path, encoding="utf-8") as handle:
-                    self.trimer_cache_artifact_hash = handle.read().strip()
-                if len(self.trimer_cache_artifact_hash) != 64:
-                    raise RuntimeError("invalid Trimer cache manifest hash")
-                trimer_store = getattr(features, "trimer", None)
-                if trimer_store is None:
-                    trimer_store = getattr(features, "stores", {}).get(
-                        "trimer"
-                    )
-                if trimer_store is not None:
-                    self.trimer_cache_hash = trimer_store.meta.get(
-                        "feature_config_hash"
-                    )
-
-        # Diagnostics scan every cached graph and write a shared JSON file. In
-        # DDP this work is identical on every rank and concurrent writes race,
-        # so only the global rank zero process performs it.
-        if int(os.environ.get("RANK", "0")) == 0:
-            self._write_feature_cache_diagnostics(
-                feature_cache,
-                processed_dir,
-                graph_tag,
-                geom_tag,
-                fp_tag,
-                reuse_existing=not cache_was_built,
-            )
-
-        # Build labeled data list from the task CSV
-        task_csv = f"{self.root}/raw/{self.dataset}.csv"
-        self._build_labeled_data_list(feature_cache, task_csv)
 
     def _lmdb_cache_specs(self, meta):
         """Resolve dataset-independent content-addressed layer roots."""
@@ -3737,10 +3230,6 @@ class UniDataset(Dataset):
             self.root, "raw", f"{self.dataset}.csv"
         )
         self._build_labeled_data_list(feature_cache, task_csv)
-        if self.graph_encoder_type == "mips_trimer_scage" and (
-            self.mts_use_smiles or self.mts_use_fp
-        ):
-            self._init_mts_sidecar(task_csv)
         if self.is_graph_only_mips_route and (
             self.smiles_tokenizer is not None or self.max_smiles_length != 0
         ):
@@ -4767,8 +4256,6 @@ class UniDataset(Dataset):
         df = pd.read_csv(task_csv)
         self._raw_targets = []
         self._target_override = None
-        self._aux_target_overrides = None
-        self._aux_target_masks = None
         self._cohort_row_mode = False
         self._lazy_feature_store = (
             features
@@ -5055,20 +4542,6 @@ class UniDataset(Dataset):
     def clear_target_override(self):
         self._target_override = None
 
-    def set_auxiliary_target_overrides(self, values, masks):
-        values = np.asarray(values, dtype=np.float32)
-        masks = np.asarray(masks, dtype=bool)
-        if values.ndim != 2 or masks.shape != values.shape:
-            raise ValueError("auxiliary target values/masks must have equal [N,K] shape")
-        if values.shape[0] != len(self.data_list):
-            raise ValueError("auxiliary target rows do not match dataset length")
-        self._aux_target_overrides = values.copy()
-        self._aux_target_masks = masks.copy()
-
-    def clear_auxiliary_target_overrides(self):
-        self._aux_target_overrides = None
-        self._aux_target_masks = None
-
     def __getitem__(self, idx):
         item = self.data_list[idx]
         lookup_key_for_hash = None
@@ -5104,14 +4577,6 @@ class UniDataset(Dataset):
                 data.y = torch.tensor(
                     [self._target_override[idx]], dtype=torch.float
                 )
-        if self._aux_target_overrides is not None:
-            data = copy.copy(data)
-            data.cross_task_aux_y = torch.as_tensor(
-                self._aux_target_overrides[idx], dtype=torch.float
-            )
-            data.cross_task_aux_mask = torch.as_tensor(
-                self._aux_target_masks[idx], dtype=torch.bool
-            )
         if lookup_key_for_hash is None:
             lookup_key_for_hash = sample_key_from_smiles(str(data.smiles))
         # A compact stable identity supports vectorised stateless augmentation
@@ -5121,25 +4586,6 @@ class UniDataset(Dataset):
             & ((1 << 63) - 1),
             dtype=torch.long,
         )
-        if self._star_rbf_v2_sidecar is not None:
-            row_hint = int(idx) if self._cohort_row_mode else None
-            sidecar_row = self._star_rbf_v2_sidecar.model_row(
-                self._star_rbf_v2_sidecar.index_for_key(
-                    lookup_key_for_hash, row_hint=row_hint
-                )
-            )
-            relations, pairs = sidecar_row["relations"], sidecar_row["pairs"]
-            data.mts_star_v2_relation_row = torch.as_tensor(relations["relation_row"], dtype=torch.long)
-            data.mts_star_v2_relation_pair_index = torch.as_tensor(relations["relation_pair_index"], dtype=torch.long)
-            data.mts_star_v2_relation_spd = torch.as_tensor(relations["relation_spd"], dtype=torch.long)
-            data.mts_star_v2_pair_key_src = torch.as_tensor(pairs["pair_key_src"], dtype=torch.long)
-            data.mts_star_v2_pair_key_dst = torch.as_tensor(pairs["pair_key_dst"], dtype=torch.long)
-            data.mts_star_v2_pair_key_shift = torch.as_tensor(pairs["pair_key_shift"], dtype=torch.long)
-            data.mts_star_v2_pair_observation_distances = torch.as_tensor(pairs["pair_observation_distances"], dtype=torch.float32)
-            data.mts_star_v2_pair_observation_count = torch.as_tensor(pairs["pair_observation_count"], dtype=torch.long)
-            data.mts_star_v2_pair_valid = torch.as_tensor(pairs["pair_valid"], dtype=torch.bool)
-            data.mts_star_v2_pair_geometry_source = torch.as_tensor(pairs["pair_geometry_source"], dtype=torch.long)
-            data.mts_star_v2_rbf_upper = float(self._star_rbf_v2_sidecar.rbf_upper)
         if self._periodic_line_glt_sidecar is not None:
             row_hint = int(idx) if self._cohort_row_mode else None
             line_row = self._periodic_line_glt_sidecar.model_row(
@@ -5171,89 +4617,9 @@ class UniDataset(Dataset):
                     f"glt_{name}",
                     torch.as_tensor(np.array(value, copy=True), dtype=dtype),
                 )
-            if self.periodic_line_joint_ra:
-                paired = derive_relation_source_distance_observations(
-                    tokens, relations
-                )
-                data.glt_relation_source_distances = torch.as_tensor(
-                    paired["source_distances"], dtype=torch.float32
-                )
-                data.glt_relation_source_distance_valid = torch.as_tensor(
-                    paired["observation_valid"], dtype=torch.bool
-                )
-                data.glt_relation_source_distance_slot = torch.as_tensor(
-                    paired["source_slots"], dtype=torch.long
-                )
-                data.glt_relation_source_cross_ru = torch.as_tensor(
-                    paired["source_cross_ru"], dtype=torch.bool
-                )
-        if self._periodic_spatial_contact_sidecar is not None:
-            row_hint = int(idx) if self._cohort_row_mode else None
-            spatial_record = self._periodic_spatial_contact_sidecar.model_row(
-                self._periodic_spatial_contact_sidecar.index_for_key(
-                    lookup_key_for_hash, row_hint=row_hint
-                )
-            )
-            spatial_row = spatial_record["pairs"]
-            data.spatial_pair_index = torch.stack(
-                [
-                    torch.from_numpy(np.array(
-                        spatial_row["pair_atom_a"], copy=True
-                    )).long(),
-                    torch.from_numpy(np.array(
-                        spatial_row["pair_atom_b"], copy=True
-                    )).long(),
-                ],
-                dim=0,
-            )
-            data.spatial_pair_shift = torch.from_numpy(np.array(
-                spatial_row["pair_shift"], copy=True
-            )).long()
-            data.spatial_obs_distances = torch.from_numpy(np.array(
-                spatial_row["pair_observation_distances"], copy=True
-            )).float()
-            data.spatial_obs_mask = torch.from_numpy(np.array(
-                spatial_row["pair_observation_valid"], copy=True
-            )).bool()
-            data.spatial_obs_count = torch.from_numpy(np.array(
-                spatial_row["pair_observation_count"], copy=True
-            )).long()
-            data.spatial_shell_id = torch.from_numpy(np.array(
-                spatial_row["pair_shell_id"], copy=True
-            )).long()
-            data.spatial_periodic_self = torch.from_numpy(np.array(
-                spatial_row["pair_periodic_self"], copy=True
-            )).bool()
-            data.spatial_pair_valid = torch.from_numpy(np.array(
-                spatial_row["pair_valid"], copy=True
-            )).bool()
-            data.spatial_graph_valid = bool(spatial_record["graph_valid"])
         if self._periodic_line_glt_sidecar is not None:
             if hasattr(data, "glt_token_runtime_valid"):
                 data.glt_token_valid = data.glt_token_runtime_valid
             if hasattr(data, "glt_relation_runtime_valid"):
                 data.glt_relation_valid = data.glt_relation_runtime_valid
-            if self.periodic_line_torsion:
-                build_periodic_torsion_fields(data)
-        if getattr(self, "_mts_input_ids", None) is not None:
-            data.input_ids_smiles = torch.from_numpy(
-                np.array(self._mts_input_ids[int(idx)], dtype=np.int64, copy=True)
-            )
-            data.attention_mask_smiles = torch.from_numpy(
-                np.array(self._mts_attention_mask[int(idx)], dtype=np.int64, copy=True)
-            )
-            data.smiles_available = bool(self._mts_smiles_valid[int(idx)])
-        if getattr(self, "_mts_attachment_count", None) is not None:
-            data.fp = torch.from_numpy(
-                np.array(
-                    self._mts_attachment_count[int(idx)],
-                    dtype=np.float32,
-                    copy=True,
-                )
-            ).unsqueeze(0)
-            data.fp_available = bool(self._mts_fp_valid[int(idx)])
         return data
-
-    def get_max_smiles_token_length(self, csv_path):
-        """Public helper kept for external callers (legacy name)."""
-        return self._compute_max_token_length_for_file(csv_path)

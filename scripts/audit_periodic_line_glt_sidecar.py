@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit offline QC for an MTS-GLT-v1 sidecar."""
+"""Explicit offline QC for the retained MTS-GLT-v2 line sidecar."""
 
 from __future__ import annotations
 

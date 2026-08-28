@@ -27,8 +27,6 @@ CACHE_CONTINUOUS_ANGLE_SCHEMA = "mts-angle-continuous-cache-v1"
 CACHE_MCL_THRESHOLD_SCHEMA = "mts-mcl-threshold-array-v2"
 CACHE_BUNDLE_SCHEMA = "mts-canonical-cache-bundle-v3"
 CACHE_TOPOLOGY_COST_SCHEMA = "mts-topology-cost-v1"
-STAR_RBF_V2_SIDECAR_SCHEMA = "mts-star-rbf-v2-sidecar-v1"
-STAR_RBF_V2_BUILDER_VERSION = 1
 TOPOLOGY_LMDB_SCHEMA = "mts-canonical-periodic-topology-lmdb-v3"
 MIGRATION_SCHEMA = "mts-canonical-cache-migration-v3"
 TARGET_CONTRACT_SCHEMA = "mts-canonical-target-contract-v1"
@@ -86,7 +84,6 @@ _STAGE_ALIASES = {
     "joint_pretrain": STAGE1_ID,
     "joint": STAGE1_ID,
     STAGE2_ID: STAGE2_ID,
-    "stage2_geometry_adapt": STAGE2_ID,
     "finetune": STAGE2_ID,
 }
 
@@ -123,25 +120,13 @@ def stage_display_name(value):
 
 
 def validate_runtime_args(args) -> None:
-    """Validate an explicitly selected B0-v2 or MTS-GLT-v1 runtime."""
+    """Validate the fixed MTS-GLT-v2 baseline runtime."""
 
     if getattr(args, "graph_encoder_type", None) != ROUTE_INTERNAL:
         return
     schema = getattr(args, "config_schema", None)
-    if schema not in {
-        CONFIG_SCHEMA,
-        "mts-glt-v1-downstream",
-        "mts-glt-v2-downstream",
-        "mts-glt-graphgate-v1-downstream",
-    }:
+    if schema not in {CONFIG_SCHEMA, "mts-glt-v2", "mts-glt-v2-downstream", "manual"}:
         raise ValueError(f"unsupported {ROUTE_NAME} config schema: {schema!r}")
-    is_glt = schema in {
-        "mts-glt-v1-downstream",
-        "mts-glt-v2-downstream",
-        "mts-glt-graphgate-v1-downstream",
-    }
-    is_glt_v2 = schema == "mts-glt-v2-downstream"
-    is_graphgate = schema == "mts-glt-graphgate-v1-downstream"
     fixed = {
         "topology_representation": TOPOLOGY_CANONICAL,
         "topology_attention_variant": "o8",
@@ -172,7 +157,7 @@ def validate_runtime_args(args) -> None:
                 f"expected {expected!r}, got {observed!r}"
             )
     switches = {
-        "use_star_rbf": not is_glt,
+        "use_star_rbf": False,
         "use_mcl": False,
         "use_md200": True,
         "mips_use_descriptors": True,
@@ -182,37 +167,16 @@ def validate_runtime_args(args) -> None:
             raise ValueError(
                 f"{ROUTE_NAME} runtime requires {name}={expected}"
             )
-    if is_graphgate:
-        if getattr(args, "mts_glt_version", None) != "graphgate_v1":
-            raise ValueError(
-                "MTS-GLT-GraphGate-v1 schema requires "
-                "mts_glt_version=graphgate_v1"
-            )
-        if getattr(args, "mts_glt_mode", None) not in {
-            "o8_only", "o8_glt_graph", "o8_glt_graph_mean",
-            "o8_glt_atom_central",
-        }:
-            raise ValueError("MTS-GLT-GraphGate-v1 downstream mode is invalid")
-    elif is_glt_v2:
-        if getattr(args, "mts_glt_version", None) != "v2":
-            raise ValueError("MTS-GLT-v2 schema requires mts_glt_version=v2")
-        if getattr(args, "mts_glt_mode", None) not in {
-            "o8_only", "o8_glt_atom", "o8_glt_atom_desc",
-            "o8_glt_atom_self3d", "o8_glt_atom_x23",
-            "o8_glt_atom_line_self", "o8_glt_atom_line_x2l",
-            "o8_glt_atom_attn_self", "o8_glt_atom_attn_x2a",
-            "o8_glt_atom_torsion_count", "o8_glt_atom_torsion",
-            "o8_glt_atom_sbf_angle_control",
-            "o8_glt_atom_sbf_radial_angle",
-            "o8_glt_atom_spatial",
-        }:
-            raise ValueError("MTS-GLT-v2 downstream mode is invalid")
-    elif is_glt and getattr(args, "mts_glt_mode", None) not in {"o8_only", "o8_glt"}:
-        raise ValueError("MTS-GLT-v1 requires mts_glt_mode=o8_only or o8_glt")
+    if getattr(args, "mts_glt_version", None) not in {None, "v2"}:
+        raise ValueError("MTS-GLT-v2 baseline requires mts_glt_version=v2")
+    if getattr(args, "mts_glt_mode", None) not in {
+        None, "none", "o8_only", "o8_glt_atom"
+    }:
+        raise ValueError("MTS-GLT-v2 baseline downstream mode is invalid")
     if list(getattr(args, "modalities", [])) != ["graph"]:
-        raise ValueError(f"{ROUTE_NAME} B0-v2 is graph-only")
+        raise ValueError(f"{ROUTE_NAME} baseline is graph-only")
     if getattr(args, "fusion_type", None) != "none":
-        raise ValueError(f"{ROUTE_NAME} B0-v2 requires fusion_type=none")
+        raise ValueError(f"{ROUTE_NAME} baseline requires fusion_type=none")
     if bool(getattr(args, "scage_use_pbc_distance", False)):
         raise ValueError(f"PBC distance is not part of {ROUTE_NAME}")
     if bool(getattr(args, "scage_use_descriptors", False)):

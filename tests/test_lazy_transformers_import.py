@@ -42,36 +42,3 @@ import src.training.pretrain.engine
         capture_output=True,
         text=True,
     )
-
-
-def test_smiles_helpers_load_transformers_on_demand(monkeypatch):
-    import transformers
-
-    from src.dataset.dataset import _load_auto_tokenizer
-    from src.modules.uni_encoder import _load_roberta_encoder
-
-    tokenizer_sentinel = object()
-    encoder_sentinel = object()
-    tokenizer_calls = []
-    encoder_calls = []
-
-    def fake_tokenizer(name):
-        tokenizer_calls.append(name)
-        return tokenizer_sentinel
-
-    def fake_encoder(name):
-        encoder_calls.append(name)
-        return encoder_sentinel
-
-    monkeypatch.setattr(
-        transformers.AutoTokenizer, "from_pretrained", fake_tokenizer
-    )
-    monkeypatch.setattr(
-        transformers.RobertaModel, "from_pretrained", fake_encoder
-    )
-    monkeypatch.setenv("UNIPOLY_MODEL_LOAD_LOG", "verbose")
-
-    assert _load_auto_tokenizer("tokenizer-test") is tokenizer_sentinel
-    assert _load_roberta_encoder("encoder-test") is encoder_sentinel
-    assert tokenizer_calls == ["tokenizer-test"]
-    assert encoder_calls == ["encoder-test"]

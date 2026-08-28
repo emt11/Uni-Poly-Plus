@@ -15,9 +15,6 @@ torch-scatter>=2.1,<2.2
 # Chemistry and molecular processing
 rdkit>=2026.3,<2027
 
-# Optional SMILES route; imported only when that route is constructed
-transformers>=5.8,<5.9
-
 # Runtime utilities
 tqdm>=4.67,<5
 lmdb>=2.3,<3

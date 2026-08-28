@@ -28,8 +28,7 @@ SCIENTIFIC_FLAGS = {
     "--amp_dtype", "--batch_size", "--eval_batch_size", "--epochs",
     "--evaluation_protocol", "--graph_lr", "--head_dropout", "--head_lr",
     "--huber_beta", "--loader_workers", "--max_grad_norm",
-    "--mts_adapter_lr", "--mts_geometry_lr", "--mts_glt_fusion_warm_epochs",
-    "--mts_glt_fusion_strategy", "--mts_glt_initial_alpha", "--mts_o8_lr",
+    "--mts_adapter_lr", "--mts_geometry_lr", "--mts_o8_lr",
     "--patience", "--regression_loss", "--target_transform",
     "--warmup_epochs", "--weight_decay", "--fusion_lr",
 }
@@ -43,9 +42,6 @@ RESOLVED_FIELDS = {
     "beta": "huber_beta",
     "grad_clip": "max_grad_norm",
     "weight_decay": "weight_decay",
-    "configured_encoder_freeze_warm_epochs": "mts_glt_fusion_warm_epochs",
-    "fusion_strategy": "mts_glt_fusion_strategy",
-    "initial_alpha": "mts_glt_initial_alpha",
     "lr_warmup_epochs": "warmup_epochs",
     "head_dropout": "head_dropout",
     "o8_lr": "mts_o8_lr",
@@ -146,10 +142,7 @@ def resolved_config_from_command(command: list[str], provenance: dict, checkpoin
         "checkpoint_sha256": checkpoint_sha256,
         **provenance,
     })
-    payload["encoder_freeze_warm_epochs"] = (
-        int(parsed.mts_glt_fusion_warm_epochs)
-        if parsed.mts_glt_fusion_strategy == "fusion_warm" else 0
-    )
+    payload["encoder_freeze_warm_epochs"] = 0
     return payload
 
 
