@@ -265,7 +265,10 @@ class EncoderModule(nn.Module):
         return graph_features, node_features, data.batch
 
     def forward(self, data):
-        graph_features, _ = self.encoder(data)
+        encoded = self.encoder(data)
+        graph_features = encoded[0] if isinstance(encoded, tuple) else encoded
+        if graph_features.ndim != 2:
+            raise ValueError("graph encoder must return [batch, hidden] features")
         return self.projection(self.norm(graph_features))
 
 

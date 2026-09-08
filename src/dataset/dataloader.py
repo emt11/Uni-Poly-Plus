@@ -66,6 +66,7 @@ def mips_trimer_collate(data_list):
     star_v2_pair_valid, star_v2_pair_sources = [], []
     star_v2_uppers = set()
     glt_fields_present = all(hasattr(item, "glt_token_atom_a") for item in data_list)
+    glt3_fields_present = all(hasattr(item, "glt3_token_atom_a") for item in data_list)
     glt_token_atom_a, glt_token_atom_b, glt_token_shift = [], [], []
     glt_token_z_a, glt_token_z_b, glt_token_bond_type, glt_token_label = [], [], [], []
     glt_token_distances, glt_token_counts, glt_token_valid = [], [], []
@@ -85,6 +86,13 @@ def mips_trimer_collate(data_list):
     glt_torsion_values, glt_torsion_relations = [], []
     glt_torsion_counts, glt_torsion_covered = [], []
     glt_torsion_source_cross, glt_graph_torsion_covered = [], []
+    glt3_token_atom_a, glt3_token_atom_b, glt3_token_shift = [], [], []
+    glt3_token_z_a, glt3_token_z_b, glt3_token_distance = [], [], []
+    glt3_token_bond_type, glt3_token_stereo, glt3_token_conjugated = [], [], []
+    glt3_token_anchor_q_a, glt3_token_anchor_q_b, glt3_token_valid = [], [], []
+    glt3_token_batch, glt3_geometry_valid = [], []
+    glt3_relation_source, glt3_relation_target, glt3_relation_center = [], [], []
+    glt3_relation_shift, glt3_relation_angle, glt3_relation_valid = [], [], []
     spatial_fields_present = all(
         hasattr(item, "spatial_pair_index") for item in data_list
     )
@@ -314,6 +322,57 @@ def mips_trimer_collate(data_list):
             glt_token_offset += token_count
             glt_relation_offset += relation_count
 
+        if glt3_fields_present:
+            token_count = int(item.glt3_token_atom_a.numel())
+            relation_count = int(item.glt3_relation_source.numel())
+            for name in (
+                "glt3_token_atom_b", "glt3_token_shift",
+                "glt3_token_endpoint_z_a", "glt3_token_endpoint_z_b",
+                "glt3_token_distance", "glt3_token_bond_type",
+                "glt3_token_stereo", "glt3_token_conjugated",
+                "glt3_token_anchor_q_a", "glt3_token_anchor_q_b",
+                "glt3_token_valid",
+            ):
+                if int(getattr(item, name).numel()) != token_count:
+                    raise ValueError(f"image GLT token length mismatch: {name}")
+            for name in (
+                "glt3_relation_target", "glt3_relation_center_atom",
+                "glt3_relation_source_image_shift", "glt3_relation_angle",
+                "glt3_relation_valid",
+            ):
+                if int(getattr(item, name).numel()) != relation_count:
+                    raise ValueError(f"image GLT relation length mismatch: {name}")
+            source = item.glt3_relation_source.long()
+            target = item.glt3_relation_target.long()
+            if relation_count and (
+                int(source.min()) < 0 or int(source.max()) >= token_count
+                or int(target.min()) < 0 or int(target.max()) >= token_count
+            ):
+                raise ValueError("image GLT relation endpoint out of bounds")
+            glt3_token_atom_a.append(item.glt3_token_atom_a.long() + canonical_offset)
+            glt3_token_atom_b.append(item.glt3_token_atom_b.long() + canonical_offset)
+            glt3_token_shift.append(item.glt3_token_shift.long())
+            glt3_token_z_a.append(item.glt3_token_endpoint_z_a.long())
+            glt3_token_z_b.append(item.glt3_token_endpoint_z_b.long())
+            glt3_token_distance.append(item.glt3_token_distance.float())
+            glt3_token_bond_type.append(item.glt3_token_bond_type.long())
+            glt3_token_stereo.append(item.glt3_token_stereo.long())
+            glt3_token_conjugated.append(item.glt3_token_conjugated.long())
+            glt3_token_anchor_q_a.append(item.glt3_token_anchor_q_a.long())
+            glt3_token_anchor_q_b.append(item.glt3_token_anchor_q_b.long())
+            glt3_token_valid.append(item.glt3_token_valid.bool())
+            glt3_token_batch.append(torch.full((token_count,), graph_id, dtype=torch.long))
+            glt3_relation_source.append(source + glt_token_offset)
+            glt3_relation_target.append(target + glt_token_offset)
+            center = item.glt3_relation_center_atom.long().clone()
+            center[center >= 0] += canonical_offset
+            glt3_relation_center.append(center)
+            glt3_relation_shift.append(item.glt3_relation_source_image_shift.long())
+            glt3_relation_angle.append(item.glt3_relation_angle.float())
+            glt3_relation_valid.append(item.glt3_relation_valid.bool())
+            glt3_geometry_valid.append(bool(item.glt3_geometry_valid))
+            glt_token_offset += token_count
+
         if spatial_fields_present:
             spatial_index = item.spatial_pair_index.long()
             if spatial_index.ndim != 2 or int(spatial_index.size(0)) != 2:
@@ -534,6 +593,27 @@ def mips_trimer_collate(data_list):
             batch.glt_relation_source_cross_ru = torch.cat(
                 glt_relation_source_cross_ru
             )
+    if glt3_fields_present:
+        batch.glt3_token_atom_a = torch.cat(glt3_token_atom_a)
+        batch.glt3_token_atom_b = torch.cat(glt3_token_atom_b)
+        batch.glt3_token_shift = torch.cat(glt3_token_shift)
+        batch.glt3_token_endpoint_z_a = torch.cat(glt3_token_z_a)
+        batch.glt3_token_endpoint_z_b = torch.cat(glt3_token_z_b)
+        batch.glt3_token_distance = torch.cat(glt3_token_distance)
+        batch.glt3_token_bond_type = torch.cat(glt3_token_bond_type)
+        batch.glt3_token_stereo = torch.cat(glt3_token_stereo)
+        batch.glt3_token_conjugated = torch.cat(glt3_token_conjugated)
+        batch.glt3_token_anchor_q_a = torch.cat(glt3_token_anchor_q_a)
+        batch.glt3_token_anchor_q_b = torch.cat(glt3_token_anchor_q_b)
+        batch.glt3_token_valid = torch.cat(glt3_token_valid)
+        batch.glt3_token_batch = torch.cat(glt3_token_batch)
+        batch.glt3_relation_source = torch.cat(glt3_relation_source)
+        batch.glt3_relation_target = torch.cat(glt3_relation_target)
+        batch.glt3_relation_center_atom = torch.cat(glt3_relation_center)
+        batch.glt3_relation_source_image_shift = torch.cat(glt3_relation_shift)
+        batch.glt3_relation_angle = torch.cat(glt3_relation_angle)
+        batch.glt3_relation_valid = torch.cat(glt3_relation_valid)
+        batch.glt3_geometry_valid = torch.tensor(glt3_geometry_valid, dtype=torch.bool)
     if spatial_fields_present:
         batch.spatial_pair_index = torch.cat(spatial_pair_index, dim=1)
         batch.spatial_pair_shift = torch.cat(spatial_pair_shift)

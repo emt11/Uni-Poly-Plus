@@ -1,0 +1,81 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, md200_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics ./data/processed/mips_trimer_scage/diagnostics_smi_all_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-ecfp_tok0.json
+Building smi_eat from feature cache:   0%|          | 0/390 [00:00<?, ?it/s]Building smi_eat from feature cache: 100%|██████████| 390/390 [00:00<00:00, 6214.30it/s]
+Built smi_eat: 390 samples from feature cache
+
+Starting task: eat
+Start 5-fold Cross Validation
+
+Fold 1
+Fold seed: 648829
+Shared 5-fold protocol: validation and test use the same held-out fold
+Fold partitions: train=312, validation=78, test=78
+Scaling y values with mean: -5.941410256410256 and std: 0.36404502524773846
+Using direct target standardization without task-specific transform
+Created dataloader with 312 samples
+Created dataloader with 78 samples
+Created dataloader with 78 samples
+Using sparse non-PBC MIPS PyG graph encoder (layers=6, emb_dim=512, heads=8, core=paper_corrected, variant=O8, spatial=trimer_scage, geometry=trimer_scage_mcl, max_hops=2, feature_mode=mips137, readout=mean).
+MTS-GLT checkpoint load: strictly loaded 190 graph tensors for o8_glt_atom.
+Loaded pretrained model from /root/workspace/Uni-Poly-Plus-master/results/mts_glt_v2/smoke/ddp/mts_glt_v2_probe_000k.pth
+Checkpoint load: 12 missing keys, 0 unexpected keys
+Using GPU for model training.
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/train.py", line 32, in <module>
+    main()
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/train.py", line 28, in main
+    return run_finetune_job(parse_arguments())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/training/finetune/engine.py", line 960, in run_finetune_job
+    metrics = run_single_fold(
+              ^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/training/finetune/engine.py", line 57, in run_single_fold
+    return train_and_evaluate(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/utils.py", line 1192, in train_and_evaluate
+    raise ValueError('MTS training requires an MTS graph model')
+ValueError: MTS training requires an MTS graph model
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, md200_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics ./data/processed/mips_trimer_scage/diagnostics_smi_all_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-ecfp_tok0.json
+Building smi_eat from feature cache:   0%|          | 0/390 [00:00<?, ?it/s]Building smi_eat from feature cache: 100%|██████████| 390/390 [00:00<00:00, 5787.38it/s]
+Built smi_eat: 390 samples from feature cache
+
+Starting task: eat
+Start 5-fold Cross Validation
+
+Fold 1
+Fold seed: 648829
+Shared 5-fold protocol: validation and test use the same held-out fold
+Fold partitions: train=312, validation=78, test=78
+Scaling y values with mean: -5.941410256410256 and std: 0.36404502524773846
+Using direct target standardization without task-specific transform
+Created dataloader with 312 samples
+Created dataloader with 78 samples
+Created dataloader with 78 samples
+Using sparse non-PBC MIPS PyG graph encoder (layers=6, emb_dim=512, heads=8, core=paper_corrected, variant=O8, spatial=trimer_scage, geometry=trimer_scage_mcl, max_hops=2, feature_mode=mips137, readout=mean).
+MTS-GLT checkpoint load: strictly loaded 190 graph tensors for o8_glt_atom.
+Loaded pretrained model from /root/workspace/Uni-Poly-Plus-master/results/mts_glt_v2/smoke/ddp/mts_glt_v2_probe_000k.pth
+Checkpoint load: 12 missing keys, 0 unexpected keys
+Using GPU for model training.
+Training:   0%|          | 0/10 [00:00<?, ?it/s]Training:  10%|█         | 1/10 [00:00<00:08,  1.05it/s]Training:  30%|███       | 3/10 [00:01<00:02,  3.35it/s]Training:  50%|█████     | 5/10 [00:01<00:00,  5.57it/s]Training:  70%|███████   | 7/10 [00:01<00:00,  7.51it/s]Training:  90%|█████████ | 9/10 [00:01<00:00,  9.32it/s]Training: 100%|██████████| 10/10 [00:01<00:00,  6.42it/s]
+Evaluating:   0%|          | 0/2 [00:00<?, ?it/s]Evaluating:  50%|█████     | 1/2 [00:00<00:00,  2.86it/s]Evaluating: 100%|██████████| 2/2 [00:00<00:00,  5.27it/s]
+Epoch 1: Validation R2 improved to -0.0248.
+Epoch 1/1
+Training Loss: 0.5784, Training R2: 0.0022
+Validation Loss: 0.5357, Validation R2: -0.0248
+--------------------------------------------------
+Testing:   0%|          | 0/2 [00:00<?, ?it/s]Testing:  50%|█████     | 1/2 [00:00<00:00,  2.97it/s]Testing: 100%|██████████| 2/2 [00:00<00:00,  5.51it/s]
+Fold 1 Test R2: -0.025, MAE: 0.275, RMSE: 0.354
+Fold 1 attention shape: (78, 1)
+Fold 1 mean attention: graph:1.000000
+
+Average of metrics over all folds
+Test R2 = -0.025
+Test MAE = 0.275
+Test RMSE = 0.354
+Standard Deviation of Test R2 = 0.000
+Standard Deviation of Test MAE = 0.000
+Standard Deviation of Test RMSE = 0.000
+Best Validation R2 = -0.025 +/- 0.000
+5-fold mean attention: graph:1.000000
+Results have been appended to '/root/workspace/Uni-Poly-Plus-master/results/mts_glt_v2/downstream/smoke_2step/o8_glt_atom/shards/42/eat/fold_0.csv'.

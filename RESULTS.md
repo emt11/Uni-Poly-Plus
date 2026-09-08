@@ -1,6 +1,6 @@
 # Uni-Poly-Plus 基线结果索引
 
-本文件只索引当前保留的 `MTS-GLT-v2-Base-5k` 及其必要证据。完整合同见 [`PIPELINE.md`](PIPELINE.md)。
+本文件只索引当前保留的 `MTS-GLT-v2-Base-5k` 和实验路线 `Atomic-PC W-CAMR-v2`。完整合同见 [`PIPELINE.md`](PIPELINE.md)。
 
 ## 当前正式基线
 
@@ -51,3 +51,18 @@ independent blind test     false
 - validation 与 test 共用 fold，结果不能当作 independent blind test。
 - 本次仓库整理没有重新训练、重跑消融或扩大评估范围。
 - 后续默认只做必要的局部测试和 smoke；新实验须使用独立配置与输出目录，并由用户明确授权。
+
+## 保留实验路线：Atomic-PC W-CAMR-v2
+
+```text
+name             Atomic-PC W-CAMR-v2
+status           retained_experimental_route
+checkpoint       results/original_mips_atomic_pc_w_camr_v2/pretraining/w_camr_checkpoint.pt
+optimizer steps  1504
+seed             42
+protocol         historical_shared5 (非独立盲测)
+loaded downstream component  atomic_point_encoder only
+macro8 R²        0.8432478932
+```
+
+证据为 `results/original_mips_atomic_pc_w_camr_v2/summary.json` 和 `results/original_mips_atomic_pc_w_camr_v2/downstream/aggregate_summary.json`。该路线仍是实验结果，不改变 `MTS-GLT-v2-Base-5k` 的正式生产基线身份。

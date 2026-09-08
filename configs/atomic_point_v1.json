@@ -1,0 +1,57 @@
+{
+  "schema": "atomic-point-cloud-v1-config",
+  "architecture": "MIPS-KFuse-Atomic-PC-v1",
+  "hidden_dim": 256,
+  "output_dim": 512,
+  "num_layers": 4,
+  "k_neighbors": 24,
+  "num_heads": 8,
+  "element_embedding_dim": 64,
+  "role_embedding_dim": 8,
+  "distance_encoder": {
+    "type": "log1p_mlp",
+    "input_dim": 1,
+    "hidden_dim": 32,
+    "dim": 32,
+    "activation": "SiLU"
+  },
+  "pool": {
+    "type": "attention",
+    "score": "w^T_tanh(W_p h)"
+  },
+  "use_geometry": true,
+  "knn_backend": "torch_cluster",
+  "a_ng_control": {
+    "implemented": true,
+    "use_geometry": false,
+    "distance_embedding": "zero",
+    "neighborhood": "coordinate-free packed-index control",
+    "training_started": false
+  },
+  "knowledge": {
+    "static": ["md"],
+    "runtime": ["atomic_pc"],
+    "dims": {"md": 200, "atomic_pc": 512}
+  },
+  "geometry_contract": {
+    "schema": "mips-trimer-scage-trimer-lmdb-v6",
+    "content_schema": "mips-trimer-scage-trimer-v8",
+    "protocol": "etkdgv3x4-mmff94-relax200-lowest-finite-v1",
+    "source": "frozen_mips_trimer_scage_dataset_item",
+    "fields": ["smiles", "trimer_pos", "trimer_atomic_number", "trimer_ru_offset"],
+    "coords_dtype": "float32",
+    "atomic_number_dtype": "int64",
+    "ru_offset_dtype": "int64",
+    "ru_offset_values": [-1, 0, 1],
+    "ordinary_addhs_hydrogen_persisted": false,
+    "collator_geometry_override": false,
+    "absolute_xyz_scalar": false
+  },
+  "provenance": {
+    "geometry_regenerated": false,
+    "persistent_embedding_cache": false,
+    "training_started": false,
+    "surface_or_mesh": false,
+    "mcp_or_ap3d": false
+  }
+}

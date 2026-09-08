@@ -87,6 +87,10 @@ from .mips_cache_validation import validate_mcl_record
 from .periodic_line_glt import (
     PeriodicLineGLTSidecar,
 )
+from .periodic_line_glt_image import (
+    PeriodicLineImageSidecar,
+    SIDECAR_SCHEMA as PERIODIC_LINE_IMAGE_SCHEMA,
+)
 from .mts_target_contract import make_target_contract
 from rdkit.Chem import rdFingerprintGenerator
 
@@ -2234,7 +2238,18 @@ class UniDataset(Dataset):
             rebuild_feature_cache=rebuild_feature_cache,
         )
         if self.periodic_line_glt_sidecar_root is not None:
-            self._periodic_line_glt_sidecar = PeriodicLineGLTSidecar(
+            sidecar_metadata = Path(
+                self.periodic_line_glt_sidecar_root, "metadata.json"
+            )
+            sidecar_schema = json.loads(
+                sidecar_metadata.read_text(encoding="utf-8")
+            ).get("schema")
+            sidecar_type = (
+                PeriodicLineImageSidecar
+                if sidecar_schema == PERIODIC_LINE_IMAGE_SCHEMA
+                else PeriodicLineGLTSidecar
+            )
+            self._periodic_line_glt_sidecar = sidecar_type(
                 self.periodic_line_glt_sidecar_root
             )
             if self._cohort_row_mode and len(self._periodic_line_glt_sidecar) != len(self.data_list):
@@ -4594,6 +4609,27 @@ class UniDataset(Dataset):
                 )
             )
             tokens, relations = line_row["tokens"], line_row["relations"]
+            is_image_v1 = (
+                getattr(self._periodic_line_glt_sidecar, "metadata", {}).get("schema")
+                == PERIODIC_LINE_IMAGE_SCHEMA
+            )
+            prefix = "glt3_" if is_image_v1 else "glt_"
+            setattr(data, prefix + "geometry_valid", bool(line_row["geometry_valid"]))
+            if is_image_v1:
+                data.glt3_query_valid = bool(
+                    line_row["geometry_valid"] and len(tokens["token_atom_a"]) > 0
+                )
+                for name, value in tokens.items():
+                    dtype = torch.float32 if name == "token_distance" else (
+                        torch.bool if name == "token_valid" else torch.long
+                    )
+                    setattr(data, f"glt3_{name}", torch.as_tensor(np.array(value, copy=True), dtype=dtype))
+                for name, value in relations.items():
+                    dtype = torch.float32 if name == "relation_angle" else (
+                        torch.bool if name == "relation_valid" else torch.long
+                    )
+                    setattr(data, f"glt3_{name}", torch.as_tensor(np.array(value, copy=True), dtype=dtype))
+                return data
             data.glt_geometry_valid = bool(line_row["geometry_valid"])
             data.glt_query_valid = bool(line_row["geometry_valid"] and len(tokens["token_atom_a"]) > 0)
             data.glt_base_mapping_valid = bool(line_row.get("base_mapping_valid", line_row["geometry_valid"]))

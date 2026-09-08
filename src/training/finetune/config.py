@@ -57,7 +57,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--model_name", default="UniEncoderAttention")
     parser.add_argument("--modalities", nargs="+", type=parse_modality, default=["graph"])
     parser.add_argument("--fusion_type", choices=SUPPORTED_FUSION_TYPES, default="none")
-    parser.add_argument("--graph_input", choices=["repeat_unit"], default="repeat_unit")
+    parser.add_argument("--graph_input", choices=["repeat_unit", "star_linking"], default="repeat_unit")
     parser.add_argument("--pretrained_model_path", default="")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=10)
@@ -118,7 +118,8 @@ def parse_arguments(argv=None):
     parser.add_argument("--star_rbf_upper", type=float, default=3.0)
     parser.add_argument("--periodic_line_glt_sidecar", default=None)
     parser.add_argument("--mts_glt_mode", choices=sorted(MODE_SPECS), default="o8_glt_atom")
-    parser.add_argument("--mts_glt_version", choices=["v2"], default="v2")
+    parser.add_argument("--mts_glt_version", choices=["v2", "v3"], default="v2")
+    parser.add_argument("--glt_readout_mode", choices=["galformer", "mips_concat"], default="galformer")
     parser.add_argument("--mts_glt_geometry_mode", choices=["full"], default="full")
     parser.add_argument("--mts_glt_layers", type=int, choices=[6], default=6)
     parser.add_argument("--mts_glt_attention_variant", choices=["mips"], default="mips")
@@ -150,6 +151,9 @@ def parse_arguments(argv=None):
         parser.error("MTS-GLT-v2-Base-5k is graph-only with fusion_type=none")
     if args.mts_glt_mode not in MODE_SPECS:
         parser.error("unsupported MTS-GLT-v2 downstream mode")
+    if args.mts_glt_version == "v3":
+        args.mts_glt_mode = "none"
+        args.graph_input = "star_linking"
     args.mts_glt_use_compact19 = False
     args.geom_input = "repeat_unit"
     args.freeze_encoder = False

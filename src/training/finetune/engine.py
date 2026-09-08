@@ -171,6 +171,13 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
         fusion_type="none",
         head_dropout=float(args.head_dropout),
     )
+    glt_version = str(getattr(args, "mts_glt_version", "v2"))
+    if glt_version == "v3":
+        from src.modules import MTSGraphLineModelV3
+        model.encoders["graph"].encoder = MTSGraphLineModelV3(
+            glt_readout_mode=str(getattr(args, "glt_readout_mode", "galformer"))
+        )
+        return model
     glt_mode = str(getattr(args, "mts_glt_mode", "none"))
     if glt_mode != "none":
         if tuple(args.modalities) != ("graph",):
@@ -212,6 +219,20 @@ def select_mts_glt_graph_state(model_state, checkpoint_state):
     return mapped
 
 
+def select_mts_glt_v3_graph_state(model_state, checkpoint):
+    if checkpoint.get("schema") != "mts-glt-v3-deploy-v1":
+        raise RuntimeError("MTS-GLT-v3 deploy checkpoint schema mismatch")
+    prefix = "encoders.graph.encoder."
+    mapped = {prefix + key: value for key, value in checkpoint["state_dict"].items()}
+    expected = {key for key in model_state if key.startswith(prefix)}
+    if set(mapped) != expected:
+        raise RuntimeError(
+            f"MTS-GLT-v3 checkpoint mismatch; missing={sorted(expected-set(mapped))[:8]} "
+            f"unexpected={sorted(set(mapped)-expected)[:8]}"
+        )
+    return mapped
+
+
 def run_finetune_job(config=None, task=None, seed=None, fold=None):
     """Run exactly one task/seed/fold through the real MTS training path."""
     args = parse_arguments() if config is None else config
@@ -245,7 +266,11 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             dataset=dataset_name,
             smiles_model_name="",
             graph_encoder_type="mips_trimer_scage",
-            graph_input="repeat_unit",
+            graph_input=(
+                "star_linking"
+                if str(getattr(args, "mts_glt_version", "v2")) == "v3"
+                else "repeat_unit"
+            ),
             use_feature_cache=not args.disable_feature_cache,
             feature_source_dataset=args.feature_source_dataset,
             rebuild_feature_cache=args.rebuild_feature_cache,
@@ -283,7 +308,12 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             experiment_id=args.experiment_id,
             feature_config_hash="manual",
             modalities=("graph",),
-            periodic_line_glt_sidecar=args.periodic_line_glt_sidecar,
+            periodic_line_glt_sidecar=(
+                None
+                if str(getattr(args, "mts_glt_version", "v2")) == "v3"
+                and str(getattr(args, "glt_readout_mode", "galformer")) == "galformer"
+                else args.periodic_line_glt_sidecar
+            ),
         )
         for dataset_name in dataset_name_list
     ]
@@ -458,7 +488,11 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                     if isinstance(checkpoint.get("meta"), dict) else {}
                 )
                 merged_state = model.state_dict()
-                glt_state = select_mts_glt_graph_state(merged_state, checkpoint_state)
+                glt_state = (
+                    select_mts_glt_v3_graph_state(merged_state, checkpoint)
+                    if str(getattr(args, "mts_glt_version", "v2")) == "v3"
+                    else select_mts_glt_graph_state(merged_state, checkpoint_state)
+                )
                 merged_state.update(glt_state)
                 print(
                     f'MTS-GLT-v2 checkpoint load: strictly loaded '

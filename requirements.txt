@@ -11,6 +11,7 @@ scikit-learn>=1.7,<1.8
 torch>=2.8,<2.9
 torch-geometric>=2.7,<2.8
 torch-scatter>=2.1,<2.2
+torch-cluster>=1.6,<1.7
 
 # Chemistry and molecular processing
 rdkit>=2026.3,<2027

@@ -1,0 +1,54 @@
+{
+  "schema": "atomic-point-cloud-v1-center-ru-config",
+  "architecture": "MIPS-KFuse-Atomic-PC-v1-CenterRU",
+  "base_frozen_config": "configs/atomic_point_v1.json",
+  "base_frozen_config_sha256": "fffd59e9df3c433307b7a45f5d30afd8f0ab18670f918b1515df50aaf05ac339",
+  "hidden_dim": 256,
+  "output_dim": 512,
+  "num_layers": 4,
+  "k_neighbors": 24,
+  "num_heads": 8,
+  "element_embedding_dim": 64,
+  "role_embedding_dim": 8,
+  "distance_encoder": {
+    "type": "log1p_mlp",
+    "input_dim": 1,
+    "hidden_dim": 32,
+    "dim": 32,
+    "activation": "SiLU"
+  },
+  "pool": {
+    "type": "attention",
+    "scope": "center",
+    "mask_field": "trimer_ru_offset",
+    "mask_value": 0,
+    "score": "w^T_tanh(W_p h)",
+    "mask_before_softmax": true,
+    "weighted_sum": "central points only"
+  },
+  "full_trimer_context": {
+    "message_passing_points": "all persisted RU(-1)+RU(0)+RU(+1) atoms from the frozen MTS Trimer",
+    "pooling_points": "ru_offset == 0 only",
+    "central_points_required_per_graph": true,
+    "zero_central_sample": "STOP"
+  },
+  "use_geometry": true,
+  "knn_backend": "torch_cluster",
+  "knowledge": {
+    "static": ["md"],
+    "runtime": ["atomic_pc"],
+    "dims": {"md": 200, "atomic_pc": 512}
+  },
+  "geometry_contract": {
+    "schema": "mips-trimer-scage-trimer-lmdb-v6",
+    "content_schema": "mips-trimer-scage-trimer-v8",
+    "protocol": "etkdgv3x4-mmff94-relax200-lowest-finite-v1",
+    "source": "frozen_mips_trimer_scage_dataset_item",
+    "fields": ["smiles", "trimer_pos", "trimer_atomic_number", "trimer_ru_offset"],
+    "ordinary_addhs_hydrogen_persisted": false,
+    "collator_geometry_override": false,
+    "authoritative_center_mask": "trimer_ru_offset == 0",
+    "geometry_regenerated": false
+  },
+  "forbidden": ["pretraining", "AP3D", "MCP", "surface", "mesh", "k_sweep", "layer_sweep", "hidden_sweep", "distance_sweep", "extra_seed", "geometry_regeneration"]
+}

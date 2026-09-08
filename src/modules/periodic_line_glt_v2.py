@@ -223,12 +223,27 @@ class LocalPeriodicGraphLineTransformerV2(nn.Module):
         valid = data.glt_token_valid.to(geometry.dtype).unsqueeze(-1)
         return self.input_norm(endpoint + valid * (geometry + count_feature + shift_feature))
 
-    def _relations(self, data, dtype):
+    def _relations(
+        self,
+        data,
+        dtype,
+        *,
+        observation_angles=None,
+        observation_counts=None,
+    ):
         real = ~data.glt_relation_is_fallback.bool()
         source = data.glt_relation_source.long()[real]
         target = data.glt_relation_target.long()[real]
-        angles = data.glt_relation_observation_angles[real]
-        counts = data.glt_relation_observation_count.long()[real]
+        angles_source = (
+            data.glt_relation_observation_angles
+            if observation_angles is None else observation_angles
+        )
+        counts_source = (
+            data.glt_relation_observation_count
+            if observation_counts is None else observation_counts
+        )
+        angles = angles_source[real]
+        counts = counts_source.long()[real]
         multiplicity = data.glt_relation_multiplicity.long()[real]
         valid = data.glt_relation_valid.bool()[real]
         angle_mean, angle_variance = self.angle_basis(angles, counts)
@@ -307,6 +322,8 @@ class LocalPeriodicGraphLineTransformerV2(nn.Module):
         observation_distances=None,
         observation_counts=None,
         token_shifts=None,
+        relation_observation_angles=None,
+        relation_observation_counts=None,
     ):
         states = self.line_inputs(
             data,
@@ -316,7 +333,12 @@ class LocalPeriodicGraphLineTransformerV2(nn.Module):
             observation_counts=observation_counts,
             token_shifts=token_shifts,
         )
-        source, target, relation_bias = self._relations(data, states.dtype)
+        source, target, relation_bias = self._relations(
+            data,
+            states.dtype,
+            observation_angles=relation_observation_angles,
+            observation_counts=relation_observation_counts,
+        )
         for layer in self.layers:
             states = layer(states, source, target, relation_bias)
         states = self.final_norm(states)

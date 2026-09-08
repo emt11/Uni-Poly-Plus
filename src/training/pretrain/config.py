@@ -12,6 +12,7 @@ from src.dataset.mips_trimer_contract import (
 
 
 BASELINE_SCHEMA = "mts-glt-v2"
+V3_SCHEMA = "mts-glt-v3-galformer-20k"
 SUPPORTED_MODALITIES = ("graph",)
 
 
@@ -38,6 +39,16 @@ _GLT_REQUIRED = {
     "cache_layers",
 }
 _GLT_ALLOWED = _GLT_REQUIRED | {"source_config", "project_root"}
+
+_V3_REQUIRED = {
+    "schema", "experiment_id", "dataset_name", "cache_root",
+    "line_sidecar_root", "md200_sidecar_root", "result_root", "output_path",
+    "atom_mask_ratio", "line_mask_ratio", "infonce_temperature",
+    "batch_size", "loader_workers", "prefetch_factor", "global_batch_size",
+    "max_optimizer_steps", "stop_after_steps", "probe_steps", "amp_dtype",
+    "seed", "lr", "warmup_steps", "end_lr", "weight_decay", "cache_layers",
+    "glt_readout_mode",
+}
 
 
 def _apply_glt_v2_config(args, config_path):
@@ -177,6 +188,85 @@ def _apply_glt_v2_config(args, config_path):
     return args
 
 
+def _apply_glt_v3_config(args, path, payload):
+    unknown = sorted(set(payload) - _V3_REQUIRED)
+    missing = sorted(_V3_REQUIRED - set(payload))
+    if unknown or missing:
+        raise ValueError(f"MTS-GLT-v3 config fields invalid; unknown={unknown} missing={missing}")
+    fixed = {
+        "atom_mask_ratio": 0.30, "line_mask_ratio": 0.40,
+        "infonce_temperature": 0.10, "weight_decay": 0.0,
+    }
+    for name, expected in fixed.items():
+        if abs(float(payload[name]) - expected) > 1e-12:
+            raise ValueError(f"MTS-GLT-v3 fixes {name}={expected}")
+    if payload["glt_readout_mode"] != "galformer":
+        raise ValueError("the formal MTS-GLT-v3 pretraining config defaults to galformer")
+    if int(payload["global_batch_size"]) != 3 * int(payload["batch_size"]):
+        raise ValueError("MTS-GLT-v3 global batch must equal three local batches")
+    if int(payload["max_optimizer_steps"]) != 20000:
+        raise ValueError("MTS-GLT-v3 formal trajectory fixes 20,000 updates")
+    if int(payload["warmup_steps"]) != 2000:
+        raise ValueError("MTS-GLT-v3 fixes 2,000 warmup updates")
+    probes = tuple(int(value) for value in payload["probe_steps"])
+    if probes != (5000, 10000, 20000):
+        raise ValueError("MTS-GLT-v3 probes must be exactly 5k/10k/20k")
+    stop_after = int(payload["stop_after_steps"])
+    if not 1 <= stop_after <= 20000:
+        raise ValueError("MTS-GLT-v3 stop_after_steps out of range")
+    args.config_schema = V3_SCHEMA
+    args.config_source_schema = V3_SCHEMA
+    args.experiment_id = str(payload["experiment_id"])
+    args.dataset_name = str(payload["dataset_name"])
+    args.root = str(payload["cache_root"])
+    args.periodic_line_glt_sidecar = str(payload["line_sidecar_root"])
+    args.md200_sidecar_root = str(payload["md200_sidecar_root"])
+    args.save_path = str(payload["output_path"])
+    args.glt_result_root = str(payload["result_root"])
+    args.graph_mask_ratio = float(payload["atom_mask_ratio"])
+    args.glt_line_mask_ratio = float(payload["line_mask_ratio"])
+    args.glt_infonce_temperature = float(payload["infonce_temperature"])
+    args.glt_atom_loss_weight = args.glt_line_loss_weight = args.glt_infonce_loss_weight = 1.0
+    args.glt_projection_dim = 256
+    args.glt_layers, args.glt_attention_variant = 6, "mips"
+    args.batch_size = int(payload["batch_size"])
+    args.loader_workers = int(payload["loader_workers"])
+    args.loader_prefetch_factor = int(payload["prefetch_factor"])
+    args.gradient_accumulation_steps = 1
+    args.global_batch_size = int(payload["global_batch_size"])
+    args.max_optimizer_steps = 20000
+    args.glt_stop_after_steps = stop_after
+    args.glt_probe_steps = probes
+    args.amp_dtype = str(payload["amp_dtype"])
+    args.seed = int(payload["seed"])
+    args.lr = float(payload["lr"])
+    args.warmup_steps = 2000
+    args.end_lr = float(payload["end_lr"])
+    args.weight_decay = 0.0
+    args.cache_layers = str(payload["cache_layers"])
+    # Shared immutable Dataset contract.
+    args.graph_encoder_type = MTS_ROUTE_INTERNAL
+    args.graph_input, args.geom_input = "star_linking", "repeat_unit"
+    args.smiles_model_name, args.feature_source_dataset = "", args.dataset_name
+    args.max_smiles_length, args.max_smiles_length_cap = None, 256
+    args.fp_mode = "disabled"
+    args.feature_cache_workers, args.feature_cache_chunksize = 0, 4
+    args.feature_cache_partial_every, args.feature_cache_item_timeout = 200, 45
+    args.cache_validate, args.cache_commit_size, args.embed_tries_multiplier = "sample", 128, 8
+    args.conformer_3d_count, args.conformer_keep_count, args.conformer_profile = 8, 4, "full"
+    args.scage_distance_mode, args.scage_distance_rbf, args.scage_distance_cutoff = "bias", 32, 12.0
+    args.mips_core, args.mips_max_hops = "paper_corrected", 2
+    args.mips_use_descriptors, args.mips_descriptor_protocol = True, "source_star_sub"
+    args.spatial_mode, args.graph_geometry_mode = "trimer_scage", "trimer_scage_mcl"
+    args.topology_representation = "canonical_lifted"
+    args.trimer_num_candidates, args.trimer_max_heavy_atoms = 4, 384
+    args.mips_variant, args.finite_variant = "O8", "none"
+    args.conformer_mode, args.field_layout, args.field_channels = "none", "none", "none"
+    args.modalities, args.max_grad_norm = ["graph"], 1.0
+    args.cache_only = False
+    return args
+
+
 def dataset_kwargs_from_args(args):
     """Translate the fixed baseline config into the Dataset constructor contract."""
     return {
@@ -229,20 +319,27 @@ def dataset_kwargs_from_args(args):
 
 def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
-        description="Pretrain the MTS-GLT-v2 baseline"
+        description="Pretrain MTS-GLT-v2 or MTS-GLT-v3-Galformer"
     )
     parser.add_argument(
         "--experiment_config",
         required=True,
-        help="Path to configs/mts/glt_v2_formal_a6_h_w1_20k.json or smoke config",
+        help="Path to an explicit MTS-GLT-v2 or MTS-GLT-v3 JSON config",
     )
     parser.add_argument("--resume_state", default=None)
     args = parser.parse_args(argv)
-    return _apply_glt_v2_config(args, args.experiment_config)
+    path = Path(args.experiment_config).resolve()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") == V3_SCHEMA:
+        if args.resume_state:
+            raise ValueError("MTS-GLT-v3 deliberately has no resume path")
+        return _apply_glt_v3_config(args, path, payload)
+    return _apply_glt_v2_config(args, path)
 
 
 __all__ = [
     "BASELINE_SCHEMA",
+    "V3_SCHEMA",
     "dataset_kwargs_from_args",
     "parse_arguments",
 ]

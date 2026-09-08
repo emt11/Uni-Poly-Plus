@@ -120,12 +120,15 @@ def stage_display_name(value):
 
 
 def validate_runtime_args(args) -> None:
-    """Validate the fixed MTS-GLT-v2 baseline runtime."""
+    """Validate the fixed MTS-GLT-v2/v3 runtime."""
 
     if getattr(args, "graph_encoder_type", None) != ROUTE_INTERNAL:
         return
     schema = getattr(args, "config_schema", None)
-    if schema not in {CONFIG_SCHEMA, "mts-glt-v2", "mts-glt-v2-downstream", "manual"}:
+    if schema not in {
+        CONFIG_SCHEMA, "mts-glt-v2", "mts-glt-v2-downstream",
+        "mts-glt-v3-downstream", "manual",
+    }:
         raise ValueError(f"unsupported {ROUTE_NAME} config schema: {schema!r}")
     fixed = {
         "topology_representation": TOPOLOGY_CANONICAL,
@@ -167,8 +170,13 @@ def validate_runtime_args(args) -> None:
             raise ValueError(
                 f"{ROUTE_NAME} runtime requires {name}={expected}"
             )
-    if getattr(args, "mts_glt_version", None) not in {None, "v2"}:
-        raise ValueError("MTS-GLT-v2 baseline requires mts_glt_version=v2")
+    version = getattr(args, "mts_glt_version", None)
+    if version not in {None, "v2", "v3"}:
+        raise ValueError("MTS-GLT runtime requires mts_glt_version=v2 or v3")
+    if version == "v3" and getattr(args, "glt_readout_mode", None) not in {
+        "galformer", "mips_concat",
+    }:
+        raise ValueError("MTS-GLT-v3 downstream readout mode is invalid")
     if getattr(args, "mts_glt_mode", None) not in {
         None, "none", "o8_only", "o8_glt_atom"
     }:

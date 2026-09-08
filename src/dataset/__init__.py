@@ -12,6 +12,10 @@ from .graph_data import (
 )
 from .dataloader import mips_trimer_collate, custom_collate
 from .periodic_line_glt import PeriodicLineGLTSidecar, build_periodic_line_sample
+from .periodic_line_glt_image import (
+    PeriodicLineImageSidecar,
+    build_periodic_line_image_sample,
+)
 
 __all__ = [
     "UniDataset",
@@ -26,4 +30,6 @@ __all__ = [
     "custom_collate",
     "PeriodicLineGLTSidecar",
     "build_periodic_line_sample",
+    "PeriodicLineImageSidecar",
+    "build_periodic_line_image_sample",
 ]

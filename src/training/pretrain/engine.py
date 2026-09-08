@@ -131,14 +131,16 @@ def _joint_masked_atom_terms(data, node_rep, prediction_head, atom_mask):
 
 
 def run_pretrain(args=None):
-    """Dispatch only the retained MTS-GLT-v2 baseline pretraining route."""
+    """Dispatch the independent v2 baseline or v3 Galformer route."""
     args = parse_arguments() if args is None else args
-    if str(getattr(args, "config_schema", "")) != "mts-glt-v2":
-        raise ValueError(
-            "pretraining requires the explicit mts-glt-v2 baseline config"
-        )
-    from src.training.pretrain.glt_v2_engine import run_glt_v2_pretrain
-    return run_glt_v2_pretrain(args)
+    schema = str(getattr(args, "config_schema", ""))
+    if schema == "mts-glt-v2":
+        from src.training.pretrain.glt_v2_engine import run_glt_v2_pretrain
+        return run_glt_v2_pretrain(args)
+    if schema == "mts-glt-v3-galformer-20k":
+        from src.training.pretrain.glt_v3_engine import run_glt_v3_pretrain
+        return run_glt_v3_pretrain(args)
+    raise ValueError(f"unsupported pretraining schema: {schema!r}")
 
 
 def main():

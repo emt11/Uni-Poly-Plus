@@ -1,6 +1,6 @@
 # Uni-Poly-Plus 当前基线流程
 
-本文只描述当前保留的 `MTS-GLT-v2-Base-5k` 及其运行依赖。结果索引见 [`RESULTS.md`](RESULTS.md)，可复现合同见 [`configs/mts/glt_v2_base_5k_v1.json`](configs/mts/glt_v2_base_5k_v1.json) 和 [`results/mts_glt_v2/base_5k_v1/baseline_manifest.json`](results/mts_glt_v2/base_5k_v1/baseline_manifest.json)。
+本文描述正式生产基线 `MTS-GLT-v2-Base-5k`、保留实验路线 `Atomic-PC W-CAMR-v2`，以及已实现但尚未执行正式训练的候选路线 `MTS-GLT-v3-Galformer-20k`。结果索引见 [`RESULTS.md`](RESULTS.md)。
 
 ## 1. 基线身份
 
@@ -119,3 +119,21 @@ seed                    42
 - cache 合同：`scripts/resolve_mips_trimer_scage.py`、`scripts/audit_mips_trimer_cache.py`、`scripts/validate_mts_cache.py`。
 
 正式结果、resolved input、训练日志和 checkpoint 的索引集中在 [`RESULTS.md`](RESULTS.md)。所有新产物必须使用独立目录，不覆盖基线文件。
+
+## 9. 保留实验路线：Atomic-PC W-CAMR-v2
+
+`Atomic-PC W-CAMR-v2` 是唯一保留的非生产实验路线。其下游结构为当前 O8、Original-MIPS MD200/KFuse 和 Center-RU Atomic-PC；完整 Trimer 参加 `kNN=24` 的四层消息传递，最终只池化 `ru_offset == 0` 的中心 RU 原子。
+
+W-CAMR 预训练只更新 Atomic-PC encoder、learned mask embedding 和临时 atom head。它在固定 50K cohort 的 48,101 个合格样本上执行 1,504 optimizer updates，对中心 RU 重原子做 15% weighted masking；权重只控制 mask 抽样，loss 是普通 masked-position mean CE。下游只迁移 `atomic_point_encoder`，不加载临时 mask/head。
+
+入口为 `scripts/run_original_mips_atomic_pc_w_camr_v2.py`，结果位于 `results/original_mips_atomic_pc_w_camr_v2/`。Center-RU 数据构造、50K cohort 解析和历史 matched-reference 读取代码集中在 `src/training/w_camr_v2_support/`；参考产物集中在该结果目录的 `references/`。它们仅作为 W-CAMR-v2 的内部实现与 provenance 依赖保留，不是独立路线。该实验同样使用 `historical_shared5`，不是独立盲测，也不替代正式生产基线。
+
+## 10. 已实现候选：MTS-GLT-v3-Galformer-20k
+
+v3 使用独立的 `mts-periodic-line-glt-image-v1` sidecar。每个周期 line token 只读取一个中心锚点 image 的真实键长；每个 source-image→center-target 关系只读取对应物理实例的一个键角，不计算 Trimer 平移副本的 distance/angle mean、variance、count 或 multiplicity。token 化学输入为端点元素、BondType、BondStereo、IsConjugated，几何输入为原子对条件化的 256 维 Gaussian distance basis；关系角度通过 128 维 Gaussian basis形成 8-head bias。line 邻域仍严格是共享真实原子的 chemical-bond 1-hop。
+
+联合预训练固定为 `L_mask2D + L_mask3D + L_cl`。O8 的 30% canonical atom masking 在 pool 前经过可学习 MD200 scalar-gated node residual；GLT 对 40% line token 使用 80/10/10 corruption与四个 factorized heads；双向 InfoNCE 使用 O8 canonical-atom mean 与 GLT atom/line readout。正式配置为 [`configs/mts/glt_v3_galformer_20k.json`](configs/mts/glt_v3_galformer_20k.json)，只保存 5k/10k/20k probes且没有 resume 路径。
+
+下游公开 `glt_readout_mode=galformer|mips_concat`：默认 `galformer` 只加载 O8 与 MD residual，完全不实例化或读取 GLT/geometry；`mips_concat` 将 atom-aligned O8/GLT states拼成 1024 维并投影回 512 维后再执行 MD residual。sidecar 构建入口为 `scripts/build_mts_glt_v3_sidecars.py`，短 smoke 为 `scripts/smoke_mts_glt_v3.py`，下游调度入口为 `scripts/run_mts_glt_v3_finetune.py`。
+
+当前状态仅为实现、单元测试和两步 smoke；未构建全量 v3 sidecar，未启动 20k 预训练或正式微调，因此 v3 不是新的生产基线，也没有性能结论。

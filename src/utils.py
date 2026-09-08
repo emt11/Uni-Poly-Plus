@@ -185,7 +185,9 @@ def _mts_glt_encoder(model):
     base = _base_model(model)
     graph = base.encoders["graph"] if "graph" in base.encoders else None
     encoder = getattr(graph, "encoder", None)
-    return encoder if getattr(encoder, "architecture_name", "") == "MIPS-Trimer-GLT-v2" else None
+    return encoder if getattr(encoder, "architecture_name", "") in {
+        "MIPS-Trimer-GLT-v2", "MTS-GLT-v3-Galformer"
+    } else None
 
 
 def _configure_mts_trainability(model):
@@ -199,6 +201,10 @@ def _configure_mts_trainability(model):
     graph_module = base.encoders["graph"]
     _set_module_trainable(graph_module, True)
     _set_module_trainable(getattr(encoder.o8, "star_distance_bias", None), False)
+    if getattr(encoder, "architecture_name", "") == "MTS-GLT-v3-Galformer":
+        _set_module_trainable(getattr(encoder.o8, "md_residual", None), False)
+        _set_module_trainable(base.mlp, True)
+        return
     # The retained checkpoint contains a compatibility container for the
     # disabled Compact19 branch; it is never a baseline trainable parameter.
     _set_module_trainable(encoder.compact19_residual, False)
@@ -249,10 +255,15 @@ def _build_downstream_optimizer(
             groups.append({"params": no_decay, "lr": float(lr), "weight_decay": 0.0, "name": f"{name}/no_decay"})
 
     add_module(encoder.o8, mts_o8_lr, "o8")
-    add_module(encoder.glt, mts_geometry_lr, "glt")
-    add_module(encoder.atom_fusion_norm, mts_adapter_lr, "atom_fusion_norm")
-    add_module(encoder.atom_fusion_projection, mts_adapter_lr, "atom_fusion_projection")
-    add_module(encoder.compact19_residual, mts_adapter_lr, "compact19")
+    add_module(getattr(encoder, "glt", None), mts_geometry_lr, "glt")
+    if getattr(encoder, "architecture_name", "") == "MTS-GLT-v3-Galformer":
+        add_module(getattr(encoder, "concat_norm", None), mts_adapter_lr, "concat_norm")
+        add_module(getattr(encoder, "concat_projection", None), mts_adapter_lr, "concat_projection")
+        add_module(encoder.md_residual, mts_adapter_lr, "md200_node_residual")
+    else:
+        add_module(encoder.atom_fusion_norm, mts_adapter_lr, "atom_fusion_norm")
+        add_module(encoder.atom_fusion_projection, mts_adapter_lr, "atom_fusion_projection")
+        add_module(encoder.compact19_residual, mts_adapter_lr, "compact19")
     add_module(graph_module, graph_lr, "graph_adapter")
     add_module(base.mlp, head_lr, "regression_head")
     remaining = [parameter for parameter in base.parameters() if parameter.requires_grad and id(parameter) not in used]
