@@ -1,0 +1,6 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+{'version': 'n_plus_2', 'teacher_grad': 2457.52832315665, 'distill_o8_grad': 7375.627939555794, 'atom_o8_grad': 23608.43804157898, 'atom_md_grad': 1.8400720038916916, 'o8_grad': 21937.118685230613, 'md_grad': 1.8709505856713804, 'status': 'pass'}
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+{'version': 'n_plus_1', 'teacher_grad': 2483.63126091336, 'distill_o8_grad': 7431.1285653421655, 'atom_o8_grad': 22853.569914788008, 'atom_md_grad': 1.8652255732158665, 'o8_grad': 19571.806585505605, 'md_grad': 1.5942226684151137, 'status': 'pass'}

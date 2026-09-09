@@ -90,6 +90,7 @@ def mips_trimer_collate(data_list):
     glt3_token_z_a, glt3_token_z_b, glt3_token_distance = [], [], []
     glt3_token_bond_type, glt3_token_stereo, glt3_token_conjugated = [], [], []
     glt3_token_anchor_q_a, glt3_token_anchor_q_b, glt3_token_valid = [], [], []
+    glt3_token_center_internal = []
     glt3_token_batch, glt3_geometry_valid = [], []
     glt3_relation_source, glt3_relation_target, glt3_relation_center = [], [], []
     glt3_relation_shift, glt3_relation_angle, glt3_relation_valid = [], [], []
@@ -361,6 +362,9 @@ def mips_trimer_collate(data_list):
             glt3_token_anchor_q_a.append(item.glt3_token_anchor_q_a.long())
             glt3_token_anchor_q_b.append(item.glt3_token_anchor_q_b.long())
             glt3_token_valid.append(item.glt3_token_valid.bool())
+            glt3_token_center_internal.append(
+                getattr(item, "glt3_token_center_internal", item.glt3_token_shift == 0).bool()
+            )
             glt3_token_batch.append(torch.full((token_count,), graph_id, dtype=torch.long))
             glt3_relation_source.append(source + glt_token_offset)
             glt3_relation_target.append(target + glt_token_offset)
@@ -606,6 +610,7 @@ def mips_trimer_collate(data_list):
         batch.glt3_token_anchor_q_a = torch.cat(glt3_token_anchor_q_a)
         batch.glt3_token_anchor_q_b = torch.cat(glt3_token_anchor_q_b)
         batch.glt3_token_valid = torch.cat(glt3_token_valid)
+        batch.glt3_token_center_internal = torch.cat(glt3_token_center_internal)
         batch.glt3_token_batch = torch.cat(glt3_token_batch)
         batch.glt3_relation_source = torch.cat(glt3_relation_source)
         batch.glt3_relation_target = torch.cat(glt3_relation_target)

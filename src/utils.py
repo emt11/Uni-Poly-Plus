@@ -186,7 +186,7 @@ def _mts_glt_encoder(model):
     graph = base.encoders["graph"] if "graph" in base.encoders else None
     encoder = getattr(graph, "encoder", None)
     return encoder if getattr(encoder, "architecture_name", "") in {
-        "MIPS-Trimer-GLT-v2", "MTS-GLT-v3-Galformer"
+        "MIPS-Trimer-GLT-v2", "MTS-GLT-v3-Galformer", "MTS-GLT-v2-Distill-Student"
     } else None
 
 
@@ -202,6 +202,10 @@ def _configure_mts_trainability(model):
     _set_module_trainable(graph_module, True)
     _set_module_trainable(getattr(encoder.o8, "star_distance_bias", None), False)
     if getattr(encoder, "architecture_name", "") == "MTS-GLT-v3-Galformer":
+        _set_module_trainable(getattr(encoder.o8, "md_residual", None), False)
+        _set_module_trainable(base.mlp, True)
+        return
+    if getattr(encoder, "architecture_name", "") == "MTS-GLT-v2-Distill-Student":
         _set_module_trainable(getattr(encoder.o8, "md_residual", None), False)
         _set_module_trainable(base.mlp, True)
         return
@@ -260,6 +264,8 @@ def _build_downstream_optimizer(
         add_module(getattr(encoder, "concat_norm", None), mts_adapter_lr, "concat_norm")
         add_module(getattr(encoder, "concat_projection", None), mts_adapter_lr, "concat_projection")
         add_module(encoder.md_residual, mts_adapter_lr, "md200_node_residual")
+    elif getattr(encoder, "architecture_name", "") == "MTS-GLT-v2-Distill-Student":
+        add_module(encoder.md_residual, mts_adapter_lr, "md200_atom_residual")
     else:
         add_module(encoder.atom_fusion_norm, mts_adapter_lr, "atom_fusion_norm")
         add_module(encoder.atom_fusion_projection, mts_adapter_lr, "atom_fusion_projection")

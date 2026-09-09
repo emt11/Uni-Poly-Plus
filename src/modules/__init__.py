@@ -8,6 +8,7 @@ from .periodic_line_glt_v2 import (
 )
 from .mts_glt_v2 import MTSGraphLineModelV2
 from .mts_glt_v3 import MD200NodeResidual, MTSGraphLineModelV3
+from .mts_glt_distill import DistillStudent, NPlusGLTTeacher
 from .periodic_line_glt_v3 import LocalPeriodicGraphLineTransformerV3
 from .uni_encoder import SUPPORTED_MODALITIES, UniEncoderAttention
 from .atomic_point_encoder import AtomicPointEncoder, PackedAtomicPointCloud
@@ -19,6 +20,8 @@ __all__ = [
     "MIPSLocalGraphEncoder",
     "MTSGraphLineModelV2",
     "MTSGraphLineModelV3",
+    "DistillStudent",
+    "NPlusGLTTeacher",
     "MD200NodeResidual",
     "LocalPeriodicGraphLineTransformerV3",
     "SUPPORTED_MODALITIES",

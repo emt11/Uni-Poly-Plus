@@ -1,6 +1,6 @@
 # Uni-Poly-Plus 当前基线流程
 
-本文描述正式生产基线 `MTS-GLT-v2-Base-5k`、保留实验路线 `Atomic-PC W-CAMR-v2`，以及已实现但尚未执行正式训练的候选路线 `MTS-GLT-v3-Galformer-20k`。结果索引见 [`RESULTS.md`](RESULTS.md)。
+本文描述正式生产基线 `MTS-GLT-v2-Base-5k`、保留实验路线 `Atomic-PC W-CAMR-v2`、已完成正式实验的 N+1/N+2 蒸馏路线，以及尚未执行正式训练的候选路线 `MTS-GLT-v3-Galformer-20k`。结果索引见 [`RESULTS.md`](RESULTS.md)。
 
 ## 1. 基线身份
 
@@ -137,3 +137,26 @@ v3 使用独立的 `mts-periodic-line-glt-image-v1` sidecar。每个周期 line 
 下游公开 `glt_readout_mode=galformer|mips_concat`：默认 `galformer` 只加载 O8 与 MD residual，完全不实例化或读取 GLT/geometry；`mips_concat` 将 atom-aligned O8/GLT states拼成 1024 维并投影回 512 维后再执行 MD residual。sidecar 构建入口为 `scripts/build_mts_glt_v3_sidecars.py`，短 smoke 为 `scripts/smoke_mts_glt_v3.py`，下游调度入口为 `scripts/run_mts_glt_v3_finetune.py`。
 
 当前状态仅为实现、单元测试和两步 smoke；未构建全量 v3 sidecar，未启动 20k 预训练或正式微调，因此 v3 不是新的生产基线，也没有性能结论。
+
+## 11. 已完成实验：N+1 / N+2 两阶段蒸馏
+
+该实验新增两个几何语义不同、参数结构一致的 GLT 教师。二者都使用六层严格 chemical-bond 1-hop line graph，token 输入包含无向端点元素、BondType、BondStereo、IsConjugated 与唯一键长，角度只进入 8-head attention bias；最终教师监督和蒸馏只读取中心 N 条内部键。
+
+- `N+2`：中心 N 条内部键加左右两个跨 RU states，分别保留左右真实键长。外围关系按共享原子位于中心 RU 的物理实例重定位，并同时更新 source、target 与角度身份。
+- `N+1`：中心 N 条内部键加一个共享跨 RU state；先对左右真实跨键长度取算术平均，再做距离 RBF。左右周期关系保持独立消息次数。
+
+全量 sidecar 由既有只读 `periodic_line_glt_v1` 与 `periodic_line_glt_image_v1` 派生，没有重建或改写 Trimer 坐标：
+
+```text
+sample_count  995799
+valid_count   959587
+N+2 tokens    28556617
+N+1 tokens    27597030
+relations     73857508（每个版本）
+```
+
+教师阶段各训练 5,000 optimizer steps，目标为 40% 中心内部键的 chemistry、length-RBF 与 angle-RBF 重建。学生阶段各训练 20,000 steps；教师全冻结，学生 O8 使用 Pre-LN、source-Q/target-K、incoming softmax。学生保留 30% masked-atom CE，并在 O8 六层后执行原子条件 MD200 sigmoid-gated residual；融合前 O8 通过中心键 local cosine 与 graph-level multi-positive InfoNCE 接收教师监督。三卡 global batch 为 1008（microbatch 84、accumulation 4），BF16，AdamW LR `2e-4`，教师/学生 warmup 分别为 500/2000 steps。
+
+下游严格只迁移各自学生 20k 的 O8＋MD200 部署包，不实例化 GLT，不读取坐标或 line sidecar。八任务五折使用 `historical_shared5`、seed 42、最多 100 epochs、patience 10；80/80 单元均已正常完成。完整入口为 [`scripts/run_mts_glt_distill_pipeline.py`](scripts/run_mts_glt_distill_pipeline.py)，配置为 [`configs/mts/glt_distill_n_plus_2.json`](configs/mts/glt_distill_n_plus_2.json) 与 [`configs/mts/glt_distill_n_plus_1.json`](configs/mts/glt_distill_n_plus_1.json)，正式产物位于 `results/mts_glt_v2_distill/`。
+
+该路线是已完成的实验，不替换生产基线。N+1/N+2 的比较同时改变边界 state 共享和跨 RU 长度处理；与旧 GLT-v2 的比较还混合 O8 更新、预训练任务、MD 融合及下游输入变化，不能把差值单独归因于蒸馏。

@@ -1,0 +1,62 @@
+W0908 14:10:47.697000 3254436 site-packages/torch/distributed/run.py:774] 
+W0908 14:10:47.697000 3254436 site-packages/torch/distributed/run.py:774] *****************************************
+W0908 14:10:47.697000 3254436 site-packages/torch/distributed/run.py:774] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0908 14:10:47.697000 3254436 site-packages/torch/distributed/run.py:774] *****************************************
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/pretrain_mts_glt_distill.py", line 3, in <module>
+    from src.training.pretrain.glt_distill_engine import run_stage
+ModuleNotFoundError: No module named 'src'
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/pretrain_mts_glt_distill.py", line 3, in <module>
+    from src.training.pretrain.glt_distill_engine import run_stage
+ModuleNotFoundError: No module named 'src'
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/pretrain_mts_glt_distill.py", line 3, in <module>
+    from src.training.pretrain.glt_distill_engine import run_stage
+ModuleNotFoundError: No module named 'src'
+E0908 14:10:48.009000 3254436 site-packages/torch/distributed/elastic/multiprocessing/api.py:874] failed (exitcode: 1) local_rank: 0 (pid: 3254558) of binary: /opt/conda/bin/python3.11
+Traceback (most recent call last):
+  File "/opt/conda/bin/torchrun", line 8, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/opt/conda/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/site-packages/torch/distributed/run.py", line 901, in main
+    run(args)
+  File "/opt/conda/lib/python3.11/site-packages/torch/distributed/run.py", line 892, in run
+    elastic_launch(
+  File "/opt/conda/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 143, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 277, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+scripts/pretrain_mts_glt_distill.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-09-08_14:10:48
+  host      : dzw2
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 3254559)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[2]:
+  time      : 2026-09-08_14:10:48
+  host      : dzw2
+  rank      : 2 (local_rank: 2)
+  exitcode  : 1 (pid: 3254560)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-09-08_14:10:48
+  host      : dzw2
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 3254558)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

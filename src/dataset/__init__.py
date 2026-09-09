@@ -16,6 +16,7 @@ from .periodic_line_glt_image import (
     PeriodicLineImageSidecar,
     build_periodic_line_image_sample,
 )
+from .periodic_line_distill import PeriodicLineDistillSidecar
 
 __all__ = [
     "UniDataset",
@@ -32,4 +33,5 @@ __all__ = [
     "build_periodic_line_sample",
     "PeriodicLineImageSidecar",
     "build_periodic_line_image_sample",
+    "PeriodicLineDistillSidecar",
 ]

@@ -93,7 +93,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--mips_max_hops", type=int, default=2)
     parser.add_argument("--mips_atom_feature_mode", choices=["mips137"], default="mips137")
     parser.add_argument("--mips_attention_scale", choices=["head_dim"], default="head_dim")
-    parser.add_argument("--mips_norm_mode", choices=["post"], default="post")
+    parser.add_argument("--mips_norm_mode", choices=["post", "pre"], default="post")
     parser.add_argument("--mips_activation", choices=["relu"], default="relu")
     parser.add_argument("--mips_spd_bias_mode", choices=["per_head"], default="per_head")
     parser.add_argument("--mips_path_bias_mode", choices=["per_head_single_path_node"], default="per_head_single_path_node")
@@ -118,7 +118,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--star_rbf_upper", type=float, default=3.0)
     parser.add_argument("--periodic_line_glt_sidecar", default=None)
     parser.add_argument("--mts_glt_mode", choices=sorted(MODE_SPECS), default="o8_glt_atom")
-    parser.add_argument("--mts_glt_version", choices=["v2", "v3"], default="v2")
+    parser.add_argument("--mts_glt_version", choices=["v2", "v3", "distill"], default="v2")
     parser.add_argument("--glt_readout_mode", choices=["galformer", "mips_concat"], default="galformer")
     parser.add_argument("--mts_glt_geometry_mode", choices=["full"], default="full")
     parser.add_argument("--mts_glt_layers", type=int, choices=[6], default=6)
@@ -151,7 +151,7 @@ def parse_arguments(argv=None):
         parser.error("MTS-GLT-v2-Base-5k is graph-only with fusion_type=none")
     if args.mts_glt_mode not in MODE_SPECS:
         parser.error("unsupported MTS-GLT-v2 downstream mode")
-    if args.mts_glt_version == "v3":
+    if args.mts_glt_version in {"v3", "distill"}:
         args.mts_glt_mode = "none"
         args.graph_input = "star_linking"
     args.mts_glt_use_compact19 = False

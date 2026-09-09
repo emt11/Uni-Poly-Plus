@@ -91,6 +91,10 @@ from .periodic_line_glt_image import (
     PeriodicLineImageSidecar,
     SIDECAR_SCHEMA as PERIODIC_LINE_IMAGE_SCHEMA,
 )
+from .periodic_line_distill import (
+    PeriodicLineDistillSidecar,
+    SCHEMA_PREFIX as PERIODIC_LINE_DISTILL_SCHEMA_PREFIX,
+)
 from .mts_target_contract import make_target_contract
 from rdkit.Chem import rdFingerprintGenerator
 
@@ -2245,7 +2249,9 @@ class UniDataset(Dataset):
                 sidecar_metadata.read_text(encoding="utf-8")
             ).get("schema")
             sidecar_type = (
-                PeriodicLineImageSidecar
+                PeriodicLineDistillSidecar
+                if str(sidecar_schema).startswith(PERIODIC_LINE_DISTILL_SCHEMA_PREFIX)
+                else PeriodicLineImageSidecar
                 if sidecar_schema == PERIODIC_LINE_IMAGE_SCHEMA
                 else PeriodicLineGLTSidecar
             )
@@ -4609,9 +4615,12 @@ class UniDataset(Dataset):
                 )
             )
             tokens, relations = line_row["tokens"], line_row["relations"]
+            active_line_schema = getattr(
+                self._periodic_line_glt_sidecar, "metadata", {}
+            ).get("schema")
             is_image_v1 = (
-                getattr(self._periodic_line_glt_sidecar, "metadata", {}).get("schema")
-                == PERIODIC_LINE_IMAGE_SCHEMA
+                active_line_schema == PERIODIC_LINE_IMAGE_SCHEMA
+                or str(active_line_schema).startswith(PERIODIC_LINE_DISTILL_SCHEMA_PREFIX)
             )
             prefix = "glt3_" if is_image_v1 else "glt_"
             setattr(data, prefix + "geometry_valid", bool(line_row["geometry_valid"]))

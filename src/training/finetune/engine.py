@@ -178,6 +178,10 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
             glt_readout_mode=str(getattr(args, "glt_readout_mode", "galformer"))
         )
         return model
+    if glt_version == "distill":
+        from src.modules.mts_glt_distill import DistillStudent
+        model.encoders["graph"].encoder = DistillStudent()
+        return model
     glt_mode = str(getattr(args, "mts_glt_mode", "none"))
     if glt_mode != "none":
         if tuple(args.modalities) != ("graph",):
@@ -216,6 +220,17 @@ def select_mts_glt_graph_state(model_state, checkpoint_state):
             + ','.join(missing[:10]) + ' unexpected='
             + ','.join(unexpected[:10])
         )
+    return mapped
+
+
+def select_mts_glt_distill_state(model_state, checkpoint):
+    if checkpoint.get("schema") != "mts-glt-distill-student-deploy-v1" or int(checkpoint.get("step", -1)) != 20000:
+        raise RuntimeError("N+ downstream requires a strict 20k student deploy bundle")
+    graph_prefix = "encoders.graph.encoder."
+    mapped = {graph_prefix + str(key): value for key, value in checkpoint["state_dict"].items()}
+    expected = {key for key in model_state if key.startswith(graph_prefix)}
+    if set(mapped) != expected:
+        raise RuntimeError("N+ student deployment state does not strictly match downstream model")
     return mapped
 
 
@@ -491,6 +506,8 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 glt_state = (
                     select_mts_glt_v3_graph_state(merged_state, checkpoint)
                     if str(getattr(args, "mts_glt_version", "v2")) == "v3"
+                    else select_mts_glt_distill_state(merged_state, checkpoint)
+                    if str(getattr(args, "mts_glt_version", "v2")) == "distill"
                     else select_mts_glt_graph_state(merged_state, checkpoint_state)
                 )
                 merged_state.update(glt_state)
@@ -621,12 +638,18 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
         print(f"Best Validation R2 = {avg_val_r2:.3f} +/- {std_val_r2:.3f}")
         print(f"5-fold mean attention: {format_attention_weights(attention_labels, cv_attention)}")
 
-        # Downstream model persistence is intentionally disabled. The best
-        # fold state remains in memory for evaluation, but saved_models is not
-        # populated after training.
-        # os.makedirs(os.path.join(model_output_dir, task), exist_ok=True)
-        # torch.save(best_model_state, os.path.join(model_output_dir, f'{task}/{args.model_name}_best.pth'))
-        # print(f"Best fold model saved by validation R2: {best_fold_val_r2:.3f}")
+        finetuned_checkpoint_path = None
+        if str(getattr(args, "mts_glt_version", "v2")) == "distill":
+            finetuned_checkpoint_path = Path(args.results_dir).with_name(
+                Path(args.results_dir).stem + "_best.pt"
+            )
+            finetuned_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "schema": "mts-glt-distill-finetune-v1",
+                "task": task, "fold": int(fold_metrics[0]["fold"]),
+                "seed": int(args.seed), "state_dict": best_model_state,
+                "best_validation_r2": float(best_fold_val_r2),
+            }, finetuned_checkpoint_path)
 
         # Save results
         result = {
@@ -642,6 +665,9 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             'eval_batch_size': int(args.eval_batch_size),
             'physical_gpu_id': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
             'checkpoint_path': str(pretrained_model_path) if pretrained_model_path else None,
+            'finetuned_checkpoint_path': (
+                str(finetuned_checkpoint_path) if finetuned_checkpoint_path else None
+            ),
             'model_modality_list': ['graph'],
             'fusion_type': 'none',
             'mips_core': args.mips_core,
