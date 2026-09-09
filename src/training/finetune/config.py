@@ -126,6 +126,13 @@ def parse_arguments(argv=None):
     parser.add_argument("--mts_glt_layers", type=int, choices=[6], default=6)
     parser.add_argument("--mts_glt_attention_variant", choices=["mips"], default="mips")
     parser.add_argument("--head_dropout", type=float, default=0.25)
+    parser.add_argument(
+        "--finetune_strategy",
+        choices=["standard", "staged_head10"],
+        default="standard",
+    )
+    parser.add_argument("--stage1_epochs", type=int, default=10)
+    parser.add_argument("--stage2_epochs", type=int, default=90)
 
     # Cache construction parameters are retained because the baseline Dataset
     # owns the immutable LMDB readers.

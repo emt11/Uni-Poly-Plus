@@ -193,3 +193,23 @@ source        frozen_trimer_coordinates_direct
 下游三组均只实例化 O8、MD200、graph adapter 与 property head，不读取坐标或 line sidecar。固定八任务、五折、seed 42、最多 100 epochs、patience 10；总计 120 个 task/fold。完整阶段入口为 [`scripts/run_mts_glt_distill_repair_pipeline.py`](scripts/run_mts_glt_distill_repair_pipeline.py)，revision-2 构建入口为 [`scripts/build_mts_glt_distill_repair_sidecars_parallel.py`](scripts/build_mts_glt_distill_repair_sidecars_parallel.py)，正式汇总入口为 [`scripts/report_mts_glt_distill_repair.py`](scripts/report_mts_glt_distill_repair.py)。
 
 两份教师、三份学生及 120/120 个下游单元均已完成并通过 checkpoint、预测、split 身份和 OOF 覆盖核验。macro8 R² 为 C0 `0.8061119181`、C1 `0.7978494262`、C2 `0.7930190200`；两条蒸馏路线均未超过 C0。完整指标、成本、异常和产物位置见 [`RESULTS.md`](RESULTS.md) 及 [`results/mts_glt_distill_repair_control/comparison/final_report.md`](results/mts_glt_distill_repair_control/comparison/final_report.md)。
+
+## 13. 已完成诊断：冻结探针与 C0 分阶段微调
+
+本轮不重新预训练，也不修改 GLT、蒸馏目标、MD200、pooling 或 `outer5_inner20`。输入固定为 revision-2 正式部署包：
+
+- C0：`results/mts_glt_distill_repair_control/c0/student/student_deploy_020k.pt`
+- C1：`results/mts_glt_distill_repair_control/c1/student/student_deploy_020k.pt`
+- C2：`results/mts_glt_distill_repair_control/c2/student/student_deploy_020k.pt`
+
+冻结探针直接读取 `DistillStudent.pool(md_residual(canonical_o8))` 的 512 维 graph state，即部署包实际提供、位于随机下游 graph adapter 之前的 pooled O8＋MD200 表示。C0/C1/C2 在 xc、eps 的每个 outer fold 上分别执行 Ridge `alpha={0.1,1,10,100}`；特征和标签 scaler 只拟合 train，alpha 只由原始标签尺度 validation R² 选择，test 不参与选择，也不进行 train＋validation refit。
+
+C0 分阶段微调把现有 graph `LayerNorm→Linear→LayerNorm→ReLU` adapter 与 regression MLP 一并定义为任务 head。第一阶段固定 10 epochs，只训练该任务 head，O8＋MD200 参数和 buffer 不变且保持 `eval()`；第二阶段从第一阶段 validation 最优 head 状态开始，使用新 optimizer 解冻联合训练最多 90 epochs。第二阶段采用 O8/MD/graph adapter `1e-5`、regression MLP `1e-4`、5 epochs warmup、cosine、patience 10；全流程最佳模型可来自任一阶段，并且只由 validation R² 更新。
+
+正式入口与产物：
+
+- 探针：`scripts/run_mts_c0_transfer_probes.py`；30/30 单元位于 `results/mts_c0_transfer_optimization/probes/`。
+- 分阶段微调：`scripts/run_mts_c0_staged_finetune.py`；40/40 单元位于 `results/mts_c0_transfer_optimization/staged_finetune/`。
+- 强审计与汇总：`scripts/report_mts_c0_transfer_optimization.py`；报告位于 `results/mts_c0_transfer_optimization/comparison/`。
+
+所有正式预测均按原 manifest 的 test indices 保存，八个任务的五折 outer-test 各覆盖每个样本一次。正式 Macro8 R² 为 `0.8010382929`，相对既有 C0 为 `-0.0050736252`；因此分阶段方案没有改善整体八任务泛化。冻结探针中 C1/C2 在 xc、eps 均不弱于 C0，诊断证据更偏向微调适应问题，但只覆盖两个任务且不能单独证明因果机制。详细结果见 [`RESULTS.md`](RESULTS.md)。

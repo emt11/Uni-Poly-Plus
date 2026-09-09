@@ -1,0 +1,23 @@
+[finetune] completed unit=42|eat|1; queued=36 active=3
+[finetune] completed unit=42|eat|0; queued=35 active=3
+[finetune] completed unit=42|eat|3; queued=34 active=3
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/run_mts_c0_staged_finetune.py", line 61, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/run_mts_c0_staged_finetune.py", line 57, in main
+    return subprocess.call(command, cwd=ROOT)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/subprocess.py", line 391, in call
+    return p.wait(timeout=timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/subprocess.py", line 1264, in wait
+    return self._wait(timeout=timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/subprocess.py", line 2053, in _wait
+    (pid, sts) = self._try_wait(0)
+                 ^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/subprocess.py", line 2011, in _try_wait
+    (pid, sts) = os.waitpid(self.pid, wait_flags)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

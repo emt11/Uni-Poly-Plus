@@ -1,0 +1,113 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, md200_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics ./data/processed/mips_trimer_scage/diagnostics_smi_all_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Building smi_ei from feature cache:   0%|          | 0/370 [00:00<?, ?it/s]Building smi_ei from feature cache: 100%|██████████| 370/370 [00:00<00:00, 6024.36it/s]
+Built smi_ei: 370 samples from feature cache
+
+Starting task: ei
+Start 5-fold Cross Validation
+
+Fold 4
+Fold seed: 313844
+Evaluation protocol: outer5_inner20
+Fold partitions: train=236, validation=60, test=74
+Created dataloader with 236 samples
+Created dataloader with 74 samples
+Created dataloader with 60 samples
+MTS-GLT-v2 checkpoint load: strictly loaded 91 graph tensors for none.
+Loaded pretrained model from /root/workspace/Uni-Poly-Plus-master/results/mts_glt_distill_repair_control/c0/student/student_deploy_020k.pt
+Using GPU for model training.
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:05,  1.31it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00,  7.90it/s]Training: 100%|██████████| 8/8 [00:00<00:00,  8.01it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.49it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.48it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.32it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 14.30it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 16.13it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 17.44it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.43it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.42it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  6.05it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 14.84it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 19.22it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 18.42it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.42it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.41it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.94it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 13.47it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 17.81it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.88it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.65it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.65it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  6.28it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 14.32it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 19.47it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 18.55it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.68it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.68it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  6.27it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 11.91it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 12.40it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.56it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.21it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.20it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  6.34it/s]Training:  25%|██▌       | 2/8 [00:00<00:00,  6.69it/s]Training:  50%|█████     | 4/8 [00:00<00:00,  9.92it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.69it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.27it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.27it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:02,  2.74it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 10.09it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.58it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.31it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.31it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.85it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.49it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.75it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.34it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.36it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.35it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.88it/s]Training:  25%|██▌       | 2/8 [00:00<00:01,  5.22it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.82it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.59it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  2.53it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  2.52it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.12it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.08it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.83it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 13.13it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.85it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.31it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.31it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.98it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.04it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.79it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.90it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.51it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.38it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.38it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.23it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.94it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.18it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.37it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.83it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.36it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.35it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.19it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.64it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.67it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 14.48it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.85it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.21it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.20it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:02,  3.34it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  8.21it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.22it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.59it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.68it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.29it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.29it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:02,  3.31it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  8.55it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.64it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.22it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.09it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.03it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.03it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.33it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.62it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.21it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.17it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.91it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.02it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.02it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:02,  3.27it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  8.37it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.40it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.96it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.88it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.88it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.87it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.28it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 11.25it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.11it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 15.27it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.87it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.91it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.90it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.08it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.39it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.45it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.78it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.98it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.40it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.39it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.24it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.08it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.23it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 13.98it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.46it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.37it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.37it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.58it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.33it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.93it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.42it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.87it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.47it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.46it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.21it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.78it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.96it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.21it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.02it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.42it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.41it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.75it/s]Training:  25%|██▌       | 2/8 [00:00<00:01,  5.69it/s]Training:  50%|█████     | 4/8 [00:00<00:00,  9.87it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 11.82it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.91it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.20it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.03it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.03it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.10it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.65it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.53it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 14.58it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.87it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.40it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.40it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.49it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.33it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.11it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.33it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.68it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.41it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.40it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.09it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  8.28it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 10.39it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 11.85it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 10.67it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.57it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.57it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:02,  3.29it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  8.10it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 10.69it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 12.21it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 10.80it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.72it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.72it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.13it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.92it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00,  7.38it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00,  9.89it/s]Training: 100%|██████████| 8/8 [00:00<00:00,  9.64it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.67it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.67it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.45it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.65it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.40it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 13.34it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.06it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.64it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.64it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  3.77it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  8.01it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 10.17it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 11.50it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 10.32it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.70it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.70it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.39it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  8.86it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 10.75it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 12.61it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.45it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.31it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.30it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.25it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.45it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.48it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 13.67it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.11it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.17it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.17it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.43it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.55it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.92it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.35it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.83it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.28it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.28it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.26it/s]Training:  25%|██▌       | 2/8 [00:00<00:00,  6.43it/s]Training:  50%|█████     | 4/8 [00:00<00:00,  9.39it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 11.29it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.24it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 10.39it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.08it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.08it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.07it/s]Training:  25%|██▌       | 2/8 [00:00<00:01,  4.93it/s]Training:  50%|█████     | 4/8 [00:00<00:00,  8.05it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 10.22it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.61it/s]Training: 100%|██████████| 8/8 [00:00<00:00,  9.43it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.14it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.13it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.31it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.29it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.12it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.34it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.61it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.24it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.24it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:02,  3.41it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  8.27it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 10.20it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 12.32it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 10.81it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.26it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.25it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:02,  2.75it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  7.19it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 10.04it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 12.67it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 10.52it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.00it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  2.99it/s]
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.06it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  7.68it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 10.49it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 13.14it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.38it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.29it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.28it/s]
+Testing:   0%|          | 0/2 [00:00<?, ?it/s]Testing:  50%|█████     | 1/2 [00:00<00:00,  2.20it/s]Testing: 100%|██████████| 2/2 [00:00<00:00,  4.25it/s]
+Fold 4 Test R2: 0.720, MAE: 0.355, RMSE: 0.509
+Fold 4 attention shape: (74, 1)
+Fold 4 mean attention: graph:1.000000
+
+Average of metrics over all folds
+Test R2 = 0.720
+Test MAE = 0.355
+Test RMSE = 0.509
+Standard Deviation of Test R2 = 0.000
+Standard Deviation of Test MAE = 0.000
+Standard Deviation of Test RMSE = 0.000
+Best Validation R2 = 0.861 +/- 0.000
+5-fold mean attention: graph:1.000000
+Results have been appended to '/root/workspace/Uni-Poly-Plus-master/results/mts_c0_transfer_optimization/staged_finetune/shards/42/ei/fold_3.csv'.

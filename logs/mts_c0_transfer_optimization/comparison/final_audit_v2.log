@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/report_mts_c0_transfer_optimization.py", line 258, in <module>
+    main()
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/report_mts_c0_transfer_optimization.py", line 160, in main
+    seen.extend(audit_prediction(prediction, task, fold).tolist())
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/report_mts_c0_transfer_optimization.py", line 63, in audit_prediction
+    raise RuntimeError(f"prediction identity/finite audit failed: {path}")
+RuntimeError: prediction identity/finite audit failed: /root/workspace/Uni-Poly-Plus-master/results/mts_c0_transfer_optimization/staged_finetune/predictions/42/xc/fold_0.npz
+EXIT=1

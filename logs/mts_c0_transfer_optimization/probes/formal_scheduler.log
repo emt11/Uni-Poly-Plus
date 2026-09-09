@@ -1,0 +1,7 @@
+[finetune] completed unit=0|eps|0; queued=3 active=2
+[finetune] completed unit=0|xc|0; queued=2 active=2
+[finetune] completed unit=1|xc|0; queued=1 active=2
+[finetune] completed unit=1|eps|0; queued=0 active=2
+[finetune] completed unit=2|eps|0; queued=0 active=1
+[finetune] completed unit=2|xc|0; queued=0 active=0
+EXIT=0

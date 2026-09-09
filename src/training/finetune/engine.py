@@ -273,6 +273,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
     from src.utils import (
         TargetScaler, get_data_loader, scale_targets,
         set_global_seed, test_model, train_and_evaluate,
+        staged_train_and_evaluate,
     )
     # Frozen cache readers perform only their local schema/shape/index checks.
     # The old full-bundle hash audit was a separate offline concern and is no
@@ -565,8 +566,14 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 seed=int(fold_seed),
                 experiment_id=str(args.experiment_id),
             )
+            train_function = (
+                staged_train_and_evaluate
+                if str(getattr(args, "finetune_strategy", "standard")) == "staged_head10"
+                else train_and_evaluate
+            )
+            resume_path = Path(task_result_output).with_suffix(".resume.pt")
             metrics = run_single_fold(
-                train_and_evaluate,
+                train_function,
                 model, scaler, train_loader, val_loader, test_loader,
                 device, num_epochs=epochs, patience=patience, max_grad_norm=args.max_grad_norm,
                 graph_lr=args.graph_lr,
@@ -581,8 +588,13 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 mts_geometry_lr=args.mts_geometry_lr,
                 mts_adapter_lr=args.mts_adapter_lr,
                 amp_dtype=args.amp_dtype,
+                stage1_epochs=getattr(args, "stage1_epochs", 10),
+                stage2_epochs=getattr(args, "stage2_epochs", 90),
+                resume_path=str(resume_path) if train_function is staged_train_and_evaluate else None,
                 context=fold_context,
             )
+            if train_function is staged_train_and_evaluate and resume_path.exists():
+                resume_path.unlink()
             metrics['refit_full_train'] = False
             metrics['refit_epochs'] = 0
             prediction_true = metrics.pop('_y_true', None)
@@ -612,6 +624,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                     'train_batch_size': int(args.batch_size),
                     'eval_batch_size': int(args.eval_batch_size),
                     'physical_gpu_id': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
+                    'finetune_strategy': str(getattr(args, 'finetune_strategy', 'standard')),
                 }
                 try:
                     with prediction_tmp.open('wb') as handle:
@@ -686,6 +699,10 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 "best_validation_r2": float(best_fold_val_r2),
                 "evaluation_protocol": protocol,
                 "split_manifest_sha256": split_identity,
+                "finetune_strategy": str(getattr(args, "finetune_strategy", "standard")),
+                "best_stage": fold_metrics[0].get("best_stage"),
+                "stage1_epochs": int(getattr(args, "stage1_epochs", 10)),
+                "stage2_epochs": int(getattr(args, "stage2_epochs", 90)),
                 **pretraining_bundle_identity,
             }, finetuned_checkpoint_path)
 
@@ -722,6 +739,9 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 args.feature_cache_item_timeout
             ),
             'evaluation_protocol': args.evaluation_protocol,
+            'finetune_strategy': str(getattr(args, 'finetune_strategy', 'standard')),
+            'stage1_epochs': int(getattr(args, 'stage1_epochs', 10)),
+            'stage2_epochs': int(getattr(args, 'stage2_epochs', 90)),
             'head_dropout': args.head_dropout,
             'regression_loss': args.regression_loss,
             'huber_beta': args.huber_beta,

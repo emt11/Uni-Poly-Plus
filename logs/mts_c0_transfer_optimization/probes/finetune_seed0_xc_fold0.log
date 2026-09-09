@@ -1,0 +1,6 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, md200_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics ./data/processed/mips_trimer_scage/diagnostics_smi_all_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand4_full_hardtimeout45_fp-disabled_tok0.json
+Building smi_xc from feature cache:   0%|          | 0/432 [00:00<?, ?it/s]Building smi_xc from feature cache:  85%|████████▌ | 369/432 [00:00<00:00, 3679.70it/s]Building smi_xc from feature cache: 100%|██████████| 432/432 [00:00<00:00, 3608.52it/s]
+Built smi_xc: 432 samples from feature cache
+Created dataloader with 432 samples
+Created dataloader with 432 samples

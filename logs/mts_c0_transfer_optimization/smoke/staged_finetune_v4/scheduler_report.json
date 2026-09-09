@@ -1,0 +1,16 @@
+{
+  "completed": [
+    "42|xc|0"
+  ],
+  "gpu_ids": [
+    "0"
+  ],
+  "pending": 0,
+  "schema": "mts-finetune-scheduler-v1",
+  "skipped": [],
+  "slots": 1,
+  "started": [
+    "42|xc|0"
+  ],
+  "units": 1
+}

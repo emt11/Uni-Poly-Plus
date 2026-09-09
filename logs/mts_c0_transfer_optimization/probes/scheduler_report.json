@@ -1,0 +1,28 @@
+{
+  "completed": [
+    "0|eps|0",
+    "0|xc|0",
+    "1|xc|0",
+    "1|eps|0",
+    "2|eps|0",
+    "2|xc|0"
+  ],
+  "gpu_ids": [
+    "0",
+    "1",
+    "2"
+  ],
+  "pending": 0,
+  "probe_units": 30,
+  "schema": "mts-c0-transfer-probe-scheduler-v1",
+  "skipped": [],
+  "slots": 3,
+  "started": [
+    "0|xc|0",
+    "0|eps|0",
+    "1|xc|0",
+    "1|eps|0",
+    "2|xc|0",
+    "2|eps|0"
+  ]
+}

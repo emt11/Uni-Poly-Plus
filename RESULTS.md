@@ -166,3 +166,59 @@ independent blind test        false
 执行期间主机发生两次重启，存活进程被终止；C2 学生从合法 checkpoint 恢复，放弃的 checkpoint 之后日志尾部被保留。C0 10k 中间状态曾使用旧 schema，继续前已保留旧文件、迁移为 repair schema 并严格加载。重启后的冷缓存造成间歇性 I/O 延迟，但没有改变训练步数、global batch、样本顺序或损失定义，最终所有 checkpoint、预测及指标均有限。
 
 `outer5_inner20` 将 validation 与 outer test 分离，但样本仍属于项目已参与开发的数据，因此不是全新独立盲测。旧 GLT-v2 与旧 N+1/N+2 使用 `historical_shared5`，不能把约 `0.844`/`0.832` 与本节数字直接解释为性能升降；新旧路线也同时改变几何修复、O8、MD 融合及下游输入，不能作单机制归因。
+
+## C0 迁移优化诊断与正式结果
+
+本轮只读取 C0/C1/C2 的正式 `student_deploy_020k.pt`，没有重新预训练。冻结表示探针为 30/30，C0 分阶段微调为 40/40；三组均使用同一 `outer5_inner20` manifest。探针结果为五折 mean ± population std：
+
+|组别|任务|R²|MAE|RMSE|相对 C0 R²|正配对 fold|既有全微调 R²|
+|-|-|---:|---:|---:|---:|---:|---:|
+|C0|xc|0.277892 ± 0.146566|15.108926 ± 1.234074|19.877955 ± 1.649107|+0.000000|0/5|0.338937|
+|C0|eps|0.714566 ± 0.024595|0.403318 ± 0.038598|0.590661 ± 0.070592|+0.000000|0/5|0.774609|
+|C1|xc|0.309335 ± 0.080669|15.100900 ± 1.087939|19.555496 ± 1.408404|+0.031444|2/5|0.263701|
+|C1|eps|0.722274 ± 0.040104|0.385852 ± 0.057017|0.583429 ± 0.090673|+0.007708|3/5|0.765674|
+|C2|xc|0.328509 ± 0.109164|14.615452 ± 1.651581|19.266855 ± 1.884372|+0.050617|4/5|0.243918|
+|C2|eps|0.737073 ± 0.039626|0.377830 ± 0.057106|0.568118 ± 0.092739|+0.022507|3/5|0.767894|
+
+30 个单元中 alpha=`100` 被选择 25 次、alpha=`10` 被选择 5 次。C1/C2 在两个任务的冻结线性探针均高于 C0，而对应既有全量微调并未保持这一优势；这更支持“微调适应存在问题”，而不是“C1/C2 冻结表示已弱于 C0”。该判断只覆盖 xc/eps，并且 Ridge 线性可读性不等于表示包含的全部任务信息。
+
+C0 分阶段微调结果：
+
+|Task|StageFT R²|StageFT MAE|StageFT RMSE|既有 C0 R²|R² 增量|
+|-|---:|---:|---:|---:|---:|
+|eat|0.958793 ± 0.016590|0.046044 ± 0.005331|0.071113 ± 0.012056|0.972401|-0.013608|
+|eea|0.904372 ± 0.023816|0.245360 ± 0.018625|0.326952 ± 0.025995|0.908299|-0.003927|
+|egb|0.916708 ± 0.019559|0.406902 ± 0.057912|0.557648 ± 0.081377|0.922540|-0.005832|
+|egc|0.905070 ± 0.005275|0.321150 ± 0.016536|0.481178 ± 0.014898|0.899035|+0.006036|
+|ei|0.777400 ± 0.045132|0.314611 ± 0.023179|0.460359 ± 0.038876|0.789809|-0.012409|
+|eps|0.762523 ± 0.045449|0.360037 ± 0.030683|0.533109 ± 0.038950|0.774609|-0.012086|
+|nc|0.833722 ± 0.049528|0.061150 ± 0.009301|0.095429 ± 0.015987|0.843265|-0.009544|
+|xc|0.349718 ± 0.124205|14.247180 ± 1.633686|18.899933 ± 1.729051|0.338937|+0.010781|
+
+```text
+stageft macro8 R²          0.8010382929
+existing C0 macro8 R²      0.8061119181
+paired macro delta         -0.0050736252
+positive tasks / folds     2/8, 15/40
+best stage                 stage2 for 40/40 folds
+optimizer updates          31,371
+completed units            probes 30/30, staged FT 40/40
+independent blind test     false
+```
+
+分阶段方案改善了 xc 和 egc，但另外六个任务下降，Macro8 为负；因此没有达到 `macro delta ≥ 0.005` 且至少 `6/8` 任务为正的多 seed 复核建议门槛，也不支持继续 sweep 冻结长度或学习率。40/40 最佳 checkpoint 都来自第二阶段；第一阶段模型确实参与全流程 validation 选择，但没有胜出。本比较是 head-first、optimizer 重置与随后联合微调的整体方案差异，不能把结果单独归因于某一个动作。
+
+成本与执行：探针累计约 `0.168` one-GPU h；staged 纯训练累计 `0.641` one-GPU h，包含数据加载、validation、checkpoint 和 test 的 fold wall 累计 `2.136` one-GPU h；四卡正式调度墙钟约 34 分钟。正式命令分别为 `python scripts/run_mts_c0_transfer_probes.py --mode all --gpu-ids 0,1,2` 和 `python scripts/run_mts_c0_staged_finetune.py --gpu-ids 0,1,2,3`，均运行于 `tmux` session `Uni-Poly` 的独立 window。
+
+证据文件：
+
+- 完整报告：[`results/mts_c0_transfer_optimization/comparison/final_report.md`](results/mts_c0_transfer_optimization/comparison/final_report.md)。
+- 机器汇总：[`summary.json`](results/mts_c0_transfer_optimization/comparison/summary.json)。
+- 探针逐 fold 与逐任务：[`probe_fold_metrics.csv`](results/mts_c0_transfer_optimization/comparison/probe_fold_metrics.csv)、[`probe_task_summary.csv`](results/mts_c0_transfer_optimization/comparison/probe_task_summary.csv)。
+- staged 逐 fold 与逐任务：[`stageft_fold_metrics.csv`](results/mts_c0_transfer_optimization/comparison/stageft_fold_metrics.csv)、[`stageft_task_summary.csv`](results/mts_c0_transfer_optimization/comparison/stageft_task_summary.csv)。
+- 40 个正式 checkpoint/指标：[`results/mts_c0_transfer_optimization/staged_finetune/shards/42`](results/mts_c0_transfer_optimization/staged_finetune/shards/42)。
+- 40 个正式预测：[`results/mts_c0_transfer_optimization/staged_finetune/predictions/42`](results/mts_c0_transfer_optimization/staged_finetune/predictions/42)。
+- 正式调度日志：[`probes`](logs/mts_c0_transfer_optimization/probes/formal_scheduler.log)、[`staged`](logs/mts_c0_transfer_optimization/staged_finetune/formal_scheduler.log)、[`report`](logs/mts_c0_transfer_optimization/comparison/final_audit_v4.log)、[`tests`](logs/mts_c0_transfer_optimization/comparison/tests_final.log)。
+- smoke：`results/mts_c0_transfer_optimization/smoke/`；风险相关测试为 `20 passed`。
+
+执行中曾发现第一版 staged 正式启动的第一阶段未复刻 bias/LayerNorm no-decay 分组。受影响调度被停止，三个已完成单元和中断状态整体保留在 `results/mts_c0_transfer_optimization/staged_finetune_invalid_stage1_decay_all_20260909/`，没有进入正式汇总。修正并重新通过 2+2 epoch smoke 后，正式 40 单元从 C0 部署包在全新目录重新启动。

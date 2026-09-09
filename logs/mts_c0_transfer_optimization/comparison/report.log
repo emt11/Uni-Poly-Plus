@@ -1,0 +1,2 @@
+{"best_stage_counts": {"stage2": 40}, "existing_c0_macro8_r2": 0.8061119181158749, "macro8_r2_delta": -0.005073625212747013, "positive_folds": 15, "positive_tasks": 2, "probe_units": 30, "recommend_multiseed_review": false, "schema": "mts-c0-transfer-optimization-report-v1", "staged_units": 40, "stageft_macro8_r2": 0.8010382929031279, "training_seconds": 2306.098138209045}
+EXIT=0

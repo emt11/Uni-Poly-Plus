@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/train.py", line 22, in <module>
+    main()
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/train.py", line 18, in main
+    return run_finetune_job(parse_arguments())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/training/finetune/engine.py", line 270, in run_finetune_job
+    validate_mips_trimer_runtime(args)
+  File "/root/workspace/Uni-Poly-Plus-master/src/dataset/mips_trimer_contract.py", line 133, in validate_runtime_args
+    raise ValueError(f"unsupported {ROUTE_NAME} config schema: {schema!r}")
+ValueError: unsupported MIPS-Trimer-SCAGE config schema: 'mts-c0-staged-finetune-v1'

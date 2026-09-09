@@ -31,6 +31,7 @@ SCIENTIFIC_FLAGS = {
     "--mts_adapter_lr", "--mts_geometry_lr", "--mts_o8_lr",
     "--patience", "--regression_loss", "--target_transform",
     "--warmup_epochs", "--weight_decay", "--fusion_lr",
+    "--finetune_strategy", "--stage1_epochs", "--stage2_epochs",
 }
 
 RESOLVED_FIELDS = {
@@ -58,6 +59,9 @@ RESOLVED_FIELDS = {
     "workers": "loader_workers",
     "evaluation_protocol": "evaluation_protocol",
     "split_manifest_dir": "split_manifest_dir",
+    "finetune_strategy": "finetune_strategy",
+    "stage1_epochs": "stage1_epochs",
+    "stage2_epochs": "stage2_epochs",
 }
 
 
@@ -148,7 +152,7 @@ def resolved_config_from_command(command: list[str], provenance: dict, checkpoin
     return payload
 
 
-def _valid_shard(results_root: Path, unit: ScheduledUnit, *, protocol: str, split_manifest_dir: Path) -> bool:
+def _valid_shard(results_root: Path, unit: ScheduledUnit, *, protocol: str, split_manifest_dir: Path, finetune_strategy: str = "standard") -> bool:
     shard = results_root / "shards" / str(unit.seed) / unit.task / f"fold_{unit.fold}.csv"
     prediction = results_root / "predictions" / str(unit.seed) / unit.task / f"fold_{unit.fold}.npz"
     checkpoint = results_root / "shards" / str(unit.seed) / unit.task / f"fold_{unit.fold}_best.pt"
@@ -191,6 +195,7 @@ def _valid_shard(results_root: Path, unit: ScheduledUnit, *, protocol: str, spli
         checkpoint_identity = (
             saved.get("evaluation_protocol") == protocol
             and saved.get("split_manifest_sha256") == split_sha256
+            and saved.get("finetune_strategy", "standard") == finetune_strategy
         ) if protocol == "outer5_inner20" else True
         prediction_identity = (
             metadata.get("fold_validation_protocol") == protocol
@@ -205,6 +210,7 @@ def _valid_shard(results_root: Path, unit: ScheduledUnit, *, protocol: str, spli
             and int(metadata.get("fold", -1)) == unit.fold
             and prediction_identity
             and str(row.get("evaluation_protocol", "")) == protocol
+            and str(row.get("finetune_strategy", "standard")) == finetune_strategy
             and checkpoint_identity
             and expected_indices is not None
             and np.array_equal(indices, expected_indices)
@@ -357,6 +363,7 @@ def main(argv=None):
             results_root, unit,
             protocol=args.evaluation_protocol,
             split_manifest_dir=split_manifest_dir,
+            finetune_strategy=str(parsed_fixed.finetune_strategy),
         ),
         log_dir=logs_root,
         cwd=ROOT,

@@ -398,6 +398,357 @@ def _cosine_scheduler(optimizer, total_steps, warmup_steps):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, scale)
 
 
+def _rng_state():
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and state.get("cuda") is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _atomic_torch_save(payload, path):
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    temporary = f"{path}.tmp.{os.getpid()}"
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _set_staged_trainability(model, *, encoder_trainable):
+    """Configure the fixed staged-transfer contract.
+
+    The task head consists of the existing graph norm/projection and regression
+    MLP.  The deployment encoder is exactly O8+MD200.
+    """
+    base = _base_model(model)
+    encoder = _mts_glt_encoder(base)
+    if getattr(encoder, "architecture_name", "") != "MTS-GLT-v2-Distill-Student":
+        raise ValueError("staged_head10 requires the repaired DistillStudent")
+    for parameter in base.parameters():
+        parameter.requires_grad = False
+    _set_module_trainable(encoder, encoder_trainable)
+    _set_module_trainable(base.encoders["graph"].norm, True)
+    _set_module_trainable(base.encoders["graph"].projection, True)
+    _set_module_trainable(base.mlp, True)
+    _set_module_trainable(getattr(encoder.o8, "star_distance_bias", None), False)
+    _set_module_trainable(getattr(encoder.o8, "md_residual", None), False)
+
+
+def _staged_train_epoch(
+    model, train_loader, criterion, optimizer, scheduler, device, *,
+    encoder_trainable, max_grad_norm, amp_dtype,
+):
+    model.train()
+    encoder = _mts_glt_encoder(model)
+    if not encoder_trainable:
+        encoder.eval()
+    started = time.perf_counter()
+    losses, steps = [], 0
+    encoder_grad_nonzero = False
+    head_grad_nonzero = False
+    encoder_ids = {id(p) for p in _mts_glt_encoder(model).parameters()}
+    for batch in tqdm(train_loader, desc="Training"):
+        batch = batch.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with _autocast_context(device, amp_dtype):
+            output, _ = model(batch)
+            loss = criterion(output, batch.y)
+        loss.backward()
+        for parameter in model.parameters():
+            if parameter.grad is None or not torch.isfinite(parameter.grad).all():
+                continue
+            nonzero = bool(parameter.grad.detach().abs().max() > 0)
+            if id(parameter) in encoder_ids:
+                encoder_grad_nonzero = encoder_grad_nonzero or nonzero
+            else:
+                head_grad_nonzero = head_grad_nonzero or nonzero
+        if float(max_grad_norm) > 0:
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                float(max_grad_norm),
+            )
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        losses.append(loss.detach().float())
+        steps += 1
+    if not losses:
+        raise RuntimeError("staged fine-tune training loader is empty")
+    elapsed = time.perf_counter() - started
+    return {
+        "loss": float(torch.stack(losses).mean().cpu()),
+        "training_steps": int(steps),
+        "training_seconds": float(elapsed),
+        "encoder_grad_nonzero": bool(encoder_grad_nonzero),
+        "head_grad_nonzero": bool(head_grad_nonzero),
+    }
+
+
+def _audit_optimizer_parameters(model, optimizer):
+    trainable = {id(p) for p in model.parameters() if p.requires_grad}
+    listed = [id(p) for group in optimizer.param_groups for p in group["params"]]
+    if len(listed) != len(set(listed)) or set(listed) != trainable:
+        raise RuntimeError("staged optimizer parameters are duplicated or incomplete")
+
+
+def _build_stage1_optimizer(modules, head_lr, weight_decay):
+    """Use the same decay/no-decay rule as the existing downstream optimizer."""
+    decay, no_decay, used = [], [], set()
+    for module in modules:
+        for name, parameter in module.named_parameters():
+            if not parameter.requires_grad or id(parameter) in used:
+                continue
+            used.add(id(parameter))
+            normalized = name.lower()
+            target = no_decay if (
+                parameter.ndim <= 1 or normalized.endswith("bias")
+                or "norm" in normalized or "gate" in normalized
+            ) else decay
+            target.append(parameter)
+    groups = []
+    if decay:
+        groups.append({"params": decay, "lr": float(head_lr), "weight_decay": float(weight_decay), "name": "task_head/decay"})
+    if no_decay:
+        groups.append({"params": no_decay, "lr": float(head_lr), "weight_decay": 0.0, "name": "task_head/no_decay"})
+    return torch.optim.AdamW(groups)
+
+
+def staged_train_and_evaluate(
+    model,
+    scaler,
+    train_loader,
+    val_loader,
+    test_loader,
+    device,
+    *,
+    stage1_epochs=10,
+    stage2_epochs=90,
+    patience=10,
+    max_grad_norm=1.0,
+    graph_lr=1e-5,
+    head_lr=1e-4,
+    weight_decay=0.02,
+    warmup_epochs=5,
+    regression_loss="huber",
+    huber_beta=0.5,
+    mts_o8_lr=1e-5,
+    mts_geometry_lr=1e-5,
+    mts_adapter_lr=1e-5,
+    amp_dtype="fp32",
+    resume_path=None,
+    return_predictions=False,
+    **_ignored,
+):
+    """Head-first C0 fine-tuning with validation-only global model selection."""
+    if str(amp_dtype) != "fp32":
+        raise ValueError("staged_head10 formal protocol requires fp32")
+    criterion = nn.SmoothL1Loss(beta=float(huber_beta)) if regression_loss == "huber" else nn.MSELoss()
+
+    def snapshot():
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        }
+    stage1_epochs, stage2_epochs = int(stage1_epochs), int(stage2_epochs)
+    if stage1_epochs <= 0 or stage2_epochs <= 0:
+        raise ValueError("both staged fine-tune phases require positive epochs")
+
+    base = _base_model(model)
+    encoder = _mts_glt_encoder(base)
+    encoder_initial = {
+        key: value.detach().cpu().clone()
+        for key, value in encoder.state_dict().items()
+    }
+    history, total_steps, total_seconds = [], 0, 0.0
+    global_best = None
+    global_best_r2 = -float("inf")
+    global_best_rmse = float("inf")
+    global_best_stage, global_best_epoch = "", -1
+    stage = 1
+    start_epoch = 0
+    no_improve = 0
+    stage1_best = None
+    stage1_best_r2 = -float("inf")
+    stage2_best_r2 = -float("inf")
+    stage1_restore_verified = False
+
+    _set_staged_trainability(model, encoder_trainable=False)
+    head_modules = [base.encoders["graph"].norm, base.encoders["graph"].projection, base.mlp]
+    optimizer = _build_stage1_optimizer(head_modules, head_lr, weight_decay)
+    _audit_optimizer_parameters(model, optimizer)
+    scheduler = None
+
+    if resume_path and os.path.isfile(resume_path):
+        saved = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if saved.get("schema") != "mts-c0-stageft-resume-v1":
+            raise RuntimeError("staged fine-tune resume schema mismatch")
+        model.load_state_dict(saved["state_dict"], strict=True)
+        stage = int(saved["stage"])
+        start_epoch = int(saved["next_epoch"])
+        history = list(saved["history"])
+        total_steps = int(saved["total_steps"])
+        total_seconds = float(saved["total_seconds"])
+        global_best = saved["global_best"]
+        global_best_r2 = float(saved["global_best_r2"])
+        global_best_rmse = float(saved["global_best_rmse"])
+        global_best_stage = str(saved["global_best_stage"])
+        global_best_epoch = int(saved["global_best_epoch"])
+        stage1_best = saved["stage1_best"]
+        stage1_best_r2 = float(saved["stage1_best_r2"])
+        stage2_best_r2 = float(saved.get("stage2_best_r2", -float("inf")))
+        stage1_restore_verified = bool(saved.get("stage1_restore_verified", False))
+        no_improve = int(saved["no_improve"])
+        if stage == 1:
+            _set_staged_trainability(model, encoder_trainable=False)
+            optimizer = _build_stage1_optimizer(head_modules, head_lr, weight_decay)
+            _audit_optimizer_parameters(model, optimizer)
+            optimizer.load_state_dict(saved["optimizer"])
+            scheduler = None
+        else:
+            _set_staged_trainability(model, encoder_trainable=True)
+            optimizer = _build_downstream_optimizer(
+                model, graph_lr, head_lr, weight_decay,
+                mts_o8_lr=mts_o8_lr,
+                mts_geometry_lr=mts_geometry_lr,
+                mts_adapter_lr=mts_adapter_lr,
+            )
+            _audit_optimizer_parameters(model, optimizer)
+            scheduler = _cosine_scheduler(
+                optimizer, stage2_epochs * max(1, len(train_loader)),
+                int(warmup_epochs) * len(train_loader),
+            )
+            optimizer.load_state_dict(saved["optimizer"])
+            scheduler.load_state_dict(saved["scheduler"])
+        _restore_rng_state(saved["rng"])
+
+    def save_resume(current_stage, next_epoch):
+        if not resume_path:
+            return
+        _atomic_torch_save({
+            "schema": "mts-c0-stageft-resume-v1",
+            "stage": int(current_stage), "next_epoch": int(next_epoch),
+            "state_dict": copy.deepcopy(model.state_dict()),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "history": history, "total_steps": total_steps,
+            "total_seconds": total_seconds, "global_best": global_best,
+            "global_best_r2": global_best_r2,
+            "global_best_rmse": global_best_rmse,
+            "global_best_stage": global_best_stage,
+            "global_best_epoch": global_best_epoch,
+            "stage1_best": stage1_best, "stage1_best_r2": stage1_best_r2,
+            "stage2_best_r2": stage2_best_r2,
+            "stage1_restore_verified": stage1_restore_verified,
+            "no_improve": no_improve, "rng": _rng_state(),
+        }, resume_path)
+
+    if stage == 1:
+        for epoch in range(start_epoch, stage1_epochs):
+            train = _staged_train_epoch(
+                model, train_loader, criterion, optimizer, None, device,
+                encoder_trainable=False, max_grad_norm=max_grad_norm,
+                amp_dtype=amp_dtype,
+            )
+            total_steps += train["training_steps"]
+            total_seconds += train["training_seconds"]
+            if train["encoder_grad_nonzero"] or not train["head_grad_nonzero"]:
+                raise RuntimeError("stage1 gradient contract failed")
+            val_loss, val_r2, val_true, val_pred = evaluate(model, val_loader, criterion, device, scaler=scaler, amp_dtype=amp_dtype)
+            val_rmse = float(np.sqrt(metrics.mean_squared_error(val_true, val_pred)))
+            history.append({"stage": 1, "epoch": epoch + 1, "train_loss": train["loss"], "val_loss": val_loss, "val_r2": val_r2, "val_rmse": val_rmse})
+            if np.isfinite(val_r2) and val_r2 > stage1_best_r2:
+                stage1_best_r2 = float(val_r2)
+                stage1_best = snapshot()
+            if np.isfinite(val_r2) and val_r2 > global_best_r2:
+                global_best_r2, global_best_rmse = float(val_r2), val_rmse
+                global_best = snapshot()
+                global_best_stage, global_best_epoch = "stage1", epoch + 1
+            save_resume(1, epoch + 1)
+        for key, value in encoder.state_dict().items():
+            if not torch.equal(value.detach().cpu(), encoder_initial[key]):
+                raise RuntimeError(f"stage1 changed frozen encoder state: {key}")
+        if stage1_best is None:
+            raise RuntimeError("stage1 produced no finite validation selection")
+        model.load_state_dict(stage1_best, strict=True)
+        stage1_restore_verified = all(
+            torch.equal(value.detach().cpu(), stage1_best[key].detach().cpu())
+            for key, value in model.state_dict().items()
+        )
+        if not stage1_restore_verified:
+            raise RuntimeError("stage transition did not restore stage1 best state")
+        _set_staged_trainability(model, encoder_trainable=True)
+        optimizer = _build_downstream_optimizer(
+            model, graph_lr, head_lr, weight_decay,
+            mts_o8_lr=mts_o8_lr, mts_geometry_lr=mts_geometry_lr,
+            mts_adapter_lr=mts_adapter_lr,
+        )
+        _audit_optimizer_parameters(model, optimizer)
+        scheduler = _cosine_scheduler(
+            optimizer, stage2_epochs * max(1, len(train_loader)),
+            int(warmup_epochs) * len(train_loader),
+        )
+        no_improve, start_epoch, stage = 0, 0, 2
+        save_resume(2, 0)
+
+    if stage == 2:
+        for epoch in range(start_epoch, stage2_epochs):
+            train = _staged_train_epoch(
+                model, train_loader, criterion, optimizer, scheduler, device,
+                encoder_trainable=True, max_grad_norm=max_grad_norm,
+                amp_dtype=amp_dtype,
+            )
+            total_steps += train["training_steps"]
+            total_seconds += train["training_seconds"]
+            if not train["encoder_grad_nonzero"] or not train["head_grad_nonzero"]:
+                raise RuntimeError("stage2 gradient contract failed")
+            val_loss, val_r2, val_true, val_pred = evaluate(model, val_loader, criterion, device, scaler=scaler, amp_dtype=amp_dtype)
+            val_rmse = float(np.sqrt(metrics.mean_squared_error(val_true, val_pred)))
+            history.append({"stage": 2, "epoch": epoch + 1, "train_loss": train["loss"], "val_loss": val_loss, "val_r2": val_r2, "val_rmse": val_rmse})
+            stage2_improved = bool(np.isfinite(val_r2) and val_r2 > stage2_best_r2)
+            if stage2_improved:
+                stage2_best_r2 = float(val_r2)
+                no_improve = 0
+            else:
+                no_improve += 1
+            if np.isfinite(val_r2) and val_r2 > global_best_r2:
+                global_best_r2, global_best_rmse = float(val_r2), val_rmse
+                global_best = snapshot()
+                global_best_stage, global_best_epoch = "stage2", epoch + 1
+            save_resume(2, epoch + 1)
+            if no_improve >= int(patience):
+                break
+
+    if global_best is None:
+        raise RuntimeError("staged fine-tune produced no finite validation model")
+    model.load_state_dict(global_best, strict=True)
+    result = test_model(model, test_loader, scaler, device, return_predictions=return_predictions, amp_dtype=amp_dtype)
+    result.update({
+        "best_val_r2": global_best_r2, "best_val_rmse": global_best_rmse,
+        "best_epoch": global_best_epoch, "best_stage": global_best_stage,
+        "stage1_epochs_completed": sum(item["stage"] == 1 for item in history),
+        "stage2_epochs_completed": sum(item["stage"] == 2 for item in history),
+        "stage1_restore_verified": bool(stage1_restore_verified),
+        "training_steps": total_steps, "training_seconds": total_seconds,
+        "optimizer_steps_per_second": total_steps / max(total_seconds, 1e-12),
+        "training_epoch_timing": history, "swa_selected": False,
+        "swa_snapshots": 0, "swa_val_r2": float("nan"),
+    })
+    return result
+
+
 def train_and_evaluate(
     model,
     scaler,
