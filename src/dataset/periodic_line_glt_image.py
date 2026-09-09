@@ -264,7 +264,7 @@ def empty_image_row(reason="invalid"):
 class PeriodicLineImageSidecar:
     """Read a packed v3 sidecar written by ``write_image_sidecar``."""
 
-    def __init__(self, root):
+    def __init__(self, root, *, build_key_index=True):
         self.root = Path(root)
         self.metadata = json.loads((self.root / "metadata.json").read_text())
         if self.metadata.get("schema") != SIDECAR_SCHEMA:
@@ -278,9 +278,10 @@ class PeriodicLineImageSidecar:
             for path in self.root.glob("*.npy")
             if path.stem not in {"sample_keys", "token_offsets", "relation_offsets", "geometry_valid"}
         }
-        self._key_to_index = {
-            bytes(row): index for index, row in enumerate(self.sample_keys)
-        }
+        self._key_to_index = (
+            {bytes(row): index for index, row in enumerate(self.sample_keys)}
+            if build_key_index else None
+        )
 
     def __len__(self):
         return int(self.sample_keys.shape[0])
@@ -289,6 +290,8 @@ class PeriodicLineImageSidecar:
         key = bytes(key)
         if row_hint is not None and bytes(self.sample_keys[int(row_hint)]) == key:
             return int(row_hint)
+        if self._key_to_index is None:
+            raise KeyError("sidecar key index disabled and row_hint did not match")
         return self._key_to_index[key]
 
     def model_row(self, index):

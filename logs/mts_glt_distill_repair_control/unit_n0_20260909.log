@@ -1,0 +1,13 @@
+..                                                                       [100%]
+=============================== warnings summary ===============================
+../../../opt/conda/lib/python3.11/site-packages/torch_geometric/llm/utils/backend_utils.py:26
+  /opt/conda/lib/python3.11/site-packages/torch_geometric/llm/utils/backend_utils.py:26: DeprecationWarning: `torch_geometric.distributed` has been deprecated since 2.7.0 and will no longer be maintained. For distributed training, refer to our tutorials on distributed training at https://pytorch-geometric.readthedocs.io/en/latest/tutorial/distributed.html or cuGraph examples at https://github.com/rapidsai/cugraph-gnn/tree/main/python/cugraph-pyg/cugraph_pyg/examples
+    from torch_geometric.distributed import (
+
+tests/test_mts_glt_distill_repair.py::test_real_n_zero_collate_and_teacher_student_loss_exclude_distillation
+  /root/workspace/Uni-Poly-Plus-master/tests/test_mts_glt_distill_repair.py:144: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+  Consider using tensor.detach() first. (Triggered internally at /pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:835.)
+    torch.isfinite(teacher_loss[name]) and float(teacher_loss[name]) == 0.0
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2 passed, 8 deselected, 2 warnings in 36.53s

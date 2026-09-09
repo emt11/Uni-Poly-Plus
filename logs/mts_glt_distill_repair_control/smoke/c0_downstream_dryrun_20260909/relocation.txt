@@ -1,0 +1,9 @@
+status=completed
+tmux_session=Uni-Poly
+tmux_window=relocate-dryrun
+working_directory=/root/workspace/Uni-Poly-Plus-master
+source_results=results/mts_glt_distill_repair_control/c0/downstream/outer5_inner20/resolved
+destination_results=results/mts_glt_distill_repair_control/smoke/c0_downstream_dryrun_20260909/resolved
+source_log=logs/mts_glt_distill_repair_control/c0/downstream/outer5_inner20/scheduler_dry_run.json
+destination_log=logs/mts_glt_distill_repair_control/smoke/c0_downstream_dryrun_20260909/scheduler_dry_run.json
+reason=keep dry-run artifacts separate from formal downstream outputs

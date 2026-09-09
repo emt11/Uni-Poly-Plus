@@ -1,0 +1,18 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_repair_sidecars.py", line 70, in <module>
+    writer.finish()
+^^
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_repair_sidecars.py", line 54, in main
+    try:
+         
+  File "/root/workspace/Uni-Poly-Plus-master/src/dataset/periodic_line_distill_v2.py", line 189, in build_periodic_line_distill_v2_pair
+    
+  File "/root/workspace/Uni-Poly-Plus-master/src/dataset/periodic_line_distill_v2.py", line 121, in build_periodic_line_distill_v2_sample
+    ])
+      
+  File "/root/workspace/Uni-Poly-Plus-master/src/dataset/periodic_line_glt.py", line 248, in _angle
+    if not bool(torch.isfinite(value)):
+                ^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

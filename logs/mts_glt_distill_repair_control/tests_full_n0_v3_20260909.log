@@ -1,0 +1,69 @@
+............F..........                                                  [100%]
+=================================== FAILURES ===================================
+__________ test_final_report_requires_n_zero_resume_and_unit_evidence __________
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-421/test_final_report_requires_n_z0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7bac638fa950>
+
+    def test_final_report_requires_n_zero_resume_and_unit_evidence(tmp_path, monkeypatch):
+        monkeypatch.setattr(repair_report, "ROOT", tmp_path)
+        log_root = tmp_path / "logs/mts_glt_distill_repair_control"
+        log_root.mkdir(parents=True)
+        with pytest.raises(FileNotFoundError, match="required validation evidence"):
+            repair_report.validation_evidence()
+    
+        (log_root / "n0_rank_smoke_20260909.log").write_text(
+            "N_ZERO_RANK_DDP_PASS "
+            f"sample_key={N_ZERO_SAMPLE_KEY_HEX}\n"
+        )
+        (log_root / "resume_current_v5_20260909.log").write_text(
+            "RESUME_CURRENT_NUMERICAL_MATCH step=4 model_atol=2e-6 "
+            "optimizer_atol=2e-5 rng_exact=true abandoned_tail_preserved=true\n"
+        )
+        (log_root / "tests_full_n0_v3_20260909.log").write_text(
+            "22 passed, 1 warning\n"
+        )
+>       evidence = repair_report.validation_evidence()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_mts_glt_distill_repair.py:325: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def validation_evidence():
+        log_root = ROOT / "logs/mts_glt_distill_repair_control"
+        n_zero_log = log_root / "n0_rank_smoke_20260909.log"
+        resume_log = log_root / "resume_current_v5_20260909.log"
+        unit_log = log_root / "tests_full_n0_v3_20260909.log"
+        for path in (n_zero_log, resume_log, unit_log):
+            if not path.is_file():
+                raise FileNotFoundError(f"missing required validation evidence: {path}")
+        n_zero_text = n_zero_log.read_text()
+        resume_text = resume_log.read_text()
+        unit_text = unit_log.read_text()
+        if (
+            "N_ZERO_RANK_DDP_PASS" not in n_zero_text
+            or f"sample_key={N_ZERO_SAMPLE_KEY_HEX}" not in n_zero_text
+        ):
+            raise RuntimeError("three-rank real-data N=0 validation did not pass")
+        required_resume_markers = (
+            "RESUME_CURRENT_NUMERICAL_MATCH step=4",
+            "model_atol=2e-06",
+            "optimizer_atol=2e-05",
+            "rng_exact=true",
+            "abandoned_tail_preserved=true",
+        )
+        if not all(marker in resume_text for marker in required_resume_markers):
+>           raise RuntimeError("current three-rank resume validation did not pass")
+E           RuntimeError: current three-rank resume validation did not pass
+
+scripts/report_mts_glt_distill_repair.py:133: RuntimeError
+=============================== warnings summary ===============================
+../../../opt/conda/lib/python3.11/site-packages/torch_geometric/llm/utils/backend_utils.py:26
+  /opt/conda/lib/python3.11/site-packages/torch_geometric/llm/utils/backend_utils.py:26: DeprecationWarning: `torch_geometric.distributed` has been deprecated since 2.7.0 and will no longer be maintained. For distributed training, refer to our tutorials on distributed training at https://pytorch-geometric.readthedocs.io/en/latest/tutorial/distributed.html or cuGraph examples at https://github.com/rapidsai/cugraph-gnn/tree/main/python/cugraph-pyg/cugraph_pyg/examples
+    from torch_geometric.distributed import (
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_mts_glt_distill_repair.py::test_final_report_requires_n_zero_resume_and_unit_evidence
+1 failed, 22 passed, 1 warning in 31.12s
+REPAIR_TESTS_V3_EXIT:1

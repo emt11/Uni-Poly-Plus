@@ -36,12 +36,14 @@ RELATION_DTYPES = {
 
 
 class PackedWriter:
-    def __init__(self, root: Path, count: int, version: str, keys):
+    def __init__(self, root: Path, count: int, version: str, keys, *, schema_prefix=SCHEMA_PREFIX, metadata_extra=None):
         if root.exists():
             raise FileExistsError(root)
         root.mkdir(parents=True)
         self.root = root
         self.version = version
+        self.schema_prefix = schema_prefix
+        self.metadata_extra = dict(metadata_extra or {})
         self.count = count
         np.save(root / "sample_keys.npy", np.asarray(keys))
         self.token_offsets = np.lib.format.open_memmap(root / "token_offsets.npy", mode="w+", dtype=np.int64, shape=(count + 1,))
@@ -74,7 +76,7 @@ class PackedWriter:
             del target, raw
             self.raw[name].unlink()
         metadata = {
-            "schema": SCHEMA_PREFIX + self.version,
+            "schema": self.schema_prefix + self.version,
             "sample_count": self.count,
             "valid_count": int(self.valid.sum()),
             "token_count": token_total,
@@ -84,6 +86,7 @@ class PackedWriter:
                 "periodic_line_glt_image_v1/PI1M_v2",
             ],
             "geometry_semantics": self.version,
+            **self.metadata_extra,
         }
         (self.root / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
         (self.root / ".done").write_text("complete\n")

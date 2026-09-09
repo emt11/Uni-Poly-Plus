@@ -1,0 +1,15 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+distill-revision2 10000/995799
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_repair_sidecars.py", line 71, in <module>
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_repair_sidecars.py", line 55, in main
+    for version, writer in writers.items():
+                          ^^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/dataset/periodic_line_distill_v2.py", line 56, in build_periodic_line_distill_v2_sample
+    internal = list(_internal_bonds(topology))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/dataset/periodic_line_glt.py", line 260, in _internal_bonds
+    u, v = int(edges[0, column]), int(edges[1, column])
+           ^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

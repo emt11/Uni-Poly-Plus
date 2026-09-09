@@ -127,7 +127,8 @@ def validate_runtime_args(args) -> None:
     schema = getattr(args, "config_schema", None)
     if schema not in {
         CONFIG_SCHEMA, "mts-glt-v2", "mts-glt-v2-downstream",
-        "mts-glt-v3-downstream", "mts-glt-distill-downstream", "manual",
+        "mts-glt-v3-downstream", "mts-glt-distill-downstream",
+        "mts-glt-distill-repair-downstream", "manual",
     }:
         raise ValueError(f"unsupported {ROUTE_NAME} config schema: {schema!r}")
     fixed = {
@@ -139,7 +140,7 @@ def validate_runtime_args(args) -> None:
         "mips_atom_feature_mode": "mips137",
         "mips_attention_scale": "head_dim",
         "mips_norm_mode": (
-            "pre" if getattr(args, "mts_glt_version", None) == "distill" else "post"
+            "pre" if getattr(args, "mts_glt_version", None) in {"distill", "distill_repair"} else "post"
         ),
         "mips_activation": "relu",
         "mips_spd_bias_mode": "per_head",
@@ -173,8 +174,8 @@ def validate_runtime_args(args) -> None:
                 f"{ROUTE_NAME} runtime requires {name}={expected}"
             )
     version = getattr(args, "mts_glt_version", None)
-    if version not in {None, "v2", "v3", "distill"}:
-        raise ValueError("MTS-GLT runtime requires mts_glt_version=v2, v3 or distill")
+    if version not in {None, "v2", "v3", "distill", "distill_repair"}:
+        raise ValueError("MTS-GLT runtime requires mts_glt_version=v2, v3, distill or distill_repair")
     if version == "v3" and getattr(args, "glt_readout_mode", None) not in {
         "galformer", "mips_concat",
     }:

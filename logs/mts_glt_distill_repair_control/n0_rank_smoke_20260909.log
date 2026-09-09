@@ -1,0 +1,11 @@
+W0909 10:34:44.347000 3346047 site-packages/torch/distributed/run.py:774] 
+W0909 10:34:44.347000 3346047 site-packages/torch/distributed/run.py:774] *****************************************
+W0909 10:34:44.347000 3346047 site-packages/torch/distributed/run.py:774] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0909 10:34:44.347000 3346047 site-packages/torch/distributed/run.py:774] *****************************************
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+N_ZERO_RANK_DDP_PASS sample_key=2320ad8ec663f0ca98eb48191b15e8b28b0f1c401a5142be68a286e990fbcfd1 counts=[[0, 1, 0, 0], [16, 1, 1, 1], [16, 1, 1, 1]]

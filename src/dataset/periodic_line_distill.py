@@ -15,11 +15,13 @@ SCHEMA_PREFIX = "mts-periodic-line-distill-v1-"
 
 
 class PeriodicLineDistillSidecar(PeriodicLineImageSidecar):
-    def __init__(self, root):
+    def __init__(self, root, *, build_key_index=True):
         self.root = Path(root)
         self.metadata = json.loads((self.root / "metadata.json").read_text())
         if self.metadata.get("schema") not in {
             SCHEMA_PREFIX + "n_plus_1", SCHEMA_PREFIX + "n_plus_2",
+            "mts-periodic-line-distill-v2-n_plus_1",
+            "mts-periodic-line-distill-v2-n_plus_2",
         }:
             raise ValueError("periodic line distillation sidecar schema mismatch")
         self.sample_keys = np.load(self.root / "sample_keys.npy", mmap_mode="r")
@@ -31,9 +33,10 @@ class PeriodicLineDistillSidecar(PeriodicLineImageSidecar):
             for path in self.root.glob("*.npy")
             if path.stem not in {"sample_keys", "token_offsets", "relation_offsets", "geometry_valid"}
         }
-        self._key_to_index = {
-            bytes(row): index for index, row in enumerate(self.sample_keys)
-        }
+        self._key_to_index = (
+            {bytes(row): index for index, row in enumerate(self.sample_keys)}
+            if build_key_index else None
+        )
 
 
 def _side(q_a: int, q_b: int) -> int:

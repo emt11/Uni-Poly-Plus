@@ -17,10 +17,11 @@ if __name__ == "__main__":
     parser.add_argument("--result-root")
     parser.add_argument("--teacher-checkpoint")
     parser.add_argument("--resume")
+    parser.add_argument("--line-sidecar-root")
     args = parser.parse_args()
     run_stage(
         args.config, args.stage,
         stop_after=args.stop_after, result_root=args.result_root,
         teacher_checkpoint=args.teacher_checkpoint,
-        resume=args.resume,
+        resume=args.resume, line_sidecar_root=args.line_sidecar_root,
     )

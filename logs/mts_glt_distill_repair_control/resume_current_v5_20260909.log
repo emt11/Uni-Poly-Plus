@@ -1,0 +1,45 @@
++ torchrun --standalone --nproc_per_node=3 scripts/pretrain_mts_glt_distill.py --config configs/mts/glt_distill_repair_c0.json --stage student --stop-after 2 --result-root /root/workspace/Uni-Poly-Plus-master/results/mts_glt_distill_repair_control/smoke/resume_current_v5_20260909
+W0909 10:40:38.734000 3348072 site-packages/torch/distributed/run.py:774] 
+W0909 10:40:38.734000 3348072 site-packages/torch/distributed/run.py:774] *****************************************
+W0909 10:40:38.734000 3348072 site-packages/torch/distributed/run.py:774] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0909 10:40:38.734000 3348072 site-packages/torch/distributed/run.py:774] *****************************************
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Created dataloader with 995799 samples
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Created dataloader with 995799 samples
+Created dataloader with 995799 samples
+none student step=1/20000 loss=4.85597 lr=2.000e-07
++ torchrun --standalone --nproc_per_node=3 scripts/pretrain_mts_glt_distill.py --config configs/mts/glt_distill_repair_c0.json --stage student --stop-after 4 --result-root /root/workspace/Uni-Poly-Plus-master/results/mts_glt_distill_repair_control/smoke/resume_current_v5_20260909 --resume /root/workspace/Uni-Poly-Plus-master/results/mts_glt_distill_repair_control/smoke/resume_current_v5_20260909/student/student_step_000002.pt
+W0909 10:41:16.728000 3348394 site-packages/torch/distributed/run.py:774] 
+W0909 10:41:16.728000 3348394 site-packages/torch/distributed/run.py:774] *****************************************
+W0909 10:41:16.728000 3348394 site-packages/torch/distributed/run.py:774] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0909 10:41:16.728000 3348394 site-packages/torch/distributed/run.py:774] *****************************************
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Created dataloader with 995799 samples
+Created dataloader with 995799 samples
+Created dataloader with 995799 samples
++ torchrun --standalone --nproc_per_node=3 scripts/pretrain_mts_glt_distill.py --config configs/mts/glt_distill_repair_c0.json --stage student --stop-after 4 --result-root /root/workspace/Uni-Poly-Plus-master/results/mts_glt_distill_repair_control/smoke/resume_current_v5_20260909_continuous
+W0909 10:41:54.102000 3348628 site-packages/torch/distributed/run.py:774] 
+W0909 10:41:54.102000 3348628 site-packages/torch/distributed/run.py:774] *****************************************
+W0909 10:41:54.102000 3348628 site-packages/torch/distributed/run.py:774] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0909 10:41:54.102000 3348628 site-packages/torch/distributed/run.py:774] *****************************************
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Created dataloader with 995799 samples
+Created dataloader with 995799 samples
+Created dataloader with 995799 samples
+none student step=1/20000 loss=4.85597 lr=2.000e-07
+RESUME_CURRENT_NUMERICAL_MATCH step=4 model_atol=2e-06 optimizer_atol=2e-05 rng_exact=true abandoned_tail_preserved=true

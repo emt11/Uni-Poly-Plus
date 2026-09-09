@@ -2248,15 +2248,23 @@ class UniDataset(Dataset):
             sidecar_schema = json.loads(
                 sidecar_metadata.read_text(encoding="utf-8")
             ).get("schema")
+            is_distill_sidecar = str(sidecar_schema).startswith(
+                (PERIODIC_LINE_DISTILL_SCHEMA_PREFIX, "mts-periodic-line-distill-v2-")
+            )
             sidecar_type = (
                 PeriodicLineDistillSidecar
-                if str(sidecar_schema).startswith(PERIODIC_LINE_DISTILL_SCHEMA_PREFIX)
+                if is_distill_sidecar
                 else PeriodicLineImageSidecar
                 if sidecar_schema == PERIODIC_LINE_IMAGE_SCHEMA
                 else PeriodicLineGLTSidecar
             )
+            sidecar_kwargs = (
+                {"build_key_index": not self._cohort_row_mode}
+                if sidecar_type in {PeriodicLineDistillSidecar, PeriodicLineImageSidecar}
+                else {}
+            )
             self._periodic_line_glt_sidecar = sidecar_type(
-                self.periodic_line_glt_sidecar_root
+                self.periodic_line_glt_sidecar_root, **sidecar_kwargs
             )
             if self._cohort_row_mode and len(self._periodic_line_glt_sidecar) != len(self.data_list):
                 raise RuntimeError("periodic line GLT sidecar record count does not match Dataset")
@@ -4620,7 +4628,9 @@ class UniDataset(Dataset):
             ).get("schema")
             is_image_v1 = (
                 active_line_schema == PERIODIC_LINE_IMAGE_SCHEMA
-                or str(active_line_schema).startswith(PERIODIC_LINE_DISTILL_SCHEMA_PREFIX)
+                or str(active_line_schema).startswith(
+                    (PERIODIC_LINE_DISTILL_SCHEMA_PREFIX, "mts-periodic-line-distill-v2-")
+                )
             )
             prefix = "glt3_" if is_image_v1 else "glt_"
             setattr(data, prefix + "geometry_valid", bool(line_row["geometry_valid"]))

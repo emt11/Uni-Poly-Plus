@@ -56,6 +56,8 @@ RESOLVED_FIELDS = {
     "eval_batch": "eval_batch_size",
     "precision": "amp_dtype",
     "workers": "loader_workers",
+    "evaluation_protocol": "evaluation_protocol",
+    "split_manifest_dir": "split_manifest_dir",
 }
 
 
@@ -146,10 +148,11 @@ def resolved_config_from_command(command: list[str], provenance: dict, checkpoin
     return payload
 
 
-def _valid_shard(results_root: Path, unit: ScheduledUnit) -> bool:
+def _valid_shard(results_root: Path, unit: ScheduledUnit, *, protocol: str, split_manifest_dir: Path) -> bool:
     shard = results_root / "shards" / str(unit.seed) / unit.task / f"fold_{unit.fold}.csv"
     prediction = results_root / "predictions" / str(unit.seed) / unit.task / f"fold_{unit.fold}.npz"
-    if not shard.is_file() or not shard.stat().st_size or not prediction.is_file():
+    checkpoint = results_root / "shards" / str(unit.seed) / unit.task / f"fold_{unit.fold}_best.pt"
+    if not shard.is_file() or not shard.stat().st_size or not prediction.is_file() or not checkpoint.is_file():
         return False
     try:
         import json as _json
@@ -176,10 +179,35 @@ def _valid_shard(results_root: Path, unit: ScheduledUnit) -> bool:
                 return False
             if not np.isfinite(y_true).all() or not np.isfinite(y_pred).all():
                 return False
+        manifest = split_manifest_dir / f"{unit.task}.json"
+        split_sha256 = _sha256_file(manifest) if manifest.is_file() else None
+        manifest_payload = _json.loads(manifest.read_text()) if manifest.is_file() else {}
+        expected_indices = np.asarray(
+            manifest_payload.get("folds", [])[unit.fold].get("test_indices", []),
+            dtype=np.int64,
+        ) if len(manifest_payload.get("folds", ())) > unit.fold else None
+        import torch
+        saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        checkpoint_identity = (
+            saved.get("evaluation_protocol") == protocol
+            and saved.get("split_manifest_sha256") == split_sha256
+        ) if protocol == "outer5_inner20" else True
+        prediction_identity = (
+            metadata.get("fold_validation_protocol") == protocol
+            and metadata.get("split_manifest_sha256") == split_sha256
+            and str(row.get("split_manifest_sha256", "")) == split_sha256
+        ) if protocol == "outer5_inner20" else (
+            metadata.get("fold_validation_protocol") in {"shared_validation_test_fold", "historical_shared5"}
+        )
         return (
             metadata.get("task") == unit.task
             and int(metadata.get("seed", -1)) == unit.seed
             and int(metadata.get("fold", -1)) == unit.fold
+            and prediction_identity
+            and str(row.get("evaluation_protocol", "")) == protocol
+            and checkpoint_identity
+            and expected_indices is not None
+            and np.array_equal(indices, expected_indices)
         )
     except Exception:
         return False
@@ -248,6 +276,8 @@ def main(argv=None):
     # argparse.REMAINDER may receive the separator itself from a caller.
     if fixed and fixed[0] == "--":
         fixed = fixed[1:]
+    parsed_fixed = parse_finetune_arguments(fixed)
+    split_manifest_dir = Path(parsed_fixed.split_manifest_dir).resolve()
 
     def command_factory(unit: ScheduledUnit, gpu: str):
         if os.environ.get("MTS_FAKE_TRAIN", "0") == "1":
@@ -323,7 +353,11 @@ def main(argv=None):
         units,
         gpu_ids=gpu_ids,
         command_factory=command_factory,
-        should_skip=lambda unit: _valid_shard(results_root, unit),
+        should_skip=lambda unit: _valid_shard(
+            results_root, unit,
+            protocol=args.evaluation_protocol,
+            split_manifest_dir=split_manifest_dir,
+        ),
         log_dir=logs_root,
         cwd=ROOT,
     )

@@ -1,0 +1,26 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_repair_sidecars.py", line 80, in <module>
+    if __name__ == "__main__":
+        ^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_repair_sidecars.py", line 56, in main
+    for index in range(count):
+               ^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/dataset/dataset.py", line 4578, in __getitem__
+    data = copy.copy(self._lazy_feature_store[lookup_key])
+                     ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/dataset/lmdb_cache.py", line 1346, in __getitem__
+    merged = copy.copy(self.topology[key])
+                       ~~~~~~~~~~~~~^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/dataset/lmdb_cache.py", line 417, in __getitem__
+    return _deserialize_record(self.get_raw(key), self.schema, key)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/dataset/lmdb_cache.py", line 234, in _deserialize_record
+    record = torch.load(
+             ^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/site-packages/torch/serialization.py", line 1443, in load
+    os.getenv("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "0") in true_values
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 773, in getenv
+KeyboardInterrupt

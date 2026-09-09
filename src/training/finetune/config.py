@@ -79,7 +79,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--regression_loss", choices=["huber"], default="huber")
     parser.add_argument("--huber_beta", type=float, default=0.5)
     parser.add_argument("--target_transform", choices=["recommended", "standard", "log"], default="recommended")
-    parser.add_argument("--evaluation_protocol", choices=["historical_shared5"], default="historical_shared5")
+    parser.add_argument("--evaluation_protocol", choices=["historical_shared5", "outer5_inner20"], default="historical_shared5")
     parser.add_argument("--fold_ids", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--seed", type=int, default=42)
 
@@ -118,7 +118,9 @@ def parse_arguments(argv=None):
     parser.add_argument("--star_rbf_upper", type=float, default=3.0)
     parser.add_argument("--periodic_line_glt_sidecar", default=None)
     parser.add_argument("--mts_glt_mode", choices=sorted(MODE_SPECS), default="o8_glt_atom")
-    parser.add_argument("--mts_glt_version", choices=["v2", "v3", "distill"], default="v2")
+    parser.add_argument("--mts_glt_version", choices=["v2", "v3", "distill", "distill_repair"], default="v2")
+    parser.add_argument("--distill_repair_version", choices=["none", "n_plus_1", "n_plus_2"])
+    parser.add_argument("--allow_smoke_checkpoint", action="store_true")
     parser.add_argument("--glt_readout_mode", choices=["galformer", "mips_concat"], default="galformer")
     parser.add_argument("--mts_glt_geometry_mode", choices=["full"], default="full")
     parser.add_argument("--mts_glt_layers", type=int, choices=[6], default=6)
@@ -151,9 +153,11 @@ def parse_arguments(argv=None):
         parser.error("MTS-GLT-v2-Base-5k is graph-only with fusion_type=none")
     if args.mts_glt_mode not in MODE_SPECS:
         parser.error("unsupported MTS-GLT-v2 downstream mode")
-    if args.mts_glt_version in {"v3", "distill"}:
+    if args.mts_glt_version in {"v3", "distill", "distill_repair"}:
         args.mts_glt_mode = "none"
         args.graph_input = "star_linking"
+    if args.mts_glt_version == "distill_repair" and args.distill_repair_version is None:
+        parser.error("--distill_repair_version is required for distill_repair")
     args.mts_glt_use_compact19 = False
     args.geom_input = "repeat_unit"
     args.freeze_encoder = False

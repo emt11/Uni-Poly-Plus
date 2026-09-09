@@ -1,0 +1,12 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_repair_sidecars.py", line 95, in <module>
+    for writer in writers.values():
+^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_repair_sidecars.py", line 79, in main
+    workers = max(1, int(args.workers))
+                    ^^^^^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_sidecars.py", line 61, in add
+    np.asarray(row["tokens"][name], dtype=dtype).tofile(self.handles[name])
+KeyboardInterrupt

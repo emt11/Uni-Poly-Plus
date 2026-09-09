@@ -1,0 +1,38 @@
+W0909 01:42:15.386000 3300369 site-packages/torch/distributed/run.py:774] 
+W0909 01:42:15.386000 3300369 site-packages/torch/distributed/run.py:774] *****************************************
+W0909 01:42:15.386000 3300369 site-packages/torch/distributed/run.py:774] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0909 01:42:15.386000 3300369 site-packages/torch/distributed/run.py:774] *****************************************
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Created dataloader with 995799 samples
+Created dataloader with 995799 samples
+Created dataloader with 995799 samples
+W0909 01:42:50.197000 3300610 site-packages/torch/distributed/run.py:774] 
+W0909 01:42:50.197000 3300610 site-packages/torch/distributed/run.py:774] *****************************************
+W0909 01:42:50.197000 3300610 site-packages/torch/distributed/run.py:774] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0909 01:42:50.197000 3300610 site-packages/torch/distributed/run.py:774] *****************************************
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+reusing feature-cache diagnostics data/processed/mips_trimer_scage/diagnostics_PI1M_v2_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Created dataloader with 995799 samples
+Created dataloader with 995799 samples
+Created dataloader with 995799 samples
+none student step=1/20000 loss=4.85596 lr=2.000e-07
+Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+  File "/opt/conda/lib/python3.11/site-packages/torch/testing/_comparison.py", line 1587, in assert_close
+    raise error_metas[0].to_error(msg)
+AssertionError: Tensor-likes are not equal!
+
+Mismatched elements: 9637 / 70144 (13.7%)
+Greatest absolute difference: 5.811452865600586e-07 at index (347, 16)
+Greatest relative difference: 0.00266082095913589 at index (356, 16)
+EXIT:1
+RESUME_NUMERICAL_MATCH 101 max_abs 9.480863809585571e-07 rtol=1e-5 atol=1e-6

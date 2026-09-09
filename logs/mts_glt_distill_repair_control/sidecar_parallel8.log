@@ -1,0 +1,16 @@
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_repair_sidecars_parallel.py", line 127, in <module>
+    main()
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/build_mts_glt_distill_repair_sidecars_parallel.py", line 108, in main
+    status = child.wait()
+             ^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/subprocess.py", line 1264, in wait
+    return self._wait(timeout=timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/subprocess.py", line 2053, in _wait
+    (pid, sts) = self._try_wait(0)
+                 ^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/subprocess.py", line 2011, in _try_wait
+    (pid, sts) = os.waitpid(self.pid, wait_flags)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

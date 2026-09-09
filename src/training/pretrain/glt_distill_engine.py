@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from datetime import timedelta
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -115,7 +116,7 @@ def _gather_with_grad(value):
         return value
     from torch.distributed.nn.functional import all_gather
     sizes = _gather_sizes(value)
-    maximum = max(sizes)
+    maximum = max(1, max(sizes))
     padded = F.pad(value, (0, 0, 0, maximum - value.size(0)))
     gathered = tuple(all_gather(padded))
     return torch.cat([item[:size] for item, size in zip(gathered, sizes)], dim=0)
@@ -126,7 +127,7 @@ def _gather_hash(value):
     if not (dist.is_available() and dist.is_initialized()):
         return value
     sizes = _gather_sizes(value)
-    maximum = max(sizes)
+    maximum = max(1, max(sizes))
     padded = F.pad(value, (0, maximum - value.size(0)))
     outputs = [torch.empty_like(padded) for _ in range(dist.get_world_size())]
     dist.all_gather(outputs, padded)
@@ -146,7 +147,7 @@ def multi_positive_infonce(student, teacher, identities, temperature=0.1):
 
 
 class StudentContainer(nn.Module):
-    def __init__(self, teacher):
+    def __init__(self, teacher=None):
         super().__init__()
         self.student = DistillStudent()
         for parameter in self.student.o8.md_residual.parameters():
@@ -154,9 +155,19 @@ class StudentContainer(nn.Module):
         self.atom_head = AtomPredictor()
         self.line_projection = StudentLineProjection()
         self.teacher = teacher
-        self.teacher.eval()
-        for parameter in self.teacher.parameters():
-            parameter.requires_grad = False
+        if self.teacher is None:
+            for parameter in self.line_projection.parameters():
+                parameter.requires_grad = False
+        if self.teacher is not None:
+            self.teacher.eval()
+            for parameter in self.teacher.parameters():
+                parameter.requires_grad = False
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.teacher is not None:
+            self.teacher.eval()
+        return self
 
     def forward(self, data, stream_step, generator=None, atom_mask=None):
         atom_mask = _joint_canonical_mask(data, 42, stream_step, 0.30) if atom_mask is None else atom_mask
@@ -171,11 +182,26 @@ class StudentContainer(nn.Module):
             F.cross_entropy(self.atom_head(raw_masked[indices]).float(), targets, reduction="sum")
             + F.cross_entropy(self.atom_head(fused_masked[indices]).float(), targets, reduction="sum")
         )
-        _, _, clean = self.student.o8.canonical(data)
-        student_lines, line_batch = self.line_projection(data, clean)
-        with torch.no_grad():
-            teacher_output = self.teacher(data)
-            teacher_lines = teacher_output["center_projected"]
+        if self.teacher is None:
+            zero = atom * 0.0
+            return {
+                "atom_sum": atom, "atom_count": int(indices.numel()),
+                "local_sum": zero, "local_count": 0,
+                "global": zero, "valid_graphs": 0, "global_pool": 0,
+                "md_disturbed": int(disturb.sum()), "md_total": int(disturb.numel()),
+            }
+        # Distillation has a private RNG stream so the extra clean O8 pass does
+        # not perturb the atom-task dropout sequence shared with C0.
+        devices = [data.mips_x.device.index] if data.mips_x.is_cuda else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(1_000_000_007 + int(stream_step))
+            if data.mips_x.is_cuda:
+                torch.cuda.manual_seed(1_000_000_007 + int(stream_step))
+            _, _, clean = self.student.o8.canonical(data)
+            student_lines, line_batch = self.line_projection(data, clean)
+            with torch.no_grad():
+                teacher_output = self.teacher(data)
+                teacher_lines = teacher_output["center_projected"]
         if student_lines.shape != teacher_lines.shape:
             raise RuntimeError("student/teacher center-line mapping mismatch")
         cosine = 1.0 - (F.normalize(student_lines.float(), dim=-1) * F.normalize(teacher_lines.float(), dim=-1)).sum(-1)
@@ -184,9 +210,10 @@ class StudentContainer(nn.Module):
         student_graph = scatter(student_lines, line_batch, dim=0, dim_size=graph_count, reduce="mean")
         teacher_graph = scatter(teacher_lines, line_batch, dim=0, dim_size=graph_count, reduce="mean")
         valid = data.glt3_geometry_valid.bool() & (scatter(torch.ones_like(line_batch), line_batch, dim=0, dim_size=graph_count, reduce="sum") > 0)
+        # Every rank enters the same gather collectives, including empty ranks.
         global_loss, global_pool = multi_positive_infonce(
             student_graph[valid], teacher_graph[valid], data.mts_sample_hash64.long()[valid]
-        ) if int(valid.sum()) else (student_graph.sum() * 0.0, 0)
+        )
         return {
             "atom_sum": atom, "atom_count": int(indices.numel()),
             "local_sum": local_sum, "local_count": valid_graphs,
@@ -223,7 +250,8 @@ def _dataset(config):
     template = {
         "schema": "mts-glt-v3-galformer-20k", "experiment_id": config["experiment_id"],
         "dataset_name": "PI1M_v2", "cache_root": "data",
-        "line_sidecar_root": config["line_sidecar_root"],
+        "line_sidecar_root": config.get("line_sidecar_root") or
+            "data/processed/mips_trimer_scage/periodic_line_glt_distill_v2/n_plus_1",
         "md200_sidecar_root": config["md200_sidecar_root"], "result_root": config["result_root"],
         "output_path": config["output_path"], "atom_mask_ratio": 0.3, "line_mask_ratio": 0.4,
         "infonce_temperature": 0.1, "batch_size": config["microbatch"], "loader_workers": config["loader_workers"],
@@ -233,7 +261,10 @@ def _dataset(config):
         "cache_layers": "ru_base,topology,trimer", "glt_readout_mode": "galformer",
     }
     args = _apply_glt_v3_config(args, Path(config["config_path"]), template)
-    return DatasetWithMD200(UniDataset(**dataset_kwargs_from_args(args)), config["md200_sidecar_root"])
+    kwargs = dataset_kwargs_from_args(args)
+    if config["version"] == "none":
+        kwargs["periodic_line_glt_sidecar"] = None
+    return DatasetWithMD200(UniDataset(**kwargs), config["md200_sidecar_root"])
 
 
 def _checkpoint(path, payload):
@@ -244,9 +275,23 @@ def _checkpoint(path, payload):
     os.replace(temporary, path)
 
 
-def _deploy_student(container, step, version):
+def _tensor_state_sha256(state):
+    digest = hashlib.sha256()
+    for name, value in sorted(state.items()):
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode())
+        digest.update(str(tensor.dtype).encode())
+        digest.update(bytes(tensor.numpy()))
+    return digest.hexdigest()
+
+
+def _deploy_student(container, step, version, geometry_revision, *, repair_experiment=False):
     return {
-        "schema": "mts-glt-distill-student-deploy-v1", "version": version, "step": int(step),
+        "schema": (
+            "mts-glt-distill-repair-student-deploy-v1" if repair_experiment
+            else "mts-glt-distill-student-deploy-v1"
+        ), "version": version, "step": int(step),
+        "geometry_revision": geometry_revision,
         "state_dict": {k: v.detach().cpu() for k, v in container.student.state_dict().items()},
         "architecture": "PreLN-sourceQ-O8+atomic-conditioned-MD200",
     }
@@ -254,13 +299,16 @@ def _deploy_student(container, step, version):
 
 def run_stage(
     config_path, stage, *, stop_after=None, result_root=None,
-    teacher_checkpoint=None, resume=None,
+    teacher_checkpoint=None, resume=None, line_sidecar_root=None,
 ):
     config_path = Path(config_path).resolve()
     config = json.loads(config_path.read_text())
     config["config_path"] = str(config_path)
+    repair_experiment = config.get("schema") == "mts-glt-distill-repair-control-v1"
     if result_root is not None:
         config["result_root"] = str(Path(result_root).resolve())
+    if line_sidecar_root is not None:
+        config["line_sidecar_root"] = str(Path(line_sidecar_root).resolve())
     if stage not in {"teacher", "student"}:
         raise ValueError(stage)
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -276,6 +324,14 @@ def run_stage(
         torch.manual_seed(42); torch.cuda.manual_seed_all(42)
         device = torch.device("cuda", local_rank)
         dataset = _dataset(config)
+        if config.get("geometry_revision") == 2:
+            sidecar = dataset.dataset._periodic_line_glt_sidecar
+            metadata = sidecar.metadata
+            if (
+                int(metadata.get("geometry_revision", -1)) != 2
+                or metadata.get("schema") != f"mts-periodic-line-distill-v2-{config['version']}"
+            ):
+                raise RuntimeError("line sidecar version/geometry revision mismatch")
         sampler = torch.utils.data.DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True, seed=42, drop_last=True)
         from src.utils import get_data_loader
         loader = get_data_loader(
@@ -287,23 +343,51 @@ def run_stage(
         version_root = Path(config["result_root"])
         root = version_root / stage
         resume_path = Path(resume).resolve() if resume else None
+        root_error = None
         if rank == 0:
-            if resume_path is None:
-                if root.exists():
-                    raise FileExistsError(root)
-                root.mkdir(parents=True)
-                (root / "resolved_config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
-            elif not resume_path.is_file() or resume_path.parent != root.resolve():
-                raise RuntimeError("resume checkpoint must exist inside the selected stage directory")
-        dist.barrier()
+            try:
+                if resume_path is None:
+                    if root.exists():
+                        raise FileExistsError(root)
+                    root.mkdir(parents=True)
+                    (root / "resolved_config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+                elif not resume_path.is_file() or resume_path.parent != root.resolve():
+                    raise RuntimeError("resume checkpoint must exist inside the selected stage directory")
+            except Exception as error:
+                root_error = f"{type(error).__name__}: {error}"
+        coordinated = [root_error]
+        dist.broadcast_object_list(coordinated, src=0)
+        if coordinated[0] is not None:
+            raise RuntimeError(f"coordinated stage preflight failure: {coordinated[0]}")
+        geometry_revision = config.get("geometry_revision")
         if stage == "teacher":
+            if config["version"] == "none":
+                raise RuntimeError("version=none has no teacher stage")
             container = TeacherContainer().to(device)
             total_steps, warmup = 5000, 500
         else:
-            teacher_path = Path(teacher_checkpoint) if teacher_checkpoint else version_root / "teacher/teacher_005k.pt"
-            teacher_payload = torch.load(teacher_path, map_location="cpu", weights_only=False)
-            teacher = NPlusGLTTeacher()
-            teacher.load_state_dict(teacher_payload["teacher_state"], strict=True)
+            teacher = None
+            if config["version"] != "none":
+                teacher_path = Path(teacher_checkpoint) if teacher_checkpoint else version_root / "teacher/teacher_005k.pt"
+                teacher_payload = torch.load(teacher_path, map_location="cpu", weights_only=False)
+                expected_teacher_schema = (
+                    "mts-glt-distill-repair-teacher-state-v1" if geometry_revision == 2
+                    else "mts-glt-distill-teacher-state-v1"
+                )
+                if (
+                    teacher_payload.get("schema") != expected_teacher_schema
+                    or teacher_payload.get("version") != config["version"]
+                    or int(teacher_payload.get("step", -1)) != (
+                        int(stop_after) if stop_after is not None and int(stop_after) < 5000 else 5000
+                    )
+                    or (geometry_revision == 2 and int(teacher_payload.get("geometry_revision", -1)) != 2)
+                ):
+                    raise RuntimeError("teacher checkpoint version/step/geometry revision mismatch")
+                # Teacher construction must not advance the public student
+                # initialization stream shared with the no-distillation C0.
+                with torch.random.fork_rng(devices=[]):
+                    teacher = NPlusGLTTeacher()
+                teacher.load_state_dict(teacher_payload["teacher_state"], strict=True)
             container = StudentContainer(teacher).to(device)
             total_steps, warmup = 20000, 2000
         run_until = total_steps
@@ -312,6 +396,18 @@ def run_stage(
             if run_until < 1:
                 raise ValueError("stop_after must be positive")
         module = torch.nn.parallel.DistributedDataParallel(container, device_ids=[local_rank], find_unused_parameters=False)
+        if stage == "student" and resume_path is None and rank == 0:
+            common_state = {
+                key: value.detach().cpu()
+                for key, value in container.state_dict().items()
+                if key.startswith(("student.", "atom_head."))
+            }
+            _checkpoint(root / "student_step0_common.pt", {
+                "schema": "mts-glt-distill-repair-common-init-v1",
+                "seed": 42, "version": config["version"],
+                "state_dict": common_state,
+                "sha256": _tensor_state_sha256(common_state),
+            })
         parameters = [p for p in container.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(parameters, lr=2e-4, betas=(0.9,0.98), weight_decay=0.0)
         floor = 1e-9 / 2e-4
@@ -324,10 +420,12 @@ def run_stage(
         resume_payload = None
         if resume_path is not None:
             resume_payload = torch.load(resume_path, map_location="cpu", weights_only=False)
-            expected_schema = f"mts-glt-distill-{stage}-state-v1"
+            schema_stem = "mts-glt-distill-repair" if repair_experiment else "mts-glt-distill"
+            expected_schema = f"{schema_stem}-{stage}-state-v1"
             if (
                 resume_payload.get("schema") != expected_schema
                 or resume_payload.get("version") != config["version"]
+                or resume_payload.get("geometry_revision") != geometry_revision
             ):
                 raise RuntimeError("resume checkpoint identity mismatch")
             start_step = int(resume_payload["step"])
@@ -338,10 +436,23 @@ def run_stage(
             scheduler.load_state_dict(resume_payload["scheduler"])
             if len(resume_payload.get("rng_states", ())) != world:
                 raise RuntimeError("resume checkpoint does not contain per-rank RNG states")
+            resume_log_error = None
             if rank == 0:
-                existing = [json.loads(line) for line in metrics_path.read_text().splitlines()]
-                if len(existing) != start_step or int(existing[-1]["step"]) != start_step:
-                    raise RuntimeError("resume metrics do not end at the checkpoint step")
+                try:
+                    lines = metrics_path.read_text().splitlines()
+                    existing = [json.loads(line) for line in lines]
+                    if len(existing) < start_step or int(existing[start_step - 1]["step"]) != start_step:
+                        raise RuntimeError("resume metrics do not contain the checkpoint step")
+                    if len(existing) > start_step:
+                        abandoned = root / f"training_metrics.abandoned_after_{start_step:06d}.jsonl"
+                        abandoned.write_text("\n".join(lines[start_step:]) + "\n")
+                        metrics_path.write_text("\n".join(lines[:start_step]) + "\n")
+                except Exception as error:
+                    resume_log_error = f"{type(error).__name__}: {error}"
+            coordinated = [resume_log_error]
+            dist.broadcast_object_list(coordinated, src=0)
+            if coordinated[0] is not None:
+                raise RuntimeError(f"coordinated resume log failure: {coordinated[0]}")
         batches_per_epoch = len(loader)
         total_batches = start_step * accumulation
         epoch, batch_offset = divmod(total_batches, batches_per_epoch)
@@ -378,9 +489,12 @@ def run_stage(
                     atom_mask = _joint_canonical_mask(
                         data, 42, step * accumulation + micro, 0.30
                     )
-                    center = data.glt3_token_center_internal.bool() & data.glt3_token_valid.bool()
-                    line_graph = data.glt3_token_batch.long()[center]
-                    valid_graphs = int(torch.unique(line_graph).numel())
+                    if config["version"] == "none":
+                        valid_graphs = 0
+                    else:
+                        center = data.glt3_token_center_internal.bool() & data.glt3_token_valid.bool()
+                        line_graph = data.glt3_token_batch.long()[center]
+                        valid_graphs = int(torch.unique(line_graph).numel())
                     prepared.append((data, seed, atom_mask, int(atom_mask.sum()), valid_graphs))
             if stage == "teacher":
                 total_main = _global_count(sum(item[3] for item in prepared), device)
@@ -462,7 +576,11 @@ def run_stage(
                 with metrics_path.open("a") as handle: handle.write(json.dumps(record, sort_keys=True)+"\n")
                 if completed % 20 == 0 or completed == 1:
                     print(f"{config['version']} {stage} step={completed}/{total_steps} loss={record['loss']:.5f} lr={record['lr']:.3e}", flush=True)
-            should_checkpoint = completed % 1000 == 0 or completed == run_until
+            should_checkpoint = (
+                completed % 1000 == 0
+                or completed == run_until
+                or (repair_experiment and completed % 250 == 0)
+            )
             if should_checkpoint:
                 local_rng = {
                     "cpu": torch.get_rng_state(),
@@ -473,20 +591,32 @@ def run_stage(
                 if rank == 0:
                     next_batches = completed * accumulation
                     next_epoch, next_offset = divmod(next_batches, batches_per_epoch)
+                    schema_stem = "mts-glt-distill-repair" if repair_experiment else "mts-glt-distill"
                     payload = {
-                        "schema": f"mts-glt-distill-{stage}-state-v1", "version": config["version"], "step": completed,
+                        "schema": f"{schema_stem}-{stage}-state-v1", "version": config["version"], "step": completed,
+                        "geometry_revision": geometry_revision,
                         "teacher_state": container.teacher.state_dict() if stage == "teacher" else None,
                         "container_state": container.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                         "rng_states": rng_states,
                         "data_position": {"epoch": next_epoch, "batch_offset": next_offset},
                     }
-                    checkpoint_name = (
-                        f"{stage}_{completed//1000:03d}k.pt" if completed >= 1000
-                        else f"{stage}_step_{completed:06d}.pt"
-                    )
+                    if completed % 1000 == 0:
+                        checkpoint_name = f"{stage}_{completed//1000:03d}k.pt"
+                    elif completed == run_until and run_until < 1000:
+                        checkpoint_name = f"{stage}_step_{completed:06d}.pt"
+                    else:
+                        checkpoint_name = f"{stage}_resume_latest.pt"
                     _checkpoint(root / checkpoint_name, payload)
                     if stage == "student" and completed in {5000,10000,20000}:
-                        _checkpoint(root / f"student_deploy_{completed//1000:03d}k.pt", _deploy_student(container, completed, config["version"]))
+                        _checkpoint(root / f"student_deploy_{completed//1000:03d}k.pt", _deploy_student(
+                            container, completed, config["version"], geometry_revision,
+                            repair_experiment=repair_experiment,
+                        ))
+                    elif stage == "student" and completed == run_until and run_until < 5000:
+                        _checkpoint(root / f"student_deploy_step_{completed:06d}.pt", _deploy_student(
+                            container, completed, config["version"], geometry_revision,
+                            repair_experiment=repair_experiment,
+                        ))
                 dist.barrier()
         dist.barrier()
     finally:

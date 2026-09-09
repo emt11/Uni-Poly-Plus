@@ -1,0 +1,50 @@
++ torchrun --standalone --nproc_per_node=1 scripts/pretrain_mts_glt_distill.py --config configs/mts/glt_distill_repair_c0.json --stage student --stop-after 2 --result-root /root/workspace/Uni-Poly-Plus-master/results/mts_glt_distill_repair_control/smoke/resume_current_v2_20260909
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/pretrain_mts_glt_distill.py", line 22, in <module>
+    run_stage(
+  File "/root/workspace/Uni-Poly-Plus-master/src/training/pretrain/glt_distill_engine.py", line 323, in run_stage
+    raise RuntimeError("formal N+ distillation requires three CUDA ranks")
+RuntimeError: formal N+ distillation requires three CUDA ranks
+E0909 09:15:21.812000 3335644 site-packages/torch/distributed/elastic/multiprocessing/api.py:874] failed (exitcode: 1) local_rank: 0 (pid: 3335760) of binary: /opt/conda/bin/python3.11
+Traceback (most recent call last):
+  File "/opt/conda/bin/torchrun", line 8, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/opt/conda/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/site-packages/torch/distributed/run.py", line 901, in main
+    run(args)
+  File "/opt/conda/lib/python3.11/site-packages/torch/distributed/run.py", line 892, in run
+    elastic_launch(
+  File "/opt/conda/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 143, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 277, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+scripts/pretrain_mts_glt_distill.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-09-09_09:15:21
+  host      : dzw2
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 3335760)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/run_mts_glt_distill_repair_resume_smoke.py", line 97, in <module>
+    main()
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/run_mts_glt_distill_repair_resume_smoke.py", line 69, in main
+    _run(common + ["--stop-after", "2", "--result-root", str(interrupted)], args.gpu_id)
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/run_mts_glt_distill_repair_resume_smoke.py", line 21, in _run
+    subprocess.run(command, cwd=ROOT, env=environment, check=True)
+  File "/opt/conda/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['torchrun', '--standalone', '--nproc_per_node=1', 'scripts/pretrain_mts_glt_distill.py', '--config', 'configs/mts/glt_distill_repair_c0.json', '--stage', 'student', '--stop-after', '2', '--result-root', '/root/workspace/Uni-Poly-Plus-master/results/mts_glt_distill_repair_control/smoke/resume_current_v2_20260909']' returned non-zero exit status 1.

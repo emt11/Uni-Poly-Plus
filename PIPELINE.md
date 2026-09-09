@@ -1,6 +1,6 @@
 # Uni-Poly-Plus 当前基线流程
 
-本文描述正式生产基线 `MTS-GLT-v2-Base-5k`、保留实验路线 `Atomic-PC W-CAMR-v2`、已完成正式实验的 N+1/N+2 蒸馏路线，以及尚未执行正式训练的候选路线 `MTS-GLT-v3-Galformer-20k`。结果索引见 [`RESULTS.md`](RESULTS.md)。
+本文描述正式生产基线 `MTS-GLT-v2-Base-5k`、保留实验路线 `Atomic-PC W-CAMR-v2`、已完成正式实验的旧 N+1/N+2 蒸馏路线、采用独立验证集的 GLT revision-2 对照，以及尚未执行正式训练的候选路线 `MTS-GLT-v3-Galformer-20k`。结果索引见 [`RESULTS.md`](RESULTS.md)。
 
 ## 1. 基线身份
 
@@ -160,3 +160,36 @@ relations     73857508（每个版本）
 下游严格只迁移各自学生 20k 的 O8＋MD200 部署包，不实例化 GLT，不读取坐标或 line sidecar。八任务五折使用 `historical_shared5`、seed 42、最多 100 epochs、patience 10；80/80 单元均已正常完成。完整入口为 [`scripts/run_mts_glt_distill_pipeline.py`](scripts/run_mts_glt_distill_pipeline.py)，配置为 [`configs/mts/glt_distill_n_plus_2.json`](configs/mts/glt_distill_n_plus_2.json) 与 [`configs/mts/glt_distill_n_plus_1.json`](configs/mts/glt_distill_n_plus_1.json)，正式产物位于 `results/mts_glt_v2_distill/`。
 
 该路线是已完成的实验，不替换生产基线。N+1/N+2 的比较同时改变边界 state 共享和跨 RU 长度处理；与旧 GLT-v2 的比较还混合 O8 更新、预训练任务、MD 融合及下游输入变化，不能把差值单独归因于蒸馏。
+
+## 12. 已完成实验：GLT revision 2 与无蒸馏对照
+
+本轮修复实验使用独立根目录 `results/mts_glt_distill_repair_control/`，不覆盖第 11 节的旧 N+1/N+2 产物，也不重跑生产 GLT-v2。三组共享学生 O8、MD200 模块和 atom head 的 seed-42 初始张量、PI1M_v2 样本顺序、20k 预算及下游协议：
+
+|组别|教师|学生目标|下游初始化|
+|-|-|-|-|
+|C0|无|两路 masked-atom CE|O8＋MD200 20k|
+|C1|revision-2 N+1，5k|masked-atom CE＋冻结教师 local/global distillation|O8＋MD200 20k|
+|C2|revision-2 N+2，5k|masked-atom CE＋冻结教师 local/global distillation|O8＋MD200 20k|
+
+revision-2 line graph 直接从现有冻结 Trimer 坐标枚举共享中心 RU 原子的不同物理键，不生成构象，也不从旧 sidecar 推测缺失角度。N+1 把左右跨键映射到一个共享 state，并先对两条真实长度取算术平均；N+2 保留左右两个独立 state 与各自真实长度。关系去重使用物理键身份，不使用 canonical state 身份，因此同原子双连接位点仍保留 N+2 的两个有向跨键关系，或 N+1 中映射后的真实周期自关系及多重性。两个版本都只以中心内部键作为教师重建与蒸馏 target，跨 RU state 只提供上下文。
+
+当前 revision-2 sidecar 合同为：
+
+```text
+root          data/processed/mips_trimer_scage/periodic_line_glt_distill_v2/
+sample_count  995799
+valid_count   959594
+N+1 tokens    27597037
+N+2 tokens    28556631
+relations     73871338（每个版本）
+revision      2
+source        frozen_trimer_coordinates_direct
+```
+
+教师和学生仍使用三卡、microbatch 84、accumulation 4、global batch 1008、BF16、AdamW LR `2e-4`。教师训练 5,000 steps、warmup 500；学生训练 20,000 steps、warmup 2,000。C1/C2 的 local cosine 与 multi-positive InfoNCE 权重均为 `0.1`，在前 2,000 steps 线性 ramp；C0 不加载教师或 line sidecar。MD200 对无效行执行严格零更新，有效行若包含 NaN/Inf 则报错。部署包仅含 O8 与 MD200，不含教师、GLT 或临时 atom/line heads。
+
+下游使用独立协议 `outer5_inner20`：保留既有 `KFold(5, shuffle=True, random_state=1)` 的 outer-test indices；对每折 outer-train 使用 `train_test_split(test_size=0.20, random_state=42+fold)` 生成 validation。标签变换只拟合最终 train，validation 只负责早停和最佳 checkpoint 选择，恢复该折最佳 checkpoint 后才进行一次 outer-test 推理。三个集合的固定 manifest 位于 `data/splits/mips_outer5_inner20/`；该协议与 `historical_shared5` 分开，结果不能互相识别为已完成。
+
+下游三组均只实例化 O8、MD200、graph adapter 与 property head，不读取坐标或 line sidecar。固定八任务、五折、seed 42、最多 100 epochs、patience 10；总计 120 个 task/fold。完整阶段入口为 [`scripts/run_mts_glt_distill_repair_pipeline.py`](scripts/run_mts_glt_distill_repair_pipeline.py)，revision-2 构建入口为 [`scripts/build_mts_glt_distill_repair_sidecars_parallel.py`](scripts/build_mts_glt_distill_repair_sidecars_parallel.py)，正式汇总入口为 [`scripts/report_mts_glt_distill_repair.py`](scripts/report_mts_glt_distill_repair.py)。
+
+两份教师、三份学生及 120/120 个下游单元均已完成并通过 checkpoint、预测、split 身份和 OOF 覆盖核验。macro8 R² 为 C0 `0.8061119181`、C1 `0.7978494262`、C2 `0.7930190200`；两条蒸馏路线均未超过 C0。完整指标、成本、异常和产物位置见 [`RESULTS.md`](RESULTS.md) 及 [`results/mts_glt_distill_repair_control/comparison/final_report.md`](results/mts_glt_distill_repair_control/comparison/final_report.md)。

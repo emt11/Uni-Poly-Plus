@@ -1,0 +1,258 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, md200_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics ./data/processed/mips_trimer_scage/diagnostics_smi_all_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Building smi_eps from feature cache:   0%|          | 0/382 [00:00<?, ?it/s]Building smi_eps from feature cache: 100%|██████████| 382/382 [00:00<00:00, 5471.05it/s]
+Built smi_eps: 382 samples from feature cache
+
+Starting task: eps
+Start 5-fold Cross Validation
+
+Fold 5
+Fold seed: 676076
+Evaluation protocol: outer5_inner20
+Fold partitions: train=244, validation=62, test=76
+Created dataloader with 244 samples
+Created dataloader with 76 samples
+Created dataloader with 62 samples
+MTS-GLT-v2 checkpoint load: strictly loaded 91 graph tensors for none.
+Loaded pretrained model from /root/workspace/Uni-Poly-Plus-master/results/mts_glt_distill_repair_control/c2/student/student_deploy_020k.pt
+Using GPU for model training.
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:06,  1.09it/s]Training:  50%|█████     | 4/8 [00:01<00:00,  4.73it/s]Training:  88%|████████▊ | 7/8 [00:01<00:00,  8.11it/s]Training: 100%|██████████| 8/8 [00:01<00:00,  6.43it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  2.56it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  2.56it/s]
+Epoch 1: Validation R2 improved to -0.0188.
+Epoch 1/100 - train=0.5905 val=0.6926 val_r2=-0.0188
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.63it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.71it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 16.14it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.73it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.67it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.67it/s]
+Epoch 2: No improvement in Validation R2 for 1 epoch(s).
+Epoch 2/100 - train=0.5986 val=0.6902 val_r2=-0.0208
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.19it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 11.47it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.96it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 17.40it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.78it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.71it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.71it/s]
+Epoch 3: No improvement in Validation R2 for 2 epoch(s).
+Epoch 3/100 - train=0.5834 val=0.6861 val_r2=-0.0258
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.26it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.79it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.73it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.56it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.05it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.60it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.60it/s]
+Epoch 4: No improvement in Validation R2 for 3 epoch(s).
+Epoch 4/100 - train=0.5965 val=0.6811 val_r2=-0.0336
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.22it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 11.22it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.62it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.97it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.47it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.89it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.88it/s]
+Epoch 5: No improvement in Validation R2 for 4 epoch(s).
+Epoch 5/100 - train=0.5689 val=0.6748 val_r2=-0.0372
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  3.91it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.65it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.53it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.66it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.11it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.11it/s]
+Epoch 6: Validation R2 improved to 0.0206.
+Epoch 6/100 - train=0.5522 val=0.6463 val_r2=0.0206
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  3.97it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 11.24it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 11.00it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.21it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.52it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.91it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.90it/s]
+Epoch 7: Validation R2 improved to 0.1052.
+Epoch 7/100 - train=0.5063 val=0.6001 val_r2=0.1052
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.29it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.49it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.07it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.70it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.97it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.75it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.74it/s]
+Epoch 8: Validation R2 improved to 0.1847.
+Epoch 8/100 - train=0.4556 val=0.5336 val_r2=0.1847
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:02,  3.42it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  5.26it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00,  7.51it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00,  9.37it/s]Training: 100%|██████████| 8/8 [00:00<00:00,  8.35it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.80it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.79it/s]
+Epoch 9: Validation R2 improved to 0.3151.
+Epoch 9/100 - train=0.3793 val=0.4461 val_r2=0.3151
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.98it/s]Training:  25%|██▌       | 2/8 [00:00<00:01,  4.46it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 10.12it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.95it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.04it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.83it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.82it/s]
+Epoch 10: Validation R2 improved to 0.4213.
+Epoch 10/100 - train=0.2852 val=0.3703 val_r2=0.4213
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.68it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 13.47it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.93it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.02it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  2.47it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  2.46it/s]
+Epoch 11: Validation R2 improved to 0.5134.
+Epoch 11/100 - train=0.2267 val=0.3263 val_r2=0.5134
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:02,  3.47it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 10.99it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 12.63it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.50it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.00it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.00it/s]
+Epoch 12: Validation R2 improved to 0.5642.
+Epoch 12/100 - train=0.2034 val=0.2983 val_r2=0.5642
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.48it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.11it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.30it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.38it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.52it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.97it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.96it/s]
+Epoch 13: Validation R2 improved to 0.5990.
+Epoch 13/100 - train=0.1855 val=0.2764 val_r2=0.5990
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  3.59it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  8.51it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.57it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.66it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.40it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.01it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.00it/s]
+Epoch 14: Validation R2 improved to 0.6101.
+Epoch 14/100 - train=0.1615 val=0.2704 val_r2=0.6101
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  3.88it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  8.99it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.39it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.32it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.06it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.01it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.00it/s]
+Epoch 15: Validation R2 improved to 0.6198.
+Epoch 15/100 - train=0.1663 val=0.2718 val_r2=0.6198
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.24it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.24it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.29it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.12it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.02it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.01it/s]
+Epoch 16: Validation R2 improved to 0.6240.
+Epoch 16/100 - train=0.1494 val=0.2739 val_r2=0.6240
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.20it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.19it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 15.84it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.37it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.08it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.08it/s]
+Epoch 17: Validation R2 improved to 0.6271.
+Epoch 17/100 - train=0.1492 val=0.2739 val_r2=0.6271
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.24it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.26it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.65it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.30it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.01it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.00it/s]
+Epoch 18: Validation R2 improved to 0.6359.
+Epoch 18/100 - train=0.1489 val=0.2682 val_r2=0.6359
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.41it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.12it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00,  9.50it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.73it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.63it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.88it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.88it/s]
+Epoch 19: Validation R2 improved to 0.6404.
+Epoch 19/100 - train=0.1375 val=0.2626 val_r2=0.6404
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.12it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.09it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.12it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.90it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.94it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.93it/s]
+Epoch 20: Validation R2 improved to 0.6519.
+Epoch 20/100 - train=0.1449 val=0.2566 val_r2=0.6519
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.39it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.28it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.68it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.61it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.92it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.92it/s]
+Epoch 21: Validation R2 improved to 0.6575.
+Epoch 21/100 - train=0.1282 val=0.2606 val_r2=0.6575
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.08it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.20it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.46it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.33it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.70it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.70it/s]
+Epoch 22: Validation R2 improved to 0.6618.
+Epoch 22/100 - train=0.1190 val=0.2569 val_r2=0.6618
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.44it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.42it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.41it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 17.17it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.96it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.89it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.88it/s]
+Epoch 23: Validation R2 improved to 0.6681.
+Epoch 23/100 - train=0.1061 val=0.2521 val_r2=0.6681
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.92it/s]Training:  25%|██▌       | 2/8 [00:00<00:01,  5.38it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.70it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.07it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.65it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.01it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.01it/s]
+Epoch 24: No improvement in Validation R2 for 1 epoch(s).
+Epoch 24/100 - train=0.1119 val=0.2610 val_r2=0.6590
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.55it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.68it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.31it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.26it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.11it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.11it/s]
+Epoch 25: No improvement in Validation R2 for 2 epoch(s).
+Epoch 25/100 - train=0.1174 val=0.2588 val_r2=0.6657
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.47it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.18it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 15.91it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.48it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.06it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.05it/s]
+Epoch 26: Validation R2 improved to 0.6712.
+Epoch 26/100 - train=0.1143 val=0.2503 val_r2=0.6712
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.19it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.63it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 16.37it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.89it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.00it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.99it/s]
+Epoch 27: Validation R2 improved to 0.6767.
+Epoch 27/100 - train=0.1197 val=0.2468 val_r2=0.6767
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.35it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.51it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 16.00it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.52it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.14it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.14it/s]
+Epoch 28: No improvement in Validation R2 for 1 epoch(s).
+Epoch 28/100 - train=0.1122 val=0.2543 val_r2=0.6723
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.41it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.72it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.51it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.88it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.68it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.10it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.10it/s]
+Epoch 29: No improvement in Validation R2 for 2 epoch(s).
+Epoch 29/100 - train=0.0941 val=0.2601 val_r2=0.6706
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:02,  2.90it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  7.86it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.10it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.24it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.64it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.13it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.12it/s]
+Epoch 30: Validation R2 improved to 0.6785.
+Epoch 30/100 - train=0.0948 val=0.2554 val_r2=0.6785
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.72it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.71it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 13.36it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.79it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.12it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.11it/s]
+Epoch 31: No improvement in Validation R2 for 1 epoch(s).
+Epoch 31/100 - train=0.1038 val=0.2558 val_r2=0.6756
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.36it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.67it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.83it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.81it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.69it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.23it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.22it/s]
+Epoch 32: Validation R2 improved to 0.6881.
+Epoch 32/100 - train=0.0921 val=0.2458 val_r2=0.6881
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.57it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.33it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.48it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.76it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.97it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.91it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.91it/s]
+Epoch 33: Validation R2 improved to 0.6908.
+Epoch 33/100 - train=0.0884 val=0.2449 val_r2=0.6908
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.70it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.29it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.90it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.37it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.85it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.85it/s]
+Epoch 34: No improvement in Validation R2 for 1 epoch(s).
+Epoch 34/100 - train=0.0815 val=0.2495 val_r2=0.6908
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.59it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.74it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.26it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.22it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.80it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.79it/s]
+Epoch 35: Validation R2 improved to 0.6972.
+Epoch 35/100 - train=0.0883 val=0.2448 val_r2=0.6972
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.31it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.28it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 16.04it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.52it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.04it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.03it/s]
+Epoch 36: No improvement in Validation R2 for 1 epoch(s).
+Epoch 36/100 - train=0.0816 val=0.2478 val_r2=0.6943
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.26it/s]Training:  25%|██▌       | 2/8 [00:00<00:01,  5.85it/s]Training:  50%|█████     | 4/8 [00:00<00:00,  9.85it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 14.30it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.29it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.86it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.86it/s]
+Epoch 37: Validation R2 improved to 0.7088.
+Epoch 37/100 - train=0.0795 val=0.2340 val_r2=0.7088
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.42it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.53it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 16.01it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.55it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.94it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.93it/s]
+Epoch 38: No improvement in Validation R2 for 1 epoch(s).
+Epoch 38/100 - train=0.0873 val=0.2364 val_r2=0.7074
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.92it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 11.02it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.79it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.81it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.12it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  2.92it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  2.92it/s]
+Epoch 39: No improvement in Validation R2 for 2 epoch(s).
+Epoch 39/100 - train=0.0832 val=0.2551 val_r2=0.6889
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.28it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.03it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00,  9.18it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.24it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.48it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.95it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.94it/s]
+Epoch 40: No improvement in Validation R2 for 3 epoch(s).
+Epoch 40/100 - train=0.0693 val=0.2444 val_r2=0.7014
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.76it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.70it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.66it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.39it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.82it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.81it/s]
+Epoch 41: No improvement in Validation R2 for 4 epoch(s).
+Epoch 41/100 - train=0.0795 val=0.2450 val_r2=0.7022
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.49it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.71it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.39it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.25it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.86it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.86it/s]
+Epoch 42: No improvement in Validation R2 for 5 epoch(s).
+Epoch 42/100 - train=0.0742 val=0.2398 val_r2=0.7078
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.24it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 11.04it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.70it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 17.00it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.47it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.87it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.87it/s]
+Epoch 43: Validation R2 improved to 0.7090.
+Epoch 43/100 - train=0.0697 val=0.2414 val_r2=0.7090
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.77it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.92it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.29it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.83it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.16it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.03it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.02it/s]
+Epoch 44: Validation R2 improved to 0.7093.
+Epoch 44/100 - train=0.0786 val=0.2446 val_r2=0.7093
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.15it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.41it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.38it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.99it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.00it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.99it/s]
+Epoch 45: No improvement in Validation R2 for 1 epoch(s).
+Epoch 45/100 - train=0.0722 val=0.2508 val_r2=0.7045
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.37it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 11.27it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.44it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 17.03it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.52it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.01it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.00it/s]
+Epoch 46: Validation R2 improved to 0.7218.
+Epoch 46/100 - train=0.0721 val=0.2293 val_r2=0.7218
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.35it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 11.46it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 14.15it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 17.34it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.83it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.98it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.98it/s]
+Epoch 47: No improvement in Validation R2 for 1 epoch(s).
+Epoch 47/100 - train=0.0684 val=0.2367 val_r2=0.7157
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.44it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 11.77it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.07it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.10it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.88it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.89it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.88it/s]
+Epoch 48: No improvement in Validation R2 for 2 epoch(s).
+Epoch 48/100 - train=0.0696 val=0.2451 val_r2=0.7091
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.38it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.59it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 11.55it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.24it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.79it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.79it/s]
+Epoch 49: No improvement in Validation R2 for 3 epoch(s).
+Epoch 49/100 - train=0.0740 val=0.2542 val_r2=0.6991
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.24it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.25it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00,  9.47it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.48it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.55it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.75it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.75it/s]
+Epoch 50: No improvement in Validation R2 for 4 epoch(s).
+Epoch 50/100 - train=0.0640 val=0.2420 val_r2=0.7149
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.06it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.29it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 13.10it/s]Training:  88%|████████▊ | 7/8 [00:00<00:00, 14.98it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.53it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.94it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.94it/s]
+Epoch 51: No improvement in Validation R2 for 5 epoch(s).
+Epoch 51/100 - train=0.0618 val=0.2437 val_r2=0.7144
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  5.11it/s]Training:  25%|██▌       | 2/8 [00:00<00:01,  5.61it/s]Training:  50%|█████     | 4/8 [00:00<00:00,  8.80it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 11.53it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 11.21it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.14it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  3.13it/s]
+Epoch 52: No improvement in Validation R2 for 6 epoch(s).
+Epoch 52/100 - train=0.0576 val=0.2461 val_r2=0.7120
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.66it/s]Training:  38%|███▊      | 3/8 [00:00<00:00, 10.20it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 12.62it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 16.09it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 13.51it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.18it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  5.17it/s]
+Epoch 53: No improvement in Validation R2 for 7 epoch(s).
+Epoch 53/100 - train=0.0627 val=0.2379 val_r2=0.7185
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.56it/s]Training:  50%|█████     | 4/8 [00:00<00:00, 12.70it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.81it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.55it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.97it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.97it/s]
+Epoch 54: No improvement in Validation R2 for 8 epoch(s).
+Epoch 54/100 - train=0.0611 val=0.2436 val_r2=0.7154
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.91it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.56it/s]Training:  75%|███████▌  | 6/8 [00:00<00:00, 14.51it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 14.09it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.91it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.91it/s]
+Epoch 55: No improvement in Validation R2 for 9 epoch(s).
+Epoch 55/100 - train=0.0534 val=0.2472 val_r2=0.7135
+Training:   0%|          | 0/8 [00:00<?, ?it/s]Training:  12%|█▎        | 1/8 [00:00<00:01,  4.38it/s]Training:  38%|███▊      | 3/8 [00:00<00:00,  9.93it/s]Training:  62%|██████▎   | 5/8 [00:00<00:00, 11.21it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 15.03it/s]Training: 100%|██████████| 8/8 [00:00<00:00, 12.60it/s]
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.91it/s]Evaluating: 100%|██████████| 1/1 [00:00<00:00,  4.91it/s]
+Epoch 56: No improvement in Validation R2 for 10 epoch(s).
+Epoch 56/100 - train=0.0623 val=0.2475 val_r2=0.7147
+Early stopping after 10 epochs with no improvement.
+Testing:   0%|          | 0/2 [00:00<?, ?it/s]Testing:  50%|█████     | 1/2 [00:00<00:00,  2.54it/s]Testing: 100%|██████████| 2/2 [00:00<00:00,  4.86it/s]
+Fold 5 Test R2: 0.839, MAE: 0.341, RMSE: 0.494
+Fold 5 attention shape: (76, 1)
+Fold 5 mean attention: graph:1.000000
+
+Average of metrics over all folds
+Test R2 = 0.839
+Test MAE = 0.341
+Test RMSE = 0.494
+Standard Deviation of Test R2 = 0.000
+Standard Deviation of Test MAE = 0.000
+Standard Deviation of Test RMSE = 0.000
+Best Validation R2 = 0.722 +/- 0.000
+5-fold mean attention: graph:1.000000
+Results have been appended to '/root/workspace/Uni-Poly-Plus-master/results/mts_glt_distill_repair_control/c2/downstream/outer5_inner20/shards/42/eps/fold_4.csv'.

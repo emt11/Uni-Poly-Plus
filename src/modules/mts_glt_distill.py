@@ -92,7 +92,13 @@ class AtomicConditionedMD200(nn.Module):
         values = data.mips_md if md200 is None else md200
         valid_graph = data.mips_md_valid.bool().flatten()
         graph_id = data.canonical_graph_index.long()
-        md = self.md(values.float())
+        if bool((~torch.isfinite(values[valid_graph])).any()):
+            raise ValueError("valid MD200 row contains NaN/Inf")
+        # Invalid descriptor rows never enter LayerNorm/MLP.  Their encoded
+        # value and therefore their atom update are exactly zero.
+        md = canonical.new_zeros((values.size(0), 64), dtype=torch.float32)
+        if bool(valid_graph.any()):
+            md[valid_graph] = self.md(values[valid_graph].float()).float()
         q = self.query(self.atom_norm(canonical))
         k = self.key(md)[graph_id]
         gate = torch.sigmoid((q.float() * k.float()).sum(-1) / math.sqrt(64.0) + self.bias.float())

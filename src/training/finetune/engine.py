@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import hashlib
 import warnings
 import time
 import torch
@@ -178,7 +179,7 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
             glt_readout_mode=str(getattr(args, "glt_readout_mode", "galformer"))
         )
         return model
-    if glt_version == "distill":
+    if glt_version in {"distill", "distill_repair"}:
         from src.modules.mts_glt_distill import DistillStudent
         model.encoders["graph"].encoder = DistillStudent()
         return model
@@ -223,9 +224,18 @@ def select_mts_glt_graph_state(model_state, checkpoint_state):
     return mapped
 
 
-def select_mts_glt_distill_state(model_state, checkpoint):
-    if checkpoint.get("schema") != "mts-glt-distill-student-deploy-v1" or int(checkpoint.get("step", -1)) != 20000:
+def select_mts_glt_distill_state(model_state, checkpoint, expected_version=None, allow_smoke=False):
+    if checkpoint.get("schema") not in {
+        "mts-glt-distill-student-deploy-v1",
+        "mts-glt-distill-repair-student-deploy-v1",
+    } or (int(checkpoint.get("step", -1)) != 20000 and not allow_smoke):
         raise RuntimeError("N+ downstream requires a strict 20k student deploy bundle")
+    if checkpoint.get("schema") == "mts-glt-distill-repair-student-deploy-v1":
+        if checkpoint.get("version") != expected_version:
+            raise RuntimeError("repair student deployment version mismatch")
+        expected_revision = None if expected_version == "none" else 2
+        if checkpoint.get("geometry_revision") != expected_revision:
+            raise RuntimeError("repair student deployment geometry revision mismatch")
     graph_prefix = "encoders.graph.encoder."
     mapped = {graph_prefix + str(key): value for key, value in checkpoint["state_dict"].items()}
     expected = {key for key in model_state if key.startswith(graph_prefix)}
@@ -283,7 +293,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             graph_encoder_type="mips_trimer_scage",
             graph_input=(
                 "star_linking"
-                if str(getattr(args, "mts_glt_version", "v2")) == "v3"
+                if str(getattr(args, "mts_glt_version", "v2")) in {"v3", "distill_repair"}
                 else "repeat_unit"
             ),
             use_feature_cache=not args.disable_feature_cache,
@@ -325,8 +335,13 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             modalities=("graph",),
             periodic_line_glt_sidecar=(
                 None
-                if str(getattr(args, "mts_glt_version", "v2")) == "v3"
-                and str(getattr(args, "glt_readout_mode", "galformer")) == "galformer"
+                if (
+                    str(getattr(args, "mts_glt_version", "v2")) == "distill_repair"
+                    or (
+                        str(getattr(args, "mts_glt_version", "v2")) == "v3"
+                        and str(getattr(args, "glt_readout_mode", "galformer")) == "galformer"
+                    )
+                )
                 else args.periodic_line_glt_sidecar
             ),
         )
@@ -375,6 +390,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
     patience = args.patience
     t1_init_artifact = False
     checkpoint_meta = {}
+    pretraining_bundle_identity = {}
 
     for task in task_list:
         print(f"\nStarting task: {task}")
@@ -412,17 +428,26 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             .str.strip()
             .tolist()
         )
+        protocol = str(args.evaluation_protocol)
+        expected_schema = (
+            "mips-outer5-inner20-fold-v1" if protocol == "outer5_inner20"
+            else "mips-shared-validation-test-fold-v1"
+        )
+        expected_validation_is_test = protocol == "historical_shared5"
+        order_hash = hashlib.sha256("\n".join(ordered_smiles).encode("utf-8")).hexdigest()
         if (
-            manifest.get("schema") != "mips-shared-validation-test-fold-v1"
+            manifest.get("schema") != expected_schema
+            or manifest.get("protocol") not in {protocol, "shared_validation_test_fold"}
             or int(manifest.get("sample_count", -1)) != len(dataset)
-            or not bool(manifest.get("validation_is_test", False))
+            or bool(manifest.get("validation_is_test", False)) != expected_validation_is_test
+            or manifest.get("sample_order_sha256") != order_hash
         ):
             raise RuntimeError(f"Fixed split manifest does not match task cohort: {manifest_path}")
-        if str(args.evaluation_protocol) != "historical_shared5":
-            raise ValueError("MTS-GLT-v2 baseline requires evaluation_protocol=historical_shared5")
+        split_identity = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         splits = [
             (
                 np.asarray(item["train_indices"], dtype=np.int64),
+                np.asarray(item["validation_indices"], dtype=np.int64),
                 np.asarray(item["test_indices"], dtype=np.int64),
             )
             for item in manifest["folds"]
@@ -436,7 +461,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
         selected_folds = set(args.fold_ids)
         if not selected_folds or any(fold < 0 or fold >= 5 for fold in selected_folds):
             raise ValueError("--fold_ids must contain one or more values from 0 to 4")
-        for fold, (train_indices, test_indices) in enumerate(splits):
+        for fold, (train_indices, manifest_val_indices, test_indices) in enumerate(splits):
             if fold not in selected_folds:
                 continue
             fold_started = time.monotonic()
@@ -446,8 +471,8 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             set_global_seed(fold_seed)
             print(f"Fold seed: {fold_seed}")
             fold_train_indices = train_indices
-            val_indices = test_indices
-            print("Shared 5-fold protocol: validation and test use the same held-out fold")
+            val_indices = manifest_val_indices
+            print(f"Evaluation protocol: {protocol}")
             print(
                 f"Fold partitions: train={len(fold_train_indices)}, "
                 f"validation={len(val_indices)}, test={len(test_indices)}"
@@ -502,12 +527,21 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                     checkpoint.get("meta", {})
                     if isinstance(checkpoint.get("meta"), dict) else {}
                 )
+                pretraining_bundle_identity = {
+                    "pretraining_bundle_schema": checkpoint.get("schema"),
+                    "pretraining_bundle_version": checkpoint.get("version"),
+                    "pretraining_bundle_step": int(checkpoint.get("step", -1)),
+                }
                 merged_state = model.state_dict()
                 glt_state = (
                     select_mts_glt_v3_graph_state(merged_state, checkpoint)
                     if str(getattr(args, "mts_glt_version", "v2")) == "v3"
-                    else select_mts_glt_distill_state(merged_state, checkpoint)
-                    if str(getattr(args, "mts_glt_version", "v2")) == "distill"
+                    else select_mts_glt_distill_state(
+                        merged_state, checkpoint,
+                        getattr(args, "distill_repair_version", None),
+                        bool(getattr(args, "allow_smoke_checkpoint", False)),
+                    )
+                    if str(getattr(args, "mts_glt_version", "v2")) in {"distill", "distill_repair"}
                     else select_mts_glt_graph_state(merged_state, checkpoint_state)
                 )
                 merged_state.update(glt_state)
@@ -571,7 +605,8 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                     'fold': int(fold),
                     'seed': int(args.seed),
                     'fold_seed': int(fold_seed),
-                    'fold_validation_protocol': 'shared_validation_test_fold',
+                    'fold_validation_protocol': protocol,
+                    'split_manifest_sha256': split_identity,
                     'independent_blind_test': False,
                     'amp_dtype': args.amp_dtype,
                     'train_batch_size': int(args.batch_size),
@@ -639,7 +674,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
         print(f"5-fold mean attention: {format_attention_weights(attention_labels, cv_attention)}")
 
         finetuned_checkpoint_path = None
-        if str(getattr(args, "mts_glt_version", "v2")) == "distill":
+        if str(getattr(args, "mts_glt_version", "v2")) in {"distill", "distill_repair"}:
             finetuned_checkpoint_path = Path(args.results_dir).with_name(
                 Path(args.results_dir).stem + "_best.pt"
             )
@@ -649,6 +684,9 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 "task": task, "fold": int(fold_metrics[0]["fold"]),
                 "seed": int(args.seed), "state_dict": best_model_state,
                 "best_validation_r2": float(best_fold_val_r2),
+                "evaluation_protocol": protocol,
+                "split_manifest_sha256": split_identity,
+                **pretraining_bundle_identity,
             }, finetuned_checkpoint_path)
 
         # Save results
@@ -690,7 +728,8 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             'seed': args.seed,
             'prediction_path': str(prediction_path) if prediction_path else None,
             'target_transform': args.target_transform,
-            'fold_validation_protocol': 'shared_validation_test_fold',
+            'fold_validation_protocol': protocol,
+            'split_manifest_sha256': split_identity,
             'independent_blind_test': False,
             'refit_full_train': False,
             'avg_refit_epochs': 0,
