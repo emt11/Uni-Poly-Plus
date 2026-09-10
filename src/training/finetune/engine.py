@@ -261,8 +261,8 @@ def select_mts_glt_distill_state(
     expected_step=20000,
 ):
     expected_step = int(expected_step)
-    if expected_step not in {5000, 20000}:
-        raise ValueError("N+ student deployment supports 5k or 20k steps")
+    if expected_step not in {5000, 10000, 20000}:
+        raise ValueError("N+ student deployment supports 5k, 10k, or 20k steps")
     if checkpoint.get("schema") not in {
         "mts-glt-distill-student-deploy-v1",
         "mts-glt-distill-repair-student-deploy-v1",
@@ -560,12 +560,14 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                         merged_state, checkpoint,
                         getattr(args, "distill_repair_version", None),
                         bool(getattr(args, "allow_smoke_checkpoint", False)),
-                        expected_step=(
-                            5000
-                            if str(getattr(args, "checkpoint_tier", ""))
-                            in {"student-5k", "student_005k", "5k"}
-                            else 20000
-                        ),
+                        expected_step={
+                            "student-5k": 5000,
+                            "student_005k": 5000,
+                            "5k": 5000,
+                            "student-10k": 10000,
+                            "student_010k": 10000,
+                            "10k": 10000,
+                        }.get(str(getattr(args, "checkpoint_tier", "")), 20000),
                     )
                     if str(getattr(args, "mts_glt_version", "v2")) in {"distill", "distill_repair"}
                     else select_mts_glt_graph_state(merged_state, checkpoint_state)
