@@ -45,7 +45,21 @@ canonical atom mean + MD200 + graph adapter + regression head
 
 ## 3. O8 输入
 
-O8 只接收 MIPS137 atom features、backbone embedding、SPD bias 和 single-path-node bias；`max_hops=2`，6 层、512 hidden、8 heads。基线关闭 Star-RBF、MCL 和 O8 的 3D attention bias，因此 O8 是纯拓扑分支。
+数据缓存继续保存 `mips_x=[N,137]` 与 `mips_backbone_mask=[N]`，其中前者的
+137 维化学属性语义不变。模型输入时先将 backbone 标记转为一列并拼接为
+`[N,138]`，再通过单个 `Linear(138,512)`；不再实例化独立的
+`Embedding(2,512)`。因此 O8 接收的是 138 维原子输入、SPD bias 和
+single-path-node bias；`max_hops=2`，6 层、512 hidden、8 heads。基线关闭
+Star-RBF、MCL 和 O8 的 3D attention bias，因此 O8 是纯拓扑分支。
+
+原子 masking 的顺序固定为“拼接 backbone 列 → 对选中原子的整行 138 维
+全部置零 → 线性投影”。未选中原子保留全部 137 个属性和 backbone 标记，
+选中原子的初始 token 只等于线性层 bias；path bias 也从这份 masking 后的
+初始 token 计算。输入缓存张量不被原地修改，mask 比例和 canonical mask
+策略保持不变。
+
+该输入布局变更会使旧的 `Linear(137,512)` 与独立 backbone 参数无法严格
+加载到新模型；本路线不提供旧 checkpoint 转换或放宽 strict-loading 的路径。
 
 canonical lifted topology 只维护一个 RU 的 canonical atom state。跨 RU 关系由 relation shift、path 和 SPD 字段表达，不创建 RU−1/RU+1 的独立可训练节点。
 
@@ -190,7 +204,7 @@ source        frozen_trimer_coordinates_direct
 
 下游使用独立协议 `outer5_inner20`：保留既有 `KFold(5, shuffle=True, random_state=1)` 的 outer-test indices；对每折 outer-train 使用 `train_test_split(test_size=0.20, random_state=42+fold)` 生成 validation。标签变换只拟合最终 train，validation 只负责早停和最佳 checkpoint 选择，恢复该折最佳 checkpoint 后才进行一次 outer-test 推理。三个集合的固定 manifest 位于 `data/splits/mips_outer5_inner20/`；该协议与 `historical_shared5` 分开，结果不能互相识别为已完成。
 
-下游三组均只实例化 O8、MD200、graph adapter 与 property head，不读取坐标或 line sidecar。固定八任务、五折、seed 42、最多 100 epochs、patience 10；总计 120 个 task/fold。完整阶段入口为 [`scripts/run_mts_glt_distill_repair_pipeline.py`](scripts/run_mts_glt_distill_repair_pipeline.py)，revision-2 构建入口为 [`scripts/build_mts_glt_distill_repair_sidecars_parallel.py`](scripts/build_mts_glt_distill_repair_sidecars_parallel.py)，正式汇总入口为 [`scripts/report_mts_glt_distill_repair.py`](scripts/report_mts_glt_distill_repair.py)。
+下游三组均只实例化 O8、MD200 与 property head，不读取坐标或 line sidecar。当前新版 DistillStudent 的 graph wrapper 是 Identity，property head 为 `Linear(512,512)→GELU→Dropout(0.1)→Linear(512,1)`（§14）；本节记录的 C0/C1/C2 正式结果由更早的 `LayerNorm→Linear→LayerNorm→ReLU` adapter 加 regression MLP head 产生，不能视为新版 predictor 的复评。固定八任务、五折、seed 42、最多 100 epochs、patience 10；总计 120 个 task/fold。完整阶段入口为 [`scripts/run_mts_glt_distill_repair_pipeline.py`](scripts/run_mts_glt_distill_repair_pipeline.py)，revision-2 构建入口为 [`scripts/build_mts_glt_distill_repair_sidecars_parallel.py`](scripts/build_mts_glt_distill_repair_sidecars_parallel.py)，正式汇总入口为 [`scripts/report_mts_glt_distill_repair.py`](scripts/report_mts_glt_distill_repair.py)。
 
 两份教师、三份学生及 120/120 个下游单元均已完成并通过 checkpoint、预测、split 身份和 OOF 覆盖核验。macro8 R² 为 C0 `0.8061119181`、C1 `0.7978494262`、C2 `0.7930190200`；两条蒸馏路线均未超过 C0。完整指标、成本、异常和产物位置见 [`RESULTS.md`](RESULTS.md) 及 [`results/mts_glt_distill_repair_control/comparison/final_report.md`](results/mts_glt_distill_repair_control/comparison/final_report.md)。
 
@@ -202,9 +216,9 @@ source        frozen_trimer_coordinates_direct
 - C1：`results/mts_glt_distill_repair_control/c1/student/student_deploy_020k.pt`
 - C2：`results/mts_glt_distill_repair_control/c2/student/student_deploy_020k.pt`
 
-冻结探针直接读取 `DistillStudent.pool(md_residual(canonical_o8))` 的 512 维 graph state，即部署包实际提供、位于随机下游 graph adapter 之前的 pooled O8＋MD200 表示。C0/C1/C2 在 xc、eps 的每个 outer fold 上分别执行 Ridge `alpha={0.1,1,10,100}`；特征和标签 scaler 只拟合 train，alpha 只由原始标签尺度 validation R² 选择，test 不参与选择，也不进行 train＋validation refit。
+冻结探针直接读取 `DistillStudent.pool(md_residual(canonical_o8))` 的 512 维 graph state，即部署包实际提供、位于下游 wrapper（新版为 Identity，不含 adapter 参数）之前的 pooled O8＋MD200 表示。C0/C1/C2 在 xc、eps 的每个 outer fold 上分别执行 Ridge `alpha={0.1,1,10,100}`；特征和标签 scaler 只拟合 train，alpha 只由原始标签尺度 validation R² 选择，test 不参与选择，也不进行 train＋validation refit。
 
-C0 分阶段微调把现有 graph `LayerNorm→Linear→LayerNorm→ReLU` adapter 与 regression MLP 一并定义为任务 head。第一阶段固定 10 epochs，只训练该任务 head，O8＋MD200 参数和 buffer 不变且保持 `eval()`；第二阶段从第一阶段 validation 最优 head 状态开始，使用新 optimizer 解冻联合训练最多 90 epochs。第二阶段采用 O8/MD/graph adapter `1e-5`、regression MLP `1e-4`、5 epochs warmup、cosine、patience 10；全流程最佳模型可来自任一阶段，并且只由 validation R² 更新。
+C0 分阶段微调把任务 head 定义为下游 predictor：新版 DistillStudent 的 wrapper 是 Identity，因此 head 只有 `Linear(512,512)→GELU→Dropout(0.1)→Linear(512,1)`；本节更早记录的正式结果对应 `LayerNorm→Linear→LayerNorm→ReLU` adapter 与 regression MLP 组成的 head。第一阶段固定 10 epochs，只训练该任务 head，O8＋MD200 参数和 buffer 不变且保持 `eval()`；第二阶段从第一阶段 validation 最优 head 状态开始，使用新 optimizer 解冻联合训练最多 90 epochs。第二阶段采用 O8/MD `1e-5`、predictor `1e-4`、5 epochs warmup、cosine、patience 10；全流程最佳模型可来自任一阶段，并且只由 validation R² 更新。
 
 正式入口与产物：
 
@@ -213,3 +227,30 @@ C0 分阶段微调把现有 graph `LayerNorm→Linear→LayerNorm→ReLU` adapte
 - 强审计与汇总：`scripts/report_mts_c0_transfer_optimization.py`；报告位于 `results/mts_c0_transfer_optimization/comparison/`。
 
 所有正式预测均按原 manifest 的 test indices 保存，八个任务的五折 outer-test 各覆盖每个样本一次。正式 Macro8 R² 为 `0.8010382929`，相对既有 C0 为 `-0.0050736252`；因此分阶段方案没有改善整体八任务泛化。冻结探针中 C1/C2 在 xc、eps 均不弱于 C0，诊断证据更偏向微调适应问题，但只覆盖两个任务且不能单独证明因果机制。详细结果见 [`RESULTS.md`](RESULTS.md)。
+
+## 14. DistillStudent O8 与下游 predictor 的新版实现
+
+`mts_glt_version=distill|distill_repair` 使用独立的 `PreLNO8Encoder`。其六层
+`SourceQPreLNLayer` 保持 hidden=512、FFN `512→2048→512`、Pre-LN、
+source-Q/target-K、incoming softmax、SPD/path bias 和 dropout=0.1；FFN
+激活固定为 `nn.GELU(approximate="none")`。这项激活替换只适用于新版
+DistillStudent，不会全局替换 MTS-GLT-v2 或其他路线的 ReLU。
+
+新版学生下游不再使用 graph norm/projection adapter：wrapper 直接输出
+512 维 pooled O8＋MD200 表示，任务 predictor 固定为
+`Linear(512,512)→GELU(approximate="none")→Dropout(0.1)→Linear(512,1)`。
+Identity wrapper 不包含可训练参数；optimizer 仍覆盖 O8、MD200 和 predictor，
+且不会重复或遗漏参数。运行配置会将新版学生的实际 `head_dropout` 固定记录为
+`0.1`，即使旧 CLI 默认值为 `0.25`。
+
+预训练 deploy metadata 记录 `o8_ffn_activation=GELU(approximate='none')`、
+`o8_ffn_hidden=512->2048->512` 及新版下游 predictor/adapter 合同。已有
+ReLU 训练产物不会因为参数形状相同或 strict loading 成功而被视为 GELU
+预训练；本次不执行 checkpoint 转换、resume、预训练或微调。
+
+因此，`RESULTS.md` 中 C0/C1/C2 的 120 个 `outer5_inner20` 正式单元、
+C0 分阶段微调 40 个单元及各组 `historical_shared5` 重新微调结果，均由
+137 维输入＋独立 backbone embedding、ReLU FFN、adapter head 的旧学生产生。
+现有 `results/mts_glt_distill_repair_control/*/student/student_deploy_*.pt`
+也不含新版架构 metadata，会被下游部署校验拒绝；新版评估必须先重新预训练
+并导出学生包。

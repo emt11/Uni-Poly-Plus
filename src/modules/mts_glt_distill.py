@@ -46,7 +46,9 @@ class SourceQPreLNLayer(nn.Module):
         self.attention = SourceQPreLNAttention(hidden, heads, dropout)
         self.norm2 = nn.LayerNorm(hidden)
         self.ffn = nn.Sequential(
-            nn.Linear(hidden, 4 * hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 4 * hidden),
+            nn.GELU(approximate="none"),
+            nn.Dropout(dropout),
             nn.Linear(4 * hidden, hidden), nn.Dropout(dropout),
         )
 

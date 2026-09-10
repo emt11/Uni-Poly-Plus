@@ -17,20 +17,25 @@ from src.dataset.mips_trimer_contract import (
     TOPOLOGY_CANONICAL,
 )
 
+
+# ``mips_x`` remains the original 137-dimensional chemical feature matrix.
+# The backbone annotation is appended at model input time as one additional
+# scalar column, so the first projection consumes 138 values per atom.
+MIPS_ATOM_INPUT_DIM = MIPS_ATOM_FEATURE_DIM + 1
+
+
 class MIPSLocalAtomEmbedding(nn.Module):
     def __init__(self, hidden_dim=512):
         super().__init__()
-        self.projection = nn.Linear(MIPS_ATOM_FEATURE_DIM, int(hidden_dim))
-        self.backbone = nn.Embedding(2, int(hidden_dim), padding_idx=0)
+        self.projection = nn.Linear(MIPS_ATOM_INPUT_DIM, int(hidden_dim))
 
     def forward(self, data, atom_mask=None):
         features = data.mips_x.float()
+        backbone = data.mips_backbone_mask.to(features).unsqueeze(-1)
+        features = torch.cat([features, backbone], dim=-1)
         if atom_mask is not None:
             features = features.masked_fill(atom_mask.unsqueeze(-1), 0.0)
-        return (
-            self.projection(features)
-            + self.backbone(data.mips_backbone_mask.long().clamp(0, 1))
-        )
+        return self.projection(features)
 
 
 class MIPSSinglePathNodeBias(nn.Module):

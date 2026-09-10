@@ -160,6 +160,11 @@ def parse_arguments(argv=None):
         parser.error("MTS-GLT-v2-Base-5k is graph-only with fusion_type=none")
     if args.mts_glt_mode not in MODE_SPECS:
         parser.error("unsupported MTS-GLT-v2 downstream mode")
+    if args.mts_glt_version in {"distill", "distill_repair"}:
+        # Revised DistillStudent uses the fixed Original-MIPS-style predictor
+        # contract; do not let the legacy 0.25 CLI default reach its model or
+        # resolved metadata.  Other routes retain their configured dropout.
+        args.head_dropout = 0.1
     if args.mts_glt_version in {"v3", "distill", "distill_repair"}:
         args.mts_glt_mode = "none"
         args.graph_input = "star_linking"

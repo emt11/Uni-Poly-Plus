@@ -46,7 +46,7 @@ def main(argv=None):
         "--mts_glt_version", "distill", "--mts_glt_mode", "o8_only", "--mips_norm_mode", "pre",
         "--target_transform", "recommended", "--regression_loss", "huber", "--huber_beta", "0.5",
         "--max_grad_norm", "1.0", "--weight_decay", "0.02", "--warmup_epochs", "5",
-        "--head_dropout", "0.25", "--mts_o8_lr", "1e-5", "--mts_adapter_lr", "1e-5",
+        "--head_dropout", "0.1", "--mts_o8_lr", "1e-5", "--mts_adapter_lr", "1e-5",
         "--graph_lr", "1e-5", "--head_lr", "1e-4",
     ]
     if args.dry_run:

@@ -270,7 +270,11 @@ def _build_downstream_optimizer(
         add_module(encoder.atom_fusion_norm, mts_adapter_lr, "atom_fusion_norm")
         add_module(encoder.atom_fusion_projection, mts_adapter_lr, "atom_fusion_projection")
         add_module(encoder.compact19_residual, mts_adapter_lr, "compact19")
-    add_module(graph_module, graph_lr, "graph_adapter")
+    # Revised DistillStudent has no trainable graph adapter: its wrapper
+    # norm/projection are identities and the encoder/MD modules were already
+    # assigned to their dedicated groups above.
+    if getattr(encoder, "architecture_name", "") != "MTS-GLT-v2-Distill-Student":
+        add_module(graph_module, graph_lr, "graph_adapter")
     add_module(base.mlp, head_lr, "regression_head")
     remaining = [parameter for parameter in base.parameters() if parameter.requires_grad and id(parameter) not in used]
     if remaining:
@@ -430,8 +434,10 @@ def _atomic_torch_save(payload, path):
 def _set_staged_trainability(model, *, encoder_trainable):
     """Configure the fixed staged-transfer contract.
 
-    The task head consists of the existing graph norm/projection and regression
-    MLP.  The deployment encoder is exactly O8+MD200.
+    The deployment encoder is exactly O8+MD200.  Revised DistillStudent builds
+    its graph wrapper norm/projection as identities, so the task head is only
+    the 512->512->1 predictor; the identity modules remain harmless here for
+    staged-transfer compatibility.
     """
     base = _base_model(model)
     encoder = _mts_glt_encoder(base)

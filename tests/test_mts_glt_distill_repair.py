@@ -25,6 +25,13 @@ from src.training.finetune.scheduler import ScheduledUnit
 
 N_ZERO_SAMPLE_INDEX = 10
 N_ZERO_SAMPLE_KEY_HEX = "2320ad8ec663f0ca98eb48191b15e8b28b0f1c401a5142be68a286e990fbcfd1"
+STUDENT_ARCHITECTURE_METADATA = {
+    "o8_ffn_activation": "GELU(approximate='none')",
+    "o8_ffn_hidden": "512->2048->512",
+    "downstream_graph_adapter": "identity",
+    "downstream_predictor": "512->512->1",
+    "downstream_predictor_dropout": 0.1,
+}
 
 
 def _attach_revision2(data, row, sample_key):
@@ -295,12 +302,29 @@ def test_repair_deployment_rejects_wrong_version_and_revision():
         "schema": "mts-glt-distill-repair-student-deploy-v1",
         "step": 20000, "version": "n_plus_1", "geometry_revision": 2,
         "state_dict": model.state_dict(),
+        **STUDENT_ARCHITECTURE_METADATA,
     }
     assert len(select_mts_glt_distill_state(model_state, checkpoint, "n_plus_1")) == len(model_state)
     with pytest.raises(RuntimeError, match="version mismatch"):
         select_mts_glt_distill_state(model_state, checkpoint, "n_plus_2")
     checkpoint["geometry_revision"] = 1
     with pytest.raises(RuntimeError, match="geometry revision"):
+        select_mts_glt_distill_state(model_state, checkpoint, "n_plus_1")
+
+
+def test_repair_deployment_accepts_explicit_5k_student_bundle():
+    model = StudentContainer(None).student
+    model_state = {"encoders.graph.encoder." + key: value for key, value in model.state_dict().items()}
+    checkpoint = {
+        "schema": "mts-glt-distill-repair-student-deploy-v1",
+        "step": 5000, "version": "n_plus_1", "geometry_revision": 2,
+        "state_dict": model.state_dict(),
+        **STUDENT_ARCHITECTURE_METADATA,
+    }
+    assert len(select_mts_glt_distill_state(
+        model_state, checkpoint, "n_plus_1", expected_step=5000
+    )) == len(model_state)
+    with pytest.raises(RuntimeError, match="strict 20k"):
         select_mts_glt_distill_state(model_state, checkpoint, "n_plus_1")
 
 

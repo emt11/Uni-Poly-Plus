@@ -222,3 +222,91 @@ independent blind test     false
 - smoke：`results/mts_c0_transfer_optimization/smoke/`；风险相关测试为 `20 passed`。
 
 执行中曾发现第一版 staged 正式启动的第一阶段未复刻 bias/LayerNorm no-decay 分组。受影响调度被停止，三个已完成单元和中断状态整体保留在 `results/mts_c0_transfer_optimization/staged_finetune_invalid_stage1_decay_all_20260909/`，没有进入正式汇总。修正并重新通过 2+2 epoch smoke 后，正式 40 单元从 C0 部署包在全新目录重新启动。
+
+## C0 使用旧版 historical_shared5 的重新微调
+
+本次从正式 C0 `student_deploy_020k.pt` 重新初始化每个 task/fold，仅使用
+O8＋MD200，并按旧版 `historical_shared5` 协议完成八任务五折。该协议中每折
+validation 与 test 是同一组 outer-fold 样本，因而以下结果不是独立测试，且不能
+与 `outer5_inner20` 的 C0 `0.8061119181` 直接解释为同协议性能变化。
+
+|Task|R2 mean +/- std|MAE mean +/- std|RMSE mean +/- std|
+|-|-:|-:|-:|
+|eat|0.982292 +/- 0.006456|0.029880 +/- 0.004694|0.046578 +/- 0.007307|
+|eea|0.919152 +/- 0.020987|0.224236 +/- 0.021016|0.300432 +/- 0.024715|
+|egb|0.936540 +/- 0.012528|0.363927 +/- 0.038554|0.487573 +/- 0.060265|
+|egc|0.918656 +/- 0.003604|0.289830 +/- 0.009620|0.445470 +/- 0.010831|
+|ei|0.817430 +/- 0.056626|0.278960 +/- 0.029788|0.412935 +/- 0.060620|
+|eps|0.794402 +/- 0.053264|0.330770 +/- 0.017911|0.492142 +/- 0.036304|
+|nc|0.871977 +/- 0.041372|0.054416 +/- 0.009306|0.083448 +/- 0.012097|
+|xc|0.436482 +/- 0.063172|13.294133 +/- 0.556824|17.631919 +/- 0.651147|
+
+```text
+macro8 R2                    0.8346162015
+completed units              40/40
+optimizer updates            41,001
+validation is test           true
+independent blind test       false
+```
+
+逐项审计确认 40 个 checkpoint、40 个预测与 40 个指标全部存在且有限，split
+identity 与 `data/splits/mips_shared5` 完全一致；每个任务的五个 test folds 恰好
+覆盖全部样本一次。完整报告见
+[`results/mts_c0_historical_shared5_rerun/comparison/final_report.md`](results/mts_c0_historical_shared5_rerun/comparison/final_report.md)，
+正式产物位于
+[`results/mts_c0_historical_shared5_rerun/formal`](results/mts_c0_historical_shared5_rerun/formal)，
+调度日志位于
+[`logs/mts_c0_historical_shared5_rerun/formal`](logs/mts_c0_historical_shared5_rerun/formal)。
+
+### C1/C2 使用相同旧版五折的重新微调
+
+C1、C2 随后使用与上述 C0 完全相同的 `historical_shared5` 配置各完成
+40/40 个正式单元。每个 fold 分别从 C1 `n_plus_1` 或 C2 `n_plus_2` 的正式
+20k O8＋MD200 部署包重新初始化；下游均不加载 GLT。
+
+|组别|Macro8 R2|相对C0|正增量任务|正增量fold|
+|-|-:|-:|-:|-:|
+|C0|0.8346162015|--|--|--|
+|C1|0.8326805138|-0.0019356877|4/8|21/40|
+|C2|0.8289977937|-0.0056184078|5/8|22/40|
+
+C2-C1 的 Macro8 R2 差值为 `-0.0036827201`，正增量任务 `4/8`、正增量
+fold `22/40`。C1/C2 相对 C0 的最大负项仍是 xc，分别为 `-0.0192581` 和
+`-0.0538902`。因此旧协议配对结果也没有显示蒸馏组整体超过无蒸馏 C0；由于
+validation 与 test 完全相同，这些数字不能称独立盲测结果。
+
+联合审计确认 C0/C1/C2 共 120 个 checkpoint、预测和指标均有效，sample
+indices 与 `mips_shared5` manifest 一致，每任务五折 test 样本恰好覆盖一次。
+C1/C2 分别执行 32,501/39,136 optimizer updates，四卡调度墙钟约
+13分4秒/14分59秒。完整逐任务结果及对照见
+[`results/mts_c1_c2_historical_shared5_rerun/comparison/final_report.md`](results/mts_c1_c2_historical_shared5_rerun/comparison/final_report.md)，
+正式产物见 [`C1`](results/mts_c1_c2_historical_shared5_rerun/c1/formal) 和
+[`C2`](results/mts_c1_c2_historical_shared5_rerun/c2/formal)。
+
+## C0/C1 使用 5k 学生预训练模型的重新微调
+
+前一轮 C1/C2 的旧协议重跑使用的是 20k 部署包；本节是本次明确授权的 **5k
+预训练模型** 实验，产物与20k运行完全隔离。C0/C1分别从
+`student_deploy_005k.pt` 初始化，在 `historical_shared5` 上完成八任务五折，
+下游只使用 O8＋MD200，不加载 GLT。
+
+|组别|预训练 step|version|Macro8 R²|C1−C0|正增量任务|正增量fold|
+|-:|-:|-|-:|-:|-:|-:|
+|C0|5,000|none|0.8360926133|--|--|--|
+|C1|5,000|n_plus_1|0.8359388559|-0.0001537575|5/8|21/40|
+
+逐任务五折 mean ± std（std 使用 `ddof=0`）及 MAE/RMSE 见
+[`results/mts_c0_c1_historical_shared5_005k_rerun/comparison/final_report.md`](results/mts_c0_c1_historical_shared5_005k_rerun/comparison/final_report.md)。
+C1 在 eat、egb、egc、ei、eps 上有小幅正均值，但 nc/xc 下降，整体 Macro8 略低于
+C0，不能称为整体提升。
+
+完整性审计确认 C0/C1 共 80/80 个单元、80/80 个 checkpoint、80/80 个预测有效，
+均严格对应 5,000-step bundle，split identity 与 `data/splits/mips_shared5`
+一致，每个任务的五个 test folds 恰好覆盖全部样本一次。正式产物见
+[`C0`](results/mts_c0_c1_historical_shared5_005k_rerun/c0/formal) 和
+[`C1`](results/mts_c0_c1_historical_shared5_005k_rerun/c1/formal)，日志见
+[`logs/mts_c0_c1_historical_shared5_005k_rerun`](logs/mts_c0_c1_historical_shared5_005k_rerun)。
+
+旧 `historical_shared5` 中 validation 与 test 相同，因此本节结果是共享开发折
+评估，不是独立盲测；与此前 20k 初始化的结果属于不同 checkpoint 条件，不能混合
+为同一实验组。

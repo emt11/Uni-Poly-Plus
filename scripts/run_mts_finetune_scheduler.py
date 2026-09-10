@@ -59,6 +59,7 @@ RESOLVED_FIELDS = {
     "workers": "loader_workers",
     "evaluation_protocol": "evaluation_protocol",
     "split_manifest_dir": "split_manifest_dir",
+    "mts_glt_version": "mts_glt_version",
     "finetune_strategy": "finetune_strategy",
     "stage1_epochs": "stage1_epochs",
     "stage2_epochs": "stage2_epochs",
@@ -148,6 +149,14 @@ def resolved_config_from_command(command: list[str], provenance: dict, checkpoin
         "checkpoint_sha256": checkpoint_sha256,
         **provenance,
     })
+    if parsed.mts_glt_version in {"distill", "distill_repair"}:
+        payload.update({
+            "o8_ffn_activation": "GELU(approximate='none')",
+            "o8_ffn_hidden": "512->2048->512",
+            "graph_adapter": "identity",
+            "predictor": "512->512->1",
+            "predictor_dropout": 0.1,
+        })
     payload["encoder_freeze_warm_epochs"] = 0
     return payload
 

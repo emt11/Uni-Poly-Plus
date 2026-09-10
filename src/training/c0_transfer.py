@@ -107,6 +107,18 @@ def load_deployment(path, expected_group, device):
         or int(checkpoint.get("step", -1)) != 20000
     ):
         raise RuntimeError(f"invalid {expected_group} 20k deployment: {path}")
+    expected_architecture = {
+        "o8_ffn_activation": "GELU(approximate='none')",
+        "o8_ffn_hidden": "512->2048->512",
+        "downstream_graph_adapter": "identity",
+        "downstream_predictor": "512->512->1",
+        "downstream_predictor_dropout": 0.1,
+    }
+    if any(checkpoint.get(key) != value for key, value in expected_architecture.items()):
+        raise RuntimeError(
+            f"invalid {expected_group} deployment architecture metadata: "
+            "pre-GELU/ReLU bundles are not compatible"
+        )
     encoder = DistillStudent()
     encoder.load_state_dict(checkpoint["state_dict"], strict=True)
     encoder.requires_grad_(False).eval().to(device)
@@ -233,4 +245,3 @@ def run_probe_group_task(group, task, checkpoint, output_root, *, folds=range(5)
         "checkpoint": checkpoint_meta, "split_manifest_sha256": manifest_sha,
     })
     return outputs
-

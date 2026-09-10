@@ -126,6 +126,40 @@ def format_attention_weights(modalities, attention_weights):
     )
 
 
+def _student_architecture_metadata(glt_version):
+    """Describe the revised DistillStudent O8 and predictor contract."""
+    if str(glt_version) not in {"distill", "distill_repair"}:
+        return {}
+    return {
+        "o8_ffn_activation": "GELU(approximate='none')",
+        "o8_ffn_hidden": "512->2048->512",
+        "graph_adapter": "identity",
+        "predictor": "512->512->1",
+        "predictor_dropout": 0.1,
+    }
+
+
+def _require_student_architecture_metadata(checkpoint):
+    """Reject same-shaped student bundles produced before the GELU contract."""
+    expected = {
+        "o8_ffn_activation": "GELU(approximate='none')",
+        "o8_ffn_hidden": "512->2048->512",
+        "downstream_graph_adapter": "identity",
+        "downstream_predictor": "512->512->1",
+        "downstream_predictor_dropout": 0.1,
+    }
+    mismatched = {
+        key: (checkpoint.get(key), value)
+        for key, value in expected.items()
+        if checkpoint.get(key) != value
+    }
+    if mismatched:
+        raise RuntimeError(
+            "student deployment architecture metadata mismatch; "
+            "a pre-GELU/ReLU bundle cannot be loaded"
+        )
+
+
 def build_mts_downstream_model(args, auxiliary_tasks=()):
     """Construct the downstream MTS UniEncoder with the exact fixed switches.
 
@@ -134,8 +168,12 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
     """
     from src.modules import UniEncoderAttention
 
+    glt_version = str(getattr(args, "mts_glt_version", "v2"))
+    is_new_student = glt_version in {"distill", "distill_repair"}
+    joint_dim = 512 if is_new_student else 256
+    actual_head_dropout = 0.1 if is_new_student else float(args.head_dropout)
     model = UniEncoderAttention(
-        joint_embedding_dim=256,
+        joint_embedding_dim=joint_dim,
         smiles_model_name="",
         gnn_model_name="",
         modality_list=("graph",),
@@ -170,9 +208,18 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
         use_star_rbf=False,
         use_mcl=False,
         fusion_type="none",
-        head_dropout=float(args.head_dropout),
+        head_dropout=actual_head_dropout,
     )
-    glt_version = str(getattr(args, "mts_glt_version", "v2"))
+    if is_new_student:
+        graph_wrapper = model.encoders["graph"]
+        graph_wrapper.norm = nn.Identity()
+        graph_wrapper.projection = nn.Identity()
+        model.mlp = nn.Sequential(
+            nn.Linear(512, 512, bias=True),
+            nn.GELU(approximate="none"),
+            nn.Dropout(0.1),
+            nn.Linear(512, 1, bias=True),
+        )
     if glt_version == "v3":
         from src.modules import MTSGraphLineModelV3
         model.encoders["graph"].encoder = MTSGraphLineModelV3(
@@ -224,12 +271,24 @@ def select_mts_glt_graph_state(model_state, checkpoint_state):
     return mapped
 
 
-def select_mts_glt_distill_state(model_state, checkpoint, expected_version=None, allow_smoke=False):
+def select_mts_glt_distill_state(
+    model_state,
+    checkpoint,
+    expected_version=None,
+    allow_smoke=False,
+    expected_step=20000,
+):
+    expected_step = int(expected_step)
+    if expected_step not in {5000, 20000}:
+        raise ValueError("N+ student deployment supports 5k or 20k steps")
     if checkpoint.get("schema") not in {
         "mts-glt-distill-student-deploy-v1",
         "mts-glt-distill-repair-student-deploy-v1",
-    } or (int(checkpoint.get("step", -1)) != 20000 and not allow_smoke):
-        raise RuntimeError("N+ downstream requires a strict 20k student deploy bundle")
+    } or (int(checkpoint.get("step", -1)) != expected_step and not allow_smoke):
+        raise RuntimeError(
+            f"N+ downstream requires a strict {expected_step // 1000}k student deploy bundle"
+        )
+    _require_student_architecture_metadata(checkpoint)
     if checkpoint.get("schema") == "mts-glt-distill-repair-student-deploy-v1":
         if checkpoint.get("version") != expected_version:
             raise RuntimeError("repair student deployment version mismatch")
@@ -541,6 +600,12 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                         merged_state, checkpoint,
                         getattr(args, "distill_repair_version", None),
                         bool(getattr(args, "allow_smoke_checkpoint", False)),
+                        expected_step=(
+                            5000
+                            if str(getattr(args, "checkpoint_tier", ""))
+                            in {"student-5k", "student_005k", "5k"}
+                            else 20000
+                        ),
                     )
                     if str(getattr(args, "mts_glt_version", "v2")) in {"distill", "distill_repair"}
                     else select_mts_glt_graph_state(merged_state, checkpoint_state)
@@ -703,8 +768,18 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 "best_stage": fold_metrics[0].get("best_stage"),
                 "stage1_epochs": int(getattr(args, "stage1_epochs", 10)),
                 "stage2_epochs": int(getattr(args, "stage2_epochs", 90)),
+                **_student_architecture_metadata(
+                    getattr(args, "mts_glt_version", "v2")
+                ),
                 **pretraining_bundle_identity,
             }, finetuned_checkpoint_path)
+
+        architecture_metadata = _student_architecture_metadata(
+            getattr(args, "mts_glt_version", "v2")
+        )
+        actual_head_dropout = architecture_metadata.get(
+            "predictor_dropout", float(args.head_dropout)
+        )
 
         # Save results
         result = {
@@ -742,7 +817,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             'finetune_strategy': str(getattr(args, 'finetune_strategy', 'standard')),
             'stage1_epochs': int(getattr(args, 'stage1_epochs', 10)),
             'stage2_epochs': int(getattr(args, 'stage2_epochs', 90)),
-            'head_dropout': args.head_dropout,
+            'head_dropout': actual_head_dropout,
             'regression_loss': args.regression_loss,
             'huber_beta': args.huber_beta,
             'seed': args.seed,
@@ -776,7 +851,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             'baseline': MTS_ROUTE_NAME,
             'route_short_name': MTS_ROUTE_SHORT_NAME,
             'scage_backbone': 'sparse_non_pbc_mips_starlink_spd_single_path_node',
-            'scage_input': 'mips137_independent_backbone_embedding',
+            'scage_input': 'mips137_plus_backbone_column_138_linear',
             'scage_checkpoint_schema': MIPS_TRIMER_CHECKPOINT_SCHEMA,
             'cache_bundle_schema': MIPS_TRIMER_CACHE_BUNDLE_SCHEMA,
             'topology_lmdb_schema': MIPS_TRIMER_TOPOLOGY_SCHEMA,
@@ -790,6 +865,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             'per_fold_metrics': json.dumps(fold_metrics, sort_keys=True),
             'attention': format_attention_weights(attention_labels, cv_attention),
         }
+        result.update(architecture_metadata)
 
         # Save to CSV.  Stage-3 campaign units write exactly one fold per
         # shard.  Use an atomic replacement for those paths so an interrupted

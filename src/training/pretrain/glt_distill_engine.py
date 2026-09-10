@@ -293,7 +293,15 @@ def _deploy_student(container, step, version, geometry_revision, *, repair_exper
         ), "version": version, "step": int(step),
         "geometry_revision": geometry_revision,
         "state_dict": {k: v.detach().cpu() for k, v in container.student.state_dict().items()},
-        "architecture": "PreLN-sourceQ-O8+atomic-conditioned-MD200",
+        "architecture": "PreLN-sourceQ-O8-GELU+atomic-conditioned-MD200",
+        "o8_ffn_activation": "GELU(approximate='none')",
+        "o8_ffn_hidden": "512->2048->512",
+        "downstream_graph_adapter": "identity",
+        "downstream_predictor": "512->512->1",
+        "downstream_predictor_dropout": 0.1,
+        "graph_adapter": "identity",
+        "predictor": "512->512->1",
+        "predictor_dropout": 0.1,
     }
 
 
@@ -600,6 +608,18 @@ def run_stage(
                         "rng_states": rng_states,
                         "data_position": {"epoch": next_epoch, "batch_offset": next_offset},
                     }
+                    if stage == "student":
+                        payload.update({
+                            "architecture": "PreLN-sourceQ-O8-GELU+atomic-conditioned-MD200",
+                            "o8_ffn_activation": "GELU(approximate='none')",
+                            "o8_ffn_hidden": "512->2048->512",
+                            "downstream_graph_adapter": "identity",
+                            "downstream_predictor": "512->512->1",
+                            "downstream_predictor_dropout": 0.1,
+                            "graph_adapter": "identity",
+                            "predictor": "512->512->1",
+                            "predictor_dropout": 0.1,
+                        })
                     if completed % 1000 == 0:
                         checkpoint_name = f"{stage}_{completed//1000:03d}k.pt"
                     elif completed == run_until and run_until < 1000:
