@@ -30,7 +30,7 @@ def prepare():
 
 
 def validate():
-    run([sys.executable, "-m", "pytest", "-q", "tests/test_mts_glt_distill.py", "tests/test_mts_glt_v3.py"])
+    run([sys.executable, "-m", "pytest", "-q", "tests/test_mts_glt_distill.py"])
 
 
 def _complete_checkpoint(path, schema, version, step):

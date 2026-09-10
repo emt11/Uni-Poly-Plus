@@ -1,0 +1,20 @@
+{
+  "schema": "mts-glt-distill-repair-control-v1",
+  "version": "none",
+  "group": "C0",
+  "geometry_revision": null,
+  "experiment_id": "glt_v2_r2_c0_gelu138_mipshead",
+  "line_sidecar_root": null,
+  "md200_sidecar_root": "data/processed/mips_trimer_scage/md200_pi1m_v1/PI1M_v2",
+  "result_root": "results/glt_v2_r2_c0_gelu138_mipshead",
+  "output_path": "pretrained_models/glt_v2_r2_c0_gelu138_mipshead.pth",
+  "protect_result_roots": [
+    "results/mts_glt_distill_repair_control",
+    "results/mts_glt_v2_distill"
+  ],
+  "microbatch": 84,
+  "accumulation": 4,
+  "global_batch": 1008,
+  "loader_workers": 4,
+  "seed": 42
+}

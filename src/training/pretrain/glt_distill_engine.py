@@ -149,9 +149,10 @@ def multi_positive_infonce(student, teacher, identities, temperature=0.1):
 class StudentContainer(nn.Module):
     def __init__(self, teacher=None):
         super().__init__()
+        # AtomicConditionedMD200 (``student.md_residual``) is trainable by the
+        # revised New-C0 contract; ``o8.md_residual`` is an Identity, so it
+        # carries no parameters to freeze.
         self.student = DistillStudent()
-        for parameter in self.student.o8.md_residual.parameters():
-            parameter.requires_grad = False
         self.atom_head = AtomPredictor()
         self.line_projection = StudentLineProjection()
         self.teacher = teacher
@@ -317,6 +318,17 @@ def run_stage(
         config["result_root"] = str(Path(result_root).resolve())
     if line_sidecar_root is not None:
         config["line_sidecar_root"] = str(Path(line_sidecar_root).resolve())
+    # A new experiment must never write into an archived formal artefact root.
+    # The config declares the roots it protects, so unrelated configs keep
+    # their previous behaviour.
+    resolved_root = str(Path(config["result_root"]).resolve())
+    for protected in config.get("protect_result_roots", ()):
+        protected = str(Path(protected).resolve())
+        if resolved_root == protected or resolved_root.startswith(protected + os.sep):
+            raise ValueError(
+                f"result_root {resolved_root} is a protected formal artefact "
+                f"root ({protected}); use an independent result_root"
+            )
     if stage not in {"teacher", "student"}:
         raise ValueError(stage)
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1

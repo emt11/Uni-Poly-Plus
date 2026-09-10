@@ -23,6 +23,7 @@ def main(argv=None):
     parser.add_argument("--folds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--results-dir")
     parser.add_argument("--logs-dir")
+    parser.add_argument("--experiment-id")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-smoke-checkpoint", action="store_true")
     args = parser.parse_args(argv)
@@ -44,7 +45,7 @@ def main(argv=None):
         "--batch-size", "32", "--eval-batch-size", "64", "--amp-dtype", "fp32",
         "--loader-workers", "2", "--evaluation-protocol", "outer5_inner20",
         "--train-args", "--config_schema", "mts-glt-distill-repair-downstream",
-        "--experiment_id", f"mts_glt_distill_repair_{args.group}_outer5_inner20",
+        "--experiment_id", args.experiment_id or f"mts_glt_distill_repair_{args.group}_outer5_inner20",
         "--split_manifest_dir", "data/splits/mips_outer5_inner20",
         "--graph_encoder_type", "mips_trimer_scage", "--graph_input", "star_linking",
         "--topology_attention_variant", "o8", "--no-use_star_rbf", "--no-use_mcl", "--use_md200",

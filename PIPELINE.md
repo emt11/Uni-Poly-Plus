@@ -283,3 +283,49 @@ C0 分阶段微调 40 个单元及各组 `historical_shared5` 重新微调结果
 现有 `results/mts_glt_distill_repair_control/*/student/student_deploy_*.pt`
 也不含新版架构 metadata，会被下游部署校验拒绝；新版评估必须先重新预训练
 并导出学生包。
+
+## 15. 待运行：New-C0（新版 GLT-V2 revision-2 无蒸馏 baseline）
+
+New-C0 是修订后 GLT-V2 路线的无蒸馏基线，定义已冻结：
+
+```text
+GLT-V2 revision-2
+├─ 138-D 原子输入（137 维 mips_x ＋ is_backbone 列）
+├─ full-row canonical atom masking（30%）
+├─ 6 层 Pre-LN O8（hidden 512 / 8 heads / head_dim 64 / 1/sqrt(64)）
+├─ GELU（approximate="none"）
+├─ trainable AtomicConditionedMD200（student.md_residual）
+├─ pre/post-MD masked atom CE（0.5 / 0.5，共享 atom head）
+├─ 无 3D teacher 蒸馏（无 local cosine、无 global InfoNCE、无 teacher checkpoint 依赖）
+├─ canonical atom mean pooling
+├─ Identity graph wrapper
+└─ 512→512→1 predictor，dropout 0.1
+```
+
+`AtomicConditionedMD200` 在 student pretraining 中按契约 **可训练**（`student.o8.md_residual` 是
+`nn.Identity`，无参数）。原子重建损失仍为 `L_atom = 0.5*L_preMD + 0.5*L_postMD`，MD corruption
+概率 0.30，invalid MD 严格零更新，本次未改动。
+
+实验身份与产物位置（与历史 C0/C1/C2 隔离）：
+
+```text
+config            configs/mts/glt_v2_r2_c0_gelu138_mipshead.json
+experiment_id     glt_v2_r2_c0_gelu138_mipshead
+result_root       results/glt_v2_r2_c0_gelu138_mipshead
+log_root          logs/glt_v2_r2_c0_gelu138_mipshead
+入口              scripts/run_glt_v2_r2_c0_pipeline.py {prepare,validate,student,finetune,all}
+```
+
+该 config 通过 `protect_result_roots` 声明 `results/mts_glt_distill_repair_control` 与
+`results/mts_glt_v2_distill` 为受保护目录；`run_stage` 在建立 stage 目录前即校验 `result_root`，
+命中受保护根会直接失败。
+
+训练超参数沿用既有 C0 协议，未调整：student `total_steps=20000`/`warmup=2000`、
+AdamW `lr=2e-4`/`betas=(0.9,0.98)`/`weight_decay=0.0`、deploy 导出点 5k/10k/20k、
+O8 dropout 0.1；下游 `outer5_inner20`、`head_dropout=0.1`、O8/MD `1e-5`、predictor `1e-4`、
+weight decay 0.02、Huber β=0.5、gradient clip 1.0。
+
+历史 C0/C1/C2 结果属于旧实验定义（137 维输入＋独立 backbone embedding、ReLU FFN、adapter head），
+New-C0 使用独立 experiment/result_root，不会覆盖
+`results/mts_glt_distill_repair_control/` 下的任何正式产物。New-C0 尚未运行，因此这里不记录任何
+性能结果。

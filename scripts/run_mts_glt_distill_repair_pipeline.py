@@ -33,7 +33,7 @@ def prepare():
 
 
 def validate():
-    run([sys.executable, "-m", "pytest", "-q", "tests/test_mts_glt_distill_repair.py", "tests/test_mts_glt_distill.py", "tests/test_mts_finetune_v2.py"])
+    run([sys.executable, "-m", "pytest", "-q", "tests/test_mts_glt_distill_repair.py", "tests/test_mts_glt_distill.py", "tests/test_mts_student_architecture.py"])
 
 
 def _complete(path, schema, version, step):
