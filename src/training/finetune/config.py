@@ -118,7 +118,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--star_rbf_upper", type=float, default=3.0)
     parser.add_argument("--periodic_line_glt_sidecar", default=None)
     parser.add_argument("--mts_glt_mode", choices=sorted(MODE_SPECS), default="o8_glt_atom")
-    parser.add_argument("--mts_glt_version", choices=["v2", "v3", "distill", "distill_repair"], default="v2")
+    parser.add_argument("--mts_glt_version", choices=["v2", "distill", "distill_repair"], default="v2")
     parser.add_argument("--distill_repair_version", choices=["none", "n_plus_1", "n_plus_2"])
     parser.add_argument("--allow_smoke_checkpoint", action="store_true")
     parser.add_argument("--glt_readout_mode", choices=["galformer", "mips_concat"], default="galformer")
@@ -165,7 +165,7 @@ def parse_arguments(argv=None):
         # contract; do not let the legacy 0.25 CLI default reach its model or
         # resolved metadata.  Other routes retain their configured dropout.
         args.head_dropout = 0.1
-    if args.mts_glt_version in {"v3", "distill", "distill_repair"}:
+    if args.mts_glt_version in {"distill", "distill_repair"}:
         args.mts_glt_mode = "none"
         args.graph_input = "star_linking"
     if args.mts_glt_version == "distill_repair" and args.distill_repair_version is None:

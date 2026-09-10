@@ -1,4 +1,4 @@
-"""Entry points for the retained v2 and independent v3 pretraining routes."""
+"""Pretraining config helpers shared by the retained GLT-V2 and Atomic-PC routes."""
 
 from .config import dataset_kwargs_from_args, parse_arguments
 

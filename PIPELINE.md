@@ -1,8 +1,24 @@
 # Uni-Poly-Plus 当前基线流程
 
-本文描述正式生产基线 `MTS-GLT-v2-Base-5k`、保留实验路线 `Atomic-PC W-CAMR-v2`、已完成正式实验的旧 N+1/N+2 蒸馏路线、采用独立验证集的 GLT revision-2 对照，以及尚未执行正式训练的候选路线 `MTS-GLT-v3-Galformer-20k`。结果索引见 [`RESULTS.md`](RESULTS.md)。
+本文描述当前保留的两条路线：`GLT-V2 revision-2`（2D O8 学生及其 N+1/N+2 蒸馏与 C0/C1/C2 对照）和 `Atomic-PC W-CAMR-v2`；已退役的 `MTS-GLT-v2-Base-5k` 与 `MTS-GLT-v3-Galformer-20k` 只保留历史记录和下列明确列出的依赖产物。结果索引见 [`RESULTS.md`](RESULTS.md)。
 
-## 1. 基线身份
+**路线范围（2026-09-10 清理后）**
+
+保留：
+
+- `GLT-V2 revision-2`：`src/modules/{mips_local_graph,mts_glt_distill,periodic_line_glt_v3,uni_encoder}.py`、`src/training/finetune/`、`src/training/pretrain/glt_distill_engine.py`、`src/training/c0_transfer.py`，配置 `configs/mts/glt_distill_{n_plus_1,n_plus_2,repair_c0,repair_c1,repair_c2}.json`。
+- `Atomic-PC W-CAMR-v2`：`src/modules/{original_mips_atomic_pc,original_mips_knowledge_fusion,original_mips_md200,atomic_point_encoder}.py`、`src/training/w_camr_v2_support/`、`src/training/pretrain/original_mips_atomic_pc_joint.py`，配置 `configs/atomic_point_*.json`。
+
+已删除：`MTS-GLT-v2-Base-5k` 与 `MTS-GLT-v3-Galformer-20k` 的模型、预训练、下游、配置、测试、`results/`、`logs/` 与 `pretrained_models/` 产物。
+
+保留的跨路线依赖（不得删除）：
+
+- `results/mts_glt_v2/formal/a6_h_w1_20k/mts_glt_v2_probe_005k.pth`：`src/training/w_camr_v2_support/cohort_runtime.py` 与 `center_runtime.py` 运行时读取，缺失即报错。
+- `results/mts_glt_v2/downstream/formal/a6_h_w1_20k_probe_005k/paired_summary.json`：`scripts/report_mts_glt_distill.py` 读取的历史对照。
+- `src/modules/periodic_line_glt_v3.py`、`scripts/build_mts_glt_v3_sidecars.py`、`data/processed/mips_trimer_scage/periodic_line_glt_image_v1`：`mts_glt_distill.py`、`scripts/build_mts_glt_distill_repair_sidecars.py` 与 `tests/test_mts_glt_distill.py` 的依赖，文件名带 v3 但服务保留路线。
+- `data/processed/mips_trimer_scage/periodic_line_glt_v1`：`tests/test_mts_glt_distill.py` 的对齐 fixture。
+
+## 1. 已退役基线：MTS-GLT-v2-Base-5k
 
 ```text
 MTS-GLT-v2-Base-5k
@@ -22,6 +38,15 @@ results/mts_glt_v2/formal/a6_h_w1_20k/mts_glt_v2_probe_005k.pth
 ```
 
 轨迹运行至 20,000 optimizer steps；下游固定使用 step 5,000 checkpoint。
+
+该路线的训练与下游代码已于 2026-09-10 退役删除（`src/modules/mts_glt_v2.py`、
+`src/modules/periodic_line_glt_v2.py`、`src/training/pretrain/glt_v2_engine.py`、
+`glt_v2_objectives.py`、`configs/mts/glt_v2_*.json`、`scripts/run_mts_glt_v2_finetune.py`、
+`scripts/report_mts_glt_v2_*.py`、`scripts/build_glt_v2_label_counts.py`、
+`tests/test_mts_finetune_v2.py`、`tests/test_mts_periodic_line_glt.py`，以及其
+`results/`、`logs/`、`pretrained_models/` 产物）。仅保留上面那个 checkpoint，因为
+保留路线 Atomic-PC W-CAMR-v2 在运行时读取它。因此本节描述的架构与下游合同自此
+只是历史记录：该基线已无法重新预训练、重新微调或重新评估。
 
 ## 2. 数据与缓存
 
@@ -99,7 +124,7 @@ trajectory              20000 optimizer steps
 selected checkpoint     step 5000
 ```
 
-入口配置为 [`configs/mts/glt_v2_formal_a6_h_w1_20k.json`](configs/mts/glt_v2_formal_a6_h_w1_20k.json)，短验证使用 [`configs/mts/glt_v2_ddp_smoke.json`](configs/mts/glt_v2_ddp_smoke.json)。
+该合同的入口配置 `configs/mts/glt_v2_formal_a6_h_w1_20k.json` 与 `configs/mts/glt_v2_ddp_smoke.json` 已随基线路线一并删除；本节作为历史记录保留。
 
 ## 7. 下游合同
 
@@ -122,17 +147,23 @@ folds                   0, 1, 2, 3, 4
 seed                    42
 ```
 
+`adapter 1e-5` 一行描述已退役的 v2 基线；保留路线的学习率、dropout 与 head 结构见 §11–§14（新版 DistillStudent 无 adapter 参数组，predictor 使用 `1e-4`，`head_dropout` 固定 `0.1`）。
+
 `historical_shared5` 使用同一 held-out fold 作为 validation 和 test，不是独立盲测。后续代码验证默认只运行必要的 unit test 和 smoke；扩大任务、fold、epoch 或样本范围须另行授权。
 
 ## 8. 保留入口与产物
 
-- 预训练：`scripts/pretrain.py` → `src.training.pretrain`。
-- 下游单 fold：`scripts/train.py` → `src.training.finetune.engine`。
-- 调度：`scripts/run_mts_finetune_scheduler.py`。
-- line sidecar：`scripts/build_periodic_line_glt_sidecar.py`、`scripts/audit_periodic_line_glt_sidecar.py`。
-- cache 合同：`scripts/resolve_mips_trimer_scage.py`、`scripts/audit_mips_trimer_cache.py`、`scripts/validate_mts_cache.py`。
+- GLT-V2 revision-2 预训练：`scripts/pretrain_mts_glt_distill.py --stage teacher|student` → `src.training.pretrain.glt_distill_engine.run_stage`；配置 `configs/mts/glt_distill_repair_c{0,1,2}.json`。
+- GLT-V2 revision-2 分词蒸馏侧车：`scripts/build_mts_glt_distill_repair_sidecars_parallel.py`。
+- 下游单 fold：`scripts/train.py` → `src.training.finetune.engine`；调度：`scripts/run_mts_finetune_scheduler.py`。
+- Atomic-PC W-CAMR-v2：`scripts/run_original_mips_atomic_pc_w_camr_v2.py`。
+- line sidecar：`scripts/build_periodic_line_glt_sidecar.py`、`scripts/audit_periodic_line_glt_sidecar.py`、`scripts/build_mts_glt_v3_sidecars.py`（同时服务保留路线的 image sidecar）。
+- cache 合同：`scripts/audit_mips_trimer_cache.py`、`scripts/validate_mts_cache.py`。
+- 已随 v2 基线删除：`scripts/run.sh`、`scripts/run_mts.sh`、`scripts/run_mips_trimer_scage.sh`、`scripts/run_train.sh`、`scripts/run_pretrain.sh`、`scripts/resolve_mips_trimer_scage.py`、`scripts/resolve_mts.py`（它们只解析 `schema=mts-glt-v2` 配置，已无有效输入）。
 
-正式结果、resolved input、训练日志和 checkpoint 的索引集中在 [`RESULTS.md`](RESULTS.md)。所有新产物必须使用独立目录，不覆盖基线文件。
+`scripts/pretrain.py` → `run_pretrain` 只保留入口壳：已退役的 `mts-glt-v2` 与 `mts-glt-v3-galformer-20k` schema 会直接报错，不再分发到任何模型。
+
+正式结果、resolved input、训练日志和 checkpoint 的索引集中在 [`RESULTS.md`](RESULTS.md)。所有新产物必须使用独立目录，不覆盖保留产物。
 
 ## 9. 保留实验路线：Atomic-PC W-CAMR-v2
 
@@ -142,15 +173,13 @@ W-CAMR 预训练只更新 Atomic-PC encoder、learned mask embedding 和临时 a
 
 入口为 `scripts/run_original_mips_atomic_pc_w_camr_v2.py`，结果位于 `results/original_mips_atomic_pc_w_camr_v2/`。Center-RU 数据构造、50K cohort 解析和历史 matched-reference 读取代码集中在 `src/training/w_camr_v2_support/`；参考产物集中在该结果目录的 `references/`。它们仅作为 W-CAMR-v2 的内部实现与 provenance 依赖保留，不是独立路线。该实验同样使用 `historical_shared5`，不是独立盲测，也不替代正式生产基线。
 
-## 10. 已实现候选：MTS-GLT-v3-Galformer-20k
+## 10. 已退役路线：MTS-GLT-v3-Galformer-20k
 
-v3 使用独立的 `mts-periodic-line-glt-image-v1` sidecar。每个周期 line token 只读取一个中心锚点 image 的真实键长；每个 source-image→center-target 关系只读取对应物理实例的一个键角，不计算 Trimer 平移副本的 distance/angle mean、variance、count 或 multiplicity。token 化学输入为端点元素、BondType、BondStereo、IsConjugated，几何输入为原子对条件化的 256 维 Gaussian distance basis；关系角度通过 128 维 Gaussian basis形成 8-head bias。line 邻域仍严格是共享真实原子的 chemical-bond 1-hop。
+该路线于 2026-09-10 删除：`src/modules/mts_glt_v3.py`、`src/training/pretrain/glt_v3_{engine,objectives}.py`、`configs/mts/glt_v3_*.json`、`scripts/{check_mts_glt_v3_ddp_parity,run_mts_glt_v3_finetune,run_mts_glt_v3_full_pipeline,smoke_mts_glt_v3}.py`、`tests/test_mts_glt_v3.py`、`results/mts_glt_v3_galformer_20k/`、`logs/mts_glt_v3_galformer_20k/` 与 `pretrained_models/mts_glt_v3_galformer_20k.pth`。
 
-联合预训练固定为 `L_mask2D + L_mask3D + L_cl`。O8 的 30% canonical atom masking 在 pool 前经过可学习 MD200 scalar-gated node residual；GLT 对 40% line token 使用 80/10/10 corruption与四个 factorized heads；双向 InfoNCE 使用 O8 canonical-atom mean 与 GLT atom/line readout。正式配置为 [`configs/mts/glt_v3_galformer_20k.json`](configs/mts/glt_v3_galformer_20k.json)，只保存 5k/10k/20k probes且没有 resume 路径。
+它只到过实现、单元测试和两步 smoke，从未构建全量 v3 sidecar，也没有启动 20k 预训练或正式微调，因此没有性能结论随删除丢失。
 
-下游公开 `glt_readout_mode=galformer|mips_concat`：默认 `galformer` 只加载 O8 与 MD residual，完全不实例化或读取 GLT/geometry；`mips_concat` 将 atom-aligned O8/GLT states拼成 1024 维并投影回 512 维后再执行 MD residual。sidecar 构建入口为 `scripts/build_mts_glt_v3_sidecars.py`，短 smoke 为 `scripts/smoke_mts_glt_v3.py`，下游调度入口为 `scripts/run_mts_glt_v3_finetune.py`。
-
-当前状态仅为实现、单元测试和两步 smoke；未构建全量 v3 sidecar，未启动 20k 预训练或正式微调，因此 v3 不是新的生产基线，也没有性能结论。
+仍在仓库中的 v3 命名组件属于保留路线的依赖，不是该路线残留：`src/modules/periodic_line_glt_v3.py`（`mts_glt_distill.py` 导入的 mask/RBF 与 line transformer）、`scripts/build_mts_glt_v3_sidecars.py`（保留路线的 image sidecar 构建入口）与 `data/processed/mips_trimer_scage/periodic_line_glt_image_v1`（化学输入来源）。
 
 ## 11. 已完成实验：N+1 / N+2 两阶段蒸馏
 

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pytest
 import torch
 from torch import nn
 
@@ -56,22 +57,15 @@ def test_distill_student_uses_identity_wrapper_and_mips_predictor():
     assert predictor[3].out_features == 1
 
 
-def test_non_distill_route_keeps_legacy_wrapper_and_head():
+def test_retired_glt_downstream_mode_is_rejected():
     args = parse_arguments([
         "--config_schema", "mts-glt-v2-downstream",
         "--mts_glt_version", "v2",
         "--mts_glt_mode", "o8_only",
         "--head_dropout", "0.25",
     ])
-    model = build_mts_downstream_model(args)
-    wrapper = model.encoders["graph"]
-
-    assert model.joint_embedding_dim == 256
-    assert isinstance(wrapper.norm, nn.LayerNorm)
-    assert isinstance(wrapper.projection, nn.Sequential)
-    assert model.mlp[0].in_features == 256
-    assert model.mlp[0].out_features == 128
-    assert model.mlp[2].p == 0.25
+    with pytest.raises(ValueError, match="retired"):
+        build_mts_downstream_model(args)
 
 
 def test_distill_optimizer_covers_trainable_parameters_without_identity_params():

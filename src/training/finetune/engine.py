@@ -220,34 +220,16 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
             nn.Dropout(0.1),
             nn.Linear(512, 1, bias=True),
         )
-    if glt_version == "v3":
-        from src.modules import MTSGraphLineModelV3
-        model.encoders["graph"].encoder = MTSGraphLineModelV3(
-            glt_readout_mode=str(getattr(args, "glt_readout_mode", "galformer"))
-        )
-        return model
     if glt_version in {"distill", "distill_repair"}:
         from src.modules.mts_glt_distill import DistillStudent
         model.encoders["graph"].encoder = DistillStudent()
         return model
     glt_mode = str(getattr(args, "mts_glt_mode", "none"))
     if glt_mode != "none":
-        if tuple(args.modalities) != ("graph",):
-            raise ValueError("MTS-GLT-v2 downstream supports graph-only mode")
-        if bool(getattr(args, "use_star_rbf", False)):
-            raise ValueError("MTS-GLT-v2 downstream requires Star-RBF off")
-        if str(getattr(args, "mts_glt_version", "v2")) != "v2":
-            raise ValueError("MTS-GLT-v2 downstream requires version v2")
-        if int(getattr(args, "mts_glt_layers", 6)) != 6 or str(getattr(args, "mts_glt_attention_variant", "mips")) != "mips":
-            raise ValueError("MTS-GLT-v2 baseline fixes six MIPS-attention GLT layers")
-        from src.modules import MTSGraphLineModelV2
-        encoder = MTSGraphLineModelV2(
-            glt_layers=int(args.mts_glt_layers),
-            glt_attention_variant=str(args.mts_glt_attention_variant),
-            use_compact19=bool(args.mts_glt_use_compact19),
+        raise ValueError(
+            "the MTS-GLT-v2 GLT downstream modes were retired with the v2/v3 "
+            "routes; only mts_glt_mode=none remains"
         )
-        encoder.downstream_mode = glt_mode
-        model.encoders["graph"].encoder = encoder
     return model
 
 
@@ -300,20 +282,6 @@ def select_mts_glt_distill_state(
     expected = {key for key in model_state if key.startswith(graph_prefix)}
     if set(mapped) != expected:
         raise RuntimeError("N+ student deployment state does not strictly match downstream model")
-    return mapped
-
-
-def select_mts_glt_v3_graph_state(model_state, checkpoint):
-    if checkpoint.get("schema") != "mts-glt-v3-deploy-v1":
-        raise RuntimeError("MTS-GLT-v3 deploy checkpoint schema mismatch")
-    prefix = "encoders.graph.encoder."
-    mapped = {prefix + key: value for key, value in checkpoint["state_dict"].items()}
-    expected = {key for key in model_state if key.startswith(prefix)}
-    if set(mapped) != expected:
-        raise RuntimeError(
-            f"MTS-GLT-v3 checkpoint mismatch; missing={sorted(expected-set(mapped))[:8]} "
-            f"unexpected={sorted(set(mapped)-expected)[:8]}"
-        )
     return mapped
 
 
@@ -395,13 +363,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             modalities=("graph",),
             periodic_line_glt_sidecar=(
                 None
-                if (
-                    str(getattr(args, "mts_glt_version", "v2")) == "distill_repair"
-                    or (
-                        str(getattr(args, "mts_glt_version", "v2")) == "v3"
-                        and str(getattr(args, "glt_readout_mode", "galformer")) == "galformer"
-                    )
-                )
+                if str(getattr(args, "mts_glt_version", "v2")) == "distill_repair"
                 else args.periodic_line_glt_sidecar
             ),
         )
@@ -594,9 +556,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                 }
                 merged_state = model.state_dict()
                 glt_state = (
-                    select_mts_glt_v3_graph_state(merged_state, checkpoint)
-                    if str(getattr(args, "mts_glt_version", "v2")) == "v3"
-                    else select_mts_glt_distill_state(
+                    select_mts_glt_distill_state(
                         merged_state, checkpoint,
                         getattr(args, "distill_repair_version", None),
                         bool(getattr(args, "allow_smoke_checkpoint", False)),

@@ -1,9 +1,0 @@
-Traceback (most recent call last):
-  File "/root/workspace/Uni-Poly-Plus-master/scripts/run_mts_finetune_scheduler.py", line 339, in <module>
-    main()
-  File "/root/workspace/Uni-Poly-Plus-master/scripts/run_mts_finetune_scheduler.py", line 322, in main
-    report = run_subprocess_scheduler(
-             ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/root/workspace/Uni-Poly-Plus-master/src/training/finetune/scheduler.py", line 154, in run_subprocess_scheduler
-    raise SchedulerError(unit, status)
-src.training.finetune.scheduler.SchedulerError: failed unit=42|eat|0 status=1; stopping all slots
