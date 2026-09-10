@@ -1,0 +1,41 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, md200_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics ./data/processed/mips_trimer_scage/diagnostics_smi_all_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Building smi_xc from feature cache:   0%|          | 0/432 [00:00<?, ?it/s]Building smi_xc from feature cache:  97%|█████████▋| 419/432 [00:00<00:00, 4182.17it/s]Building smi_xc from feature cache: 100%|██████████| 432/432 [00:00<00:00, 4189.93it/s]
+Built smi_xc: 432 samples from feature cache
+
+Starting task: xc
+Start 5-fold Cross Validation
+
+Fold 1
+Fold seed: 320904
+Evaluation protocol: historical_shared5
+Fold partitions: train=345, validation=87, test=87
+Created dataloader with 345 samples
+Created dataloader with 87 samples
+Created dataloader with 87 samples
+MTS-GLT-v2 checkpoint load: strictly loaded 91 graph tensors for none.
+Loaded pretrained model from results/mts_glt_distill_repair_control/c1/student/student_deploy_005k.pt
+Using GPU for model training.
+Training:   0%|          | 0/11 [00:00<?, ?it/s]Training:   9%|▉         | 1/11 [00:00<00:07,  1.26it/s]Training:  36%|███▋      | 4/11 [00:00<00:01,  5.49it/s]Training:  64%|██████▎   | 7/11 [00:01<00:00,  9.39it/s]Training:  91%|█████████ | 10/11 [00:01<00:00, 12.84it/s]Training: 100%|██████████| 11/11 [00:01<00:00,  9.21it/s]
+Evaluating:   0%|          | 0/2 [00:00<?, ?it/s]Evaluating:  50%|█████     | 1/2 [00:00<00:00,  3.33it/s]Evaluating: 100%|██████████| 2/2 [00:00<00:00,  6.34it/s]
+Epoch 1: Validation R2 improved to 0.0032.
+Epoch 1/2 - train=0.5825 val=0.6025 val_r2=0.0032
+Training:   0%|          | 0/11 [00:00<?, ?it/s]Training:   9%|▉         | 1/11 [00:00<00:02,  4.77it/s]Training:  36%|███▋      | 4/11 [00:00<00:00, 13.95it/s]Training:  64%|██████▎   | 7/11 [00:00<00:00, 16.51it/s]Training:  91%|█████████ | 10/11 [00:00<00:00, 18.51it/s]Training: 100%|██████████| 11/11 [00:00<00:00, 16.83it/s]
+Evaluating:   0%|          | 0/2 [00:00<?, ?it/s]Evaluating:  50%|█████     | 1/2 [00:00<00:00,  5.12it/s]Evaluating: 100%|██████████| 2/2 [00:00<00:00,  9.53it/s]
+Epoch 2: No improvement in Validation R2 for 1 epoch(s).
+Epoch 2/2 - train=0.5768 val=0.5906 val_r2=0.0004
+Testing:   0%|          | 0/2 [00:00<?, ?it/s]Testing:  50%|█████     | 1/2 [00:00<00:00,  3.53it/s]Testing: 100%|██████████| 2/2 [00:00<00:00,  6.72it/s]
+Fold 1 Test R2: 0.003, MAE: 18.677, RMSE: 22.780
+Fold 1 attention shape: (87, 1)
+Fold 1 mean attention: graph:1.000000
+
+Average of metrics over all folds
+Test R2 = 0.003
+Test MAE = 18.677
+Test RMSE = 22.780
+Standard Deviation of Test R2 = 0.000
+Standard Deviation of Test MAE = 0.000
+Standard Deviation of Test RMSE = 0.000
+Best Validation R2 = 0.003 +/- 0.000
+5-fold mean attention: graph:1.000000
+Results have been appended to 'results/mts_c0_c1_historical_shared5_005k_rerun/c1/smoke_v2/shards/42/xc/fold_0.csv'.

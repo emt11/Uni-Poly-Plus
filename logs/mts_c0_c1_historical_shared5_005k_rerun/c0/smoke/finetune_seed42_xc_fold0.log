@@ -1,0 +1,27 @@
+[lmdb_cache] ru_base_missing=0, topology_missing=0, trimer_missing=0, md200_missing=0, jobs=0, workers=0
+reusing feature-cache diagnostics ./data/processed/mips_trimer_scage/diagnostics_smi_all_mips_trimer_scage-starlink-backbone-mts-canonical-periodic-feature-v3-paper_corrected-hop2-manual_geom-repeat-unit-energytop4_cand8_full_hardtimeout45_fp-disabled_tok0.json
+Building smi_xc from feature cache:   0%|          | 0/432 [00:00<?, ?it/s]Building smi_xc from feature cache:  97%|█████████▋| 419/432 [00:00<00:00, 4183.85it/s]Building smi_xc from feature cache: 100%|██████████| 432/432 [00:00<00:00, 4191.02it/s]
+Built smi_xc: 432 samples from feature cache
+
+Starting task: xc
+Start 5-fold Cross Validation
+
+Fold 1
+Fold seed: 320904
+Evaluation protocol: historical_shared5
+Fold partitions: train=345, validation=87, test=87
+Created dataloader with 345 samples
+Created dataloader with 87 samples
+Created dataloader with 87 samples
+Traceback (most recent call last):
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/train.py", line 22, in <module>
+    main()
+  File "/root/workspace/Uni-Poly-Plus-master/scripts/train.py", line 18, in main
+    return run_finetune_job(parse_arguments())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/training/finetune/engine.py", line 540, in run_finetune_job
+    else select_mts_glt_distill_state(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/workspace/Uni-Poly-Plus-master/src/training/finetune/engine.py", line 232, in select_mts_glt_distill_state
+    raise RuntimeError("N+ downstream requires a strict 20k student deploy bundle")
+RuntimeError: N+ downstream requires a strict 20k student deploy bundle
