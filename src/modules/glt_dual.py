@@ -228,11 +228,11 @@ class DualGLTModel(nn.Module):
         atoms, bias = self.o8(data, atom_mask)
         result = self.glt(data)
         result.update(atom_states=atoms, bond_path_attention_bias=bias,
+                      canonical_graph_index=data.canonical_graph_index,
                       graph_2d=mean_pool(atoms, data.canonical_graph_index, data.graph_available.numel()))
         return result
 
-    def forward(self, data, *, atom_mask=None):
-        encoded = self.encode(data, atom_mask=atom_mask)
+    def fuse(self, encoded):
         valid = encoded['geometry_valid']
         if self.fusion_mode == 'concat':
             geometry = self.norm3(encoded['graph_3d'])
@@ -240,11 +240,15 @@ class DualGLTModel(nn.Module):
             features = torch.cat([self.norm2(encoded['graph_2d']), geometry], -1)
         else:
             atoms = encoded['atom_states']
-            fused = self.kfuse(atoms, {'glt3d': encoded['graph_3d']}, data.canonical_graph_index)
+            index = encoded['canonical_graph_index']
+            fused = self.kfuse(atoms, {'glt3d': encoded['graph_3d']}, index)
             # Mask the entire projected update, including v_proj.bias.
-            fused = torch.where(valid[data.canonical_graph_index].unsqueeze(-1), fused, atoms)
-            features = mean_pool(fused, data.canonical_graph_index, data.graph_available.numel())
-        return self.predictor(features)
+            fused = torch.where(valid[index].unsqueeze(-1), fused, atoms)
+            features = mean_pool(fused, index, encoded['graph_2d'].size(0))
+        return features
+
+    def forward(self, data, *, atom_mask=None):
+        return self.predictor(self.fuse(self.encode(data, atom_mask=atom_mask)))
 
 
 def build_dual_glt_model(fusion_mode='concat', *, dropout=0.1):

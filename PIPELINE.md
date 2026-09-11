@@ -487,3 +487,118 @@ python scripts/validate_dual_glt.py --topology-root TOPOLOGY_LAYER --trimer-root
 
 以上路径与 key 需对应执行环境实际冻结产物，不使用历史样本编号猜测新环境身份。
 遵守项目 tmux/log 规则。当前没有执行上述命令，没有生成新性能结果。
+
+## 18. GLT 双路三任务预训练与 outer5_inner20 微调（实现，未执行）
+
+本节是独立新入口；第 17 节模型及冻结输入不再需要借用旧 C0/C1/C2 runner。
+两种模式分别使用 `configs/mts/glt_dual_three_task_concat.json` 与
+`configs/mts/glt_dual_three_task_kfuse.json`。无 MD200、教师、蒸馏或 InfoNCE。
+本轮没有启动任何测试、模型、训练或缓存构建，以下命令仅供允许执行的环境使用。
+
+### 数据、目标与共享融合
+
+`src/dataset/glt_dual_pretrain.py` 从只读 topology/Trimer 记录按需构建输入和独立
+targets。开放 Trimer 按 BRICS 切分后的连通分量与中心 RU 求交，再映射为 canonical
+原子组；整组选取约 30%，至少保留一个原子。只有一个组时使用连通子集退化并计数，
+单原子跳过元素 loss。138 维整体遮蔽，path-node 使用遮蔽后的 embedding。
+元素头是两层 incoming-mean 图解码器，仅读取 O8 hidden；不读取 3D 或融合结果。
+
+完整 Trimer 坐标副本添加独立 `sigma=0.03 Å` Gaussian 噪声，从同一受扰动坐标
+重算全部距离/角度/path bias。干净标签不进入 encoder；原本有效的几何被噪声破坏
+时明确报错。长度监督仅取中心内部键，角度监督仅取两条中心内部键的真实无向夹角，
+每个只计一次；不监督多路径重复和 self 合成角。`N=0`/无效几何跳过几何任务；
+无中心角度只跳过角度项。长度误差单位为 Å，角度目标为 cosine。
+
+指纹标签来自无坐标的开放 7-RU 拓扑，以中心 RU 为 roots，radius=2、2048 bit、
+`includeChirality=False`。验证 roots 到两个开放端点至少 3 hop；不满足时报错。
+标签不作为输入，不引入额外 3D RU。确定性化学目标仅有进程内 512 项 LRU 缓存，
+不会写全量 sidecar。`DualGLTModel.fuse(encoded)` 为预训练和微调共享的融合接口。
+
+三项任务分别先按每个样本的有效目标平均，再对有效样本平均：
+
+$$
+L=L_{chem}+L_{geo}+0.1L_{FP},\quad
+L_{geo}=\operatorname{mean}_{E_0}(\hat d-d)^2+
+\operatorname{mean}_{A_0}(\widehat{\cos\theta}-\cos\theta)^2.
+$$
+
+几何任务以有中心键的有效样本为分母，没有角度的样本角度项为零。指纹采用逐 bit
+BCE；数据适配拒绝无效 2D 拓扑，但保留无效 3D 的合法 2D 样本。跨 rank 按全局
+sum/count 归约；日志包含任务均值、有效样本数、目标数量、各 rank 的退化数及跳过原因。
+两种融合各自训练；单 knowledge KFuse 的 Query/Key 零梯度仍是预期行为。
+
+论文依据为 [Motif-Aware Attribute Masking (2025)](https://proceedings.mlr.press/v269/inae25a.html)、
+[SCAGE (2025)](https://www.nature.com/articles/s41467-025-59634-0)、
+[FlexMol (2025)](https://arxiv.org/html/2510.07035v1)。BRICS 周期分组、中心标量去噪、
+7-RU rooted 指纹和损失权重均为项目适配，非逐代码复刻或已验证最优设置。
+
+### 预训练调用与恢复
+
+`scripts/pretrain_glt_dual.py` 支持单进程/DDP；默认 microbatch=84，有效 batch=1008，
+累积次数自动取 `1008/(84*world_size)`，不整除即报错。逐 optimizer update 按绝对
+抽样位置分配样本；每 epoch 确定性打乱，跨 epoch 连续填满有效 batch。样本 key、seed、
+绝对位置决定 mask/噪声。数据在主进程按 microbatch 构建，不启动 DataLoader workers。
+BF16 仅用于模型，几何和 loss 使用 FP32。AdamW 默认 betas=(0.9,0.999)，weight decay=0。
+
+5000 updates，LR=2e-4，warmup=2000，cosine horizon=20000，end LR=1e-9，每 1000
+步保存完整恢复包和部署包。注意旧 no-MD runner 源码实际使用线性衰减；本入口按新计划
+使用 cosine，因此不是旧 runner 学习率轨迹的逐步复刻，不宣称匹配旧训练。
+恢复包保存任务头、优化器、调度位置、各 rank RNG、顺序样本身份及下一数据位置；
+要求同配置、world size、输入路径和样本顺序。恢复不得覆盖已有的更晚 checkpoint。
+部署包仅含 O8/GLT/fusion/norm，不含任务头或性质头，严格核查 fusion/step 与张量集合。
+
+下面 shell 模板在工作目录的 `tmux` session `Uni-Poly` 独立 window 内使用。
+先检查已有 session/任务，避免重复启动；`MODE` 分别设为 concat/kfuse；所有数据路径
+必须指向真实冻结层，输出目录必须全新。模板不自动串行启动另一模式或微调。
+
+```bash
+MODE=concat
+mkdir -p logs/glt_dual_three_task
+set -o pipefail
+torchrun --standalone --nproc_per_node=3 scripts/pretrain_glt_dual.py \
+  --config configs/mts/glt_dual_three_task_${MODE}.json \
+  --samples-csv PI1M_CSV --topology-root TOPOLOGY_LAYER --trimer-root TRIMER_LAYER \
+  --output results/glt_dual_three_task/${MODE}/pretrain \
+  2>&1 | tee logs/glt_dual_three_task/${MODE}_pretrain.log
+```
+
+同一命令增加 `--resume results/.../resume_01000.pt` 恢复；必须使用原输出目录。
+这些命令需要用户单独授权执行，不属于当前已运行产物。
+
+### 下游五折与指标
+
+`scripts/finetune_glt_dual.py` 复用既有 train_epoch/evaluate/test_model、standard target
+scaler 和 split 生成函数，隔离旧模型工厂与默认参数。固定八任务×五折，优先读取
+`data/splits/mips_outer5_inner20/{task}.json`；缺失时按 outer seed=1、inner seed=42+fold
+生成并保留。存在的 split 若不匹配则报错，不覆盖。300 条为 192/48/60。
+
+每 fold 独立初始化性质头，加载对应模式的 5000-step 部署包；clean Trimer，无 mask、
+无噪声、无预训练标签。scaler 只拟合 train，standard-label MSE。两路 LR=1e-5，
+fusion/head LR=1e-4，AdamW weight decay=.02，batch=32/eval=64，FP32，worker=0；
+最多 100 epochs、warmup=5、patience=10、clip=1。非有限 loss/gradient/指标报错。
+按 validation R² 选权重，恢复后 test 只评估一次。每行一次 OOF 预测；五折统计 std
+采用 ddof=1，macro8 为八个任务的 fold-mean R² 均值，pooled OOF 指标另列。
+这是既有开发折评估，不是独立盲测。微调不提供自动断点续跑，不覆盖已有输出目录。
+
+```bash
+python scripts/finetune_glt_dual.py \
+  --config configs/mts/glt_dual_three_task_${MODE}.json \
+  --checkpoint results/glt_dual_three_task/${MODE}/pretrain/deploy_05000.pt \
+  --raw-root data/raw --topology-root DOWNSTREAM_TOPOLOGY_LAYER --trimer-root DOWNSTREAM_TRIMER_LAYER \
+  --split-root data/splits/mips_outer5_inner20 \
+  --output results/glt_dual_three_task/${MODE}/downstream \
+  2>&1 | tee logs/glt_dual_three_task/${MODE}_finetune.log
+```
+
+### 局部验证（全部未执行）
+
+```text
+pytest -q tests/test_dual_glt_pretrain.py tests/test_dual_glt.py
+python scripts/validate_glt_dual_pretrain.py --topology-root TOPOLOGY_LAYER --trimer-root TRIMER_LAYER --sample ORDINARY_KEY "ORDINARY_PSMILES" --sample N0_KEY "N0_PSMILES"
+```
+
+真实入口最多两条冻结记录、CPU 单线程、无 workers/optimizer/训练循环；三任务前后向、
+内存中 step=0 包的严格加载、clean 下游 forward。step=0 仅为验证包，不冒充已训练模型。
+测试涵盖 mask 泄漏、目标几何、fingerprint reference、DDP 梯度归约的代数参考、优化器/RNG
+恢复、绝对位置抽样、部署加载与 300 条分折；以隔离 mock 检查 validation 选模后 test
+只运行一次。人工测试坐标不是实际构象。当前没有实际 DDP 或真实样本验证。

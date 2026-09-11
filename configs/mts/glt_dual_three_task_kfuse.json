@@ -1,0 +1,32 @@
+{
+  "fusion_mode": "kfuse",
+  "dataset_name": "PI1M_v2",
+  "seed": 42,
+  "use_md200": false,
+  "microbatch": 84,
+  "global_batch": 1008,
+  "max_optimizer_steps": 5000,
+  "save_every": 1000,
+  "lr": 0.0002,
+  "warmup_steps": 2000,
+  "schedule_total_steps": 20000,
+  "end_lr": 1e-9,
+  "weight_decay": 0,
+  "amp_dtype": "bf16",
+  "atom_mask_ratio": 0.3,
+  "noise_sigma": 0.03,
+  "loss_weights": [
+    1,
+    1,
+    0.1
+  ],
+  "downstream_step": 5000,
+  "encoder_lr": 0.00001,
+  "fusion_head_lr": 0.0001,
+  "finetune_weight_decay": 0.02,
+  "finetune_batch": 32,
+  "eval_batch": 64,
+  "epochs": 100,
+  "finetune_warmup": 5,
+  "patience": 10
+}

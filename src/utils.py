@@ -301,6 +301,7 @@ def train_epoch(
     max_grad_norm=1.0,
     amp_dtype="fp32",
     return_timing=False,
+    fail_nonfinite=False,
 ):
     model.train()
     started = time.perf_counter()
@@ -312,9 +313,11 @@ def train_epoch(
         with _autocast_context(device, amp_dtype):
             output, _ = model(batch)
             loss = criterion(output, batch.y)
+        if fail_nonfinite and not torch.isfinite(loss):
+            raise FloatingPointError('nonfinite training loss')
         loss.backward()
         if float(max_grad_norm) > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+            torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm), error_if_nonfinite=fail_nonfinite)
         optimizer.step()
         scheduler.step()
         steps += 1
