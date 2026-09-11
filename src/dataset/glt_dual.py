@@ -5,8 +5,6 @@ must return a canonical topology record with frozen Trimer fields, or a tuple
 ``(topology, trimer, smiles)``. The dedicated collator never handles MD200.
 """
 
-from collections import deque
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -54,7 +52,7 @@ def bond_paths(topology, smiles):
 
 
 def two_hop_paths(row):
-    """One shortest path per physical pair; reverse directions are exact reverses."""
+    """All shortest paths per physical pair, grouped into one attention edge."""
     count = len(row['tokens']['token_distance'])
     rel = row['relations']
     adjacent = [set() for _ in range(count)]
@@ -68,41 +66,43 @@ def two_hop_paths(row):
             raise ValueError('ambiguous physical line relation')
         adjacent[s].add(t)
         angles[s, t] = float(angle)
-    paths, values, self_flags = [], [], []
+    paths, values, self_flags, groups = [], [], [], []
+    sources, targets = [], []
     for start in range(count):
-        found = {start: [start]}
-        queue = deque([start])
-        while queue:
-            current = queue.popleft()
-            if len(found[current]) == 3:
-                continue
-            for target in sorted(adjacent[current]):
-                if target not in found:
-                    found[target] = found[current] + [target]
-                    queue.append(target)
+        found = {target: [[start, target]] for target in adjacent[start] if target != start}
+        for middle in adjacent[start]:
+            for target in adjacent[middle]:
+                if target != start and target not in adjacent[start]:
+                    found.setdefault(target, []).append([start, middle, target])
         for end in sorted(found):
             if end <= start:
                 continue
-            forward = found[end]
-            for path in (forward, forward[::-1]):
-                paths.append(path)
-                values.append([angles[a, b] for a, b in zip(path, path[1:])])
-                self_flags.append(False)
+            for reverse in (False, True):
+                group = len(sources)
+                sources.append(end if reverse else start)
+                targets.append(start if reverse else end)
+                for forward in sorted(found[end]):
+                    path = forward[::-1] if reverse else forward
+                    paths.append(path)
+                    values.append([angles[a, b] for a, b in zip(path, path[1:])])
+                    self_flags.append(False)
+                    groups.append(group)
     for token in range(count):
+        groups.append(len(sources))
+        sources.append(token)
+        targets.append(token)
         paths.append([token, token])
         values.append([0.0])
         self_flags.append(True)
     p = torch.full((len(paths), 3), -1, dtype=torch.long)
     a = torch.zeros((len(paths), 2))
     mask = torch.zeros_like(a, dtype=torch.bool)
-    sources, targets = [], []
     for i, (path, angle) in enumerate(zip(paths, values)):
         p[i, :len(path)] = torch.tensor(path)
         a[i, :len(angle)] = torch.tensor(angle)
         mask[i, :len(angle)] = True
-        sources.append(path[0])
-        targets.append(path[-1])
     return dict(path=p, angle=a, mask=mask, is_self=torch.tensor(self_flags, dtype=torch.bool),
+                path_group=torch.tensor(groups, dtype=torch.long),
                 source=torch.tensor(sources, dtype=torch.long), target=torch.tensor(targets, dtype=torch.long))
 
 
@@ -190,7 +190,7 @@ def dual_glt_collate(samples):
         raise ValueError('empty dual batch')
     batch = Data()
     fields = {}
-    atom_offset = bond_offset = 0
+    atom_offset = bond_offset = relation_offset = 0
     for graph, item in enumerate(samples):
         n, m = item.mips_x.size(0), item.bond_distance.numel()
         for name in ('mips_x', 'mips_backbone_mask', 'lga_spd', 'lga_path_mask',
@@ -206,10 +206,12 @@ def dual_glt_collate(samples):
             fields.setdefault(name, []).append(torch.where(value >= 0, value + offset, value))
         for name in ('line_source', 'line_target'):
             fields.setdefault(name, []).append(getattr(item, name) + bond_offset)
+        fields.setdefault('line_path_group', []).append(item.line_path_group + relation_offset)
         fields.setdefault('canonical_graph_index', []).append(torch.full((n,), graph, dtype=torch.long))
         fields.setdefault('bond_batch', []).append(torch.full((m,), graph, dtype=torch.long))
         atom_offset += n
         bond_offset += m
+        relation_offset += item.line_source.numel()
     for name, values in fields.items():
         setattr(batch, name, torch.cat(values, dim=1 if name == 'lga_edge_index' else 0))
     batch.graph_available = torch.tensor([x.graph_available for x in samples], dtype=torch.bool)

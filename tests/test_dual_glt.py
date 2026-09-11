@@ -8,6 +8,9 @@ import math
 
 import pytest
 import torch
+from rdkit import Chem
+from src.dataset.graph_data import build_periodic_multimer_mol
+from src.dataset.glt_bond_chemistry import bond_feature_vector
 
 from test_complete_trimer_glt import _toy_pair
 from src.dataset.canonical_periodic import build_canonical_periodic_topology
@@ -16,6 +19,7 @@ from src.dataset.periodic_line_glt_complete import build_complete_trimer_glt_sam
 from src.modules.glt_dual import (
     SharedBondPathBias, SourceAttention512, TransformerBlock, TypeGaussian,
     PathAngleBias, triplet_type, build_dual_glt_model,
+    mean_pool,
 )
 from src.modules.mts_glt_distill import SourceQPreLNAttention
 
@@ -62,6 +66,96 @@ def test_bond_bias_reference_and_padding():
     g2 = torch.autograd.grad(expected.square().sum(), encoder.position)[0]
     torch.testing.assert_close(g1, g2)
     assert (actual[~mask.any(-1)] == 0).all()
+
+
+@pytest.mark.parametrize('smiles', ['*C/C=C/C*', '*C/C=C\\C*', '*/C=C/*', '*/C=C\\*'])
+def test_stereo_survives_real_neighbor_mapping(smiles):
+    original = Chem.MolFromSmiles(smiles)
+    expected = next(b.GetStereo() for b in original.GetBonds()
+                    if b.GetBondType() == Chem.BondType.DOUBLE)
+    for source in (original, Chem.RenumberAtoms(original, list(reversed(range(original.GetNumAtoms()))))):
+        mol, meta = build_periodic_multimer_mol(source, 3, close_periodic=False)
+        middle = set(meta['unit_atoms'][1])
+        bond = next(b for b in mol.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE
+                    and b.GetBeginAtomIdx() in middle and b.GetEndAtomIdx() in middle)
+        assert bond.GetStereo() == expected
+        refs = list(bond.GetStereoAtoms())
+        assert len(refs) == 2
+        assert mol.GetBondBetweenAtoms(bond.GetBeginAtomIdx(), refs[0]) is not None
+        assert mol.GetBondBetweenAtoms(bond.GetEndAtomIdx(), refs[1]) is not None
+        if smiles.startswith('*/'):
+            assert all(ref not in middle for ref in refs)
+    if not smiles.startswith('*/'):
+        assert all(b.GetStereo() == expected for b in mol.GetBonds()
+                   if b.GetBondType() == Chem.BondType.DOUBLE)
+        features, mask = bond_paths(build_canonical_periodic_topology(smiles), smiles)
+        actual = features[mask]
+        doubles = actual[actual[:, 1] == 1]
+        assert doubles.numel() > 0
+        target = torch.from_numpy(bond_feature_vector(bond)[7:])
+        torch.testing.assert_close(doubles[:, 7:], target.expand_as(doubles[:, 7:]))
+        _, _, item = sample(smiles)
+        batch = dual_glt_collate([item, item])
+        torch.testing.assert_close(batch.bond_path_features[:item.bond_path_features.size(0)],
+                                   item.bond_path_features)
+        top, tri, _ = sample(smiles)
+        physical = build_complete_trimer_glt_sample(top, tri, smiles)['tokens']
+        chemistry = torch.from_numpy(physical['token_bond_features'])
+        torch.testing.assert_close(chemistry[chemistry[:, 1] == 1, 7:],
+                                   target.expand_as(chemistry[chemistry[:, 1] == 1, 7:]))
+
+
+def test_e_z_have_distinct_bond_bias_inputs():
+    vectors = []
+    for smiles in ('*C/C=C/C*', '*C/C=C\\C*'):
+        features, mask = bond_paths(build_canonical_periodic_topology(smiles), smiles)
+        vectors.append(features[mask][features[mask][:, 1] == 1][0])
+    assert not torch.equal(vectors[0][7:], vectors[1][7:])
+    encoder = SharedBondPathBias()
+    features = torch.zeros(2, 2, 14)
+    features[:, 0] = torch.stack(vectors)
+    mask = torch.tensor([[True, False], [True, False]])
+    assert not torch.equal(encoder(features, mask)[0], encoder(features, mask)[1])
+
+
+def test_terminal_stereo_reference_substitution():
+    mol, _ = build_periodic_multimer_mol('*/C(C)=C(C)/*', 3, close_periodic=False)
+    doubles = [b for b in mol.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE]
+    assert doubles[0].GetStereo() == doubles[2].GetStereo()
+    assert doubles[0].GetStereo() != doubles[1].GetStereo()
+    terminal, _ = build_periodic_multimer_mol('*/C=C/*', 3, close_periodic=False)
+    doubles = [b for b in terminal.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE]
+    assert doubles[0].GetStereo() == doubles[2].GetStereo() == Chem.BondStereo.STEREONONE
+
+
+def test_all_shortest_paths_are_renumbering_invariant():
+    # Opposite bonds of a four-cycle: unequal geometry on both shortest paths.
+    edges = [(a, b) for a, b in [(0, 1), (1, 2), (2, 3), (3, 0)] for a, b in [(a, b), (b, a)]]
+    angles = [0.6, 0.6, 1.1, 1.1, 1.7, 1.7, 2.2, 2.2]
+    def build(permutation):
+        return two_hop_paths(dict(tokens={'token_distance': [1.] * 4}, relations=dict(
+            relation_source=[permutation[a] for a, _ in edges],
+            relation_target=[permutation[b] for _, b in edges],
+            relation_angle=angles, relation_valid=[True] * 8)))
+    torch.manual_seed(41)
+    encoder = PathAngleBias()
+    types = torch.tensor([11, 52, 83, 114])
+    permutation = torch.tensor([2, 0, 3, 1])  # old -> new
+    a, b = build(torch.arange(4)), build(permutation)
+    assert a['source'].numel() == 16  # still one edge per pair including self
+    assert a['path'].size(0) == 20  # four extra alternative paths
+    changed_types = torch.empty_like(types)
+    changed_types[permutation] = types
+    def biases(row, token_types):
+        encoded = encoder(token_types, row['path'], row['angle'], row['mask'])
+        return mean_pool(encoded, row['path_group'], row['source'].numel())
+    left, right = biases(a, types), biases(b, changed_types)
+    lookup = {(int(s), int(t)): i for i, (s, t) in enumerate(zip(b['source'], b['target']))}
+    order = [lookup[int(permutation[s]), int(permutation[t])] for s, t in zip(a['source'], a['target'])]
+    torch.testing.assert_close(left, right[order])
+    ga = torch.autograd.grad(left.square().sum(), encoder.heads[2].weight, retain_graph=True)[0]
+    gb = torch.autograd.grad(right.square().sum(), encoder.heads[2].weight)[0]
+    torch.testing.assert_close(ga, gb)
 
 
 def test_two_hop_physical_paths_and_reverse():

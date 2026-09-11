@@ -190,7 +190,9 @@ class GalformerTrimer3D(nn.Module):
         radial = self.distance_projection(self.distance_basis(distance, torch.stack([za, zb], -1)))
         states = self.triplet(torch.cat([endpoints, radial], -1))
         types = triplet_type(data.bond_z_a, data.bond_z_b, data.bond_type)
-        bias = self.angle_bias(types, data.line_path, data.line_angle, data.line_mask)
+        path_bias = self.angle_bias(types, data.line_path, data.line_angle, data.line_mask)
+        # Equal shortest paths contribute symmetrically to ONE attention edge.
+        bias = mean_pool(path_bias, data.line_path_group, data.line_source.numel())
         for layer in self.layers:
             states = layer(states, data.line_source, data.line_target, bias)
         center = data.bond_center.bool()

@@ -633,6 +633,49 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
         # aromaticity/kekulization. Keep it as an explicit virtual graph edge.
         periodic_edge = (right, left)
 
+    # Restore bond metadata from the ORIGINAL bonds only after all real seam
+    # neighbors exist. AddBond copies the order, not direction/stereo atoms.
+    for unit_idx, atom_map in enumerate(atom_maps):
+        mapping = {old: atom_map[base_id] for old, base_id in old_to_base.items()}
+        reference_map = dict(mapping)
+        if unit_idx > 0:
+            reference_map[int(dummy_atoms[0])] = atom_maps[unit_idx - 1][right_base]
+        if unit_idx + 1 < num_repeat_units:
+            reference_map[int(dummy_atoms[1])] = atom_maps[unit_idx + 1][left_base]
+        for original in copy_source.GetBonds():
+            begin, end = original.GetBeginAtomIdx(), original.GetEndAtomIdx()
+            if begin not in mapping or end not in mapping:
+                continue
+            copied = combined.GetBondBetweenAtoms(mapping[begin], mapping[end])
+            copied.SetBondDir(original.GetBondDir())
+            stereo = original.GetStereo()
+            references = list(original.GetStereoAtoms())
+            if not references:
+                copied.SetStereo(stereo)
+                continue
+            resolved, flips = [], 0
+            for endpoint, other, reference in zip((begin, end), (end, begin), references):
+                if reference in reference_map:
+                    resolved.append(reference_map[reference])
+                    continue
+                # A terminal dummy becomes implicit H. Use the other explicit
+                # substituent if present and invert the reference convention.
+                alternatives = [a.GetIdx() for a in combined.GetAtomWithIdx(mapping[endpoint]).GetNeighbors()
+                                if a.GetIdx() != mapping[other]]
+                if len(alternatives) != 1:
+                    break  # e.g. terminal CH2: no defined alkene stereo
+                resolved.append(alternatives[0])
+                flips += 1
+            if len(resolved) == 2:
+                if flips % 2:
+                    inverse = {Chem.BondStereo.STEREOE: Chem.BondStereo.STEREOZ,
+                               Chem.BondStereo.STEREOZ: Chem.BondStereo.STEREOE,
+                               Chem.BondStereo.STEREOCIS: Chem.BondStereo.STEREOTRANS,
+                               Chem.BondStereo.STEREOTRANS: Chem.BondStereo.STEREOCIS}
+                    stereo = inverse.get(stereo, stereo)
+                copied.SetStereoAtoms(*resolved)
+                copied.SetStereo(stereo)
+
     result = combined.GetMol()
     Chem.SanitizeMol(result)
     unit_atoms = [
