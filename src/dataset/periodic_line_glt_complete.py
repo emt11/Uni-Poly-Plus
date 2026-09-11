@@ -19,13 +19,17 @@ import torch
 from rdkit import Chem
 
 from .graph_data import build_periodic_multimer_mol
+from .glt_bond_chemistry import (
+    bond_feature_vector, bond_type_index, bond_stereo_index,
+    BOND_FEATURE_DIM, STEREO_VALUES, STEREO_TO_INDEX, STEREO_UNKNOWN,
+NUM_STEREO_TYPES,
+)
 
 
 SIDECAR_SCHEMA = "mts-periodic-line-glt-complete-v1"
 BUILDER_VERSION = 1
 MAX_ATOMIC_NUMBER = 100
 ELEMENT_CLASSES = 101  # Z=1..100 plus unknown
-BOND_FEATURE_DIM = 14
 
 BOND_TYPE_SINGLE = 0
 BOND_TYPE_DOUBLE = 1
@@ -33,46 +37,6 @@ BOND_TYPE_TRIPLE = 2
 BOND_TYPE_AROMATIC = 3
 BOND_TYPE_UNKNOWN = 4
 NUM_BOND_TYPES = 5
-
-STEREO_VALUES = (
-    Chem.rdchem.BondStereo.STEREONONE,
-    Chem.rdchem.BondStereo.STEREOANY,
-    Chem.rdchem.BondStereo.STEREOZ,
-    Chem.rdchem.BondStereo.STEREOE,
-    Chem.rdchem.BondStereo.STEREOCIS,
-    Chem.rdchem.BondStereo.STEREOTRANS,
-)
-STEREO_TO_INDEX = {value: index for index, value in enumerate(STEREO_VALUES)}
-STEREO_UNKNOWN = len(STEREO_VALUES)
-NUM_STEREO_TYPES = len(STEREO_VALUES) + 1
-
-
-def bond_type_index(bond: Chem.Bond) -> int:
-    """Return the five-way Galformer/DGL-LifeSci bond type index."""
-
-    return {
-        Chem.rdchem.BondType.SINGLE: BOND_TYPE_SINGLE,
-        Chem.rdchem.BondType.DOUBLE: BOND_TYPE_DOUBLE,
-        Chem.rdchem.BondType.TRIPLE: BOND_TYPE_TRIPLE,
-        Chem.rdchem.BondType.AROMATIC: BOND_TYPE_AROMATIC,
-    }.get(bond.GetBondType(), BOND_TYPE_UNKNOWN)
-
-
-def bond_stereo_index(bond: Chem.Bond) -> int:
-    """Return six declared stereo values plus a distinct unknown value."""
-
-    return STEREO_TO_INDEX.get(bond.GetStereo(), STEREO_UNKNOWN)
-
-
-def bond_feature_vector(bond: Chem.Bond) -> np.ndarray:
-    """Encode ``BondType|Conjugation|Ring|BondStereo`` as fourteen values."""
-
-    output = np.zeros(BOND_FEATURE_DIM, dtype=np.float32)
-    output[bond_type_index(bond)] = 1.0
-    output[5] = float(bool(bond.GetIsConjugated()))
-    output[6] = float(bool(bond.IsInRing()))
-    output[7 + bond_stereo_index(bond)] = 1.0
-    return output
 
 
 def _bond_chemistry(smiles: str):

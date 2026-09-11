@@ -385,3 +385,94 @@ sidecar 写入/读取往返以及刚体旋转/平移不变性；测试结果为 
 个跨 RU tokens/无中心键/2 relations）完成只读构建、批处理及 CPU forward/backward；
 两者均有限，样本 1 的 endpoint、bond-feature、distance、angle 和 GLT block 梯度均
 为非零。验证日志保存在 `logs/complete_trimer_glt_validation.log`；window 已正常结束。
+
+## 17. 独立新接口：O8 Bond-Path＋Galformer Trimer Hop2
+
+本节记录代码实现，**尚未运行单元测试、真实样本 forward/backward、预训练或微调**。
+本次环境禁止执行模型/测试；§16 的旧测试和 smoke 不构成本节模型的验证证据。
+旧 O8、CompleteTrimerGLTEncoder、C0/C1/C2 和历史 checkpoint 行为保持原样。
+
+新模型工厂为 `src.modules.build_dual_glt_model(fusion_mode="concat" | "kfuse")`。
+两路都是 6 层、512 hidden、8 heads、source-Q/target-K、incoming softmax，
+QK 乘 `512**-0.5` 后再加 bias。没有 MD200、CLS、教师或新预训练 head/loss。
+
+### 数据接口
+
+`src/dataset/glt_dual.py` 提供 `build_dual_sample(topology, trimer, smiles)`、
+`DualGLTDataset` 和 `dual_glt_collate`。输入已有 canonical 拓扑与冻结坐标；
+输出仅模型所需的原子、物理键、路径及有效性字段，不向 batch 传递 MD 或坐标。
+`FrozenDualLayerSource(topology_root, trimer_root, samples)` 使用现有只读
+`LmdbLayerStore`，仅打开 topology/trimer 两层，检查完成标记、当前 schema 和 key，
+缺少记录时报错，不调用缓存生成器。`samples` 为 `(32字节 key, P-SMILES)` 序列。
+通用 `DualGLTDataset` 包装其他 source 时，调用者也必须关闭 MD 和构象生成。
+
+2D 沿既有 `lga_path_index/lga_path_shift` 生成 `[R,2,14]` 键特征与 `[R,2]`
+mask，不改 O8 的关系集合。化学 helper 与旧完整 Trimer 共用：BondType(5)、
+Conjugation(1)、Ring(1)、Stereo(7)。用平移不变的物理键身份查询跨 RU 属性，
+可处理 RU±2 拓扑路径；不平均或合并不同 shift 的关系。不同副本的键化学若不一致则
+明确报错，不任意挑选。Ring 沿用开放 Trimer 的真实环语义。
+
+3D 每条物理键一个 state。先保留完整一跳物理 line graph，再为每个无向物理
+token 对确定最短路径（稳定 token ID 排序），反序生成反向路径。最多两个 line hops，
+即三个 bond tokens、两个真实角度。self 单独标记，使用 `[token,token]` 与合成零角。
+无效必需角度使整个样本 3D 无效，附带原因，不静默删除关系；空中心键读出为零。
+
+### 两路编码器
+
+2D 保留 138 维输入及整行 mask、SPD/path-node bias、Pre-LN/GELU。
+新增 bond bias：四项类别 embedding 各 8 维并求和，两个路径位置各一个 8×8
+矩阵，按有效路径键数平均。SPD＋path-node＋bond bias 每次 forward 一次生成，
+六层复用，不 detach。self bond contribution 为零。这是 MolGT 路径运算加
+Galformer-style 跨层共享的项目适配，**不是 MolGT 的逐层 bias 实现**。
+
+3D 使用 Galformer 的端点元素 `101→512` 共享投影求和、元素条件的 256 维
+归一化 Gaussian 距离编码投影到 512，再以 `1024→512→512` GELU MLP 生成
+token；不直接输入 14 维键化学。BondType 仅参与 `Vocab(Za,Zb,BondType)` 的
+path-angle 类型条件。角度使用 128 维 Gaussian、两个位置 MLP、有效平均、
+`128→128→8` head MLP，跨层共享。padding 在位置 MLP 后再次清零。
+移除独立 self bias、输入与最终 LayerNorm；层内遵循 Galformer residual，
+FFN 为 `512→2048→512`，feature/attention dropout=0.1。无虚拟 CLS 节点。
+物理 line-hop 构图和中心池化是聚合物适配，不等于官方原子路径/虚拟节点构图。
+
+参考：[MolGT modeling.py](https://github.com/robbenplus/MolGT/blob/master/src/models/modeling.py)、
+[Galformer module_utils.py](https://github.com/peizhenbai/Galformer/blob/main/model/module_utils.py)、
+[Galformer model_3d.py](https://github.com/peizhenbai/Galformer/blob/main/model/model_3d.py)。
+
+### 融合与输出
+
+`encode(batch)` 返回 `atom_states`、`bond_states`、`center_bond_states`、
+`graph_2d`、`graph_3d`、`geometry_valid` 与两路 bias。`forward(batch)` 返回 `[B,1]`。
+3D 的有效性统一为 `geometry_valid AND center_count>0`，仅中心内部键 GAP。
+
+* `concat`：两路 GAP 分别 LayerNorm，3D 在 LN 后 mask，再拼接；
+  predictor 为 `1024→512→GELU→Dropout(0.1)→1`。
+* `kfuse`：原版 `OriginalMIPSAttentiveFusion`，仅 `glt3d` 一项 knowledge，
+  Query/Key 为 128 维、Value 为 512 维、缩放 √512、残差系数 0.5。
+  融合发生在 O8 原子 GAP 前，无额外 graph norm/adapter；
+  predictor 为 `512→512→GELU→Dropout(0.1)→1`。
+  单 knowledge 的 softmax 恒为 1，所以这是各原子接收相同 3D 投影残差的特例，
+  Query/Key 梯度为零是预期行为。无效样本屏蔽整个投影残差，包括 Value bias。
+
+新模型不接入旧正式 runner，不加载旧 checkpoint 作为完整新模型权重。
+
+### 验证入口（未执行）
+
+`tests/test_dual_glt.py` 覆盖共享/scaling、独立参考公式、Vocab 顺序、周期路径、
+物理两跳与反序、无效几何、N=0、刚体不变性、两种融合和梯度。
+其人工坐标样本不宣称为真实 fixture。
+
+在允许执行的环境中，只执行相关测试：
+
+```text
+pytest -q tests/test_dual_glt.py tests/test_complete_trimer_glt.py
+```
+
+真实验证入口只接受两条现有缓存记录（一条普通、一条真实 N=0），CPU、单线程、
+`num_workers=0`，两种融合各一次 forward/backward，无 optimizer、无缓存写入：
+
+```text
+python scripts/validate_dual_glt.py --topology-root TOPOLOGY_LAYER --trimer-root TRIMER_LAYER --sample ORDINARY_KEY "ORDINARY_PSMILES" --sample N0_KEY "N0_PSMILES"
+```
+
+以上路径与 key 需对应执行环境实际冻结产物，不使用历史样本编号猜测新环境身份。
+遵守项目 tmux/log 规则。当前没有执行上述命令，没有生成新性能结果。
