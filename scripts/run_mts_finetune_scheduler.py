@@ -149,7 +149,7 @@ def resolved_config_from_command(command: list[str], provenance: dict, checkpoin
         "checkpoint_sha256": checkpoint_sha256,
         **provenance,
     })
-    if parsed.mts_glt_version in {"distill", "distill_repair"}:
+    if parsed.mts_glt_version in {"distill", "distill_repair", "distill_nomd"}:
         payload.update({
             "o8_ffn_activation": "GELU(approximate='none')",
             "o8_ffn_hidden": "512->2048->512",
@@ -157,6 +157,8 @@ def resolved_config_from_command(command: list[str], provenance: dict, checkpoin
             "predictor": "512->512->1",
             "predictor_dropout": 0.1,
         })
+        if parsed.mts_glt_version == "distill_nomd":
+            payload["use_md200"] = False
     payload["encoder_freeze_warm_epochs"] = 0
     return payload
 

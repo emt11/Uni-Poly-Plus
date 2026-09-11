@@ -1,0 +1,32 @@
+{
+  "schema": "mts-glt-v2-r2-o8-nomd-mipsloss-v1",
+  "version": "none",
+  "experiment_id": "glt_v2_r2_o8_nomd_mipsloss_005k",
+  "dataset_name": "PI1M_v2",
+  "cache_root": "data",
+  "result_root": "results/glt_v2_r2_o8_nomd_mipsloss_005k",
+  "output_path": "pretrained_models/glt_v2_r2_o8_nomd_mipsloss_005k.pth",
+  "protect_result_roots": [
+    "results/glt_v2_r2_c0_gelu138_mipshead",
+    "results/mts_glt_distill_repair_control",
+    "results/mts_glt_v2_distill"
+  ],
+  "batch_size": 84,
+  "microbatch": 84,
+  "loader_workers": 4,
+  "accumulation": 4,
+  "global_batch": 1008,
+  "max_optimizer_steps": 5000,
+  "stop_after_steps": 5000,
+  "probe_steps": [5000],
+  "amp_dtype": "bf16",
+  "seed": 42,
+  "lr": 0.0002,
+  "warmup_steps": 2000,
+  "schedule_total_steps": 20000,
+  "end_lr": 1e-9,
+  "weight_decay": 0.0,
+  "cache_layers": "ru_base,topology",
+  "atom_mask_ratio": 0.3,
+  "use_md200": false
+}

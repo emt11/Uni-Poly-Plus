@@ -13,6 +13,7 @@ from src.dataset.mips_trimer_contract import (
 
 BASELINE_SCHEMA = "mts-glt-v2"
 V3_SCHEMA = "mts-glt-v3-galformer-20k"
+NOMD_SCHEMA = "mts-glt-v2-r2-o8-nomd-mipsloss-v1"
 SUPPORTED_MODALITIES = ("graph",)
 
 
@@ -267,6 +268,116 @@ def _apply_glt_v3_config(args, path, payload):
     return args
 
 
+def _apply_nomd_config(args, path, payload):
+    """Resolve the independent O8-only 5k MIPS-CE trajectory.
+
+    This route intentionally has a smaller contract than the historical
+    distillation configs: it has no teacher, line sidecar or MD200 sidecar.
+    The fixed MTS topology cache is still used for the canonical O8 graph.
+    """
+    required = {
+        "schema", "experiment_id", "dataset_name", "cache_root",
+        "result_root", "output_path", "protect_result_roots", "version",
+        "batch_size", "microbatch", "loader_workers", "accumulation", "global_batch",
+        "max_optimizer_steps", "stop_after_steps", "probe_steps",
+        "amp_dtype", "seed", "lr", "warmup_steps", "schedule_total_steps", "end_lr",
+        "weight_decay", "cache_layers", "atom_mask_ratio", "use_md200",
+    }
+    unknown = sorted(set(payload) - required - {"config_path"})
+    missing = sorted(required - set(payload))
+    if unknown or missing:
+        raise ValueError(
+            "MTS no-MD config fields are invalid; "
+            f"unknown={unknown} missing={missing}"
+        )
+    if payload["schema"] != NOMD_SCHEMA:
+        raise ValueError(f"unsupported no-MD pretraining schema: {payload['schema']!r}")
+    if payload["version"] != "none":
+        raise ValueError("the no-MD route fixes version=none")
+    if bool(payload["use_md200"]):
+        raise ValueError("the no-MD route fixes use_md200=false")
+    if abs(float(payload["atom_mask_ratio"]) - 0.30) > 1e-12:
+        raise ValueError("the no-MD route fixes atom_mask_ratio=0.30")
+    if int(payload["max_optimizer_steps"]) != 5000:
+        raise ValueError("the no-MD route fixes max_optimizer_steps=5000")
+    stop_after = int(payload["stop_after_steps"])
+    if not 1 <= stop_after <= 5000:
+        raise ValueError("stop_after_steps must be within 1..5000")
+    probes = tuple(int(value) for value in payload["probe_steps"])
+    if probes != (5000,):
+        raise ValueError("the no-MD route saves only the 5k deployment probe")
+    if int(payload["global_batch"]) != 3 * int(payload["batch_size"]) * int(payload["accumulation"]):
+        raise ValueError("global_batch must equal 3*batch_size*accumulation")
+    if int(payload["microbatch"]) != int(payload["batch_size"]):
+        raise ValueError("microbatch and batch_size must match")
+    if str(payload["amp_dtype"]) not in {"fp32", "bf16"}:
+        raise ValueError("amp_dtype must be fp32 or bf16")
+    if int(payload["warmup_steps"]) != 2000:
+        raise ValueError("the no-MD route keeps the original 20k warmup=2000")
+    if int(payload["schedule_total_steps"]) != 20000:
+        raise ValueError("the no-MD route uses the original 20k schedule horizon")
+    if float(payload["weight_decay"]) != 0.0:
+        raise ValueError("the no-MD route fixes weight_decay=0")
+    cache_layers = str(payload["cache_layers"])
+    if set(item.strip() for item in cache_layers.split(",") if item.strip()) - {"ru_base", "topology"}:
+        raise ValueError("the no-MD route cannot request Trimer, MD200 or line caches")
+
+    args.config_schema = NOMD_SCHEMA
+    args.config_source_schema = NOMD_SCHEMA
+    args.experiment_id = str(payload["experiment_id"])
+    args.version = "none"
+    args.dataset_name = str(payload["dataset_name"])
+    args.root = str(payload["cache_root"])
+    args.periodic_line_glt_sidecar = None
+    args.md200_sidecar_root = None
+    args.save_path = str(payload["output_path"])
+    args.glt_result_root = str(payload["result_root"])
+    args.graph_mask_ratio = float(payload["atom_mask_ratio"])
+    args.batch_size = int(payload["batch_size"])
+    args.loader_workers = int(payload["loader_workers"])
+    args.loader_prefetch_factor = 2
+    args.gradient_accumulation_steps = int(payload["accumulation"])
+    args.global_batch_size = int(payload["global_batch"])
+    args.max_optimizer_steps = int(payload["max_optimizer_steps"])
+    args.checkpoint_interval_steps = 1000
+    args.glt_probe_steps = probes
+    args.glt_stop_after_steps = stop_after
+    args.amp_dtype = str(payload["amp_dtype"])
+    args.seed = int(payload["seed"])
+    args.lr = float(payload["lr"])
+    args.warmup_steps = int(payload["warmup_steps"])
+    args.schedule_total_steps = int(payload["schedule_total_steps"])
+    args.end_lr = float(payload["end_lr"])
+    args.weight_decay = float(payload["weight_decay"])
+    args.cache_layers = cache_layers
+    args.use_md200 = False
+    args.protect_result_roots = list(payload["protect_result_roots"])
+
+    # Fixed O8/LMDB dataset contract.  The no-MD switch is handled by the
+    # model and by the selected cache layers, not by altering O8 mathematics.
+    args.graph_encoder_type = MTS_ROUTE_INTERNAL
+    args.graph_input, args.geom_input = "star_linking", "repeat_unit"
+    args.smiles_model_name, args.feature_source_dataset = "", args.dataset_name
+    args.disable_feature_cache, args.rebuild_feature_cache = False, False
+    args.max_smiles_length, args.max_smiles_length_cap = None, 256
+    args.fp_mode = "disabled"
+    args.feature_cache_workers, args.feature_cache_chunksize = 0, 4
+    args.feature_cache_partial_every, args.feature_cache_item_timeout = 200, 45
+    args.cache_validate, args.cache_commit_size, args.embed_tries_multiplier = "sample", 128, 8
+    args.conformer_3d_count, args.conformer_keep_count, args.conformer_profile = 8, 4, "full"
+    args.scage_distance_mode, args.scage_distance_rbf, args.scage_distance_cutoff = "bias", 32, 12.0
+    args.mips_core, args.mips_max_hops = "paper_corrected", 2
+    args.mips_use_descriptors, args.mips_descriptor_protocol = True, "source_star_sub"
+    args.spatial_mode, args.graph_geometry_mode = "trimer_scage", "trimer_scage_mcl"
+    args.topology_representation = "canonical_lifted"
+    args.trimer_num_candidates, args.trimer_max_heavy_atoms = 4, 384
+    args.mips_variant, args.finite_variant = "O8", "none"
+    args.conformer_mode, args.field_layout, args.field_channels = "none", "none", "none"
+    args.modalities, args.max_grad_norm = ["graph"], 1.0
+    args.cache_only = False
+    return args
+
+
 def dataset_kwargs_from_args(args):
     """Translate the fixed baseline config into the Dataset constructor contract."""
     return {
@@ -318,9 +429,7 @@ def dataset_kwargs_from_args(args):
 
 
 def parse_arguments(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Pretrain MTS-GLT-v2 or MTS-GLT-v3-Galformer"
-    )
+    parser = argparse.ArgumentParser(description="Pretrain an MTS route")
     parser.add_argument(
         "--experiment_config",
         required=True,
@@ -330,6 +439,10 @@ def parse_arguments(argv=None):
     args = parser.parse_args(argv)
     path = Path(args.experiment_config).resolve()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") == NOMD_SCHEMA:
+        if args.resume_state:
+            raise ValueError("the no-MD 5k route deliberately has no resume path")
+        return _apply_nomd_config(args, path, payload)
     if payload.get("schema") == V3_SCHEMA:
         if args.resume_state:
             raise ValueError("MTS-GLT-v3 deliberately has no resume path")
@@ -340,6 +453,8 @@ def parse_arguments(argv=None):
 __all__ = [
     "BASELINE_SCHEMA",
     "V3_SCHEMA",
+    "NOMD_SCHEMA",
+    "_apply_nomd_config",
     "dataset_kwargs_from_args",
     "parse_arguments",
 ]

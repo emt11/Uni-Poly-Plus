@@ -4,6 +4,7 @@ from .mips_trimer_contract import (
     FEATURE_SCHEMA,
     TOPOLOGY_CANONICAL,
 )
+from .periodic_line_glt_complete import BOND_FEATURE_DIM
 
 
 def mips_trimer_collate(data_list):
@@ -67,6 +68,22 @@ def mips_trimer_collate(data_list):
     star_v2_uppers = set()
     glt_fields_present = all(hasattr(item, "glt_token_atom_a") for item in data_list)
     glt3_fields_present = all(hasattr(item, "glt3_token_atom_a") for item in data_list)
+    glt3_complete_fields = [
+        hasattr(item, "glt3_token_bond_features") for item in data_list
+    ]
+    if any(glt3_complete_fields) and not all(glt3_complete_fields):
+        raise ValueError(
+            "cannot mix complete-Trimer GLT rows with legacy image GLT rows"
+        )
+    glt3_complete_present = bool(glt3_complete_fields and all(glt3_complete_fields))
+    if glt3_complete_present and not glt3_fields_present:
+        raise ValueError(
+            "complete-Trimer GLT rows require the token/relation fields"
+        )
+    if glt3_complete_present and any(
+        not hasattr(item, "glt3_token_ring") for item in data_list
+    ):
+        raise ValueError("complete-Trimer GLT rows require the Ring field")
     glt_token_atom_a, glt_token_atom_b, glt_token_shift = [], [], []
     glt_token_z_a, glt_token_z_b, glt_token_bond_type, glt_token_label = [], [], [], []
     glt_token_distances, glt_token_counts, glt_token_valid = [], [], []
@@ -89,9 +106,11 @@ def mips_trimer_collate(data_list):
     glt3_token_atom_a, glt3_token_atom_b, glt3_token_shift = [], [], []
     glt3_token_z_a, glt3_token_z_b, glt3_token_distance = [], [], []
     glt3_token_bond_type, glt3_token_stereo, glt3_token_conjugated = [], [], []
+    glt3_token_ring, glt3_token_bond_features = [], []
     glt3_token_anchor_q_a, glt3_token_anchor_q_b, glt3_token_valid = [], [], []
     glt3_token_center_internal = []
     glt3_token_batch, glt3_geometry_valid = [], []
+    glt3_token_offset = 0
     glt3_relation_source, glt3_relation_target, glt3_relation_center = [], [], []
     glt3_relation_shift, glt3_relation_angle, glt3_relation_valid = [], [], []
     spatial_fields_present = all(
@@ -336,6 +355,26 @@ def mips_trimer_collate(data_list):
             ):
                 if int(getattr(item, name).numel()) != token_count:
                     raise ValueError(f"image GLT token length mismatch: {name}")
+            if glt3_complete_present:
+                bond_features = getattr(item, "glt3_token_bond_features")
+                if bond_features.ndim != 2 or tuple(bond_features.shape) != (
+                    token_count, BOND_FEATURE_DIM
+                ):
+                    raise ValueError(
+                        "complete-Trimer GLT bond features must have shape [M,14]"
+                    )
+                if not bool(torch.isfinite(bond_features.float()).all()):
+                    raise ValueError(
+                        "complete-Trimer GLT bond features contain NaN/Inf"
+                    )
+                if not hasattr(item, "glt3_token_ring"):
+                    raise ValueError(
+                        "complete-Trimer GLT rows require the Ring field"
+                    )
+                if int(item.glt3_token_ring.numel()) != token_count:
+                    raise ValueError(
+                        "complete-Trimer GLT token ring length mismatch"
+                    )
             for name in (
                 "glt3_relation_target", "glt3_relation_center_atom",
                 "glt3_relation_source_image_shift", "glt3_relation_angle",
@@ -359,6 +398,13 @@ def mips_trimer_collate(data_list):
             glt3_token_bond_type.append(item.glt3_token_bond_type.long())
             glt3_token_stereo.append(item.glt3_token_stereo.long())
             glt3_token_conjugated.append(item.glt3_token_conjugated.long())
+            if glt3_complete_present:
+                glt3_token_bond_features.append(
+                    item.glt3_token_bond_features.float()
+                )
+                glt3_token_ring.append(
+                    item.glt3_token_ring.long()
+                )
             glt3_token_anchor_q_a.append(item.glt3_token_anchor_q_a.long())
             glt3_token_anchor_q_b.append(item.glt3_token_anchor_q_b.long())
             glt3_token_valid.append(item.glt3_token_valid.bool())
@@ -366,8 +412,8 @@ def mips_trimer_collate(data_list):
                 getattr(item, "glt3_token_center_internal", item.glt3_token_shift == 0).bool()
             )
             glt3_token_batch.append(torch.full((token_count,), graph_id, dtype=torch.long))
-            glt3_relation_source.append(source + glt_token_offset)
-            glt3_relation_target.append(target + glt_token_offset)
+            glt3_relation_source.append(source + glt3_token_offset)
+            glt3_relation_target.append(target + glt3_token_offset)
             center = item.glt3_relation_center_atom.long().clone()
             center[center >= 0] += canonical_offset
             glt3_relation_center.append(center)
@@ -375,7 +421,7 @@ def mips_trimer_collate(data_list):
             glt3_relation_angle.append(item.glt3_relation_angle.float())
             glt3_relation_valid.append(item.glt3_relation_valid.bool())
             glt3_geometry_valid.append(bool(item.glt3_geometry_valid))
-            glt_token_offset += token_count
+            glt3_token_offset += token_count
 
         if spatial_fields_present:
             spatial_index = item.spatial_pair_index.long()
@@ -607,6 +653,11 @@ def mips_trimer_collate(data_list):
         batch.glt3_token_bond_type = torch.cat(glt3_token_bond_type)
         batch.glt3_token_stereo = torch.cat(glt3_token_stereo)
         batch.glt3_token_conjugated = torch.cat(glt3_token_conjugated)
+        if glt3_complete_present:
+            batch.glt3_token_ring = torch.cat(glt3_token_ring)
+            batch.glt3_token_bond_features = torch.cat(
+                glt3_token_bond_features, dim=0
+            )
         batch.glt3_token_anchor_q_a = torch.cat(glt3_token_anchor_q_a)
         batch.glt3_token_anchor_q_b = torch.cat(glt3_token_anchor_q_b)
         batch.glt3_token_valid = torch.cat(glt3_token_valid)

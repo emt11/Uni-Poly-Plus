@@ -307,3 +307,61 @@ C0，不能称为整体提升。
 旧 `historical_shared5` 中 validation 与 test 相同，因此本节结果是共享开发折
 评估，不是独立盲测；与此前 20k 初始化的结果属于不同 checkpoint 条件，不能混合
 为同一实验组。
+
+## GLT-V2 revision-2：无 MD＋MIPS 损失基线（New-C0，5k）
+
+本轮新增独立实验 `glt_v2_r2_o8_nomd_mipsloss_005k`。与旧 New-C0 的整体方案不同之处
+是：不实例化、不读取、不扰动 MD200；预训练只计算 30% canonical atom 的单路 masked-atom
+CE（138-D 整行清零，global sum/count）；下游统一 `target_transform=standard` 与
+`regression_loss=mse`。O8 仍为 6-layer Pre-LN、GELU、source-Q/target-K、SPD/path bias，
+canonical atom mean pooling，predictor 为 `512→512→1`、dropout 0.1。新包仅含 O8，未读取
+教师、GLT line sidecar 或坐标。
+
+### 预训练
+
+正式轨迹在 `Uni-Poly` 的独立 3-GPU window 中完成 `5,000/5,000` updates（PI1M_v2 全量、
+local batch 84、accumulation 4、global batch 1008、BF16、AdamW `2e-4`、seed 42）。warmup
+为 2,000 updates，衰减使用原 20k 曲线前缀，末步学习率为 `1.66666833e-4`。部署包
+[`student_deploy_005k.pt`](glt_v2_r2_o8_nomd_mipsloss_005k/student/student_deploy_005k.pt)
+的 schema 为 `mts-glt-v2-r2-o8-nomd-student-deploy-v1`，`use_md200=false`，80 个 state
+tensors 且无 MD key；训练记录 5,000 行，loss `4.565→0.208`，峰值显存约
+`1.372 GiB/card`。
+
+### 新 no-MD 下游（`outer5_inner20`，40/40）
+
+|Task|R² mean ± std|MAE mean ± std|RMSE mean ± std|
+|-|-:|-:|-:|
+|eat|0.969 ± 0.013|0.044 ± 0.008|0.062 ± 0.012|
+|eea|0.901 ± 0.021|0.246 ± 0.008|0.332 ± 0.012|
+|egb|0.914 ± 0.019|0.419 ± 0.037|0.565 ± 0.043|
+|egc|0.890 ± 0.005|0.356 ± 0.018|0.518 ± 0.019|
+|ei|0.758 ± 0.065|0.335 ± 0.013|0.477 ± 0.051|
+|eps|0.746 ± 0.067|0.373 ± 0.031|0.549 ± 0.060|
+|nc|0.816 ± 0.065|0.066 ± 0.009|0.099 ± 0.016|
+|xc|0.300 ± 0.069|15.275 ± 0.955|19.688 ± 1.075|
+
+`Macro8 R² = 0.787`。每 task 的五个 outer-test fold 均产生一次预测；40 个
+checkpoint、CSV 和预测全部有限，split identity 与 `data/splits/mips_outer5_inner20`
+一致。旧 New-C0 的 5k/10k/20k Macro8 参考值为 `0.782/0.779/0.774`，
+但旧训练包含 MD200 且使用历史下游损失/标签协议，因此这里只作描述性比较，不能解释为
+单独去掉 MD 的因果增益。
+
+### 冻结 Ridge 探针（80/80）
+
+对旧 New-C0 5k/10k/20k 和新 no-MD 5k，任务 `ei、xc、eps、nc` 各执行五折 Ridge
+`alpha={0.1,1,10,100}`（float64、`solver=svd`）。特征和标签 scaler 只拟合 train，
+alpha 只由 validation R² 选择，不做 train+validation refit。新 no-MD 的 probe R² 均值为：
+`ei 0.761`、`xc 0.286`、`eps 0.722`、`nc 0.806`；完整 80 行及旧三档
+对照见 [`comparison/final_report.md`](glt_v2_r2_o8_nomd_mipsloss_005k/comparison/final_report.md)。
+探针仅反映冻结读出的线性可读性，不等于完整任务信息或微调因果证明。
+
+### 审计、日志和边界
+
+- 相关测试为 `21 passed, 1 warning`；三卡两步 no-MD smoke 的有限 CE、梯度和 O8-only 导出通过。
+- 首轮预训练因错误将 5k 曲线压缩而在约 1,460 步停止，产物保留于
+  `results/glt_v2_r2_o8_nomd_mipsloss_005k/failed_pretrain_schedule_student_001460/`；修复后重跑才计入上述结果。
+- 下游参数解析和探针入口各有一次即时失败，均未启动对应正式单元；修复后的调度最终为
+  `40/40` 和 `80/80`，失败日志均保留。
+- 预训练日志：`logs/glt_v2_r2_o8_nomd_mipsloss_005k/{pretrain_005k.log,tmux_pretrain_retry01.log}`；
+  下游承载日志：`tmux_finetune_retry01.log`；探针承载日志：`tmux_probes_retry01.log`。
+- 本轮未启动新 10k/20k、其他 seed、3D/教师路线或额外 sweep；旧缓存、旧 New-C0 和旧 C0/C1/C2 产物未覆盖。

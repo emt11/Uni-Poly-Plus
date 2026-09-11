@@ -128,15 +128,18 @@ def format_attention_weights(modalities, attention_weights):
 
 def _student_architecture_metadata(glt_version):
     """Describe the revised DistillStudent O8 and predictor contract."""
-    if str(glt_version) not in {"distill", "distill_repair"}:
+    if str(glt_version) not in {"distill", "distill_repair", "distill_nomd"}:
         return {}
-    return {
+    metadata = {
         "o8_ffn_activation": "GELU(approximate='none')",
         "o8_ffn_hidden": "512->2048->512",
         "graph_adapter": "identity",
         "predictor": "512->512->1",
         "predictor_dropout": 0.1,
     }
+    if str(glt_version) == "distill_nomd":
+        metadata["use_md200"] = False
+    return metadata
 
 
 def _require_student_architecture_metadata(checkpoint):
@@ -169,7 +172,7 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
     from src.modules import UniEncoderAttention
 
     glt_version = str(getattr(args, "mts_glt_version", "v2"))
-    is_new_student = glt_version in {"distill", "distill_repair"}
+    is_new_student = glt_version in {"distill", "distill_repair", "distill_nomd"}
     joint_dim = 512 if is_new_student else 256
     actual_head_dropout = 0.1 if is_new_student else float(args.head_dropout)
     model = UniEncoderAttention(
@@ -220,9 +223,11 @@ def build_mts_downstream_model(args, auxiliary_tasks=()):
             nn.Dropout(0.1),
             nn.Linear(512, 1, bias=True),
         )
-    if glt_version in {"distill", "distill_repair"}:
+    if glt_version in {"distill", "distill_repair", "distill_nomd"}:
         from src.modules.mts_glt_distill import DistillStudent
-        model.encoders["graph"].encoder = DistillStudent()
+        model.encoders["graph"].encoder = DistillStudent(
+            use_md200=(glt_version != "distill_nomd")
+        )
         return model
     glt_mode = str(getattr(args, "mts_glt_mode", "none"))
     if glt_mode != "none":
@@ -266,12 +271,18 @@ def select_mts_glt_distill_state(
     if checkpoint.get("schema") not in {
         "mts-glt-distill-student-deploy-v1",
         "mts-glt-distill-repair-student-deploy-v1",
+        "mts-glt-v2-r2-o8-nomd-student-deploy-v1",
     } or (int(checkpoint.get("step", -1)) != expected_step and not allow_smoke):
         raise RuntimeError(
             f"N+ downstream requires a strict {expected_step // 1000}k student deploy bundle"
         )
     _require_student_architecture_metadata(checkpoint)
-    if checkpoint.get("schema") == "mts-glt-distill-repair-student-deploy-v1":
+    if checkpoint.get("schema") == "mts-glt-v2-r2-o8-nomd-student-deploy-v1":
+        if expected_version != "none" or checkpoint.get("version") != "none":
+            raise RuntimeError("no-MD student deployment version mismatch")
+        if bool(checkpoint.get("use_md200", True)):
+            raise RuntimeError("no-MD student deployment unexpectedly contains MD200")
+    elif checkpoint.get("schema") == "mts-glt-distill-repair-student-deploy-v1":
         if checkpoint.get("version") != expected_version:
             raise RuntimeError("repair student deployment version mismatch")
         expected_revision = None if expected_version == "none" else 2
@@ -321,7 +332,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             graph_encoder_type="mips_trimer_scage",
             graph_input=(
                 "star_linking"
-                if str(getattr(args, "mts_glt_version", "v2")) in {"v3", "distill_repair"}
+                if str(getattr(args, "mts_glt_version", "v2")) in {"v3", "distill", "distill_repair", "distill_nomd"}
                 else "repeat_unit"
             ),
             use_feature_cache=not args.disable_feature_cache,
@@ -363,7 +374,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             modalities=("graph",),
             periodic_line_glt_sidecar=(
                 None
-                if str(getattr(args, "mts_glt_version", "v2")) == "distill_repair"
+                if str(getattr(args, "mts_glt_version", "v2")) in {"distill_repair", "distill_nomd"}
                 else args.periodic_line_glt_sidecar
             ),
         )
@@ -377,7 +388,11 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
     if args.graph_encoder_type == "mips_trimer_scage" and not args.cache_only:
         cache_dataset = dataset_list[0]
         original_layers = cache_dataset.cache_layers
-        cache_dataset.cache_layers = ("ru_base", "topology", "trimer", "md200")
+        cache_dataset.cache_layers = (
+            ("ru_base", "topology")
+            if str(getattr(args, "mts_glt_version", "v2")) == "distill_nomd"
+            else ("ru_base", "topology", "trimer", "md200")
+        )
         specs = cache_dataset._lmdb_cache_specs({})
         cache_dataset.cache_layers = original_layers
         unfrozen = [
@@ -569,7 +584,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
                             "10k": 10000,
                         }.get(str(getattr(args, "checkpoint_tier", "")), 20000),
                     )
-                    if str(getattr(args, "mts_glt_version", "v2")) in {"distill", "distill_repair"}
+                    if str(getattr(args, "mts_glt_version", "v2")) in {"distill", "distill_repair", "distill_nomd"}
                     else select_mts_glt_graph_state(merged_state, checkpoint_state)
                 )
                 merged_state.update(glt_state)
@@ -714,7 +729,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
         print(f"5-fold mean attention: {format_attention_weights(attention_labels, cv_attention)}")
 
         finetuned_checkpoint_path = None
-        if str(getattr(args, "mts_glt_version", "v2")) in {"distill", "distill_repair"}:
+        if str(getattr(args, "mts_glt_version", "v2")) in {"distill", "distill_repair", "distill_nomd"}:
             finetuned_checkpoint_path = Path(args.results_dir).with_name(
                 Path(args.results_dir).stem + "_best.pt"
             )

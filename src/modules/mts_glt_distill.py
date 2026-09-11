@@ -203,10 +203,17 @@ class NPlusGLTTeacher(nn.Module):
 class DistillStudent(nn.Module):
     architecture_name = "MTS-GLT-v2-Distill-Student"
 
-    def __init__(self, dropout=0.1):
+    def __init__(self, dropout=0.1, *, use_md200=True):
         super().__init__()
+        self.use_md200 = bool(use_md200)
         self.o8 = PreLNO8Encoder(dropout)
-        self.md_residual = AtomicConditionedMD200(512, 64, dropout)
+        # The no-MD route deliberately does not instantiate the descriptor
+        # adapter.  This keeps its state dict O8-only and prevents an old
+        # O8+MD bundle from being silently accepted as a new baseline.
+        self.md_residual = (
+            AtomicConditionedMD200(512, 64, dropout)
+            if self.use_md200 else nn.Identity()
+        )
 
     @staticmethod
     def pool(data, canonical):
@@ -216,7 +223,10 @@ class DistillStudent(nn.Module):
 
     def encode(self, data, *, atom_mask=None, md200=None):
         _, _, canonical = self.o8.canonical(data, atom_mask=atom_mask)
-        fused = self.md_residual(canonical, data, md200=md200)
+        if self.use_md200:
+            fused = self.md_residual(canonical, data, md200=md200)
+        else:
+            fused = canonical
         return canonical, fused
 
     def forward(self, data):

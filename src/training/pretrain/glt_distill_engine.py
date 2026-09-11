@@ -147,12 +147,13 @@ def multi_positive_infonce(student, teacher, identities, temperature=0.1):
 
 
 class StudentContainer(nn.Module):
-    def __init__(self, teacher=None):
+    def __init__(self, teacher=None, *, use_md200=True):
         super().__init__()
         # AtomicConditionedMD200 (``student.md_residual``) is trainable by the
         # revised New-C0 contract; ``o8.md_residual`` is an Identity, so it
         # carries no parameters to freeze.
-        self.student = DistillStudent()
+        self.use_md200 = bool(use_md200)
+        self.student = DistillStudent(use_md200=self.use_md200)
         self.atom_head = AtomPredictor()
         self.line_projection = StudentLineProjection()
         self.teacher = teacher
@@ -172,6 +173,30 @@ class StudentContainer(nn.Module):
 
     def forward(self, data, stream_step, generator=None, atom_mask=None):
         atom_mask = _joint_canonical_mask(data, 42, stream_step, 0.30) if atom_mask is None else atom_mask
+        if not self.use_md200:
+            # Pure O8 MIPS objective: one masked-atom CE over the fused (and
+            # identical) canonical representation.  No MD tensor is read or
+            # disturbed, and no teacher/line projection is involved.
+            _, fused_masked = self.student.encode(data, atom_mask=atom_mask)
+            indices = torch.nonzero(atom_mask, as_tuple=False).flatten()
+            targets = data.mips_x[indices, :101].argmax(-1).long()
+            atom_sum = (
+                F.cross_entropy(
+                    self.atom_head(fused_masked[indices]).float(),
+                    targets, reduction="sum",
+                ) if indices.numel() else fused_masked.sum() * 0.0
+            )
+            return {
+                "atom_sum": atom_sum,
+                "atom_count": int(indices.numel()),
+                "local_sum": atom_sum * 0.0,
+                "local_count": 0,
+                "global": atom_sum * 0.0,
+                "valid_graphs": 0,
+                "global_pool": 0,
+                "md_disturbed": 0,
+                "md_total": 0,
+            }
         md = data.mips_md.clone()
         disturb = torch.rand(md.shape, device=md.device, generator=generator) < 0.30
         replacements = torch.rand(md.shape, device=md.device, generator=generator)
@@ -246,7 +271,17 @@ def _dataset(config):
     from types import SimpleNamespace
     from src.dataset import UniDataset
     from src.dataset.md200_sidecar import DatasetWithMD200
-    from src.training.pretrain.config import _apply_glt_v3_config, dataset_kwargs_from_args
+    from src.training.pretrain.config import (
+        _apply_glt_v3_config, _apply_nomd_config, dataset_kwargs_from_args,
+    )
+    if config.get("schema") == "mts-glt-v2-r2-o8-nomd-mipsloss-v1":
+        args = SimpleNamespace()
+        _apply_nomd_config(args, Path(config["config_path"]), config)
+        kwargs = dataset_kwargs_from_args(args)
+        kwargs["periodic_line_glt_sidecar"] = None
+        # ``cache_layers`` is explicitly topology-only for this route.  It
+        # therefore never opens or materialises a descriptor/geometry sidecar.
+        return UniDataset(**kwargs)
     args = SimpleNamespace(resume_state=None)
     template = {
         "schema": "mts-glt-v3-galformer-20k", "experiment_id": config["experiment_id"],
@@ -287,6 +322,23 @@ def _tensor_state_sha256(state):
 
 
 def _deploy_student(container, step, version, geometry_revision, *, repair_experiment=False):
+    no_md = not bool(getattr(container.student, "use_md200", True))
+    if no_md:
+        return {
+            "schema": "mts-glt-v2-r2-o8-nomd-student-deploy-v1",
+            "version": "none", "step": int(step),
+            "geometry_revision": None,
+            "use_md200": False,
+            "state_dict": {k: v.detach().cpu() for k, v in container.student.state_dict().items()},
+            "architecture": "PreLN-sourceQ-O8-GELU-no-MD200",
+            "o8_ffn_activation": "GELU(approximate='none')",
+            "o8_ffn_hidden": "512->2048->512",
+            "downstream_graph_adapter": "identity",
+            "downstream_predictor": "512->512->1",
+            "downstream_predictor_dropout": 0.1,
+            "graph_adapter": "identity", "predictor": "512->512->1",
+            "predictor_dropout": 0.1,
+        }
     return {
         "schema": (
             "mts-glt-distill-repair-student-deploy-v1" if repair_experiment
@@ -314,6 +366,7 @@ def run_stage(
     config = json.loads(config_path.read_text())
     config["config_path"] = str(config_path)
     repair_experiment = config.get("schema") == "mts-glt-distill-repair-control-v1"
+    nomd_experiment = config.get("schema") == "mts-glt-v2-r2-o8-nomd-mipsloss-v1"
     if result_root is not None:
         config["result_root"] = str(Path(result_root).resolve())
     if line_sidecar_root is not None:
@@ -331,6 +384,10 @@ def run_stage(
             )
     if stage not in {"teacher", "student"}:
         raise ValueError(stage)
+    if nomd_experiment and stage != "student":
+        raise ValueError("the no-MD route has only a student masked-atom stage")
+    if nomd_experiment and resume is not None:
+        raise ValueError("the no-MD 5k route does not implement resume")
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if distributed:
         local_rank = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(local_rank)
@@ -408,8 +465,11 @@ def run_stage(
                 with torch.random.fork_rng(devices=[]):
                     teacher = NPlusGLTTeacher()
                 teacher.load_state_dict(teacher_payload["teacher_state"], strict=True)
-            container = StudentContainer(teacher).to(device)
-            total_steps, warmup = 20000, 2000
+            container = StudentContainer(teacher, use_md200=not nomd_experiment).to(device)
+            if nomd_experiment:
+                total_steps, warmup = 5000, 2000
+            else:
+                total_steps, warmup = 20000, 2000
         run_until = total_steps
         if stop_after is not None:
             run_until = min(total_steps, int(stop_after))
@@ -431,8 +491,17 @@ def run_stage(
         parameters = [p for p in container.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(parameters, lr=2e-4, betas=(0.9,0.98), weight_decay=0.0)
         floor = 1e-9 / 2e-4
+        # The no-MD 5k ablation is explicitly the prefix of the existing
+        # 20k schedule: warmup remains 2,000 updates and the decay horizon is
+        # not recompressed to the 5k stopping point.  Other routes retain
+        # their historical horizon.
+        schedule_total_steps = int(
+            config.get("schedule_total_steps", 20000 if nomd_experiment else total_steps)
+        )
+        if schedule_total_steps < total_steps or schedule_total_steps < warmup:
+            raise ValueError("schedule_total_steps must cover the requested trajectory")
         scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lambda k: (k + 1) / warmup if k < warmup else floor + (1-floor) * (1-min(1.0,(k-warmup)/max(1,total_steps-warmup)))
+            optimizer, lambda k: (k + 1) / warmup if k < warmup else floor + (1-floor) * (1-min(1.0,(k-warmup)/max(1,schedule_total_steps-warmup)))
         )
         metrics_path = root / "training_metrics.jsonl"
         accumulation = int(config["accumulation"])
@@ -509,7 +578,7 @@ def run_stage(
                     atom_mask = _joint_canonical_mask(
                         data, 42, step * accumulation + micro, 0.30
                     )
-                    if config["version"] == "none":
+                    if nomd_experiment or config["version"] == "none":
                         valid_graphs = 0
                     else:
                         center = data.glt3_token_center_internal.bool() & data.glt3_token_valid.bool()
@@ -535,13 +604,16 @@ def run_stage(
                             + output["angle_sum"] / max(1, total_angle)
                         )
                     else:
-                        ramp = min(1.0, step / 2000.0)
-                        global_total_pool = _global_count(sum(value[4] for value in prepared), device)
-                        global_weight = output["global_pool"] / max(1, global_total_pool)
-                        loss = world * (
-                            output["atom_sum"] / max(1, total_atom)
-                            + ramp * 0.1 * output["local_sum"] / max(1, total_local)
-                        ) + ramp * 0.1 * global_weight * output["global"]
+                        if nomd_experiment:
+                            loss = world * output["atom_sum"] / max(1, total_atom)
+                        else:
+                            ramp = min(1.0, step / 2000.0)
+                            global_total_pool = _global_count(sum(value[4] for value in prepared), device)
+                            global_weight = output["global_pool"] / max(1, global_total_pool)
+                            loss = world * (
+                                output["atom_sum"] / max(1, total_atom)
+                                + ramp * 0.1 * output["local_sum"] / max(1, total_local)
+                            ) + ramp * 0.1 * global_weight * output["global"]
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"non-finite {stage} loss at step {step + 1}")
                 loss.backward(); records.append({k: float(v.detach()) if torch.is_tensor(v) and v.numel()==1 else v for k,v in output.items()})
@@ -591,8 +663,14 @@ def run_stage(
                         "md_disturbance_fraction": float(diagnostics[5] / diagnostics[6].clamp_min(1)),
                         "global_distill_loss": sum(item["global"] for item in records) / accumulation,
                     })
-                    ramp = min(1.0, step / 2000.0)
-                    record["loss"] = record["atom_loss"] + ramp * 0.1 * (record["local_distill_loss"] + record["global_distill_loss"])
+                    if nomd_experiment:
+                        record["local_distill_loss"] = 0.0
+                        record["global_distill_loss"] = 0.0
+                        record["md_disturbance_fraction"] = 0.0
+                        record["loss"] = record["atom_loss"]
+                    else:
+                        ramp = min(1.0, step / 2000.0)
+                        record["loss"] = record["atom_loss"] + ramp * 0.1 * (record["local_distill_loss"] + record["global_distill_loss"])
                 with metrics_path.open("a") as handle: handle.write(json.dumps(record, sort_keys=True)+"\n")
                 if completed % 20 == 0 or completed == 1:
                     print(f"{config['version']} {stage} step={completed}/{total_steps} loss={record['loss']:.5f} lr={record['lr']:.3e}", flush=True)
@@ -622,7 +700,11 @@ def run_stage(
                     }
                     if stage == "student":
                         payload.update({
-                            "architecture": "PreLN-sourceQ-O8-GELU+atomic-conditioned-MD200",
+                            "architecture": (
+                                "PreLN-sourceQ-O8-GELU-no-MD200"
+                                if nomd_experiment else
+                                "PreLN-sourceQ-O8-GELU+atomic-conditioned-MD200"
+                            ),
                             "o8_ffn_activation": "GELU(approximate='none')",
                             "o8_ffn_hidden": "512->2048->512",
                             "downstream_graph_adapter": "identity",
@@ -631,6 +713,7 @@ def run_stage(
                             "graph_adapter": "identity",
                             "predictor": "512->512->1",
                             "predictor_dropout": 0.1,
+                            "use_md200": not nomd_experiment,
                         })
                     if completed % 1000 == 0:
                         checkpoint_name = f"{stage}_{completed//1000:03d}k.pt"
@@ -639,7 +722,7 @@ def run_stage(
                     else:
                         checkpoint_name = f"{stage}_resume_latest.pt"
                     _checkpoint(root / checkpoint_name, payload)
-                    if stage == "student" and completed in {5000,10000,20000}:
+                    if stage == "student" and completed in ({5000} if nomd_experiment else {5000,10000,20000}):
                         _checkpoint(root / f"student_deploy_{completed//1000:03d}k.pt", _deploy_student(
                             container, completed, config["version"], geometry_revision,
                             repair_experiment=repair_experiment,

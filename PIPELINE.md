@@ -284,9 +284,11 @@ C0 分阶段微调 40 个单元及各组 `historical_shared5` 重新微调结果
 也不含新版架构 metadata，会被下游部署校验拒绝；新版评估必须先重新预训练
 并导出学生包。
 
-## 15. 待运行：New-C0（新版 GLT-V2 revision-2 无蒸馏 baseline）
+## 15. 已完成：New-C0（新版 GLT-V2 revision-2 无 MD＋MIPS-loss baseline）
 
-New-C0 是修订后 GLT-V2 路线的无蒸馏基线，定义已冻结：
+New-C0 是修订后 GLT-V2 路线的纯 O8 基线。本轮明确移除 MD200，预训练只保留
+原 MIPS masked-atom CE，下游使用 standard-label MSE；这是整体方案比较，不把差值
+单独归因于某一个组件：
 
 ```text
 GLT-V2 revision-2
@@ -294,38 +296,92 @@ GLT-V2 revision-2
 ├─ full-row canonical atom masking（30%）
 ├─ 6 层 Pre-LN O8（hidden 512 / 8 heads / head_dim 64 / 1/sqrt(64)）
 ├─ GELU（approximate="none"）
-├─ trainable AtomicConditionedMD200（student.md_residual）
-├─ pre/post-MD masked atom CE（0.5 / 0.5，共享 atom head）
-├─ 无 3D teacher 蒸馏（无 local cosine、无 global InfoNCE、无 teacher checkpoint 依赖）
+├─ 无 MD200 参数、输入或 corruption
+├─ 单路 masked-atom CE（30%，138-D 整行清零，global sum/count）
+├─ 无 3D teacher、line sidecar、local/global 蒸馏
 ├─ canonical atom mean pooling
 ├─ Identity graph wrapper
 └─ 512→512→1 predictor，dropout 0.1
 ```
 
-`AtomicConditionedMD200` 在 student pretraining 中按契约 **可训练**（`student.o8.md_residual` 是
-`nn.Identity`，无参数）。原子重建损失仍为 `L_atom = 0.5*L_preMD + 0.5*L_postMD`，MD corruption
-概率 0.30，invalid MD 严格零更新，本次未改动。
+无 MD 分支的 `DistillStudent` 不实例化 `AtomicConditionedMD200`，canonical pooled graph
+state 直接来自 O8；部署包只保存 O8 state，state key 共 80 个且不含 `md`。
 
 实验身份与产物位置（与历史 C0/C1/C2 隔离）：
 
 ```text
-config            configs/mts/glt_v2_r2_c0_gelu138_mipshead.json
-experiment_id     glt_v2_r2_c0_gelu138_mipshead
-result_root       results/glt_v2_r2_c0_gelu138_mipshead
-log_root          logs/glt_v2_r2_c0_gelu138_mipshead
-入口              scripts/run_glt_v2_r2_c0_pipeline.py {prepare,validate,student,finetune,all}
+config            configs/mts/glt_v2_r2_o8_nomd_mipsloss_005k.json
+experiment_id     glt_v2_r2_o8_nomd_mipsloss_005k
+result_root       results/glt_v2_r2_o8_nomd_mipsloss_005k
+log_root          logs/glt_v2_r2_o8_nomd_mipsloss_005k
+入口              scripts/run_glt_v2_r2_o8_nomd_pipeline.py {preflight,validate,smoke,pretrain,finetune}
 ```
 
-该 config 通过 `protect_result_roots` 声明 `results/mts_glt_distill_repair_control` 与
-`results/mts_glt_v2_distill` 为受保护目录；`run_stage` 在建立 stage 目录前即校验 `result_root`，
-命中受保护根会直接失败。
+该 config 通过 `protect_result_roots` 声明旧正式目录为受保护目录；新的预训练/下游/探针
+产物均写入独立根目录，未修改 geometry、topology 或 MD200 cache。
 
-训练超参数沿用既有 C0 协议，未调整：student `total_steps=20000`/`warmup=2000`、
-AdamW `lr=2e-4`/`betas=(0.9,0.98)`/`weight_decay=0.0`、deploy 导出点 5k/10k/20k、
-O8 dropout 0.1；下游 `outer5_inner20`、`head_dropout=0.1`、O8/MD `1e-5`、predictor `1e-4`、
-weight decay 0.02、Huber β=0.5、gradient clip 1.0。
+训练协议：PI1M_v2 全量同序 cohort，3 GPU、local batch 84、accumulation 4、global batch
+1008、BF16、AdamW `lr=2e-4`、`betas=(0.9,0.98)`、`weight_decay=0`、seed 42；实际
+5,000 updates，warmup 2,000，并使用原 20k 调度曲线前缀（`schedule_total_steps=20000`）。
+正式部署为 `student_deploy_005k.pt`；训练记录 5,000 行，首/末 loss 为
+`4.565/0.208`，峰值显存约 `1.372 GiB/card`。
 
-历史 C0/C1/C2 结果属于旧实验定义（137 维输入＋独立 backbone embedding、ReLU FFN、adapter head），
-New-C0 使用独立 experiment/result_root，不会覆盖
-`results/mts_glt_distill_repair_control/` 下的任何正式产物。New-C0 尚未运行，因此这里不记录任何
-性能结果。
+下游使用 `outer5_inner20`、8 tasks×5 folds、seed 42、batch 32/64、FP32、
+`target_transform=standard`、`regression_loss=mse`、O8-only predictor
+`512→512→1`（dropout 0.1），已完成 40/40。冻结表示 Ridge 探针已完成 80/80：
+旧 New-C0 5k/10k/20k 各 20 个，加新 no-MD 5k 20 个；特征/标签 scaler 只拟合 train，
+alpha 只由 validation R² 选择。
+
+新 no-MD 下游 Macro8 R² 为 `0.787`；旧 New-C0 5k/10k/20k 参考值分别为
+`0.782/0.779/0.774`。这些是描述性对照，因为旧包仍含 MD200、
+历史下游 loss/标签协议不同，不能当作只移除 MD 的因果消融，也不是独立盲测。
+逐任务、逐折指标和 80 个 probe 结果见
+[`results/glt_v2_r2_o8_nomd_mipsloss_005k/comparison/final_report.md`](results/glt_v2_r2_o8_nomd_mipsloss_005k/comparison/final_report.md)。
+
+执行中三类入口问题均已停止、修复并保留证据：首轮预训练错误压缩学习率曲线（约 1,460
+updates），下游参数曾使用非法 `mts_glt_mode=none`，探针入口曾缺少 `src` 路径。修复后
+正式结果均从独立合法目录完成，失败尝试不计入指标。
+
+## 16. 新增：完整 Trimer GLT（端点元素＋14 维键特征）
+
+本节只记录已实现的独立代码接口和局部验证，不代表已启动新的预训练或微调。旧
+`periodic_line_glt_image_v1`、旧 C1/C2 checkpoint 和正式结果均未修改。
+
+新 sidecar schema 为 `mts-periodic-line-glt-complete-v1`，由冻结的三 RU Trimer
+真实物理键图直接生成内存记录：每条唯一物理键各一个 token，通常为 `3N+2`；每个
+token 持有端点 `(canonical_atom_id, RU_offset)`、真实欧氏键长、端点原子序数、
+`token_bond_features=[BondType(5), Conjugation(1), Ring(1), BondStereo(7)]`，即
+`glt3_token_bond_features: float32[M,14]`。Ring 来自开放 Trimer 的真实 RDKit 环，
+不依据周期闭合拓扑推断；Stereo 的 unknown 与 NONE 分开。所有共享真实物理原子的
+有向一跳 line-graph 关系保留对应真实角度；不存在距离/角度均值或重复物理三元组。
+
+完整分支的 token 编码为：
+
+```text
+one_hot(Z_a, 101) → Linear(101,256) ┐
+one_hot(Z_b, 101) → Linear(101,256) ├→ sum + Linear(14,256)
+RBF(distance; unordered Z pair) → Linear(256,256) ┘
+                                   concat → LayerNorm → 512
+```
+
+两个端点共享 `Linear(101,256)` 并求和；键化学向量使用一个
+`Linear(14,256)`，不再叠加旧的 BondType/Stereo/Conjugation embedding。可选
+`token_mask` 在编码后用独立可学习 512 维 mask token 替换整行；`angle_mask` 只清零
+对应关系的角度 bias。新 `CompleteTrimerGLTEncoder` 保持当前 8-head、Pre-LN、
+GELU、6 层和 source-Q/target-K attention，全部物理键参与消息传递，最终只对
+中心 RU 内部键做 GAP。无中心键时输出零图向量并标记无有效 3D readout。
+
+下游接口 `CompleteTrimerGLTFusionRegressor` 接收已完成 GAP 的 O8 `[B,512]` 与中心
+GLT `[B,512]`：分别 LayerNorm 后拼接为 `[B,1024]`，经过
+`Linear(1024,512)→GELU→Dropout(0.1)→Linear(512,1)`。无有效 GLT 时在 GLT
+LayerNorm 后置零，2D O8 路径仍可预测。`scripts/build_mts_glt_v3_sidecars.py`
+新增 `line-complete` 入口，但本轮没有调用它、没有写新 sidecar、没有生成构象。
+
+相关单元测试覆盖物理键数量、14 维顺序、Ring/unknown Stereo、端点交换、整 token
+mask、批处理 `[M,14]` 检查、融合形状、新旧 sidecar 混用拒绝、缺失 Ring 字段拒绝、
+sidecar 写入/读取往返以及刚体旋转/平移不变性；测试结果为 `8 passed`。另在 `tmux` 的
+`complete_trimer_validation` window
+中对冻结缓存的真实样本 1（50 tokens/16 个中心键/132 relations）和样本 10（2
+个跨 RU tokens/无中心键/2 relations）完成只读构建、批处理及 CPU forward/backward；
+两者均有限，样本 1 的 endpoint、bond-feature、distance、angle 和 GLT block 梯度均
+为非零。验证日志保存在 `logs/complete_trimer_glt_validation.log`；window 已正常结束。

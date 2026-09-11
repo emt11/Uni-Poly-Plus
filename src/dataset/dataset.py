@@ -91,6 +91,10 @@ from .periodic_line_glt_image import (
     PeriodicLineImageSidecar,
     SIDECAR_SCHEMA as PERIODIC_LINE_IMAGE_SCHEMA,
 )
+from .periodic_line_glt_complete import (
+    CompleteTrimerGLTSidecar,
+    SIDECAR_SCHEMA as PERIODIC_LINE_COMPLETE_SCHEMA,
+)
 from .periodic_line_distill import (
     PeriodicLineDistillSidecar,
     SCHEMA_PREFIX as PERIODIC_LINE_DISTILL_SCHEMA_PREFIX,
@@ -2254,13 +2258,19 @@ class UniDataset(Dataset):
             sidecar_type = (
                 PeriodicLineDistillSidecar
                 if is_distill_sidecar
+                else CompleteTrimerGLTSidecar
+                if sidecar_schema == PERIODIC_LINE_COMPLETE_SCHEMA
                 else PeriodicLineImageSidecar
                 if sidecar_schema == PERIODIC_LINE_IMAGE_SCHEMA
                 else PeriodicLineGLTSidecar
             )
             sidecar_kwargs = (
                 {"build_key_index": not self._cohort_row_mode}
-                if sidecar_type in {PeriodicLineDistillSidecar, PeriodicLineImageSidecar}
+                if sidecar_type in {
+                    PeriodicLineDistillSidecar,
+                    PeriodicLineImageSidecar,
+                    CompleteTrimerGLTSidecar,
+                }
                 else {}
             )
             self._periodic_line_glt_sidecar = sidecar_type(
@@ -4628,6 +4638,7 @@ class UniDataset(Dataset):
             ).get("schema")
             is_image_v1 = (
                 active_line_schema == PERIODIC_LINE_IMAGE_SCHEMA
+                or active_line_schema == PERIODIC_LINE_COMPLETE_SCHEMA
                 or str(active_line_schema).startswith(
                     (PERIODIC_LINE_DISTILL_SCHEMA_PREFIX, "mts-periodic-line-distill-v2-")
                 )
@@ -4635,12 +4646,22 @@ class UniDataset(Dataset):
             prefix = "glt3_" if is_image_v1 else "glt_"
             setattr(data, prefix + "geometry_valid", bool(line_row["geometry_valid"]))
             if is_image_v1:
-                data.glt3_query_valid = bool(
-                    line_row["geometry_valid"] and len(tokens["token_atom_a"]) > 0
-                )
+                if active_line_schema == PERIODIC_LINE_COMPLETE_SCHEMA:
+                    center_tokens = tokens.get("token_center_internal", ())
+                    data.glt3_query_valid = bool(
+                        line_row["geometry_valid"] and np.asarray(center_tokens).any()
+                    )
+                else:
+                    data.glt3_query_valid = bool(
+                        line_row["geometry_valid"] and len(tokens["token_atom_a"]) > 0
+                    )
                 for name, value in tokens.items():
-                    dtype = torch.float32 if name == "token_distance" else (
-                        torch.bool if name == "token_valid" else torch.long
+                    dtype = torch.float32 if name in {
+                        "token_distance", "token_bond_features",
+                    } else (
+                        torch.bool if name in {
+                            "token_valid", "token_center_internal",
+                        } else torch.long
                     )
                     setattr(data, f"glt3_{name}", torch.as_tensor(np.array(value, copy=True), dtype=dtype))
                 for name, value in relations.items():

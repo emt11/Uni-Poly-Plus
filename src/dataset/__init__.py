@@ -16,6 +16,11 @@ from .periodic_line_glt_image import (
     PeriodicLineImageSidecar,
     build_periodic_line_image_sample,
 )
+from .periodic_line_glt_complete import (
+    CompleteTrimerGLTSidecar,
+    build_complete_trimer_glt_sample,
+    write_complete_trimer_sidecar,
+)
 from .periodic_line_distill import PeriodicLineDistillSidecar
 from .periodic_line_distill_v2 import build_periodic_line_distill_v2_sample
 
@@ -34,6 +39,9 @@ __all__ = [
     "build_periodic_line_sample",
     "PeriodicLineImageSidecar",
     "build_periodic_line_image_sample",
+    "CompleteTrimerGLTSidecar",
+    "build_complete_trimer_glt_sample",
+    "write_complete_trimer_sidecar",
     "PeriodicLineDistillSidecar",
     "build_periodic_line_distill_v2_sample",
 ]

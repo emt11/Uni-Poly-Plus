@@ -76,7 +76,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--mts_adapter_lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.02)
     parser.add_argument("--warmup_epochs", type=int, default=5)
-    parser.add_argument("--regression_loss", choices=["huber"], default="huber")
+    parser.add_argument("--regression_loss", choices=["huber", "mse"], default="huber")
     parser.add_argument("--huber_beta", type=float, default=0.5)
     parser.add_argument("--target_transform", choices=["recommended", "standard", "log"], default="recommended")
     parser.add_argument("--evaluation_protocol", choices=["historical_shared5", "outer5_inner20"], default="historical_shared5")
@@ -118,7 +118,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--star_rbf_upper", type=float, default=3.0)
     parser.add_argument("--periodic_line_glt_sidecar", default=None)
     parser.add_argument("--mts_glt_mode", choices=sorted(MODE_SPECS), default="o8_glt_atom")
-    parser.add_argument("--mts_glt_version", choices=["v2", "distill", "distill_repair"], default="v2")
+    parser.add_argument("--mts_glt_version", choices=["v2", "distill", "distill_repair", "distill_nomd"], default="v2")
     parser.add_argument("--distill_repair_version", choices=["none", "n_plus_1", "n_plus_2"])
     parser.add_argument("--allow_smoke_checkpoint", action="store_true")
     parser.add_argument("--glt_readout_mode", choices=["galformer", "mips_concat"], default="galformer")
@@ -160,12 +160,12 @@ def parse_arguments(argv=None):
         parser.error("MTS-GLT-v2-Base-5k is graph-only with fusion_type=none")
     if args.mts_glt_mode not in MODE_SPECS:
         parser.error("unsupported MTS-GLT-v2 downstream mode")
-    if args.mts_glt_version in {"distill", "distill_repair"}:
+    if args.mts_glt_version in {"distill", "distill_repair", "distill_nomd"}:
         # Revised DistillStudent uses the fixed Original-MIPS-style predictor
         # contract; do not let the legacy 0.25 CLI default reach its model or
         # resolved metadata.  Other routes retain their configured dropout.
         args.head_dropout = 0.1
-    if args.mts_glt_version in {"distill", "distill_repair"}:
+    if args.mts_glt_version in {"distill", "distill_repair", "distill_nomd"}:
         args.mts_glt_mode = "none"
         args.graph_input = "star_linking"
     if args.mts_glt_version == "distill_repair" and args.distill_repair_version is None:
