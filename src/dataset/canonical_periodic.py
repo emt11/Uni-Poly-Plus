@@ -187,6 +187,187 @@ def find_base_atom_mapping(source, target):
     return torch.tensor(mapped, dtype=torch.long)
 
 
+def resolve_normalized_identity(topology, source_smiles, *, require_fields=None):
+    """Resolve the model atom identity for one cached/source row.
+
+    ``source_smiles`` is deliberately kept as the provenance representation;
+    every model-side graph is built from the frozen normalized representation
+    carried by the Topology record.  The two representations are joined by a
+    validated graph-isomorphism permutation (source atom index -> normalized
+    atom index, and the corresponding non-dummy base ranks).  A sample with an
+    incomplete or contradictory table is rejected rather than falling back to
+    positional or same-element matching.
+
+    Small hand-built test ``Data`` rows from the historical sidecar contract do
+    not carry the new identity fields.  They are accepted only when they also
+    omit model ``mips_x`` rows; production/cached model records are required to
+    carry ``normalized_canonical_smiles`` and its base mapping.
+    """
+
+    source = _as_mol(source_smiles)
+    has_model_rows = hasattr(topology, "mips_x")
+    normalized_text = getattr(topology, "normalized_canonical_smiles", None)
+    if normalized_text is None:
+        if require_fields is True or has_model_rows:
+            raise ValueError(
+                "normalized atom identity fields are missing from Topology"
+            )
+        # Compatibility for the complete-Trimer unit tests, whose tiny
+        # topology carrier contains only the legacy mapping/element fields.
+        normalized_text = Chem.MolToSmiles(source, canonical=True)
+    normalized_text = str(normalized_text)
+    normalized = _as_mol(normalized_text)
+    canonical_text = Chem.MolToSmiles(normalized, canonical=True)
+    if canonical_text != normalized_text:
+        raise ValueError(
+            "normalized_canonical_smiles is not in canonical RDKit form"
+        )
+
+    source_to_normalized_atom = find_atom_graph_mapping(source, normalized)
+    source_to_normalized_base = find_base_atom_mapping(source, normalized)
+
+    # The persisted mapping describes the source spelling used when the
+    # frozen topology was written.  A caller may later provide a different,
+    # non-canonical spelling with the same normalized sample key, so validate
+    # the persisted table against ``topology.smiles`` while returning a fresh
+    # caller->normalized permutation for the current audit/model call.
+    cached_source_text = getattr(topology, "smiles", None)
+    cached_source = _as_mol(cached_source_text) if cached_source_text else source
+    cached_atom = find_atom_graph_mapping(cached_source, normalized)
+    cached_base = find_base_atom_mapping(cached_source, normalized)
+    observed_atom = getattr(topology, "source_to_normalized_atom_id", None)
+    observed_base = getattr(
+        topology, "source_to_normalized_canonical_atom_id", None
+    )
+    if observed_atom is not None:
+        try:
+            observed_atom = torch.as_tensor(
+                observed_atom, dtype=torch.long
+            ).reshape(-1)
+        except Exception as exc:
+            raise ValueError(
+                "cached source-to-normalized atom mapping is invalid"
+            ) from exc
+        if not torch.equal(observed_atom, cached_atom):
+            raise ValueError("cached source-to-normalized atom mapping disagrees")
+    if observed_base is not None:
+        try:
+            observed_base = torch.as_tensor(
+                observed_base, dtype=torch.long
+            ).reshape(-1)
+        except Exception as exc:
+            raise ValueError(
+                "cached source-to-normalized base mapping is invalid"
+            ) from exc
+        if not torch.equal(observed_base, cached_base):
+            raise ValueError(
+                "cached source-to-normalized base mapping disagrees"
+            )
+    elif has_model_rows or require_fields is True:
+        raise ValueError(
+            "cached source-to-normalized base mapping is missing"
+        )
+
+    observed_attachments = getattr(
+        topology, "source_to_normalized_attachment_map", None
+    )
+    if observed_attachments is not None:
+        expected_attachments = []
+        for dummy in cached_source.GetAtoms():
+            if dummy.GetAtomicNum() != 0:
+                continue
+            neighbors = list(dummy.GetNeighbors())
+            if len(neighbors) != 1:
+                raise ValueError("cached attachment dummy must have one neighbor")
+            expected_attachments.append({
+                "source_dummy": int(dummy.GetIdx()),
+                "source_neighbor": int(neighbors[0].GetIdx()),
+                "normalized_dummy": int(cached_atom[dummy.GetIdx()]),
+                "normalized_neighbor": int(cached_atom[neighbors[0].GetIdx()]),
+            })
+        observed_attachments = list(observed_attachments)
+        if not all(isinstance(item, Mapping) for item in observed_attachments):
+            raise ValueError(
+                "cached source-to-normalized attachment map is invalid"
+            )
+        sort_attachment = lambda item: (
+            int(item.get("source_dummy", -1)),
+            int(item.get("source_neighbor", -1)),
+        )
+        if sorted(observed_attachments, key=sort_attachment) != sorted(
+            expected_attachments, key=sort_attachment
+        ):
+            raise ValueError("cached source-to-normalized attachment map disagrees")
+
+    base_order = _base_atom_order(normalized)
+    base_count = len(base_order)
+    canonical_to_base = getattr(
+        topology, "canonical_to_trimer_base_atom_id", None
+    )
+    topology_z = getattr(topology, "atomic_numbers", getattr(topology, "z", None))
+    if canonical_to_base is not None or topology_z is not None:
+        if canonical_to_base is None or topology_z is None:
+            raise ValueError("canonical atom identity table is incomplete")
+        canonical_to_base = torch.as_tensor(
+            canonical_to_base, dtype=torch.long
+        ).reshape(-1)
+        topology_z = torch.as_tensor(topology_z, dtype=torch.long).reshape(-1)
+        if canonical_to_base.numel() != topology_z.numel():
+            raise ValueError("canonical atom identity/element lengths differ")
+        if canonical_to_base.numel() != base_count:
+            raise ValueError("canonical atom count differs from normalized RU")
+        if sorted(canonical_to_base.tolist()) != list(range(base_count)):
+            raise ValueError("canonical-to-Trimer mapping is not a permutation")
+        normalized_z = torch.tensor(
+            [int(normalized.GetAtomWithIdx(idx).GetAtomicNum()) for idx in base_order],
+            dtype=torch.long,
+        )
+        expected_z = normalized_z[canonical_to_base]
+        if not torch.equal(topology_z, expected_z):
+            raise ValueError("canonical elements do not follow normalized atom identity")
+    else:
+        canonical_to_base = torch.arange(base_count, dtype=torch.long)
+
+    source_attachments = []
+    target_attachments = []
+    for molecule, output in ((source, source_attachments), (normalized, target_attachments)):
+        for atom in molecule.GetAtoms():
+            if atom.GetAtomicNum() != 0:
+                continue
+            neighbors = list(atom.GetNeighbors())
+            if len(neighbors) != 1:
+                raise ValueError("attachment dummy must have one neighbor")
+            output.append((int(atom.GetIdx()), int(neighbors[0].GetIdx())))
+    mapped_attachments = sorted(
+        (int(source_to_normalized_atom[dummy]), int(source_to_normalized_atom[neighbor]))
+        for dummy, neighbor in source_attachments
+    )
+    if mapped_attachments != sorted(target_attachments):
+        raise ValueError("source/normalized attachment mapping is incomplete")
+    attachment_map = [
+        {
+            "source_dummy": int(dummy),
+            "source_neighbor": int(neighbor),
+            "normalized_dummy": int(source_to_normalized_atom[dummy]),
+            "normalized_neighbor": int(source_to_normalized_atom[neighbor]),
+        }
+        for dummy, neighbor in source_attachments
+    ]
+    return {
+        "source_molecule": source,
+        "normalized_molecule": normalized,
+        "normalized_smiles": normalized_text,
+        "source_to_normalized_atom": source_to_normalized_atom,
+        "source_to_normalized_base": source_to_normalized_base,
+        "cached_source_molecule": cached_source,
+        "cached_source_to_normalized_atom": cached_atom,
+        "cached_source_to_normalized_base": cached_base,
+        "canonical_to_normalized_base": canonical_to_base,
+        "attachments": attachment_map,
+        "base_count": base_count,
+    }
+
+
 def remap_rows_by_base_atom(rows, source_to_target, *, target_count=None):
     """Reorder per-RU rows from source base order into target base order."""
 
@@ -406,7 +587,19 @@ def build_canonical_periodic_topology(smiles_or_mol, max_hops: int = 2) -> Data:
     as integer structural diagnostics only.
     """
 
-    molecule = _as_mol(smiles_or_mol)
+    # Canonical periodic rows are model identities, not the caller's RDKit
+    # insertion order.  Keep the source molecule solely for the explicit
+    # provenance permutation and build every topology/Trimer-facing tensor
+    # from the normalized canonical graph.
+    source_molecule = _as_mol(smiles_or_mol)
+    normalized_smiles = Chem.MolToSmiles(source_molecule, canonical=True)
+    molecule = _as_mol(normalized_smiles)
+    source_to_normalized_atom = find_atom_graph_mapping(
+        source_molecule, molecule
+    )
+    source_to_normalized_base = find_base_atom_mapping(
+        source_molecule, molecule
+    )
     if int(max_hops) < 0:
         raise ValueError("max_hops must be non-negative")
     ru, metadata = build_periodic_multimer_mol(
@@ -573,6 +766,10 @@ def build_canonical_periodic_topology(smiles_or_mol, max_hops: int = 2) -> Data:
          for _ in (0, 1)], dtype=torch.long
     )
     data.attachment_bond_mismatch = bool(metadata.get("attachment_bond_mismatch", False))
+    data.normalized_canonical_smiles = str(normalized_smiles)
+    data.source_to_normalized_atom_id = source_to_normalized_atom
+    data.source_to_normalized_canonical_atom_id = source_to_normalized_base
+    data.source_to_canonical_atom_id = source_to_normalized_base
     data.connection_bond_policy = str(metadata.get("connection_bond_policy", ""))
     data.shared_attachment_boundary = bool(metadata.get("shared_boundary", False))
     data.repeat_metadata = dict(metadata)
@@ -618,6 +815,11 @@ def migrate_explicit_topology_to_canonical(
     if normalized_text is None:
         normalized_text = Chem.MolToSmiles(source_molecule, canonical=True)
     target_molecule = _as_mol(normalized_text)
+    # Keep both permutations: the full table is needed for provenance and
+    # attachment dummies, while the base-rank table is what indexes MIPS/RU
+    # rows.  A migration record must not silently collapse the former into the
+    # latter because their lengths and index spaces differ for P-SMILES.
+    source_to_target_atom = find_atom_graph_mapping(source_molecule, target_molecule)
     source_to_target = find_base_atom_mapping(source_molecule, target_molecule)
     target_count = int(target_molecule.GetNumAtoms()) - sum(
         int(atom.GetAtomicNum() == 0) for atom in target_molecule.GetAtoms()
@@ -680,7 +882,27 @@ def migrate_explicit_topology_to_canonical(
                 "old topology backbone mask disagrees with native canonical features"
             )
         migrated.mips_backbone_mask = backbone
+    migrated.smiles = str(
+        getattr(old, "smiles", getattr(ru_base, "smiles", normalized_text))
+    )
+    migrated.source_to_normalized_atom_id = source_to_target_atom
     migrated.source_to_normalized_canonical_atom_id = source_to_target
+    migrated.source_to_canonical_atom_id = source_to_target
+    source_attachments = []
+    for atom in source_molecule.GetAtoms():
+        if atom.GetAtomicNum() != 0:
+            continue
+        neighbors = list(atom.GetNeighbors())
+        if len(neighbors) != 1:
+            raise ValueError("migration attachment dummy must have one neighbor")
+        neighbor = neighbors[0]
+        source_attachments.append({
+            "source_dummy": int(atom.GetIdx()),
+            "source_neighbor": int(neighbor.GetIdx()),
+            "normalized_dummy": int(source_to_target_atom[atom.GetIdx()]),
+            "normalized_neighbor": int(source_to_target_atom[neighbor.GetIdx()]),
+        })
+    migrated.source_to_normalized_attachment_map = source_attachments
     migrated.normalized_canonical_smiles = str(normalized_text)
     migrated.canonical_to_trimer_base_atom_id = torch.arange(
         target_count, dtype=torch.long
@@ -709,6 +931,7 @@ __all__ = [
     "build_canonical_periodic_topology", "build_mts_canonical_periodic_topology",
     "build_canonical_periodic_lga", "migrate_explicit_topology_to_canonical",
     "find_atom_graph_mapping", "find_base_atom_mapping",
+    "resolve_normalized_identity",
     "remap_rows_by_base_atom",
     "attach_canonical_periodic_lga",
     "build_lifted_periodic_relations",

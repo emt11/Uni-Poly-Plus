@@ -388,8 +388,8 @@ sidecar 写入/读取往返以及刚体旋转/平移不变性；测试结果为 
 
 ## 17. 独立新接口：O8 Bond-Path＋Galformer Trimer Hop2
 
-本节记录代码实现，**尚未运行单元测试、真实样本 forward/backward、预训练或微调**。
-本次环境禁止执行模型/测试；§16 的旧测试和 smoke 不构成本节模型的验证证据。
+本节记录当前 GLT-V2 双路接口及其规范化身份修复。代码回归已在本轮执行；真实冻结记录
+审计已执行但因坐标化学异常阻断后续模型 smoke，不能把合成测试结果外推为真实数据覆盖。
 旧 O8、CompleteTrimerGLTEncoder、C0/C1/C2 和历史 checkpoint 行为保持原样。
 
 新模型工厂为 `src.modules.build_dual_glt_model(fusion_mode="concat" | "kfuse")`。
@@ -420,13 +420,14 @@ token 对保留全部等长最短路径，反序生成反向路径。逐路径�
 即三个 bond tokens、两个真实角度。self 单独标记，使用 `[token,token]` 与合成零角。
 无效必需角度使整个样本 3D 无效，附带原因，不静默删除关系；空中心键读出为零。
 
-Trimer 构建在完整连接后复制原始 bond direction/stereo，并重映射 stereo atoms。
-内部 dummy 参照映射到相邻 RU 的真实连接原子；有限链末端参照改为其他显式
-取代基时翻转 E/Z（或 CIS/TRANS）约定，失去立体定义的末端不强行设置 stereo。
-修复不重建或修改冻结坐标。已有坐标是否满足原始 E/Z 必须另行验证。
-本次补充 E/Z、跨 RU 参照、重编号、多最短路径梯度及真实记录检查代码，
-受当前环境禁止执行的限制，均未执行。真实验证仍最多两条冻结记录：普通记录
-须含明确的中心 E/Z，另一条为 N=0；检查原坐标立体一致性和重编号预测不变性。
+Trimer 构建在完整连接后从 Kekulize 前的原始分子复制 BondDir/stereo，并重映射
+StereoAtoms。内部 dummy 参照只映射到相邻 RU 的真实连接原子；有限链末端没有真实参照
+时显式记为 `terminal_stereo_unset`/`STEREONONE`，不任意选取另一取代基或翻转 E/Z
+(CIS/TRANS)。修复不重建或修改冻结坐标。已有坐标是否满足原始 E/Z 必须独立验证。
+规范化 P-SMILES、缓存显式映射和调用方原始字符串通过严格图同构关联；bond-path、BRICS、
+物理键和监督索引均从规范化 base atom 身份生成，原始字符串只保留为来源和独立 Stereo 审计。
+真实验证仍最多两条冻结记录：普通记录须含明确的中心 E/Z，另一条为 N=0；同时检查
+原坐标立体一致性和重编号预测不变性。
 
 ### 两路编码器
 
@@ -466,17 +467,31 @@ FFN 为 `512→2048→512`，feature/attention dropout=0.1。无虚拟 CLS 节�
 
 新模型不接入旧正式 runner，不加载旧 checkpoint 作为完整新模型权重。
 
-### 验证入口（未执行）
+### 验证入口与本轮状态
 
 `tests/test_dual_glt.py` 覆盖共享/scaling、独立参考公式、Vocab 顺序、周期路径、
 物理两跳与反序、无效几何、N=0、刚体不变性、两种融合和梯度。
 其人工坐标样本不宣称为真实 fixture。
 
-在允许执行的环境中，只执行相关测试：
+本轮在 `tmux` 的 `glt_local_tests3` window 中执行了相关回归：
 
 ```text
-pytest -q tests/test_dual_glt.py tests/test_complete_trimer_glt.py
+PYTHONPATH=tests pytest -q tests/test_dual_glt.py tests/test_dual_glt_audit.py \
+  tests/test_complete_trimer_glt.py tests/test_mts_canonical_periodic.py
 ```
+
+结果为 `57 passed`，日志为 `logs/glt_v2_local_tests3_20260911.log`。辅助的三任务目标、
+LMDB 坏样本、缓存完整性和 no-MD 路线回归在 `glt_aux_tests2` window 中为 `37 passed`，
+日志为 `logs/glt_v2_aux_tests2_20260911.log`。这些用例包含合成模型前后向和梯度检查，
+不构成真实构象或性能证据。
+随后在补强“身份/化学错误不得降级为空几何行”及审计完整 JSON 状态后，重新执行包含
+`test_dual_glt_pretrain.py` 的目标集合，结果为 `71 passed`，日志为
+`logs/glt_v2_regression_postfix2_20260911.log`；仍只有合成/契约证据。
+再执行覆盖 LMDB、checkpoint 生命周期、no-MD、规范化 Trimer 映射及完整性校验的扩展
+目标集合，结果为 `104 passed`，日志为 `logs/glt_v2_regression_final3_20260911.log`。
+补充非对称 Z 构型的规范化端点反向、映射字段异常、审计收尾退出码及“全部明确副本均检查”后，
+审计目标集合为 `65 passed`（`logs/glt_v2_audit_final20_20260911.log`）；随后重跑完整
+扩展目标集合为 `107 passed, 6 warnings`（`logs/glt_v2_regression_final21_20260911.log`）。
 
 真实验证入口只接受两条现有缓存记录（一条普通、一条真实 N=0），CPU、单线程、
 `num_workers=0`，两种融合各一次 forward/backward，无 optimizer、无缓存写入：
@@ -486,14 +501,22 @@ python scripts/validate_dual_glt.py --topology-root TOPOLOGY_LAYER --trimer-root
 ```
 
 以上路径与 key 需对应执行环境实际冻结产物，不使用历史样本编号猜测新环境身份。
-遵守项目 tmux/log 规则。当前没有执行上述命令，没有生成新性能结果。
+本轮实际只读审计了 PI1M_v2 的两条记录（普通中心 E/Z 与真实 N=0），最终代码命令在
+`glt_real_audit_final22` window 中执行；stdout JSON 和 `--report-json` 均保存为
+`logs/glt_v2_real_audit_final22_20260911.json`，日志为 `logs/glt_v2_real_audit_final22_20260911.log`。
+两条记录的规范化身份、原始 Stereo、2D/连接审计和 N=0 角色均有明确状态；普通记录三个
+明确中心副本中有两个冻结坐标投影与 E/Z 不一致，退出码为 `1`、`outcome=DATA_ANOMALY`。
+普通样本 Star-Linking 为 `REVIEW`（实际边为 aromatic/ring/conjugated），N=0 的
+Star-Linking 为 `REVIEW`（两侧落在同一 boundary atom）；模型状态为 `NOT_RUN`，因此
+没有执行真实记录 forward/backward。
 
-## 18. GLT 双路三任务预训练与 outer5_inner20 微调（实现，未执行）
+## 18. GLT 双路三任务预训练与 outer5_inner20 微调（实现；本轮未执行）
 
 本节是独立新入口；第 17 节模型及冻结输入不再需要借用旧 C0/C1/C2 runner。
 两种模式分别使用 `configs/mts/glt_dual_three_task_concat.json` 与
 `configs/mts/glt_dual_three_task_kfuse.json`。无 MD200、教师、蒸馏或 InfoNCE。
-本轮没有启动任何测试、模型、训练或缓存构建，以下命令仅供允许执行的环境使用。
+本轮未启动预训练、微调、DDP 或缓存构建；相关合成回归已在第 17 节记录，以下正式
+命令仍仅供通过真实数据阻断复核后的环境使用。
 
 ### 数据、目标与共享融合
 
@@ -590,20 +613,32 @@ python scripts/finetune_glt_dual.py \
   2>&1 | tee logs/glt_dual_three_task/${MODE}_finetune.log
 ```
 
-### 局部验证（全部未执行）
+### 局部验证与阻断状态
+
+三任务目标、DDP 归约代数、优化器/RNG 恢复、部署张量集合、固定分折和 clean 下游
+helper 的合成回归已执行（`37 passed`，见上节日志）；身份/审计补强后的目标集合为
+`71 passed`，最新审计相关集合为 `65 passed`，最新扩展目标集合为 `107 passed, 6 warnings`
+（`logs/glt_v2_regression_final21_20260911.log`）。`finetune_glt_dual.py` 新增
+`--smoke --task eat --fold 0`，只构建 train/validation loader、只用 train 拟合 scaler、
+最多两 epoch，并明确把 outer-test/OOF 标为 `NOT_RUN`；默认不带 `--smoke` 仍是完整
+八任务五折行为。该 smoke 入口尚未执行。
+
+真实双记录入口使用：
 
 ```text
-pytest -q tests/test_dual_glt_pretrain.py tests/test_dual_glt.py
-python scripts/validate_glt_dual_pretrain.py --topology-root TOPOLOGY_LAYER --trimer-root TRIMER_LAYER --sample ORDINARY_KEY "ORDINARY_PSMILES" --sample N0_KEY "N0_PSMILES"
+python scripts/validate_dual_glt.py --audit-only --topology-root TOPOLOGY_LAYER \
+  --trimer-root TRIMER_LAYER --sample ORDINARY_KEY "ORDINARY_PSMILES" \
+  --sample N0_KEY "N0_PSMILES" --report-json NEW_REPORT.json
 ```
 
 真实入口最多两条冻结记录、CPU 单线程、无 workers/optimizer/训练循环；三任务前后向、
 内存中 step=0 包的严格加载、clean 下游 forward。step=0 仅为验证包，不冒充已训练模型。
 测试涵盖 mask 泄漏、目标几何、fingerprint reference、DDP 梯度归约的代数参考、优化器/RNG
 恢复、绝对位置抽样、部署加载与 300 条分折；以隔离 mock 检查 validation 选模后 test
-只运行一次。人工测试坐标不是实际构象。当前没有实际 DDP 或真实样本验证。
+只运行一次。人工测试坐标不是实际构象。当前没有实际 DDP、真实记录模型前后向或预训练
+smoke 验证。
 
-### 数据保真审查后的局部修复（2026-09-11，验证未执行）
+### 数据保真审查后的局部修复（2026-09-11，本轮状态）
 
 本次明确了 2D 周期键化学的代表规则：内部键只取开放 Trimer 中心 RU；有限链末端
 内部键的 Stereo/Conjugation 不参与周期特征一致性判定。两条真实跨 RU 键仍须具有
@@ -612,25 +647,32 @@ python scripts/validate_glt_dual_pretrain.py --topology-root TOPOLOGY_LAYER --tr
 
 完整 Trimer 读取新增全部 `(base_atom_id, RU_offset)` 身份、逐物理原子元素、canonical
 覆盖以及预期/冻结物理键集合相等检查；缺边、额外边和键类型冲突使 3D 分支无效并
-给出原因。允许有向或无向边表，正常双向存储仅在物理键层归并。缺少程序必需字段
-产生的 `KeyError` 不再由双路适配器包装为普通无效角度。
+给出原因。允许有向或无向边表，正常双向存储仅在物理键层归并。缺少程序必需字段或
+身份/化学解析错误现在显式拒绝，不再由双路适配器包装为普通无效角度。
 
 复制 Stereo/BondDir 的来源改为 Kekulize 前的原始分子。`validate_dual_glt.py` 独立从
 原始 P-SMILES 记录 Stereo、StereoAtoms、BondDir，并核对全部内部键副本的参照关系；
-允许合法末端参照替换或立体定义消失。该检查验证 metadata 传递，不等同于完整 CIP
-重新赋值验证。化学传递检查通过后再检查冻结坐标；轴长、投影退化有独立错误原因。
+末端没有真实物理参照时只允许明确变成未指定，不能用另一显式取代基自证翻转。该检查
+验证 metadata 传递，不等同于完整 CIP 重新赋值验证。化学传递检查通过后再检查冻结坐标；
+轴长、投影退化有独立错误原因。
 原有坐标一致性阈值 0.5 保持不变，它是几何容差判据，不是纯 E/Z 符号定义。
 
 审计报告区分 `ANOMALY`（已发现异常）与 `REVIEW`（策略或有限链差异待复核），
 提前返回的检查显式为 `NOT_RUN`。真实普通样本必须自身包含中心 E/Z；真实 N=0
 须同时满足原始结构内部键数为零、模型读出键数为零。修复 LMDB 初始化失败清理、
 双资源关闭与模型失败状态；正常审计 stdout 只输出最终 JSON，进度写 stderr。
-`REVIEW` 不被写成 `PASS`，但不阻止本入口的局部模型验证；它不授权正式实验。
+`REVIEW` 不被写成 `PASS`，但不阻止审计继续收集其他检查；真实记录的明确坐标异常会
+使审计以 `DATA_ANOMALY` 退出并阻止后续模型/训练 smoke。它不授权正式实验。
 CLI 参数格式错误仍使用 argparse 的 stderr/非零退出，不生成样本审计报告。
-三任务真实验证入口复用相同数据审计，避免只凭 geometry_valid 进入模型验证。
+资源关闭、fixture 收尾或 JSON 序列化失败均标记 `SCRIPT_ERROR` 并返回退出码 `2`；
+非有限报告值不会以 NaN 写出。三任务真实验证入口复用相同数据审计，避免只凭
+geometry_valid 进入模型验证。
 
 新增 `tests/test_dual_glt_audit.py`，并扩展 `tests/test_dual_glt.py`：覆盖末端 Stereo
 到 bond bias、缺边与真实身份契约、无向存储、重编号、原始参照审计的故障注入、
-fixture 角色绑定、资源释放、JSON 输出、多路径独立平均公式和混合 batch 偏移。
-所有测试、两条真实记录检查及前后向均**未执行**；仅完成代码修改与静态补丁检查。
-未生成真实 fixture，未重建缓存，未修改历史结果，未启动预训练或微调。
+fixture 角色绑定、资源释放、JSON 输出、多路径独立平均公式和混合 batch 偏移；本轮
+相关合成回归记录为 `57 passed`、`37 passed`，补强后目标集合 `71 passed`，审计子集
+`29 passed`，最新审计相关集合 `65 passed`，最新扩展目标集合 `107 passed, 6 warnings`
+（`logs/glt_v2_regression_final21_20260911.log`）。
+没有生成真实 fixture、没有重建缓存、没有修改历史
+结果，也没有启动预训练或微调。两条真实记录仅代表这两条记录，不外推全量覆盖率。

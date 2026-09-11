@@ -635,6 +635,18 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
 
     # Restore bond metadata from the ORIGINAL bonds only after all real seam
     # neighbors exist. AddBond copies the order, not direction/stereo atoms.
+    # Keep the records until after sanitization: SanitizeMol is allowed to
+    # update bond caches/aromaticity, but it must not be the operation that
+    # silently decides whether a stereo reference survived.
+    bond_restores = []
+    stereo_restore_failures = []
+    terminal_stereo_unset = []
+    defined_stereo = {
+        Chem.BondStereo.STEREOE,
+        Chem.BondStereo.STEREOZ,
+        Chem.BondStereo.STEREOCIS,
+        Chem.BondStereo.STEREOTRANS,
+    }
     for unit_idx, atom_map in enumerate(atom_maps):
         mapping = {old: atom_map[base_id] for old, base_id in old_to_base.items()}
         reference_map = dict(mapping)
@@ -649,37 +661,93 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
             if begin not in mapping or end not in mapping:
                 continue
             copied = combined.GetBondBetweenAtoms(mapping[begin], mapping[end])
-            copied.SetBondDir(original.GetBondDir())
+            if copied is None:
+                stereo_restore_failures.append({
+                    "unit": int(unit_idx),
+                    "bond": [int(begin), int(end)],
+                    "reason": "copied bond is missing",
+                })
+                continue
             stereo = original.GetStereo()
             references = list(original.GetStereoAtoms())
-            if not references:
-                copied.SetStereo(stereo)
-                continue
-            resolved, flips = [], 0
-            for endpoint, other, reference in zip((begin, end), (end, begin), references):
-                if reference in reference_map:
-                    resolved.append(reference_map[reference])
-                    continue
-                # A terminal dummy becomes implicit H. Use the other explicit
-                # substituent if present and invert the reference convention.
-                alternatives = [a.GetIdx() for a in combined.GetAtomWithIdx(mapping[endpoint]).GetNeighbors()
-                                if a.GetIdx() != mapping[other]]
-                if len(alternatives) != 1:
-                    break  # e.g. terminal CH2: no defined alkene stereo
-                resolved.append(alternatives[0])
-                flips += 1
-            if len(resolved) == 2:
-                if flips % 2:
-                    inverse = {Chem.BondStereo.STEREOE: Chem.BondStereo.STEREOZ,
-                               Chem.BondStereo.STEREOZ: Chem.BondStereo.STEREOE,
-                               Chem.BondStereo.STEREOCIS: Chem.BondStereo.STEREOTRANS,
-                               Chem.BondStereo.STEREOTRANS: Chem.BondStereo.STEREOCIS}
-                    stereo = inverse.get(stereo, stereo)
-                copied.SetStereoAtoms(*resolved)
-                copied.SetStereo(stereo)
+            resolved = []
+            unresolved = False
+            if references:
+                if len(references) != 2:
+                    if stereo in defined_stereo:
+                        raise ValueError(
+                            "defined stereo bond has an invalid reference count"
+                        )
+                    unresolved = True
+                else:
+                    for endpoint, other, reference in zip(
+                        (begin, end), (end, begin), references
+                    ):
+                        if reference in reference_map:
+                            resolved.append(reference_map[reference])
+                            continue
+                        if reference not in dummy_atoms:
+                            raise ValueError(
+                                "stereo reference atom is not present in the source graph"
+                            )
+                        # A terminal dummy has no physical neighbour in the
+                        # finite open chain.  It is an implicit-H/provenance
+                        # reference, not an invitation to choose another
+                        # explicit substituent.  Assigning that alternative
+                        # and flipping E/Z changes the chemical meaning of the
+                        # source bond, so the terminal copy is intentionally
+                        # left unspecified.
+                        unresolved = True
+                        break
+            elif stereo in defined_stereo:
+                raise ValueError(
+                    "defined stereo bond is missing its two reference atoms"
+                )
+            if unresolved or (references and len(resolved) != 2):
+                terminal_stereo_unset.append({
+                    "unit": int(unit_idx),
+                    "bond": [int(begin), int(end)],
+                    "source_stereo": str(stereo),
+                    "reason": "terminal or incomplete stereo reference",
+                })
+                resolved = []
+                restore_stereo = Chem.BondStereo.STEREONONE
+            else:
+                restore_stereo = stereo
+            bond_restores.append({
+                "unit": int(unit_idx),
+                "begin": int(mapping[begin]),
+                "end": int(mapping[end]),
+                "bond_dir": original.GetBondDir(),
+                "stereo": restore_stereo,
+                "references": tuple(int(value) for value in resolved),
+                "source_stereo": stereo,
+            })
 
     result = combined.GetMol()
     Chem.SanitizeMol(result)
+    # SetStereoAtoms must precede SetStereo according to RDKit's bond API.  Do
+    # this after sanitization so the references are checked against the final
+    # atom/bond graph and cannot be erased by a later sanitize pass.
+    for restore in bond_restores:
+        copied = result.GetBondBetweenAtoms(restore["begin"], restore["end"])
+        if copied is None:
+            stereo_restore_failures.append({
+                "unit": restore["unit"],
+                "bond": [restore["begin"], restore["end"]],
+                "reason": "bond disappeared during sanitization",
+            })
+            continue
+        copied.SetBondDir(restore["bond_dir"])
+        references = restore["references"]
+        if len(references) == 2:
+            copied.SetStereoAtoms(*references)
+        copied.SetStereo(restore["stereo"])
+    if stereo_restore_failures:
+        raise ValueError(
+            "stereo metadata restoration failed: "
+            + str(stereo_restore_failures[:3])
+        )
     unit_atoms = [
         [int(atom_maps[unit_idx][atom_idx]) for atom_idx in range(base_atoms)]
         for unit_idx in range(num_repeat_units)
@@ -704,6 +772,15 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
         "unit_right_boundaries": [int(mapping[right_base]) for mapping in atom_maps],
         "backbone_base": [int(idx) for idx in backbone_base],
         "ordered_backbone_path": ordered_backbone,
+        "source_atom_to_base": [
+            int(old_to_base.get(idx, -1)) for idx in range(source.GetNumAtoms())
+        ],
+        "base_atom_to_source": [
+            int(idx) for idx in sorted(old_to_base, key=old_to_base.get)
+        ],
+        "source_attachment_neighbors": [int(idx) for idx in neighbors],
+        "stereo_restore_failures": stereo_restore_failures,
+        "terminal_stereo_unset": terminal_stereo_unset,
         "inter_unit_edges": inter_unit_edges,
         "periodic_edge": periodic_edge,
         "attachment_bond_type": connection_bond_type,
@@ -918,8 +995,12 @@ def build_star_linking_mol(smiles, return_mapping=False):
         raise ValueError("star_linking requires two distinct boundary atoms")
     if bond_types[0] != bond_types[1]:
         raise ValueError("attachment bond types are not consistent")
+    existing_bond = mol.GetBondBetweenAtoms(
+        int(neighbors[0]), int(neighbors[1])
+    )
+    added_link = existing_bond is None
     editable = Chem.EditableMol(mol)
-    if mol.GetBondBetweenAtoms(int(neighbors[0]), int(neighbors[1])) is None:
+    if added_link:
         editable.AddBond(int(neighbors[0]), int(neighbors[1]), order=bond_types[0])
     for atom_idx in sorted(dummy_atoms, reverse=True):
         editable.RemoveAtom(int(atom_idx))
@@ -929,6 +1010,9 @@ def build_star_linking_mol(smiles, return_mapping=False):
     remaining = [idx for idx in range(mol.GetNumAtoms()) if idx not in set(dummy_atoms)]
     old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(remaining)}
     mapped_neighbors = [old_to_new[int(idx)] for idx in neighbors]
+    actual_link = linked_mol.GetBondBetweenAtoms(*mapped_neighbors)
+    if actual_link is None:
+        raise ValueError("Star-Linking edge disappeared during sanitization")
     raw_backbone = list(Chem.GetShortestPath(mol, int(neighbors[0]), int(neighbors[1])))
     mapped_backbone = [old_to_new[int(idx)] for idx in raw_backbone if int(idx) in old_to_new]
     mapping = {
@@ -936,6 +1020,30 @@ def build_star_linking_mol(smiles, return_mapping=False):
         "attachment_pair": mapped_neighbors,
         "star_link_edge": mapped_neighbors,
         "ordered_backbone_path": mapped_backbone,
+        # Preserve the declared policy and the actual physical edge
+        # separately.  If the boundary atoms were already bonded, Star-Linking
+        # does not add a second edge; its actual attributes come from that
+        # existing bond rather than from the attachment declaration.
+        "connection_policy": (
+            "matching_attachment_type"
+            if bond_types[0] == bond_types[1]
+            else "mismatch_single"
+        ),
+        "declared_attachment_bond_type_left": str(bond_types[0]),
+        "declared_attachment_bond_type_right": str(bond_types[1]),
+        "actual_link_added": bool(added_link),
+        "actual_link_bond_type": str(
+            actual_link.GetBondType()
+        ),
+        "actual_link_stereo": str(
+            actual_link.GetStereo()
+        ),
+        "actual_link_conjugated": bool(
+            actual_link.GetIsConjugated()
+        ),
+        "actual_link_ring": bool(
+            actual_link.IsInRing()
+        ),
     }
     return (linked_mol, mapping) if return_mapping else linked_mol
 

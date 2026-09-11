@@ -25,7 +25,8 @@ from src.modules.mts_glt_distill import SourceQPreLNAttention
 
 
 def sample(smiles='*COC*'):
-    _, trimer = _toy_pair(smiles)
+    normalized = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=True)
+    _, trimer = _toy_pair(normalized)
     topology = build_canonical_periodic_topology(smiles)
     return topology, trimer, build_dual_sample(topology, trimer, smiles)
 
@@ -83,8 +84,10 @@ def test_stereo_survives_real_neighbor_mapping(smiles):
         assert len(refs) == 2
         assert mol.GetBondBetweenAtoms(bond.GetBeginAtomIdx(), refs[0]) is not None
         assert mol.GetBondBetweenAtoms(bond.GetEndAtomIdx(), refs[1]) is not None
-        if smiles.startswith('*/'):
+        if smiles in ('*/C=C/*', '*/C=C\\*'):
             assert all(ref not in middle for ref in refs)
+        elif smiles == '*/C(C)=C(C)/*':
+            assert all(ref in middle for ref in refs)
     if not smiles.startswith('*/'):
         assert all(b.GetStereo() == expected for b in mol.GetBonds()
                    if b.GetBondType() == Chem.BondType.DOUBLE)
@@ -119,13 +122,24 @@ def test_e_z_have_distinct_bond_bias_inputs():
 
 
 def test_terminal_stereo_reference_substitution():
-    mol, _ = build_periodic_multimer_mol('*/C(C)=C(C)/*', 3, close_periodic=False)
+    mol, meta = build_periodic_multimer_mol('*/C(C)=C(C)/*', 3, close_periodic=False)
     doubles = [b for b in mol.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE]
-    assert doubles[0].GetStereo() == doubles[2].GetStereo()
-    assert doubles[0].GetStereo() != doubles[1].GetStereo()
-    terminal, _ = build_periodic_multimer_mol('*/C=C/*', 3, close_periodic=False)
+    # Explicit branch substituents remain real references in every copy; no
+    # arbitrary E/Z flip is scientifically justified at a finite endpoint.
+    assert all(bond.GetStereo() == Chem.BondStereo.STEREOE for bond in doubles)
+    assert meta['terminal_stereo_unset'] == []
+    terminal, terminal_meta = build_periodic_multimer_mol('*/C=C/*', 3, close_periodic=False)
     doubles = [b for b in terminal.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE]
     assert doubles[0].GetStereo() == doubles[2].GetStereo() == Chem.BondStereo.STEREONONE
+    assert len(terminal_meta['terminal_stereo_unset']) == 2
+
+
+def test_malformed_defined_stereo_references_are_rejected():
+    source = Chem.MolFromSmiles('*C=C*')
+    double = next(b for b in source.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE)
+    double.SetStereo(Chem.BondStereo.STEREOE)
+    with pytest.raises(ValueError, match='missing its two reference atoms'):
+        build_periodic_multimer_mol(source, 3, close_periodic=False)
 
 
 @pytest.mark.parametrize('smiles', ['*/C(C)=C(C)/*', '*/C=C/*', '*/C=C\\*'])

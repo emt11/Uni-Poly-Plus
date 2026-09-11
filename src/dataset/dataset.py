@@ -44,6 +44,7 @@ from .canonical_periodic import (
     CANONICAL_LGA_SCHEMA_VERSION,
     CANONICAL_TOPOLOGY_SCHEMA,
     build_canonical_periodic_topology,
+    find_atom_graph_mapping,
     find_base_atom_mapping,
 )
 from .mips_trimer_contract import (
@@ -594,6 +595,8 @@ def _prune_nonpbc_mips_data(data):
         "canonical_ru_atom_index", "canonical_atom_id",
         "canonical_pair_index", "ru_copy_index",
         "source_to_normalized_canonical_atom_id",
+        "source_to_normalized_atom_id",
+        "source_to_normalized_attachment_map",
         "source_to_canonical_atom_id",
         "canonical_to_trimer_base_atom_id",
         "canonical_to_trimer_base_atom_index",
@@ -1498,27 +1501,75 @@ def _compute_ru_base_layer(smiles):
 
     normalized, chemistry_valid = normalize_polymer_smiles(smiles)
     try:
-        molecule = Chem.MolFromSmiles(str(smiles)) if chemistry_valid else None
+        source_molecule = Chem.MolFromSmiles(str(smiles)) if chemistry_valid else None
     except Exception:
-        molecule = None
+        source_molecule = None
         chemistry_valid = False
         normalized = f"INVALID::{smiles}"
     # The RU-base artifact is an existing frozen dependency.  Preserve its
     # original molecule binary exactly; canonical-periodic topology/Trimer
     # builders reparse the normalized identity locally when they need
     # translation/reversal invariance.
-    effective = Chem.Mol(molecule) if molecule is not None else Chem.MolFromSmiles("*CC*")
+    effective = (
+        Chem.Mol(source_molecule)
+        if source_molecule is not None else Chem.MolFromSmiles("*CC*")
+    )
     if effective is None:  # pragma: no cover - fixed internal fallback
         raise RuntimeError("failed to create RU base placeholder")
+    normalized_molecule = (
+        Chem.MolFromSmiles(str(normalized)) if chemistry_valid else None
+    )
+    if chemistry_valid and normalized_molecule is None:
+        raise ValueError("normalized P-SMILES could not be parsed")
     data = Data()
     data.smiles = str(smiles)
     data.normalized_polymer_smiles = str(normalized)
     data.ru_chemistry_valid = bool(chemistry_valid)
     data.ru_mol_binary = bytes(effective.ToBinary())
-    data.ru_base_failure_code = "" if chemistry_valid else "rdkit_parse_failed"
+    identity_failure = None
+    if normalized_molecule is not None:
+        data.ru_normalized_mol_binary = bytes(normalized_molecule.ToBinary())
+        try:
+            source_to_normalized_atom = find_atom_graph_mapping(
+                source_molecule, normalized_molecule
+            )
+            source_to_normalized_base = find_base_atom_mapping(
+                source_molecule, normalized_molecule
+            )
+            data.source_to_normalized_atom_id = source_to_normalized_atom
+            data.source_to_normalized_canonical_atom_id = source_to_normalized_base
+            data.source_to_canonical_atom_id = source_to_normalized_base
+            source_attachments = []
+            for atom in source_molecule.GetAtoms():
+                if atom.GetAtomicNum() != 0:
+                    continue
+                neighbors = list(atom.GetNeighbors())
+                if len(neighbors) != 1:
+                    raise ValueError("attachment dummy must have one neighbor")
+                source_attachments.append({
+                    "source_dummy": int(atom.GetIdx()),
+                    "source_neighbor": int(neighbors[0].GetIdx()),
+                    "normalized_dummy": int(source_to_normalized_atom[atom.GetIdx()]),
+                    "normalized_neighbor": int(
+                        source_to_normalized_atom[neighbors[0].GetIdx()]
+                    ),
+                })
+            data.source_to_normalized_attachment_map = source_attachments
+        except Exception as exc:
+            # A syntactically valid ordinary SMILES (or a malformed P-SMILES)
+            # remains an explicit unavailable RU row.  Do not invent a
+            # positional identity merely to keep the cache writer alive.
+            identity_failure = f"{type(exc).__name__}:{exc}"[:240]
+    data.ru_base_failure_code = (
+        "" if chemistry_valid and identity_failure is None
+        else identity_failure or "rdkit_parse_failed"
+    )
     try:
+        model_source = (
+            normalized_molecule if normalized_molecule is not None else effective
+        )
         base, metadata = build_periodic_multimer_mol(
-            effective, num_repeat_units=1, close_periodic=False
+            model_source, num_repeat_units=1, close_periodic=False
         )
         data.ru_atomic_number = torch.tensor(
             [atom.GetAtomicNum() for atom in base.GetAtoms()], dtype=torch.long
@@ -1559,7 +1610,7 @@ def _compute_ru_base_layer(smiles):
         data.ru_multimer_builder_version = int(
             metadata["multimer_builder_version"]
         )
-        data.ru_base_valid = bool(chemistry_valid)
+        data.ru_base_valid = bool(chemistry_valid and identity_failure is None)
     except Exception as exc:
         data.ru_atomic_number = torch.empty(0, dtype=torch.long)
         data.ru_edge_index = torch.empty((2, 0), dtype=torch.long)
@@ -1676,9 +1727,29 @@ def _compute_topology_layer_impl(
     # Persist the explicit atom identity table used by Trimer migration.  The
     # canonical topology itself is in normalized-RU order; the source row may
     # use a reversed or otherwise non-canonical P-SMILES order.
+    source_to_normalized_atom = find_atom_graph_mapping(
+        source_molecule, molecule
+    )
     source_to_normalized = find_base_atom_mapping(source_molecule, molecule)
+    data.source_to_normalized_atom_id = source_to_normalized_atom
     data.source_to_normalized_canonical_atom_id = source_to_normalized
     data.source_to_canonical_atom_id = source_to_normalized
+    source_attachments = []
+    for atom in source_molecule.GetAtoms():
+        if atom.GetAtomicNum() != 0:
+            continue
+        neighbors = list(atom.GetNeighbors())
+        if len(neighbors) != 1:
+            raise ValueError("attachment dummy must have one neighbor")
+        source_attachments.append({
+            "source_dummy": int(atom.GetIdx()),
+            "source_neighbor": int(neighbors[0].GetIdx()),
+            "normalized_dummy": int(source_to_normalized_atom[atom.GetIdx()]),
+            "normalized_neighbor": int(
+                source_to_normalized_atom[neighbors[0].GetIdx()]
+            ),
+        })
+    data.source_to_normalized_attachment_map = source_attachments
     data.normalized_canonical_smiles = str(normalized)
     canonical_count = (
         int(torch.as_tensor(data.canonical_ru_atom_index).max().item()) + 1

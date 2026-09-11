@@ -19,6 +19,7 @@ import torch
 from rdkit import Chem
 
 from .graph_data import build_periodic_multimer_mol
+from .canonical_periodic import resolve_normalized_identity
 from .glt_bond_chemistry import (
     bond_feature_vector, bond_type_index, bond_stereo_index,
     BOND_FEATURE_DIM, STEREO_VALUES, STEREO_TO_INDEX, STEREO_UNKNOWN,
@@ -117,7 +118,7 @@ def empty_complete_trimer_row(reason: str = "invalid"):
     }
 
 
-def build_complete_trimer_glt_sample(topology, trimer, smiles: str):
+def build_complete_trimer_glt_sample(topology, trimer, smiles: str, *, identity=None):
     """Build one complete-Trimer row from frozen coordinates and topology.
 
     The row contains every unique physical edge in ``trimer_edge_index``.  A
@@ -127,13 +128,10 @@ def build_complete_trimer_glt_sample(topology, trimer, smiles: str):
     checked against the frozen bond type code.
     """
 
-    if not bool(getattr(trimer, "trimer_geometry_valid", False)):
-        return empty_complete_trimer_row("geometry_invalid")
-    if not bool(getattr(trimer, "trimer_geometry_is_3d", False)):
-        return empty_complete_trimer_row("non_3d_geometry")
-    if bool(getattr(trimer, "trimer_2d_fallback", False)):
-        return empty_complete_trimer_row("2d_fallback")
-
+    # Check the identity carrier before any geometry flag.  An unavailable
+    # geometry row is a legal empty branch only when the cache still carries
+    # the complete program-required identity table; a sparse/malformed row
+    # must not be relabeled as an ordinary geometry fallback.
     raw_positions = getattr(trimer, "trimer_pos", None)
     raw_atomic = getattr(trimer, "trimer_atomic_number", None)
     raw_base = getattr(
@@ -151,7 +149,13 @@ def build_complete_trimer_glt_sample(topology, trimer, smiles: str):
         raw_positions, raw_atomic, raw_base, raw_offsets, raw_edge,
         raw_bond_codes, raw_mapping, raw_topology_z,
     )):
-        return empty_complete_trimer_row("trimer_identity_missing")
+        raise ValueError("trimer_identity_missing")
+    if not bool(getattr(trimer, "trimer_geometry_valid", False)):
+        return empty_complete_trimer_row("geometry_invalid")
+    if not bool(getattr(trimer, "trimer_geometry_is_3d", False)):
+        return empty_complete_trimer_row("non_3d_geometry")
+    if bool(getattr(trimer, "trimer_2d_fallback", False)):
+        return empty_complete_trimer_row("2d_fallback")
     positions = torch.as_tensor(raw_positions).float()
     atomic = torch.as_tensor(raw_atomic).long()
     base = torch.as_tensor(raw_base).long()
@@ -164,7 +168,10 @@ def build_complete_trimer_glt_sample(topology, trimer, smiles: str):
     if (
         positions.ndim != 2 or positions.size(1) != 3
         or not bool(torch.isfinite(positions).all())
-        or atomic.ndim != 1 or atomic.numel() != positions.size(0)
+    ):
+        return empty_complete_trimer_row("trimer_coordinates_invalid")
+    if (
+        atomic.ndim != 1 or atomic.numel() != positions.size(0)
         or base.ndim != 1 or base.numel() != positions.size(0)
         or offsets.ndim != 1 or offsets.numel() != positions.size(0)
         or edge.ndim != 2 or edge.size(0) != 2
@@ -172,7 +179,7 @@ def build_complete_trimer_glt_sample(topology, trimer, smiles: str):
         or mapping.ndim != 1 or topology_z.ndim != 1
         or mapping.numel() != topology_z.numel()
     ):
-        return empty_complete_trimer_row("trimer_identity_missing")
+        return empty_complete_trimer_row("trimer_identity_invalid")
     if edge.numel() and (
         int(edge.min()) < 0 or int(edge.max()) >= positions.size(0)
     ):
@@ -190,10 +197,19 @@ def build_complete_trimer_glt_sample(topology, trimer, smiles: str):
         if state.numel() != 1 or int(atomic[state[0]]) != int(topology_z[canonical_id]):
             return empty_complete_trimer_row("canonical_trimer_mapping_mismatch")
 
+    # Identity and chemistry failures are data-contract failures.  They must
+    # not be turned into an ordinary geometry-invalid row, otherwise a caller
+    # could silently train on a sample whose atom numbering was never joined.
+    identity = identity or resolve_normalized_identity(
+        topology, smiles, require_fields=hasattr(topology, "mips_x")
+    )
+    construction_smiles = identity["normalized_smiles"]
     try:
-        chemistry, expected_atoms = _bond_chemistry(str(smiles))
+        chemistry, expected_atoms = _bond_chemistry(str(construction_smiles))
     except ValueError as exc:
-        return empty_complete_trimer_row(f"bond_chemistry_parse:{type(exc).__name__}")
+        raise ValueError(
+            f"bond_chemistry_parse:{type(exc).__name__}"
+        ) from exc
 
     identities = list(zip(base.tolist(), offsets.tolist()))
     if len(identities) != len(expected_atoms) or set(identities) != set(expected_atoms):

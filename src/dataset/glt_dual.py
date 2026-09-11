@@ -13,6 +13,7 @@ from torch_geometric.data import Data
 from .graph_data import build_periodic_multimer_mol
 from .glt_bond_chemistry import bond_feature_vector
 from .periodic_line_glt_complete import build_complete_trimer_glt_sample
+from .canonical_periodic import resolve_normalized_identity
 
 
 def _periodic_key(a, qa, b, qb):
@@ -20,13 +21,19 @@ def _periodic_key(a, qa, b, qb):
     return min((a, b, qb - qa), (b, a, qa - qb))
 
 
-def bond_paths(topology, smiles):
+def bond_paths(topology, smiles, *, identity=None):
     """Periodic chemistry: central internal bonds and matching real seams.
 
     Terminal internal copies belong to a finite molecule and may legitimately
     lose/change stereo. They are not representatives of the periodic 2D cell.
     """
-    mol, meta = build_periodic_multimer_mol(smiles, num_repeat_units=3, close_periodic=False)
+    identity = identity or resolve_normalized_identity(
+        topology, smiles, require_fields=hasattr(topology, "mips_x")
+    )
+    construction_smiles = identity["normalized_smiles"]
+    mol, meta = build_periodic_multimer_mol(
+        construction_smiles, num_repeat_units=3, close_periodic=False
+    )
     size = int(meta['base_atom_count'])
     chemistry = {}
     for bond in mol.GetBonds():
@@ -38,7 +45,9 @@ def bond_paths(topology, smiles):
         if key in chemistry and not np.array_equal(chemistry[key], feature):
             raise ValueError('real seam bonds have inconsistent periodic chemistry')
         chemistry[key] = feature
-    mapping = topology.canonical_to_trimer_base_atom_id.long()
+    mapping = torch.as_tensor(
+        identity["canonical_to_normalized_base"], dtype=torch.long
+    )
     path, shift, mask = topology.lga_path_index.long(), topology.lga_path_shift.long(), topology.lga_path_mask.bool()
     if path.shape != mask.shape or path.shape != shift.shape or path.shape[1] != 3:
         raise ValueError('dual O8 requires existing max-hop=2 lifted paths of width 3')
@@ -47,7 +56,14 @@ def bond_paths(topology, smiles):
     for row in range(path.size(0)):
         for k in range(2):
             if bool(mask[row, k] and mask[row, k + 1]):
-                a, b = int(mapping[path[row, k]]), int(mapping[path[row, k + 1]])
+                source_node, target_node = int(path[row, k]), int(path[row, k + 1])
+                if (
+                    source_node < 0 or target_node < 0
+                    or source_node >= mapping.numel()
+                    or target_node >= mapping.numel()
+                ):
+                    raise ValueError("lifted path contains an invalid canonical atom")
+                a, b = int(mapping[source_node]), int(mapping[target_node])
                 key = _periodic_key(a, int(shift[row, k]), b, int(shift[row, k + 1]))
                 if key not in chemistry:
                     raise ValueError(f'no real periodic bond for path step {key}')
@@ -116,8 +132,21 @@ def two_hop_paths(row):
 def build_dual_sample(topology, trimer, smiles):
     """Build only model-required fields; never carry MD/coordinate tensors into a batch."""
     result = Data()
+    required = (
+        "mips_x", "mips_backbone_mask", "canonical_ru_atom_index",
+        "lga_edge_index", "lga_spd", "lga_path_index", "lga_path_mask",
+        "lga_path_shift", "lga_source_image_shift", "graph_available",
+    )
+    missing = [name for name in required if not hasattr(topology, name)]
+    if missing:
+        raise ValueError(
+            "dual Topology is missing required fields: " + ",".join(missing)
+        )
     if not torch.equal(topology.canonical_ru_atom_index.long(), torch.arange(topology.mips_x.size(0))):
         raise ValueError('dual route requires one canonical state per atom')
+    identity = resolve_normalized_identity(
+        topology, smiles, require_fields=True
+    )
     for name in ('mips_x', 'mips_backbone_mask', 'lga_edge_index', 'lga_spd',
                  'lga_path_index', 'lga_path_mask', 'lga_path_shift',
                  'lga_source_image_shift'):
@@ -125,14 +154,27 @@ def build_dual_sample(topology, trimer, smiles):
     result.graph_available = bool(topology.graph_available)
     if hasattr(topology, 'lga_relation_mask'):
         result.lga_relation_mask = topology.lga_relation_mask.clone()
-    result.bond_path_features, result.bond_path_mask = bond_paths(topology, smiles)
-    row = build_complete_trimer_glt_sample(topology, trimer, smiles)
-    try:
+    result.bond_path_features, result.bond_path_mask = bond_paths(
+        topology, smiles, identity=identity
+    )
+    row = build_complete_trimer_glt_sample(
+        topology, trimer, smiles, identity=identity
+    )
+    if row["geometry_valid"]:
         paths = two_hop_paths(row)
-    except ValueError as exc:
+    else:
+        # Invalid frozen geometry has no usable physical relations.  Structural
+        # identity/chemistry failures are not geometry fallbacks: reject them
+        # before an empty row could hide a malformed cached relation table.
+        reason = str(row["invalid_reason"])
+        geometry_reasons = {
+            "geometry_invalid", "non_3d_geometry", "2d_fallback",
+            "trimer_coordinates_invalid", "bond_distance_invalid",
+        }
+        if reason not in geometry_reasons:
+            raise ValueError(f"complete Trimer contract failure: {reason}")
         from .periodic_line_glt_complete import empty_complete_trimer_row
-        row = empty_complete_trimer_row(str(exc))
-        paths = two_hop_paths(row)
+        paths = two_hop_paths(empty_complete_trimer_row(row["invalid_reason"]))
     result.geometry_valid = bool(row['geometry_valid'])
     result.geometry_invalid_reason = row['invalid_reason']
     for src, dst in [('token_endpoint_z_a', 'bond_z_a'), ('token_endpoint_z_b', 'bond_z_b'),
@@ -194,7 +236,12 @@ class FrozenDualLayerSource(Dataset):
 
     def __getitem__(self, index):
         key, smiles = self.samples[index]
-        return self.topology[key], self.trimer[key], smiles
+        topology, trimer = self.topology[key], self.trimer[key]
+        # Validate the frozen source/canonical join at the cache boundary.  A
+        # missing or contradictory identity table is a data-contract failure,
+        # never a reason to substitute a geometry placeholder.
+        resolve_normalized_identity(topology, smiles, require_fields=True)
+        return topology, trimer, smiles
 
     def close(self):
         topology, trimer = self.topology, self.trimer

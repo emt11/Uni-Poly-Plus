@@ -11,6 +11,7 @@ from rdkit.Chem import BRICS, rdFingerprintGenerator
 
 from .graph_data import build_periodic_multimer_mol
 from .glt_dual import build_dual_sample, dual_glt_collate
+from .canonical_periodic import resolve_normalized_identity
 
 
 def sample_generator(seed, key, position):
@@ -21,7 +22,16 @@ def sample_generator(seed, key, position):
 
 @lru_cache(maxsize=512)
 def chemical_targets(smiles):
-    mol, meta = build_periodic_multimer_mol(smiles, 3, close_periodic=False)
+    source = Chem.MolFromSmiles(str(smiles))
+    if source is None:
+        raise ValueError("invalid P-SMILES for chemical targets")
+    # BRICS groups and the fingerprint roots are model-side identities.  The
+    # input spelling is a provenance view and may use a different RDKit atom
+    # order, so canonicalize before extracting any integer atom ids.
+    normalized = Chem.MolToSmiles(source, canonical=True)
+    mol, meta = build_periodic_multimer_mol(
+        normalized, 3, close_periodic=False
+    )
     size = meta['base_atom_count']
     cut = {frozenset(pair) for pair, _ in BRICS.FindBRICSBonds(mol)}
     unseen, groups = set(range(mol.GetNumAtoms())), []
@@ -40,7 +50,9 @@ def chemical_targets(smiles):
         center = sorted(i - size for i in component if size <= i < 2 * size)
         if center:
             groups.append(tuple(center))
-    large, info = build_periodic_multimer_mol(smiles, 7, close_periodic=False)
+    large, info = build_periodic_multimer_mol(
+        normalized, 7, close_periodic=False
+    )
     roots = info['unit_atoms'][3]
     terminals = [info['unit_left_boundaries'][0], info['unit_right_boundaries'][-1]]
     distances = Chem.GetDistanceMatrix(large)
@@ -53,10 +65,14 @@ def chemical_targets(smiles):
 
 def motif_mask(topology, groups, generator, ratio=0.3):
     count = topology.mips_x.size(0)
+    mapping = torch.as_tensor(
+        topology.canonical_to_trimer_base_atom_id, dtype=torch.long
+    ).reshape(-1).tolist()
+    if len(mapping) != count or sorted(mapping) != list(range(count)):
+        raise ValueError("canonical-to-Trimer atom mapping is not a permutation")
     mask = torch.zeros(count, dtype=torch.bool)
     if count <= 1:
         return mask, False
-    mapping = topology.canonical_to_trimer_base_atom_id.tolist()
     inverse = {base: canonical for canonical, base in enumerate(mapping)}
     canonical = [[inverse[i] for i in group] for group in groups]
     if sorted(i for group in canonical for i in group) != list(range(count)):
@@ -98,8 +114,9 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position, si
         raise ValueError('three-task training requires valid canonical 2D topology')
     if not math.isfinite(sigma) or sigma < 0 or not 0 < ratio < 1:
         raise ValueError('invalid noise sigma or masking ratio')
+    identity = resolve_normalized_identity(topology, smiles, require_fields=True)
     generator = sample_generator(seed, key, position)
-    groups, fingerprint = chemical_targets(smiles)
+    groups, fingerprint = chemical_targets(identity["normalized_smiles"])
     mask, fallback = motif_mask(topology, groups, generator, ratio)
     clean = build_dual_sample(topology, trimer, smiles)
     noisy = clean
