@@ -602,3 +602,35 @@ python scripts/validate_glt_dual_pretrain.py --topology-root TOPOLOGY_LAYER --tr
 测试涵盖 mask 泄漏、目标几何、fingerprint reference、DDP 梯度归约的代数参考、优化器/RNG
 恢复、绝对位置抽样、部署加载与 300 条分折；以隔离 mock 检查 validation 选模后 test
 只运行一次。人工测试坐标不是实际构象。当前没有实际 DDP 或真实样本验证。
+
+### 数据保真审查后的局部修复（2026-09-11，验证未执行）
+
+本次明确了 2D 周期键化学的代表规则：内部键只取开放 Trimer 中心 RU；有限链末端
+内部键的 Stereo/Conjugation 不参与周期特征一致性判定。两条真实跨 RU 键仍须具有
+相同的 14 维化学特征，否则显式报错，暂不任意选择副本或扩展拓扑。3D 继续保留
+全部物理副本及独立几何；没有改变 star 连接类型策略、模型架构或冻结缓存。
+
+完整 Trimer 读取新增全部 `(base_atom_id, RU_offset)` 身份、逐物理原子元素、canonical
+覆盖以及预期/冻结物理键集合相等检查；缺边、额外边和键类型冲突使 3D 分支无效并
+给出原因。允许有向或无向边表，正常双向存储仅在物理键层归并。缺少程序必需字段
+产生的 `KeyError` 不再由双路适配器包装为普通无效角度。
+
+复制 Stereo/BondDir 的来源改为 Kekulize 前的原始分子。`validate_dual_glt.py` 独立从
+原始 P-SMILES 记录 Stereo、StereoAtoms、BondDir，并核对全部内部键副本的参照关系；
+允许合法末端参照替换或立体定义消失。该检查验证 metadata 传递，不等同于完整 CIP
+重新赋值验证。化学传递检查通过后再检查冻结坐标；轴长、投影退化有独立错误原因。
+原有坐标一致性阈值 0.5 保持不变，它是几何容差判据，不是纯 E/Z 符号定义。
+
+审计报告区分 `ANOMALY`（已发现异常）与 `REVIEW`（策略或有限链差异待复核），
+提前返回的检查显式为 `NOT_RUN`。真实普通样本必须自身包含中心 E/Z；真实 N=0
+须同时满足原始结构内部键数为零、模型读出键数为零。修复 LMDB 初始化失败清理、
+双资源关闭与模型失败状态；正常审计 stdout 只输出最终 JSON，进度写 stderr。
+`REVIEW` 不被写成 `PASS`，但不阻止本入口的局部模型验证；它不授权正式实验。
+CLI 参数格式错误仍使用 argparse 的 stderr/非零退出，不生成样本审计报告。
+三任务真实验证入口复用相同数据审计，避免只凭 geometry_valid 进入模型验证。
+
+新增 `tests/test_dual_glt_audit.py`，并扩展 `tests/test_dual_glt.py`：覆盖末端 Stereo
+到 bond bias、缺边与真实身份契约、无向存储、重编号、原始参照审计的故障注入、
+fixture 角色绑定、资源释放、JSON 输出、多路径独立平均公式和混合 batch 偏移。
+所有测试、两条真实记录检查及前后向均**未执行**；仅完成代码修改与静态补丁检查。
+未生成真实 fixture，未重建缓存，未修改历史结果，未启动预训练或微调。

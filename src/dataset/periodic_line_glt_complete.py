@@ -60,7 +60,9 @@ def _bond_chemistry(smiles: str):
             "ring": int(bool(bond.IsInRing())),
             "features": bond_feature_vector(bond),
         }
-    return chemistry
+    identities = {(i % base_count, i // base_count - 1): atom.GetAtomicNum()
+                  for i, atom in enumerate(molecule.GetAtoms())}
+    return chemistry, identities
 
 
 def _angle(positions: torch.Tensor, outer_a: int, center: int, outer_b: int):
@@ -189,9 +191,17 @@ def build_complete_trimer_glt_sample(topology, trimer, smiles: str):
             return empty_complete_trimer_row("canonical_trimer_mapping_mismatch")
 
     try:
-        chemistry = _bond_chemistry(str(smiles))
-    except Exception as exc:
+        chemistry, expected_atoms = _bond_chemistry(str(smiles))
+    except ValueError as exc:
         return empty_complete_trimer_row(f"bond_chemistry_parse:{type(exc).__name__}")
+
+    identities = list(zip(base.tolist(), offsets.tolist()))
+    if len(identities) != len(expected_atoms) or set(identities) != set(expected_atoms):
+        return empty_complete_trimer_row("physical_atom_identity_mismatch")
+    if set(mapping.tolist()) != {i for i, q in expected_atoms if q == 0}:
+        return empty_complete_trimer_row("canonical_base_coverage_mismatch")
+    if any(int(atomic[i]) != expected_atoms[key] for i, key in enumerate(identities)):
+        return empty_complete_trimer_row("physical_element_mismatch")
 
     edge_codes = {}
     for column in range(int(edge.size(1))):
@@ -203,6 +213,13 @@ def build_complete_trimer_glt_sample(topology, trimer, smiles: str):
         if key in edge_codes and edge_codes[key] != code:
             return empty_complete_trimer_row("real_bond_type_conflict")
         edge_codes[key] = code
+
+    observed = {tuple(sorted((identities[a], identities[b]))) for a, b in edge_codes}
+    missing, extra = set(chemistry) - observed, observed - set(chemistry)
+    if missing or extra:
+        return empty_complete_trimer_row(
+            f"physical_bond_set_mismatch:missing={sorted(missing)};extra={sorted(extra)}"
+        )
 
     records = []
     for (local_a, local_b), frozen_code in sorted(edge_codes.items()):

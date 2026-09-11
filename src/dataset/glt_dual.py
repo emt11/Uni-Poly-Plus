@@ -21,15 +21,22 @@ def _periodic_key(a, qa, b, qb):
 
 
 def bond_paths(topology, smiles):
+    """Periodic chemistry: central internal bonds and matching real seams.
+
+    Terminal internal copies belong to a finite molecule and may legitimately
+    lose/change stereo. They are not representatives of the periodic 2D cell.
+    """
     mol, meta = build_periodic_multimer_mol(smiles, num_repeat_units=3, close_periodic=False)
     size = int(meta['base_atom_count'])
     chemistry = {}
     for bond in mol.GetBonds():
         a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if a // size == b // size and a // size != 1:
+            continue
         key = _periodic_key(a % size, a // size, b % size, b // size)
         feature = bond_feature_vector(bond)
         if key in chemistry and not np.array_equal(chemistry[key], feature):
-            raise ValueError('translation-equivalent bonds have inconsistent chemistry')
+            raise ValueError('real seam bonds have inconsistent periodic chemistry')
         chemistry[key] = feature
     mapping = topology.canonical_to_trimer_base_atom_id.long()
     path, shift, mask = topology.lga_path_index.long(), topology.lga_path_shift.long(), topology.lga_path_mask.bool()
@@ -122,7 +129,7 @@ def build_dual_sample(topology, trimer, smiles):
     row = build_complete_trimer_glt_sample(topology, trimer, smiles)
     try:
         paths = two_hop_paths(row)
-    except (ValueError, KeyError) as exc:
+    except ValueError as exc:
         from .periodic_line_glt_complete import empty_complete_trimer_row
         row = empty_complete_trimer_row(str(exc))
         paths = two_hop_paths(row)
@@ -164,14 +171,23 @@ class FrozenDualLayerSource(Dataset):
     def __init__(self, topology_root, trimer_root, samples):
         from .lmdb_cache import LmdbLayerStore, sample_key_from_smiles
         from .mips_trimer_contract import TOPOLOGY_LMDB_SCHEMA, TRIMER_LMDB_SCHEMA
-        self.topology = LmdbLayerStore(topology_root)
-        self.trimer = LmdbLayerStore(trimer_root)
-        if self.topology.schema != TOPOLOGY_LMDB_SCHEMA or self.trimer.schema != TRIMER_LMDB_SCHEMA:
-            raise ValueError('frozen layers do not have current topology/Trimer semantics')
-        self.samples = list(samples)
-        for key, smiles in self.samples:
-            if bytes(key) != sample_key_from_smiles(smiles):
-                raise ValueError('sample key does not match P-SMILES')
+        self.topology = self.trimer = None
+        try:
+            self.topology = LmdbLayerStore(topology_root)
+            self.trimer = LmdbLayerStore(trimer_root)
+            if self.topology.schema != TOPOLOGY_LMDB_SCHEMA or self.trimer.schema != TRIMER_LMDB_SCHEMA:
+                raise ValueError('frozen layers do not have current topology/Trimer semantics')
+            self.samples = list(samples)
+            for key, smiles in self.samples:
+                if bytes(key) != sample_key_from_smiles(smiles):
+                    raise ValueError('sample key does not match P-SMILES')
+        except Exception:
+            # Preserve the opening/validation error while attempting both closes.
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def __len__(self):
         return len(self.samples)
@@ -181,8 +197,14 @@ class FrozenDualLayerSource(Dataset):
         return self.topology[key], self.trimer[key], smiles
 
     def close(self):
-        self.topology.close()
-        self.trimer.close()
+        topology, trimer = self.topology, self.trimer
+        self.topology = self.trimer = None
+        try:
+            if topology is not None:
+                topology.close()
+        finally:
+            if trimer is not None:
+                trimer.close()
 
 
 def dual_glt_collate(samples):

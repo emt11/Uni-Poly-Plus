@@ -16,6 +16,7 @@ from src.dataset.glt_dual import FrozenDualLayerSource, build_dual_sample, dual_
 from src.dataset.glt_dual_pretrain import prepare_pretrain_sample, pretrain_collate
 from src.modules.glt_dual import build_dual_glt_model
 from src.modules.glt_dual_pretrain import DualPretrainer, global_objective, deployment_package, load_deployment
+from scripts.validate_dual_glt import audit_record, fixture_coverage
 
 
 def main():
@@ -31,6 +32,12 @@ def main():
                                    [(bytes.fromhex(k), s) for k, s in args.sample])
     try:
         records = [source[i] for i in range(2)]
+        audits = [audit_record(*record) for record in records]
+        coverage = fixture_coverage(audits)
+        print(json.dumps(dict(data_audits=audits, fixture_coverage=coverage)), file=sys.stderr)
+        if coverage['status'] != 'PASS' or any(check['status'] == 'ANOMALY'
+                for entry in audits for check in entry['checks'].values()):
+            raise ValueError('real data audit failed; no model validation performed')
         clean = dual_glt_collate([build_dual_sample(*r) for r in records])
         centers = torch.bincount(clean.bond_batch[clean.bond_center], minlength=2)
         if not clean.geometry_valid.all() or not (centers == 0).any() or not (centers > 0).any():

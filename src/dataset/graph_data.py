@@ -642,7 +642,9 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
             reference_map[int(dummy_atoms[0])] = atom_maps[unit_idx - 1][right_base]
         if unit_idx + 1 < num_repeat_units:
             reference_map[int(dummy_atoms[1])] = atom_maps[unit_idx + 1][left_base]
-        for original in copy_source.GetBonds():
+        # Stereo and directional metadata come from the pristine input, not
+        # from the temporary Kekule representation used to copy bond orders.
+        for original in source.GetBonds():
             begin, end = original.GetBeginAtomIdx(), original.GetEndAtomIdx()
             if begin not in mapping or end not in mapping:
                 continue

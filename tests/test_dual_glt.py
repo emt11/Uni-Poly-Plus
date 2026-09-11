@@ -128,6 +128,30 @@ def test_terminal_stereo_reference_substitution():
     assert doubles[0].GetStereo() == doubles[2].GetStereo() == Chem.BondStereo.STEREONONE
 
 
+@pytest.mark.parametrize('smiles', ['*/C(C)=C(C)/*', '*/C=C/*', '*/C=C\\*'])
+def test_terminal_stereo_does_not_poison_periodic_bond_paths(smiles):
+    top, tri, item = sample(smiles)
+    mol, meta = build_periodic_multimer_mol(smiles, 3, close_periodic=False)
+    center = set(meta['unit_atoms'][1])
+    double = next(b for b in mol.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE
+                  and b.GetBeginAtomIdx() in center and b.GetEndAtomIdx() in center)
+    expected = torch.from_numpy(bond_feature_vector(double))
+    actual = item.bond_path_features[item.bond_path_mask]
+    actual = actual[actual[:, 1] == 1]
+    assert actual.numel() > 0
+    torch.testing.assert_close(actual, expected.expand_as(actual))
+    batch = dual_glt_collate([item, item])
+    encoder = SharedBondPathBias()
+    bias = encoder(batch.bond_path_features, batch.bond_path_mask)
+    assert torch.isfinite(bias).all()
+    bias.square().sum().backward()
+    assert encoder.stereo_emb.weight.grad.abs().sum() > 0
+    # The physical 3D copies remain independent; no stereo/geometry rewriting.
+    physical = build_complete_trimer_glt_sample(top, tri, smiles)
+    assert physical['geometry_valid']
+    assert len(physical['tokens']['token_distance']) == mol.GetNumBonds()
+
+
 def test_all_shortest_paths_are_renumbering_invariant():
     # Opposite bonds of a four-cycle: unequal geometry on both shortest paths.
     edges = [(a, b) for a, b in [(0, 1), (1, 2), (2, 3), (3, 0)] for a, b in [(a, b), (b, a)]]
@@ -148,7 +172,12 @@ def test_all_shortest_paths_are_renumbering_invariant():
     changed_types[permutation] = types
     def biases(row, token_types):
         encoded = encoder(token_types, row['path'], row['angle'], row['mask'])
-        return mean_pool(encoded, row['path_group'], row['source'].numel())
+        pooled = mean_pool(encoded, row['path_group'], row['source'].numel())
+        # Independent reduction: no production scatter/mean_pool in oracle.
+        expected = torch.stack([encoded[row['path_group'] == i].mean(0)
+                                for i in range(row['source'].numel())])
+        torch.testing.assert_close(pooled, expected)
+        return pooled
     left, right = biases(a, types), biases(b, changed_types)
     lookup = {(int(s), int(t)): i for i, (s, t) in enumerate(zip(b['source'], b['target']))}
     order = [lookup[int(permutation[s]), int(permutation[t])] for s, t in zip(a['source'], a['target'])]
