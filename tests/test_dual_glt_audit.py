@@ -285,6 +285,28 @@ def test_fixture_roles_use_source_counts_and_bound_stereo():
     assert audit.fixture_coverage([_entry(1, 0, 1), _entry(2, 2, 0)])['status'] == 'ANOMALY'
 
 
+def test_real_smoke_does_not_require_ez_or_n0_fixture():
+    result = audit.fixture_coverage([_entry(2, 2, 0)])
+    assert result['status'] == 'PASS'
+    assert result['roles'] == ['ordinary']
+    assert not result['has_n0'] and not result['has_center_stereo']
+    assert audit.fixture_coverage([_entry(2, 2, 0), _entry(0, 0, 0)])['status'] == 'PASS'
+    assert audit.fixture_coverage([])['status'] == 'ANOMALY'
+
+
+def test_legacy_star_graph_is_not_part_of_active_audit(monkeypatch):
+    from src.dataset import graph_data
+    top = build_canonical_periodic_topology('*COC*')
+    _, trimer = _toy_pair('*COC*')
+    def forbidden(*args, **kwargs):
+        raise AssertionError('legacy Star graph must not gate active Trimer audit')
+    monkeypatch.setattr(graph_data, 'build_star_linking_mol', forbidden)
+    report = audit.audit_record(top, trimer, '*COC*')
+    assert report['checks']['star_linking']['status'] == 'NOT_APPLICABLE'
+    assert report['checks']['model_input']['status'] == 'PASS'
+    assert len(report['connections']) == 2
+
+
 def test_partial_lmdb_open_failure_closes_first_layer(monkeypatch):
     from src.dataset import lmdb_cache
     closed = []
@@ -348,7 +370,8 @@ def test_multipath_batch_offsets_with_n0():
 
 
 @pytest.mark.parametrize('failure', [None, 'close', 'report', 'model'])
-def test_audit_json_status_and_failure_reporting(monkeypatch, capsys, tmp_path, failure):
+@pytest.mark.parametrize('record_count', [1, 2])
+def test_audit_json_status_and_failure_reporting(monkeypatch, capsys, tmp_path, failure, record_count):
     class Source:
         def __init__(self, *args):
             pass
@@ -358,7 +381,7 @@ def test_audit_json_status_and_failure_reporting(monkeypatch, capsys, tmp_path, 
             if failure == 'close':
                 raise OSError('close failure')
     def record(top, tri, smiles):
-        result = _entry(0, 0, 0) if smiles == '0' else _entry(2, 2, 1)
+        result = _entry(0, 0, 0) if smiles == '0' and record_count == 2 else _entry(2, 2, 0)
         result['checks']['connection_policy'] = dict(status='REVIEW')
         return result
     monkeypatch.setattr(audit, 'FrozenDualLayerSource', Source)
@@ -371,8 +394,10 @@ def test_audit_json_status_and_failure_reporting(monkeypatch, capsys, tmp_path, 
             raise RuntimeError('model validation fixture failure')
         monkeypatch.setattr(audit, 'DualGLTDataset', fail_dataset)
     argv = ['audit', '--topology-root', 'top', '--trimer-root', 'tri',
-        '--sample', '00' * 32, '*C*', '--sample', '11' * 32, '*CC*',
+        '--sample', '00' * 32, '*CC*',
         '--report-json', str(destination)]
+    if record_count == 2:
+        argv.extend(['--sample', '11' * 32, '*C*'])
     if failure != 'model':
         argv.append('--audit-only')
     monkeypatch.setattr(sys, 'argv', argv)
@@ -381,6 +406,8 @@ def test_audit_json_status_and_failure_reporting(monkeypatch, capsys, tmp_path, 
     assert report['outcome'] == ('REVIEW' if failure is None else
                                  'MODEL_FAILURE' if failure == 'model' else 'SCRIPT_ERROR')
     assert report['model']['status'] == ('FAIL' if failure == 'model' else 'NOT_RUN')
+    assert not report['fixture_coverage']['has_center_stereo']
+    assert report['fixture_coverage']['has_n0'] == (record_count == 2)
     if failure != 'report':
         assert json.loads(destination.read_text(encoding='utf-8')) == report
 

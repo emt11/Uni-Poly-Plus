@@ -20,7 +20,7 @@ import torch
 from rdkit import Chem
 from torch.utils.data import DataLoader
 from src.dataset.glt_dual import FrozenDualLayerSource, DualGLTDataset, dual_glt_collate, build_dual_sample
-from src.dataset.graph_data import build_periodic_multimer_mol, build_star_linking_mol
+from src.dataset.graph_data import build_periodic_multimer_mol
 from src.dataset.glt_bond_chemistry import bond_feature_vector
 from src.dataset.canonical_periodic import resolve_normalized_identity
 
@@ -351,47 +351,10 @@ def audit_record(topology, trimer, smiles):
     checks['connection_policy'] = check_result(
         'PASS' if policy == 'matching_attachment_type' else 'REVIEW',
         '' if policy == 'matching_attachment_type' else 'policy requires review; not proof of invalid chemistry')
-    try:
-        linked, star = build_star_linking_mol(construction_smiles, return_mapping=True)
-        star_edge = linked.GetBondBetweenAtoms(*star['attachment_pair'])
-        if star_edge is None:
-            checks['star_linking'] = check_result(
-                'ANOMALY', 'Star-Linking mapping does not expose its declared edge'
-            )
-        else:
-            actual = {
-                'bond_type': str(star_edge.GetBondType()),
-                'stereo': str(star_edge.GetStereo()),
-                'conjugation': bool(star_edge.GetIsConjugated()),
-                'ring': bool(star_edge.IsInRing()),
-            }
-            report['star_linking'] = {
-                **star,
-                'actual_link': actual,
-            }
-            declared = {
-                str(star['declared_attachment_bond_type_left']),
-                str(star['declared_attachment_bond_type_right']),
-            }
-            check_status = 'PASS' if (
-                len(declared) == 1 and next(iter(declared)) == actual['bond_type']
-            ) else 'REVIEW'
-            checks['star_linking'] = check_result(
-                check_status,
-                '' if check_status == 'PASS' else
-                'actual Star-Linking edge differs from declared attachment type; strategy requires confirmation',
-                declared_left=star['declared_attachment_bond_type_left'],
-                declared_right=star['declared_attachment_bond_type_right'],
-                actual=actual,
-                added=bool(star['actual_link_added']),
-            )
-    except ValueError as exc:
-        # Keep the current Star-Linking strategy unchanged: a mismatched pair
-        # is rejected by that constructor, while the periodic builder records
-        # its explicit single-bond fallback above.
-        checks['star_linking'] = check_result(
-            'REVIEW', f'Star-Linking strategy rejected this attachment pair: {exc}'
-        )
+    checks['star_linking'] = check_result(
+        'NOT_APPLICABLE',
+        'legacy single-RU Star graph is not an input to this route; physical seams audited below',
+    )
     size = meta['base_atom_count']
     normalized_base = [
         atom.GetIdx() for atom in identity['normalized_molecule'].GetAtoms()
@@ -704,7 +667,11 @@ def renumber_frozen(topology, trimer, smiles):
 
 
 def fixture_coverage(entries):
-    """Bind roles to each record and independently count source internal bonds."""
+    """Validate supplied records without requiring a special E/Z + N=0 pair.
+
+    Report the edge-case coverage actually present. Synthetic regression tests
+    cover N=0/stereo separately; their absence is not a real-smoke failure.
+    """
     roles = []
     for entry in entries:
         checks = entry['checks']
@@ -715,12 +682,13 @@ def fixture_coverage(entries):
         if source.get('status') == 'PASS' and model.get('status') == 'PASS' and expected == actual:
             if expected == 0:
                 role = 'n0'
-            elif expected is not None and expected > 0 and source.get('center_specified', 0) > 0:
-                role = 'ordinary_ez'
+            elif expected is not None and expected > 0:
+                role = 'ordinary_ez' if source.get('center_specified', 0) > 0 else 'ordinary'
         roles.append(role)
-    passed = len(roles) == 2 and set(roles) == {'n0', 'ordinary_ez'}
+    passed = 1 <= len(roles) <= 2 and all(role is not None for role in roles)
     return check_result('PASS' if passed else 'ANOMALY',
-        '' if passed else 'requires ordinary central E/Z and independently verified real N=0', roles=roles)
+        '' if passed else 'requires 1-2 valid records with matching source/model center counts',
+        roles=roles, has_n0='n0' in roles, has_center_stereo='ordinary_ez' in roles)
 
 
 def main():
@@ -731,8 +699,8 @@ def main():
     parser.add_argument('--audit-only', action='store_true', help='inspect data without constructing a model')
     parser.add_argument('--report-json', type=Path, help='new report path; existing files are not overwritten')
     args = parser.parse_args()
-    if len(args.sample) != 2:
-        parser.error('provide exactly two records: one ordinary and one real N=0')
+    if not 1 <= len(args.sample) <= 2:
+        parser.error('provide one or two real frozen records')
     if args.report_json is not None and args.report_json.exists():
         parser.error('report path already exists; choose a new path')
     torch.set_num_threads(1)
@@ -740,11 +708,11 @@ def main():
         samples = [(bytes.fromhex(key), smiles) for key, smiles in args.sample]
         if any(len(key) != 32 for key, _ in samples):
             raise ValueError('sample keys must have 32 bytes')
-        if len({key for key, _ in samples}) != 2:
-            raise ValueError('provide two distinct frozen records')
+        if len({key for key, _ in samples}) != len(samples):
+            raise ValueError('provide distinct frozen records')
     except ValueError as exc:
         parser.error(str(exc))
-    report = dict(scope='only the two explicitly supplied records; not full-cache coverage',
+    report = dict(scope='only the explicitly supplied 1-2 records; not full-cache coverage',
                   samples=[], model=check_result('NOT_RUN', 'not executed'), outcome='NOT_RUN')
     source = None
     exit_code = 0
@@ -810,15 +778,11 @@ def main():
         from src.modules.glt_dual import build_dual_glt_model
         dataset = DualGLTDataset(source)
         batch = next(iter(DataLoader(dataset, batch_size=2, num_workers=0, collate_fn=dual_glt_collate)))
-        centers = torch.bincount(batch.bond_batch[batch.bond_center], minlength=2)
-        if not batch.geometry_valid.all() or not (centers == 0).any() or not (centers > 0).any():
-            raise RuntimeError('fixtures must contain valid ordinary and N=0 geometry')
-        checked = sum(
-            audit_frozen_stereo(trimer, smiles, topology=topology)
-            for topology, trimer, smiles in records
-        )
-        if checked == 0:
-            raise RuntimeError('ordinary real fixture must contain specified central E/Z; do not claim stereo coverage')
+        centers = torch.bincount(batch.bond_batch[batch.bond_center], minlength=len(records))
+        if not batch.geometry_valid.all() or not (centers > 0).any():
+            raise RuntimeError('model smoke needs at least one valid graph with center bonds')
+        checked = sum(entry['checks']['stereo_coordinates'].get('checked_bonds', 0)
+                      for entry in report['samples'])
         renumbered = dual_glt_collate([renumber_frozen(*record) for record in records])
         if not renumbered.geometry_valid.all():
             raise RuntimeError('renumbering invalidated real geometry')
@@ -828,9 +792,10 @@ def main():
             prediction = model(batch)
             torch.testing.assert_close(prediction, model(renumbered), atol=1e-5, rtol=1e-5)
             print({'mode': mode, 'stereo_bonds_checked': checked, 'renumbering': 'PASS'}, file=sys.stderr)
-            if prediction.shape != (2, 1) or not torch.isfinite(prediction).all():
+            if prediction.shape != (len(records), 1) or not torch.isfinite(prediction).all():
                 raise RuntimeError('invalid predictions')
-            (prediction - torch.tensor([[0.3], [-0.7]])).square().mean().backward()
+            targets = torch.linspace(0.3, -0.7, len(records)).unsqueeze(-1)
+            (prediction - targets).square().mean().backward()
             names = ['o8.bond_bias.position', 'o8.layers.0.attention.qkv.weight',
                      'glt.endpoint.weight', 'glt.distance_projection.weight',
                      'glt.angle_bias.heads.2.weight', 'glt.layers.0.attention.qkv.weight',
