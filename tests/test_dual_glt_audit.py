@@ -136,6 +136,53 @@ def test_degenerate_stereo_axis_has_explicit_failure():
         audit.audit_frozen_stereo(tri, '*C/C=C/C*')
 
 
+@pytest.mark.parametrize('smiles, expected_stereo, sign', [
+    ('*C/C=C/C*', Chem.BondStereo.STEREOE, -1),
+    ('*C/C=C\\C*', Chem.BondStereo.STEREOZ, 1),
+])
+@pytest.mark.parametrize('signed_cosine', [0.01, 0.25, 1.0, -0.01, -1.0, 0.0])
+def test_stereo_coordinates_check_side_without_quality_cutoff(smiles, expected_stereo, sign, signed_cosine):
+    # Deliberately synthetic projected directions, not generated conformers or
+    # claims about physical conformer quality. Each RU has four distinct atoms.
+    normalized = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=True)
+    _, tri = _toy_pair(normalized)
+    mol, meta = build_periodic_multimer_mol(normalized, 3, close_periodic=False)
+    lookup = {
+        (int(base), int(offset)): index
+        for index, (base, offset) in enumerate(zip(
+            tri.trimer_base_ru_atom_id, tri.trimer_ru_offset))
+    }
+    physical = {
+        int(atom): lookup[(base, unit - 1)]
+        for unit, atoms in enumerate(meta['unit_atoms'])
+        for base, atom in enumerate(atoms)
+    }
+    doubles = [bond for bond in mol.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE]
+    assert len(doubles) == 3
+    cosine = sign * signed_cosine
+    for unit, bond in enumerate(doubles):
+        assert bond.GetStereo() == expected_stereo
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        left, right = bond.GetStereoAtoms()
+        origin = 4.0 * unit
+        for atom, xyz in (
+            (i, [origin, 0., 0.]),
+            (j, [origin + 1., 0., 0.]),
+            (left, [origin, 1., 0.]),
+            (right, [origin + 1., cosine, (1. - cosine ** 2) ** 0.5]),
+        ):
+            tri.trimer_pos[physical[atom]] = torch.tensor(xyz)
+    original = tri.trimer_pos.clone()
+    if signed_cosine > 0:
+        assert audit.audit_frozen_stereo(tri, normalized) == 3
+    else:
+        reason = ('indeterminate orthogonal stereo projection' if signed_cosine == 0
+                  else 'frozen coordinates disagree with specified bond stereo')
+        with pytest.raises(ValueError, match=reason):
+            audit.audit_frozen_stereo(tri, normalized)
+    assert torch.equal(tri.trimer_pos, original)
+
+
 def test_missing_model_field_is_not_geometry_fallback(monkeypatch):
     from src.dataset import glt_dual
     _, tri = _toy_pair('*COC*')

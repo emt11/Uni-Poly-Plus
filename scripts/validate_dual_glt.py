@@ -540,6 +540,9 @@ def audit_frozen_stereo(trimer, smiles, *, topology=None, identity=None):
     No coordinate is generated or repaired here.  Terminal finite-chain copies
     whose dummy reference was intentionally removed are ``STEREONONE`` and are
     therefore not counted as retained stereo.
+
+    Only projected side agreement is checked, with no angular-quality cutoff.
+    Opposite signs fail; an exactly orthogonal projection is indeterminate.
     """
     if identity is None and topology is not None:
         identity = resolve_normalized_identity(
@@ -639,9 +642,17 @@ def audit_frozen_stereo(trimer, smiles, *, topology=None, identity=None):
         expected_sign = -1 if stereo in (
             Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOTRANS
         ) else 1
-        if not bool(torch.isfinite(cosine)) or float(expected_sign * cosine) < 0.5:
+        if not bool(torch.isfinite(cosine)):
+            failures.append(f'nonfinite stereo projection cosine at {(i, j)}')
+            continue
+        signed_cosine = float(expected_sign * cosine)
+        if signed_cosine == 0.0:
+            failures.append(f'indeterminate orthogonal stereo projection at {(i, j)}')
+            continue
+        if signed_cosine < 0.0:
             failures.append(
-                f'frozen coordinates disagree with specified bond stereo at {(i, j)}; cache unchanged'
+                f'frozen coordinates disagree with specified bond stereo at {(i, j)}; '
+                f'signed_cosine={signed_cosine}; cache unchanged'
             )
             continue
         retained += 1
