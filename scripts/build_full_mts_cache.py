@@ -31,14 +31,15 @@ sys.path.insert(0, str(ROOT))
 
 EXPECTED_DISK_GIB = 150.0  # >= 2x the ~74 GiB full-scale estimate
 
-# Production build-spec hashes after the approved RU_BUILD_UNSUPPORTED
-# failure-policy semantics change (commit bccf3c1).  The preflight fails on
-# drift from THESE values; the 1000-pilot bundle predates the policy change
-# and is recorded as an informational diff only.
+# Production build-spec hashes after the approved relaxed per-sample failure
+# policy (sample-local exception -> record FAILED + continue; only
+# infrastructure failures abort the build).  The preflight fails on drift
+# from THESE values; earlier bundles predate the policy change and are
+# recorded as an informational diff only.
 EXPECTED_BUILD_SPEC_HASHES = {
-    "ru_base": "649fe769a590f3362c63b78e928b689ff40904c1916ffaf20b70d875280141c4",
-    "topology": "02666da2f6da0c734cfe211a0040d7b543c174a40c9e7d6c53977bd2e0f35578",
-    "trimer": "3970f8d2529d30139ae9afa203ec0279537c18512e482611491028332b6b0773",
+    "ru_base": "33984911e74d1500ffbb888f80fb6c7db9c0a8642cadcd97607ba26dd8c5f132",
+    "topology": "73ad6d96a696cfaf2a0486ab137300d3e6d6c1618ef00d98dbf2d10adc16c168",
+    "trimer": "a5c89ac88d0435e63a09c9a4ae82b1b3a63eede97cde9d1d90ef3ca015255162",
 }
 
 
@@ -73,15 +74,15 @@ def preflight(args) -> tuple[bool, dict]:
         matches_expected = hashes == EXPECTED_BUILD_SPEC_HASHES
         checks["build_specs_match_expected_production"] = matches_expected
         ok &= matches_expected
-        # Informational only: the 1000-pilot bundle predates the approved
-        # RU_BUILD_UNSUPPORTED failure-policy change, so its metadata hashes
-        # are expected to differ.  Drift here is NOT a preflight failure.
+        # Informational only: earlier bundles predate the approved relaxed
+        # failure-policy change, so their metadata hashes are expected to
+        # differ.  Drift here is NOT a preflight failure.
         pilot_root = (
             ROOT / "data/processed/mts_cache_pilot_20260913/builds/"
             "7339faaf6401fe58176dbfe5a9e3692eced0a5aec2751fc1d979450d2f34074e"
         )
         if pilot_root.is_dir():
-            checks["pilot_bundle_predates_ru_failure_policy_change"] = True
+            checks["pilot_bundle_predates_relaxed_failure_policy"] = True
     except Exception as exc:  # noqa: BLE001
         checks["build_spec_hashes"] = f"error: {exc}"
         ok = False

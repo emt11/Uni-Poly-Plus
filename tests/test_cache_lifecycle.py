@@ -206,6 +206,10 @@ def test_sidecar_binding_rejects_any_parent_or_cohort_change():
 
 
 def test_multiworker_contract_error_is_not_rejection(tmp_path):
+    """Relaxed policy: a sample-local Trimer contract error (here an
+    unparsable normalized identity) is a terminal per-sample UNCLASSIFIED
+    failure recorded in the ledger; the trimer phase completes instead of
+    hard-stopping."""
     source, hashes, metadata, staging, _ = _world(tmp_path)
     key = b"z" * 32
     writer = StagingWriter(staging / "ru_base", metadata["ru_base"])
@@ -217,7 +221,13 @@ def test_multiworker_contract_error_is_not_rejection(tmp_path):
         "sample_key": key.hex(), "source_smiles": "not-a-smiles",
         "normalized_smiles": "not-a-smiles", "source_row": 0,
     }]
-    with pytest.raises(TrimerContractError):
-        _run_trimer(staging, rows, metadata, workers=2, interrupt_after=0)
-    assert (staging / "trimer" / "rejections.jsonl").read_text() == ""
+    resume, processed_new, _ = _run_trimer(
+        staging, rows, metadata, workers=2, interrupt_after=0
+    )
+    assert resume is False
+    assert processed_new == 1
+    rejections = (staging / "trimer" / "rejections.jsonl").read_text()
+    assert key.hex() in rejections
+    assert "UNCLASSIFIED_SAMPLE_FAILURE" in rejections
+    assert "TrimerContractError" in rejections
     assert not (staging / "trimer" / ".frozen").exists()

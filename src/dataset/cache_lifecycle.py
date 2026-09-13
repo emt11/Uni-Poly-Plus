@@ -416,7 +416,9 @@ def read_rejections(path: Path) -> dict[bytes, dict]:
             row = json.loads(line)
             if set(row) - {
                 "sample_key", "failure_code", "candidate_attempts",
-                "elapsed_seconds", "round_reached",
+                "elapsed_seconds", "round_reached", "source_row",
+                "canonical_smiles", "layer", "status", "exception_type",
+                "exception_message", "worker_pid", "traceback_hash",
             }:
                 raise CacheLifecycleError("rejection ledger has unsupported fields")
             key = bytes.fromhex(row["sample_key"])

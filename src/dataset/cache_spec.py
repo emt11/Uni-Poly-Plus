@@ -185,6 +185,18 @@ def build_spec_from_metadata(artifact_type: str, metadata: dict) -> dict:
 # change edits these parameters directly.
 # ---------------------------------------------------------------------------
 
+# The formal per-sample failure policy of the production builder: any
+# exception attributable to exactly one sample records that sample as FAILED
+# for its layer and the build continues.  Only failures that break the
+# cache-wide write/consistency infrastructure abort the whole build.  The
+# values are semantics, not version numbers; a policy change changes these
+# dicts, which changes every affected build_spec hash.
+SAMPLE_FAILURE_POLICY = {
+    "sample_local_exception": "record_and_continue",
+    "parent_failure": "skip_downstream",
+    "system_failure": "abort",
+}
+
 RU_BASE_BUILD_SPEC = validate_build_spec({
     "artifact_type": "ru_base",
     "parameters": {
@@ -202,13 +214,11 @@ RU_BASE_BUILD_SPEC = validate_build_spec({
             "dummy_atom_policy": "preserve",
             "invalid_identity_policy": "INVALID::{source}",
         },
-        # The RU mapping search runs normally and validates zero graph
-        # isomorphisms for some canonical, parseable sources: that is a
-        # builder capability boundary and an ordinary RU rejection — never a
-        # data corruption and never a hard stop.
-        "failure_policy": {
-            "no_validated_graph_isomorphism": "reject",
-        },
+        # Every sample-local RU failure (no validated graph isomorphism,
+        # dummy-only repeat units, attachment/bond/sanitization failures,
+        # unknown RDKit exceptions, ...) records that sample FAILED and the
+        # build continues.  See SAMPLE_FAILURE_POLICY.
+        "failure_policy": SAMPLE_FAILURE_POLICY,
         "mismatched_bond_policy": "single",
         "molecule_serialization": "rdkit_mol_binary",
     },
@@ -228,6 +238,7 @@ TOPOLOGY_BUILD_SPEC = validate_build_spec({
         "max_model_atoms": 384,
         "max_repeat_units": 1,
         "mismatched_bond_policy": "single",
+        "failure_policy": SAMPLE_FAILURE_POLICY,
         "topology_representation": "single_canonical_ru_lifted_relations",
     },
     "parents": {"ru_base": build_spec_hash(RU_BASE_BUILD_SPEC)},
@@ -277,7 +288,11 @@ TRIMER_BUILD_SPEC = validate_build_spec({
         "etkdg_max_iterations": 200,
         "etkdg_rmsd_pruning": False,
         "etkdg_use_random_coords": True,
-        "failure_policy": "exclude_geometry_failure",
+        # Every sample-local geometry failure (MMFF unsupported, timeout,
+        # ETKDG/stereo/mapping failures, unexpected RDKit exceptions, ...)
+        # records that sample FAILED for the Trimer layer and the build
+        # continues.  See SAMPLE_FAILURE_POLICY.
+        "failure_policy": SAMPLE_FAILURE_POLICY,
         "hard_timeout_seconds": 60,
         "max_rounds": 2,
         "max_total_candidates": 8,

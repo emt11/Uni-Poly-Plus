@@ -1,9 +1,9 @@
 """RU builder capability-boundary tests (RU_BUILD_UNSUPPORTED).
 
 A canonical, parseable P-SMILES whose RU mapping search validates zero graph
-isomorphisms is an ordinary RU rejection: the build continues, no RU record,
-no Topology record and no Trimer participation is produced for it, and the
-whole-build hard-stop scope is unchanged.
+isomorphisms is an ordinary per-sample RU failure under the relaxed failure
+policy: the build continues, no RU record, no Topology record and no Trimer
+participation is produced for it, and the published accounting stays closed.
 """
 
 import json
@@ -39,7 +39,7 @@ def test_boundary_sample_is_canonical_and_deterministically_unsupported():
     assert first.ru_base_failure_code == second.ru_base_failure_code
 
 
-def test_struct_worker_classifies_boundary_as_rejection_not_contract_error():
+def test_struct_worker_classifies_boundary_as_sample_failure():
     from scripts.build_mts_cache import _build_struct_one
 
     result = _build_struct_one({
@@ -47,18 +47,17 @@ def test_struct_worker_classifies_boundary_as_rejection_not_contract_error():
         "sample_key": BOUNDARY_KEY,
         "source_smiles": BOUNDARY_SMILES,
     })
-    assert result["status"] == "rejected"
-    assert result["failure_code"] == "RU_BUILD_UNSUPPORTED"
+    assert result["status"] == "ru_failed"
+    assert result["entry"]["failure_code"] == "RU_BUILD_UNSUPPORTED"
+    assert result["entry"]["layer"] == "ru_base"
     assert "ru_payload" not in result and "topology_payload" not in result
+    assert "topology_entry" not in result
 
 
-def test_identity_corruption_still_hard_stops(monkeypatch):
-    """The hard-stop scope is unchanged: a non-boundary invalid RU stays a
-    contract error (program/data integrity), never a silent rejection."""
-    from src.dataset import trimer_mcl
-    from src.dataset.trimer_mcl import TrimerContractError
-    from scripts.build_mts_cache import _build_struct_one
-
+def test_unclassified_ru_failure_is_recorded_never_hard_stop(monkeypatch):
+    """Any non-known RU failure is an honest UNCLASSIFIED_SAMPLE_FAILURE
+    per-sample terminal state — never a build-wide stop and never disguised
+    as a known capability code."""
     import scripts.build_mts_cache as builder_module
 
     real = builder_module._compute_ru_base_layer
@@ -70,14 +69,17 @@ def test_identity_corruption_still_hard_stops(monkeypatch):
         return ru
 
     monkeypatch.setattr(builder_module, "_compute_ru_base_layer", corrupted)
-    result = _build_struct_one({
+    result = builder_module._build_struct_one({
         "phase": "struct",
         "sample_key": "b" * 64,
         "source_smiles": "*CC*",
     })
-    assert result["status"] == "contract_error"
-    assert "source_identity_corruption" in result["error"]
-    del trimer_mcl, TrimerContractError
+    assert result["status"] == "ru_failed"
+    assert result["entry"]["failure_code"] == "UNCLASSIFIED_SAMPLE_FAILURE"
+    assert result["entry"]["exception_type"] == "ValueError"
+    assert "synthetic_identity_contradiction" in (
+        result["entry"]["exception_message"]
+    )
 
 
 def test_full_build_continues_past_boundary_sample_and_publishes(tmp_path):
@@ -136,6 +138,15 @@ def test_full_build_continues_past_boundary_sample_and_publishes(tmp_path):
     ru_rejections = (bundle / "ru_base" / "rejections.jsonl").read_text()
     assert BOUNDARY_KEY in ru_rejections
     assert "RU_BUILD_UNSUPPORTED" in ru_rejections
+    entry = next(
+        json.loads(line) for line in ru_rejections.splitlines()
+        if BOUNDARY_KEY in line
+    )
+    for field in ("sample_key", "source_row", "canonical_smiles", "layer",
+                  "failure_code", "exception_type", "exception_message",
+                  "worker_pid", "elapsed_seconds"):
+        assert field in entry
+    assert entry["layer"] == "ru_base"
 
     # the boundary sample has no RU, Topology or Trimer record at all
     import numpy as np

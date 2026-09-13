@@ -1564,44 +1564,56 @@ def _compute_ru_base_layer(smiles):
     data.ru_chemistry_valid = bool(chemistry_valid)
     data.ru_mol_binary = bytes(effective.ToBinary())
     identity_failure = None
+    # A repeat unit with no non-dummy atom at all (e.g. "*=*", "**") defines
+    # no polymer graph: an ordinary per-sample RU failure with its own
+    # diagnostic code, not a data corruption and never a build-wide stop.
+    degenerate_identity = normalized_molecule is not None and not any(
+        atom.GetAtomicNum() > 0 for atom in normalized_molecule.GetAtoms()
+    )
     if normalized_molecule is not None:
         data.ru_normalized_mol_binary = bytes(normalized_molecule.ToBinary())
-        try:
-            source_to_normalized_atom = find_atom_graph_mapping(
-                source_molecule, normalized_molecule
-            )
-            source_to_normalized_base = find_base_atom_mapping(
-                source_molecule, normalized_molecule
-            )
-            data.source_to_normalized_atom_id = source_to_normalized_atom
-            data.source_to_normalized_canonical_atom_id = source_to_normalized_base
-            data.source_to_canonical_atom_id = source_to_normalized_base
-            source_attachments = []
-            for atom in source_molecule.GetAtoms():
-                if atom.GetAtomicNum() != 0:
-                    continue
-                neighbors = list(atom.GetNeighbors())
-                if len(neighbors) != 1:
-                    raise ValueError("attachment dummy must have one neighbor")
-                source_attachments.append({
-                    "source_dummy": int(atom.GetIdx()),
-                    "source_neighbor": int(neighbors[0].GetIdx()),
-                    "normalized_dummy": int(source_to_normalized_atom[atom.GetIdx()]),
-                    "normalized_neighbor": int(
-                        source_to_normalized_atom[neighbors[0].GetIdx()]
-                    ),
-                })
-            data.source_to_normalized_attachment_map = source_attachments
-        except RuBuildUnsupported as exc:
-            # Builder capability boundary for a canonical, parseable source:
-            # the mapping search ran and validated zero isomorphisms.  This
-            # is an ordinary RU rejection, never a data corruption.
-            identity_failure = f"RU_BUILD_UNSUPPORTED:{exc}"[:240]
-        except Exception as exc:
-            # A syntactically valid ordinary SMILES (or a malformed P-SMILES)
-            # remains an explicit unavailable RU row.  Do not invent a
-            # positional identity merely to keep the cache writer alive.
-            identity_failure = f"{type(exc).__name__}:{exc}"[:240]
+        if degenerate_identity:
+            identity_failure = (
+                "RU_DEGENERATE_DUMMY_ONLY:"
+                "repeat unit has no non-dummy base atom"
+            )[:240]
+        else:
+            try:
+                source_to_normalized_atom = find_atom_graph_mapping(
+                    source_molecule, normalized_molecule
+                )
+                source_to_normalized_base = find_base_atom_mapping(
+                    source_molecule, normalized_molecule
+                )
+                data.source_to_normalized_atom_id = source_to_normalized_atom
+                data.source_to_normalized_canonical_atom_id = source_to_normalized_base
+                data.source_to_canonical_atom_id = source_to_normalized_base
+                source_attachments = []
+                for atom in source_molecule.GetAtoms():
+                    if atom.GetAtomicNum() != 0:
+                        continue
+                    neighbors = list(atom.GetNeighbors())
+                    if len(neighbors) != 1:
+                        raise ValueError("attachment dummy must have one neighbor")
+                    source_attachments.append({
+                        "source_dummy": int(atom.GetIdx()),
+                        "source_neighbor": int(neighbors[0].GetIdx()),
+                        "normalized_dummy": int(source_to_normalized_atom[atom.GetIdx()]),
+                        "normalized_neighbor": int(
+                            source_to_normalized_atom[neighbors[0].GetIdx()]
+                        ),
+                    })
+                data.source_to_normalized_attachment_map = source_attachments
+            except RuBuildUnsupported as exc:
+                # Builder capability boundary for a canonical, parseable source:
+                # the mapping search ran and validated zero isomorphisms.  This
+                # is an ordinary RU rejection, never a data corruption.
+                identity_failure = f"RU_BUILD_UNSUPPORTED:{exc}"[:240]
+            except Exception as exc:
+                # A syntactically valid ordinary SMILES (or a malformed P-SMILES)
+                # remains an explicit unavailable RU row.  Do not invent a
+                # positional identity merely to keep the cache writer alive.
+                identity_failure = f"{type(exc).__name__}:{exc}"[:240]
     data.ru_base_failure_code = (
         "" if chemistry_valid and identity_failure is None
         else identity_failure or "rdkit_parse_failed"
@@ -1669,7 +1681,12 @@ def _compute_ru_base_layer(smiles):
         data.ru_shared_boundary = False
         data.ru_multimer_builder_version = MIPS_MULTIMER_BUILDER_VERSION
         data.ru_base_valid = False
-        data.ru_base_failure_code = f"{type(exc).__name__}:{exc}"[:240]
+        # The degenerate-identity diagnosis is precise and comes first; a
+        # follow-on geometry exception for such a row must not overwrite it.
+        if not str(data.ru_base_failure_code or "").startswith(
+            "RU_DEGENERATE_DUMMY_ONLY"
+        ):
+            data.ru_base_failure_code = f"{type(exc).__name__}:{exc}"[:240]
     data.ru_base_schema = RU_BASE_SCHEMA
     return data
 

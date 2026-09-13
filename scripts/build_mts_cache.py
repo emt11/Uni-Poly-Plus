@@ -8,12 +8,15 @@ same command resumes only its content-addressed ``.staging`` bundle.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import os
 import pickle
+import shutil
 import sys
 import time
+import traceback
 from collections import Counter
 from pathlib import Path
 
@@ -101,17 +104,118 @@ def _write_source(staging, rows, manifest):
         atomic_json(manifest_path, observed)
 
 
-def _progress_line(phase, processed, total, accepted, rejected, failure_counts,
-                   started_wall):
+# RU failure codes with a dedicated diagnostic identity.  Everything else a
+# sample raises is recorded honestly as UNCLASSIFIED_SAMPLE_FAILURE with its
+# exception type and message; classification can be refined after the build.
+KNOWN_RU_FAILURE_CODES = ("RU_BUILD_UNSUPPORTED", "RU_DEGENERATE_DUMMY_ONLY")
+
+UNCLASSIFIED = "UNCLASSIFIED_SAMPLE_FAILURE"
+
+
+def _split_ru_failure_code(raw):
+    """Map a recorded RU failure code onto (failure_code, exception_type,
+    exception_message).  Known builder-capability codes keep their identity;
+    anything else becomes an explicit UNCLASSIFIED_SAMPLE_FAILURE."""
+    text = str(raw or "").strip()
+    head, separator, tail = text.partition(":")
+    if head in KNOWN_RU_FAILURE_CODES:
+        return head, head, (tail if separator else text)
+    if not separator:
+        return UNCLASSIFIED, text, text
+    return UNCLASSIFIED, head, tail
+
+
+def _failure_entry(payload, layer, *, failure_code, exception_type,
+                   exception_message, elapsed_seconds, candidate_attempts=0,
+                   round_reached=-1):
+    """One per-sample failure ledger row (see the relaxed failure policy)."""
+    return {
+        "sample_key": str(payload["sample_key"]),
+        "source_row": int(payload.get("source_row", -1)),
+        "canonical_smiles": str(payload.get("normalized_smiles", ""))[:300],
+        "layer": str(layer),
+        "failure_code": str(failure_code),
+        "exception_type": str(exception_type)[:80],
+        "exception_message": str(exception_message)[:240],
+        "worker_pid": int(os.getpid()),
+        "elapsed_seconds": round(float(elapsed_seconds), 3),
+        "candidate_attempts": int(candidate_attempts),
+        "round_reached": int(round_reached),
+    }
+
+
+class _FailureLedger:
+    """Parent-side writer for one per-layer failure ledger (JSONL).
+
+    Full tracebacks are deduplicated by content hash into a sidecar file, so
+    a recurring failure never repeats its long traceback per sample.
+    """
+
+    def __init__(self, layer_dir: Path):
+        self.path = layer_dir / "rejections.jsonl"
+        self.traceback_path = layer_dir / "failure_tracebacks.jsonl"
+        self.path.touch(exist_ok=True)
+        self.rows = read_rejections(self.path)
+        self._seen_tracebacks = set()
+        if self.traceback_path.is_file():
+            for line in self.traceback_path.read_text(
+                encoding="utf-8"
+            ).splitlines():
+                if line.strip():
+                    self._seen_tracebacks.add(
+                        json.loads(line)["traceback_hash"]
+                    )
+
+    def append(self, entry: dict, traceback_text: str | None = None) -> None:
+        key = bytes.fromhex(entry["sample_key"])
+        if key in self.rows:
+            raise CacheLifecycleError(
+                f"duplicate failure ledger key: {entry['sample_key']}"
+            )
+        row = dict(entry)
+        if traceback_text:
+            digest = hashlib.sha256(
+                traceback_text.encode("utf-8")
+            ).hexdigest()[:16]
+            row["traceback_hash"] = digest
+            if digest not in self._seen_tracebacks:
+                self._seen_tracebacks.add(digest)
+                append_jsonl(self.traceback_path, {
+                    "traceback_hash": digest,
+                    "traceback": traceback_text[-4000:],
+                })
+        append_jsonl(self.path, row)
+        self.rows[key] = row
+
+
+def _progress_line(phase, processed, total, counts, failure_counts,
+                   started_wall, fs_path):
     elapsed = max(time.monotonic() - started_wall, 1e-9)
     remaining = max(0, total - processed)
+    rate = processed / elapsed
+    rss_bytes = 0
+    try:
+        for line in Path("/proc/self/status").read_text(
+            encoding="utf-8"
+        ).splitlines():
+            if line.startswith("VmRSS:"):
+                rss_bytes = int(line.split()[1]) * 1024
+                break
+    except OSError:
+        pass
+    try:
+        disk_free_bytes = shutil.disk_usage(fs_path).free
+    except OSError:
+        disk_free_bytes = None
     print(json.dumps({
         "phase": phase, "processed": processed, "total": total,
-        "accepted": accepted, "rejected": rejected,
         "unresolved": remaining,
-        "samples_per_second": round(processed / elapsed, 3),
-        "eta_seconds": round(remaining / max(processed / elapsed, 1e-9), 1)
+        "samples_per_second": round(rate, 3),
+        "eta_seconds": round(remaining / max(rate, 1e-9), 1)
         if processed else None,
+        "rss_bytes": rss_bytes,
+        "disk_free_bytes": disk_free_bytes,
+        **counts,
         "failure_counts": dict(sorted(failure_counts.items())),
     }), flush=True)
 
@@ -121,20 +225,37 @@ def _run_struct(staging, rows, metadata, workers):
 
     Scheduling-only parallelisation of the pilot-verified serial phase: the
     scientific generators are unchanged and the parent remains the single
-    writer for both layers.  Resume skips samples already present in both
-    layers.  Identity corruption is a hard stop (never a rejection).
+    writer for both layers.  Relaxed per-sample failure policy: a sample-local
+    exception is a terminal per-sample ledger entry and the build continues;
+    RU failure skips Topology/Trimer for that sample.  Resume skips samples
+    whose RU and Topology states are both terminal (written, failed, or
+    skipped).  Only parent/writer/infrastructure failures stop the build.
     """
 
     ru_writer = StagingWriter(staging / "ru_base", metadata["ru_base"])
     topology_writer = StagingWriter(staging / "topology", metadata["topology"])
-    rejection_path = staging / "ru_base" / "rejections.jsonl"
-    rejection_path.touch(exist_ok=True)
-    ru_rejections = read_rejections(rejection_path)
+    ru_ledger = _FailureLedger(staging / "ru_base")
+    topology_ledger = _FailureLedger(staging / "topology")
     processed_new = 0
     writer_seconds = 0.0
     total = len(rows)
     started_wall = time.monotonic()
     last_report = 0.0
+
+    def failure_counts():
+        counter = Counter()
+        for row in ru_ledger.rows.values():
+            counter[f"ru_base:{row.get('failure_code', '?')}"] += 1
+        for row in topology_ledger.rows.values():
+            counter[f"topology:{row.get('failure_code', '?')}"] += 1
+        return counter
+
+    def unclassified_count():
+        return sum(
+            1 for row in list(ru_ledger.rows.values())
+            + list(topology_ledger.rows.values())
+            if row.get("failure_code") == UNCLASSIFIED
+        )
 
     def progress(force=False):
         nonlocal last_report
@@ -142,70 +263,102 @@ def _run_struct(staging, rows, metadata, workers):
         if not force and now - last_report < 30.0:
             return
         last_report = now
-        _progress_line("struct", processed_new, total,
-                       processed_new - len(ru_rejections),
-                       len(ru_rejections),
-                       Counter(row["failure_code"]
-                               for row in ru_rejections.values()),
-                       started_wall)
+        ru_failed = len(ru_ledger.rows)
+        _progress_line(
+            "struct", ru_writer.count() + ru_failed, total,
+            {
+                "ru_success": ru_writer.count(),
+                "ru_failed": ru_failed,
+                "topology_success": topology_writer.count(),
+                "topology_failed": len(topology_ledger.rows),
+                "skipped_parent_failed": ru_failed,
+                "unclassified_sample_failures": unclassified_count(),
+            },
+            failure_counts(), started_wall, staging,
+        )
 
     def commit_result(result):
         nonlocal processed_new, writer_seconds
         key = bytes.fromhex(result["sample_key"])
         status = result["status"]
-        if status == "contract_error":
-            raise TrimerContractError(
-                f"sample_key={result['sample_key']}:{result['error']}"
-            )
-        if status == "program_error":
-            raise CacheLifecycleError(
-                f"sample_key={result['sample_key']}:{result['error']}"
-            )
-        if status == "rejected":
-            if key in ru_rejections:
-                raise CacheLifecycleError("duplicate RU rejection")
-            rejection = {
-                "sample_key": key.hex(),
-                "failure_code": str(result["failure_code"]),
-                "candidate_attempts": int(result["candidate_attempts"]),
-                "elapsed_seconds": float(result["elapsed_seconds"]),
-                "round_reached": int(result["round_reached"]),
-            }
-            append_jsonl(rejection_path, rejection)
-            ru_rejections[key] = rejection
+        if status == "ru_failed":
+            if key in ru_writer:
+                raise CacheLifecycleError(
+                    "ledger/data contradiction: RU record and RU failure "
+                    f"for {result['sample_key']}"
+                )
+            ru_ledger.append(result["entry"], result.get("traceback_text"))
             processed_new += 1
             progress()
             return
-        if key in ru_writer or key in topology_writer:
-            raise CacheLifecycleError("duplicate struct write")
-        ru_data = deserialize_record(result.pop("ru_payload"), key)
-        topology_data = deserialize_record(result.pop("topology_payload"), key)
-        inserted_ru, _, elapsed_ru = ru_writer.put(key, ru_data)
-        inserted_topo, _, elapsed_topo = topology_writer.put(key, topology_data)
-        if not inserted_ru or not inserted_topo:
-            raise CacheLifecycleError("duplicate struct LMDB write")
-        writer_seconds += elapsed_ru + elapsed_topo
+        if status != "ok":
+            raise CacheLifecycleError(
+                f"unexpected struct worker status: {status}"
+            )
+        has_topo_payload = "topology_payload" in result
+        has_topo_entry = "topology_entry" in result
+        if has_topo_payload == has_topo_entry:
+            raise CacheLifecycleError(
+                "struct worker topology terminal state missing: "
+                f"{result['sample_key']}"
+            )
+        if key not in ru_writer:
+            ru_data = deserialize_record(result.pop("ru_payload"), key)
+            inserted_ru, _, elapsed_ru = ru_writer.put(key, ru_data)
+            if not inserted_ru:
+                raise CacheLifecycleError("duplicate struct LMDB write")
+            writer_seconds += elapsed_ru
+        else:
+            # resume re-run after a crash between the two layer writes
+            result.pop("ru_payload")
+        if has_topo_payload:
+            topo_data = deserialize_record(result.pop("topology_payload"), key)
+            if key not in topology_writer:
+                inserted_topo, _, elapsed_topo = topology_writer.put(
+                    key, topo_data
+                )
+                if not inserted_topo:
+                    raise CacheLifecycleError("duplicate struct LMDB write")
+                writer_seconds += elapsed_topo
+        if has_topo_entry:
+            entry = result.pop("topology_entry")
+            traceback_text = result.pop("topology_traceback_text", None)
+            if key in topology_writer:
+                raise CacheLifecycleError(
+                    "ledger/data contradiction: Topology record and Topology "
+                    f"failure for {result['sample_key']}"
+                )
+            if key not in topology_ledger.rows:
+                topology_ledger.append(entry, traceback_text)
         processed_new += 1
         progress()
 
-    jobs = [
-        {**row, "phase": "struct"} for row in rows
-        if bytes.fromhex(row["sample_key"]) not in ru_rejections
-        and (bytes.fromhex(row["sample_key"]) not in ru_writer
-             or bytes.fromhex(row["sample_key"]) not in topology_writer)
-    ]
+    jobs = []
+    for row in rows:
+        key = bytes.fromhex(row["sample_key"])
+        if key in ru_ledger.rows:
+            continue  # RU failed: terminal, downstream skipped
+        ru_written = key in ru_writer
+        topo_terminal = key in topology_writer or key in topology_ledger.rows
+        if not ru_written and topo_terminal:
+            raise CacheLifecycleError(
+                "staging contradiction: Topology terminal without RU record"
+            )
+        if ru_written and topo_terminal:
+            continue
+        jobs.append({**row, "phase": "struct"})
     struct_timeout = 600.0
 
     if int(workers) <= 1 or len(jobs) <= 1:
         try:
             for job in jobs:
                 commit_result(_build_struct_one(job))
+            progress(force=True)
             ru_writer.sync()
             topology_writer.sync()
         finally:
             ru_writer.close()
             topology_writer.close()
-        progress(force=True)
         return {"struct_new": processed_new,
                 "struct_writer_seconds": writer_seconds}
 
@@ -219,73 +372,123 @@ def _run_struct(staging, rows, metadata, workers):
         return {"process": process, "connection": parent, "job": None,
                 "job_id": None, "started": 0.0}
 
-    def stop_worker(state):
-        try:
-            state["connection"].close()
-        except Exception:
-            pass
-        process = state["process"]
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=2)
-        if process.is_alive():
-            process.kill()
-            process.join(timeout=2)
-
     states = [start_worker() for _ in range(min(int(workers), len(jobs)))]
     iterator = iter(jobs)
     next_job_id = 0
     retried = {}
 
-    def assign(state):
+    def worker_crash_result(job, reason):
+        exitcode = None
+        for state in states:
+            if state["job"] is not None and \
+                    state["job"]["sample_key"] == job["sample_key"]:
+                exitcode = state["process"].exitcode
+                break
+        return {
+            "status": "ru_failed", "sample_key": job["sample_key"],
+            "entry": _failure_entry(
+                job, "ru_base",
+                failure_code="WORKER_CRASH", exception_type="WorkerDied",
+                exception_message=f"{reason} (exitcode={exitcode})",
+                elapsed_seconds=0.0,
+            ),
+        }
+
+    def assign(index):
         nonlocal next_job_id
+        state = states[index]
         try:
             job = next(iterator)
         except StopIteration:
             state["job"] = None
-            return False
+            return
         next_job_id += 1
         state.update(job=job, job_id=next_job_id, started=time.monotonic())
-        state["connection"].send((next_job_id, job))
-        return True
+        try:
+            state["connection"].send((next_job_id, job))
+        except (EOFError, BrokenPipeError, OSError):
+            # The job was never delivered: sample-local worker failure, the
+            # build continues with a replacement worker (relaxed policy).
+            _stop_worker(state)
+            states[index] = start_worker()
+            commit_result(worker_crash_result(job, "IPC send to worker failed"))
+            assign(index)
 
-    for state in states:
-        assign(state)
+    def mark_worker_crash(index, reason):
+        state = states[index]
+        failed_job = state["job"]
+        started_at = state["started"]
+        exitcode = state["process"].exitcode
+        _stop_worker(state)
+        states[index] = start_worker()
+        commit_result({
+            "status": "ru_failed", "sample_key": failed_job["sample_key"],
+            "entry": _failure_entry(
+                failed_job, "ru_base",
+                failure_code="WORKER_CRASH", exception_type="WorkerDied",
+                exception_message=f"{reason} (exitcode={exitcode})",
+                elapsed_seconds=time.monotonic() - started_at,
+            ),
+        })
+        assign(index)
+
+    for index in range(len(states)):
+        assign(index)
     try:
         while any(state["job"] is not None for state in states):
             progressed = False
-            for index, state in enumerate(states):
+            for index in range(len(states)):
+                state = states[index]
                 if state["job"] is None:
                     continue
                 if state["connection"].poll():
-                    returned, result = pickle.loads(
-                        state["connection"].recv_bytes()
-                    )
+                    try:
+                        returned, result = pickle.loads(
+                            state["connection"].recv_bytes()
+                        )
+                    except (EOFError, OSError):
+                        mark_worker_crash(
+                            index, "worker connection closed unexpectedly"
+                        )
+                        progressed = True
+                        continue
                     if returned != state["job_id"]:
                         raise CacheLifecycleError("worker job identity mismatch")
                     commit_result(result)
-                    assign(state)
+                    assign(index)
                     progressed = True
                     continue
                 if not state["process"].is_alive():
-                    raise CacheLifecycleError(
-                        f"struct worker crashed for "
-                        f"{state['job']['sample_key']}"
-                    )
+                    mark_worker_crash(index, "worker process died unexpectedly")
+                    progressed = True
+                    continue
                 if time.monotonic() - state["started"] >= struct_timeout:
                     timed_out = state["job"]
-                    stop_worker(state)
+                    _stop_worker(state)
                     states[index] = start_worker()
                     if retried.get(timed_out["sample_key"]):
-                        raise CacheLifecycleError(
-                            f"struct job exceeded timeout twice: "
-                            f"{timed_out['sample_key']}"
-                        )
-                    retried[timed_out["sample_key"]] = True
-                    assign(states[index])
+                        # The deterministic retry also hung: this sample is a
+                        # terminal per-sample failure, the build continues.
+                        commit_result({
+                            "status": "ru_failed",
+                            "sample_key": timed_out["sample_key"],
+                            "entry": _failure_entry(
+                                timed_out, "ru_base",
+                                failure_code="TIMEOUT",
+                                exception_type="StructJobTimeout",
+                                exception_message=(
+                                    "struct job exceeded its timeout twice"
+                                ),
+                                elapsed_seconds=struct_timeout,
+                            ),
+                        })
+                    else:
+                        retried[timed_out["sample_key"]] = True
+                        assign(index)
                     progressed = True
             if not progressed:
                 time.sleep(0.01)
+        progress(force=True)
     finally:
         try:
             ru_writer.sync()
@@ -300,8 +503,7 @@ def _run_struct(staging, rows, metadata, workers):
                 except Exception:
                     pass
             for state in states:
-                stop_worker(state)
-    progress(force=True)
+                _stop_worker(state)
     return {"struct_new": processed_new,
             "struct_writer_seconds": writer_seconds}
 
@@ -330,65 +532,100 @@ def _build_struct_one(payload):
 
     Scheduling only: the scientific generators are the same functions the
     serial pilot path used, and the parent remains the single LMDB writer.
+    Under the relaxed failure policy every sample-local Exception is a
+    terminal per-sample failure result (RU or Topology layer); workers never
+    die from Python-level sample exceptions.  KeyboardInterrupt and SystemExit
+    are deliberately not caught.
     """
 
+    started = time.monotonic()
+    key = payload["sample_key"]
+    # Test-only fault injection (integration tests prove the per-sample
+    # failure path).  Inert unless the environment variable is set.
+    fault_key = os.environ.get("MTS_CACHE_FAULT_UNCLASSIFIED_KEY")
+
+    def ru_failure(exc):
+        return {
+            "status": "ru_failed", "sample_key": key,
+            "entry": _failure_entry(
+                payload, "ru_base",
+                failure_code=UNCLASSIFIED,
+                exception_type=type(exc).__name__,
+                exception_message=str(exc),
+                elapsed_seconds=time.monotonic() - started,
+            ),
+            "traceback_text": traceback.format_exc(),
+        }
+
     try:
+        if fault_key and key == fault_key:
+            raise ValueError("unexpected sample-local condition")
         ru = _compute_ru_base_layer(payload["source_smiles"])
-        if not bool(getattr(ru, "ru_base_valid", False)):
-            failure_code = str(getattr(ru, "ru_base_failure_code", "") or "")
-            if failure_code.startswith("RU_BUILD_UNSUPPORTED"):
-                # Builder capability boundary on a canonical, parseable
-                # source: ordinary RU rejection, the build continues.
-                return {
-                    "status": "rejected", "sample_key": payload["sample_key"],
-                    "failure_code": "RU_BUILD_UNSUPPORTED",
-                    "candidate_attempts": 0,
-                    "elapsed_seconds": 0.0,
-                    "round_reached": -1,
-                }
-            return {
-                "status": "contract_error", "sample_key": payload["sample_key"],
-                "error": "source_identity_corruption",
-            }
+    except Exception as exc:
+        return ru_failure(exc)
+    if not bool(getattr(ru, "ru_base_valid", False)):
+        failure_code, exception_type, message = _split_ru_failure_code(
+            getattr(ru, "ru_base_failure_code", "")
+        )
+        return {
+            "status": "ru_failed", "sample_key": key,
+            "entry": _failure_entry(
+                payload, "ru_base",
+                failure_code=failure_code,
+                exception_type=exception_type,
+                exception_message=message,
+                elapsed_seconds=time.monotonic() - started,
+            ),
+        }
+    try:
+        ru_payload = serialize_record(
+            bytes.fromhex(key), select_record_fields("ru_base", ru)
+        )
+    except Exception as exc:
+        return ru_failure(exc)
+    topology_entry = None
+    topology_traceback = None
+    topology_payload = None
+    try:
         topology = _compute_topology_layer_impl(
             payload["source_smiles"], ru, max_hops=int(
                 ROUTE_BUILD_SPECS["topology"]["parameters"]["max_hops"]
             )
         )
-        return {
-            "status": "ok", "sample_key": payload["sample_key"],
-            "ru_payload": serialize_record(
-                bytes.fromhex(payload["sample_key"]),
-                select_record_fields("ru_base", ru),
-            ),
-            "topology_payload": serialize_record(
-                bytes.fromhex(payload["sample_key"]),
-                select_record_fields("topology", topology),
-            ),
-        }
-    except TrimerContractError as exc:
-        return {
-            "status": "contract_error", "sample_key": payload["sample_key"],
-            "error": f"{type(exc).__name__}:{exc}",
-        }
-    except BaseException as exc:
-        return {
-            "status": "program_error", "sample_key": payload["sample_key"],
-            "error": f"{type(exc).__name__}:{exc}",
-        }
+        topology_payload = serialize_record(
+            bytes.fromhex(key), select_record_fields("topology", topology)
+        )
+    except Exception as exc:
+        # A Topology failure never blocks the Trimer layer: both depend only
+        # on the RU record.
+        topology_entry = _failure_entry(
+            payload, "topology",
+            failure_code=UNCLASSIFIED,
+            exception_type=type(exc).__name__,
+            exception_message=str(exc),
+            elapsed_seconds=time.monotonic() - started,
+        )
+        topology_traceback = traceback.format_exc()
+    result = {
+        "status": "ok", "sample_key": key, "ru_payload": ru_payload,
+    }
+    if topology_payload is not None:
+        result["topology_payload"] = topology_payload
+    if topology_entry is not None:
+        result["topology_entry"] = topology_entry
+        result["topology_traceback_text"] = topology_traceback
+    return result
 
 
 def _build_trimer_one(payload):
     started = time.monotonic()
-    # Test-only fault injection (integration tests prove the multi-worker
-    # hard-stop path).  Inert unless the environment variable is set.
-    fault_key = os.environ.get("MTS_CACHE_FAULT_CONTRACT_KEY")
-    if fault_key and payload["sample_key"] == fault_key:
-        return {
-            "status": "contract_error", "sample_key": payload["sample_key"],
-            "error": "test_fault:injected_contract_error",
-        }
+    key = payload["sample_key"]
+    # Test-only fault injection (integration tests prove the per-sample
+    # failure path).  Inert unless the environment variable is set.
+    fault_key = os.environ.get("MTS_CACHE_FAULT_SAMPLE_KEY")
     try:
+        if fault_key and key == fault_key:
+            raise ValueError("unexpected sample-local condition")
         carrier = _trimer_identity_carrier(payload["normalized_smiles"])
         attach_finite_trimer_mcl(
             carrier,
@@ -399,8 +636,8 @@ def _build_trimer_one(payload):
         diagnostics = dict(getattr(carrier, "generation_diagnostics", {}))
         data = select_record_fields("trimer", carrier)
         return {
-            "status": "accepted", "sample_key": payload["sample_key"],
-            "payload": serialize_record(bytes.fromhex(payload["sample_key"]), data),
+            "status": "accepted", "sample_key": key,
+            "payload": serialize_record(bytes.fromhex(key), data),
             "elapsed_seconds": time.monotonic() - started,
             "candidate_attempts": sum(
                 len(row.get("candidates", []))
@@ -410,21 +647,33 @@ def _build_trimer_one(payload):
         }
     except TrimerGeometryRejection as exc:
         return {
-            "status": "rejected", "sample_key": payload["sample_key"],
-            "failure_code": exc.code,
-            "candidate_attempts": int(exc.candidate_attempts),
-            "elapsed_seconds": float(exc.elapsed_seconds),
-            "round_reached": int(exc.round_reached if exc.round_reached is not None else -1),
+            "status": "trimer_failed", "sample_key": key,
+            "entry": _failure_entry(
+                payload, "trimer",
+                failure_code=str(exc.code),
+                exception_type="TrimerGeometryRejection",
+                exception_message=str(exc.last_embed_failure or exc.code),
+                elapsed_seconds=float(exc.elapsed_seconds),
+                candidate_attempts=int(exc.candidate_attempts),
+                round_reached=int(
+                    exc.round_reached if exc.round_reached is not None else -1
+                ),
+            ),
         }
-    except TrimerContractError as exc:
+    except Exception as exc:
+        # Any other sample-local exception (including former contract errors
+        # such as stereo/mapping contradictions) is a terminal per-sample
+        # Trimer failure; the build continues.
         return {
-            "status": "contract_error", "sample_key": payload["sample_key"],
-            "error": f"{type(exc).__name__}:{exc}",
-        }
-    except BaseException as exc:
-        return {
-            "status": "program_error", "sample_key": payload["sample_key"],
-            "error": f"{type(exc).__name__}:{exc}",
+            "status": "trimer_failed", "sample_key": key,
+            "entry": _failure_entry(
+                payload, "trimer",
+                failure_code=UNCLASSIFIED,
+                exception_type=type(exc).__name__,
+                exception_message=str(exc),
+                elapsed_seconds=time.monotonic() - started,
+            ),
+            "traceback_text": traceback.format_exc(),
         }
 
 
@@ -468,11 +717,10 @@ def _stop_worker(state):
 
 def _run_trimer(staging, rows, metadata, workers, interrupt_after):
     writer = StagingWriter(staging / "trimer", metadata["trimer"])
-    rejection_path = staging / "trimer" / "rejections.jsonl"
     runtime_path = staging / "trimer" / "runtime.jsonl"
-    rejection_path.touch(exist_ok=True)
     runtime_path.touch(exist_ok=True)
-    rejections = read_rejections(rejection_path)
+    ledger = _FailureLedger(staging / "trimer")
+    rejections = ledger.rows
     runtime = {}
     if runtime_path.is_file():
         for line in runtime_path.read_text(encoding="utf-8").splitlines():
@@ -489,6 +737,9 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
     if accepted_existing & set(rejections):
         raise CacheLifecycleError("accepted/rejected staging overlap")
     ru_rejections = read_rejections(staging / "ru_base" / "rejections.jsonl")
+    topology_failures = read_rejections(
+        staging / "topology" / "rejections.jsonl"
+    )
     jobs = []
     ru_environment = _raw_artifact(staging / "ru_base")
     try:
@@ -522,14 +773,6 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
         nonlocal processed_new, writer_seconds, last_progress
         key = bytes.fromhex(result["sample_key"])
         status = result["status"]
-        if status == "contract_error":
-            raise TrimerContractError(
-                f"sample_key={result['sample_key']}:{result['error']}"
-            )
-        if status == "program_error":
-            raise CacheLifecycleError(
-                f"sample_key={result['sample_key']}:{result['error']}"
-            )
         if status == "accepted":
             data = deserialize_record(result.pop("payload"), key)
             inserted, payload_bytes, elapsed = writer.put(key, data)
@@ -544,23 +787,20 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
                 "record_bytes": int(payload_bytes),
                 "writer_seconds": float(elapsed),
             }
-        else:
-            rejection = {
-                "sample_key": key.hex(),
-                "failure_code": str(result["failure_code"]),
-                "candidate_attempts": int(result["candidate_attempts"]),
-                "elapsed_seconds": float(result["elapsed_seconds"]),
-                "round_reached": int(result["round_reached"]),
-            }
-            append_jsonl(rejection_path, rejection)
-            rejections[key] = rejection
+        elif status == "trimer_failed":
+            entry = result["entry"]
+            ledger.append(entry, result.get("traceback_text"))
             runtime_row = {
                 "sample_key": key.hex(), "status": "rejected",
-                "elapsed_seconds": float(result["elapsed_seconds"]),
-                "candidate_attempts": int(result["candidate_attempts"]),
-                "round_reached": int(result["round_reached"]),
+                "elapsed_seconds": float(entry["elapsed_seconds"]),
+                "candidate_attempts": int(entry["candidate_attempts"]),
+                "round_reached": int(entry["round_reached"]),
                 "record_bytes": 0, "writer_seconds": 0.0,
             }
+        else:
+            raise CacheLifecycleError(
+                f"unexpected trimer worker status: {status}"
+            )
         if key not in runtime:
             append_jsonl(runtime_path, runtime_row)
             runtime[key] = runtime_row
@@ -571,10 +811,39 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
                 1 for row in runtime.values() if row["status"] == "accepted"
             )
             rejected_now = len(rejections)
+            ru_failed_now = len(ru_rejections)
+            combined = Counter(
+                f"ru_base:{row.get('failure_code', '?')}"
+                for row in ru_rejections.values()
+            )
+            combined.update(
+                f"topology:{row.get('failure_code', '?')}"
+                for row in topology_failures.values()
+            )
+            combined.update(
+                f"trimer:{row.get('failure_code', '?')}"
+                for row in rejections.values()
+            )
             _progress_line(
-                "trimer", len(runtime), len(rows), accepted_now, rejected_now,
-                Counter(row["failure_code"] for row in rejections.values()),
-                started_wall,
+                "trimer", len(runtime), len(rows),
+                {
+                    "ru_success": len(rows) - ru_failed_now,
+                    "ru_failed": ru_failed_now,
+                    "topology_success": (
+                        len(rows) - ru_failed_now - len(topology_failures)
+                    ),
+                    "topology_failed": len(topology_failures),
+                    "skipped_parent_failed": ru_failed_now,
+                    "trimer_success": accepted_now,
+                    "trimer_failed": rejected_now,
+                    "unclassified_sample_failures": sum(
+                        1 for row in list(ru_rejections.values())
+                        + list(topology_failures.values())
+                        + list(rejections.values())
+                        if row.get("failure_code") == UNCLASSIFIED
+                    ),
+                },
+                combined, started_wall, staging,
             )
         if interrupt_after and processed_new >= int(interrupt_after):
             writer.sync()
@@ -604,48 +873,99 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
     iterator = iter(jobs)
     next_job_id = 0
 
-    def assign(state):
+    def assign(index):
         nonlocal next_job_id
+        state = states[index]
         try:
             job = next(iterator)
         except StopIteration:
             state["job"] = None
-            return False
+            return
         next_job_id += 1
         state.update(job=job, job_id=next_job_id, started=time.monotonic())
-        state["connection"].send((next_job_id, job))
-        return True
+        try:
+            state["connection"].send((next_job_id, job))
+        except (EOFError, BrokenPipeError, OSError):
+            # Job never delivered: per-sample worker failure, build continues.
+            _stop_worker(state)
+            states[index] = start_worker()
+            commit_result({
+                "status": "trimer_failed", "sample_key": job["sample_key"],
+                "entry": _failure_entry(
+                    job, "trimer",
+                    failure_code="WORKER_CRASH", exception_type="WorkerDied",
+                    exception_message="IPC send to worker failed",
+                    elapsed_seconds=0.0,
+                ),
+            })
+            assign(index)
 
-    for state in states:
-        assign(state)
+    def mark_worker_crash(index, reason):
+        state = states[index]
+        failed_job = state["job"]
+        started_at = state["started"]
+        exitcode = state["process"].exitcode
+        _stop_worker(state)
+        states[index] = start_worker()
+        commit_result({
+            "status": "trimer_failed", "sample_key": failed_job["sample_key"],
+            "entry": _failure_entry(
+                failed_job, "trimer",
+                failure_code="WORKER_CRASH", exception_type="WorkerDied",
+                exception_message=f"{reason} (exitcode={exitcode})",
+                elapsed_seconds=time.monotonic() - started_at,
+            ),
+        })
+        assign(index)
+
+    for index in range(len(states)):
+        assign(index)
     try:
         while any(state["job"] is not None for state in states):
             progressed = False
-            for index, state in enumerate(states):
+            for index in range(len(states)):
+                state = states[index]
                 if state["job"] is None:
                     continue
                 if state["connection"].poll():
-                    returned, result = pickle.loads(state["connection"].recv_bytes())
+                    try:
+                        returned, result = pickle.loads(
+                            state["connection"].recv_bytes()
+                        )
+                    except (EOFError, OSError):
+                        mark_worker_crash(
+                            index, "worker connection closed unexpectedly"
+                        )
+                        progressed = True
+                        continue
                     if returned != state["job_id"]:
                         raise CacheLifecycleError("worker job identity mismatch")
                     commit_result(result)
-                    assign(state)
+                    assign(index)
                     progressed = True
                     continue
                 if not state["process"].is_alive():
-                    raise CacheLifecycleError(
-                        f"Trimer worker crashed for {state['job']['sample_key']}"
-                    )
+                    mark_worker_crash(index, "worker process died unexpectedly")
+                    progressed = True
+                    continue
                 if time.monotonic() - state["started"] >= hard_timeout:
                     timed_out = state["job"]
                     _stop_worker(state)
                     states[index] = start_worker()
                     commit_result({
-                        "status": "rejected", "sample_key": timed_out["sample_key"],
-                        "failure_code": "TIMEOUT", "candidate_attempts": 0,
-                        "elapsed_seconds": hard_timeout, "round_reached": -1,
+                        "status": "trimer_failed",
+                        "sample_key": timed_out["sample_key"],
+                        "entry": _failure_entry(
+                            timed_out, "trimer",
+                            failure_code="TIMEOUT",
+                            exception_type="SampleTimeout",
+                            exception_message=(
+                                "trimer exceeded the shared hard deadline"
+                            ),
+                            elapsed_seconds=hard_timeout,
+                        ),
                     })
-                    assign(states[index])
+                    assign(index)
                     progressed = True
             if not progressed:
                 time.sleep(0.01)
@@ -769,8 +1089,8 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
     source_keys = [bytes.fromhex(row["sample_key"]) for row in rows]
     source_set = set(source_keys)
 
-    # RU layer: capability-boundary rejections exclude a sample from RU,
-    # Topology and Trimer entirely.
+    # RU layer: per-sample failures exclude a sample from RU, Topology and
+    # Trimer entirely (downstream layers are SKIPPED_PARENT_FAILED).
     ru_rejection_path = staging / "ru_base" / "rejections.jsonl"
     ru_rejection_path.touch(exist_ok=True)
     ru_rejections = read_rejections(ru_rejection_path)
@@ -780,6 +1100,29 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
     ru_accepted = [key for key in source_keys if key not in ru_rejected_set]
     ru_rejected = [key for key in source_keys if key in ru_rejected_set]
     ru_accepted_set = set(ru_accepted)
+
+    # Topology layer: a per-sample failure is terminal for Topology only and
+    # never blocks the Trimer layer (both depend only on the RU record).
+    topology_rejection_path = staging / "topology" / "rejections.jsonl"
+    topology_rejection_path.touch(exist_ok=True)
+    topology_rejections = read_rejections(topology_rejection_path)
+    topo_failed_set = set(topology_rejections)
+    if topo_failed_set - ru_accepted_set:
+        raise CacheAuditError("Topology failure ledger contains foreign keys")
+    topo_env = _raw_artifact(staging / "topology")
+    try:
+        with topo_env.begin(buffers=False) as txn:
+            topo_accepted_set = {bytes(key) for key, _ in txn.cursor()}
+    finally:
+        topo_env.close()
+    if topo_accepted_set & topo_failed_set:
+        raise CacheAuditError("Topology accepted/failed are not disjoint")
+    if topo_accepted_set | topo_failed_set != ru_accepted_set:
+        raise CacheAuditError(
+            "Topology accepted/failed do not cover the RU-accepted cohort"
+        )
+    topo_accepted = [key for key in ru_accepted if key in topo_accepted_set]
+    topo_failed = [key for key in ru_accepted if key in topo_failed_set]
 
     rejection_path = staging / "trimer" / "rejections.jsonl"
     rejections = read_rejections(rejection_path)
@@ -825,7 +1168,7 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
     }
     layer_expected = {
         "ru_base": (source_keys, ru_accepted, ru_rejected, source_keys),
-        "topology": (ru_accepted, ru_accepted, [], []),
+        "topology": (ru_accepted, topo_accepted, topo_failed, ru_accepted),
         "trimer": (ru_accepted, accepted, rejected, ru_accepted),
     }
     for layer in ("ru_base", "topology", "trimer"):
@@ -858,10 +1201,15 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
         manifest["rejected_keys_file_sha256"] = sha256_file(
             staging / layer / "rejected_keys.npy"
         )
-        if layer != "topology":
-            manifest["rejections_file_sha256"] = sha256_file(
+        manifest["rejections_file_sha256"] = sha256_file(
+            staging / layer / "rejections.jsonl"
+        )
+        manifest["unclassified_failure_count"] = sum(
+            1 for row in read_rejections(
                 staging / layer / "rejections.jsonl"
-            )
+            ).values()
+            if row.get("failure_code") == UNCLASSIFIED
+        )
         if layer == "trimer":
             manifest["runtime_file_sha256"] = sha256_file(
                 staging / layer / "runtime.jsonl"
@@ -869,12 +1217,16 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
         manifests[layer] = manifest
 
     # Join audit is independent of generation: exact published Topology and
-    # Trimer records must agree on central atom identity for every accepted key.
+    # Trimer records must agree on central atom identity for every key that
+    # has both records.  A Topology failure removes only the Topology record;
+    # its Trimer record stays valid without a join check.
     topo_env = _raw_artifact(staging / "topology")
     tri_env = _raw_artifact(staging / "trimer")
     try:
         with topo_env.begin() as topo_txn, tri_env.begin() as tri_txn:
             for key in accepted:
+                if key not in topo_accepted_set:
+                    continue
                 topology = deserialize_record(bytes(topo_txn.get(key)), key)
                 trimer = deserialize_record(bytes(tri_txn.get(key)), key)
                 mapping = torch.as_tensor(trimer.mips_to_trimer_central_index).long()
@@ -990,8 +1342,16 @@ def _make_report(cache_root, store, manifests, rejections, staging_existed,
     total_wall = time.monotonic() - build_started
     full_rows = 1_000_000
     ru_manifest = manifests["ru_base"]
+    topo_manifest = manifests["topology"]
     ru_accepted_count = ru_manifest["accepted_count"]
     ru_rejected_count = ru_manifest["rejected_count"]
+    topo_accepted_count = topo_manifest["accepted_count"]
+    topo_failed_count = topo_manifest["rejected_count"]
+    unclassified_failure_count = sum(
+        manifest.get("unclassified_failure_count", 0)
+        for manifest in manifests.values()
+    )
+    bundle_root = trimer_root.parent
     acceptance = accepted_count / source_count
     mean_cpu = float(np.mean(elapsed)) if elapsed else 0.0
     workers = int(phase_stats["workers"])
@@ -1011,15 +1371,29 @@ def _make_report(cache_root, store, manifests, rejections, staging_existed,
         dataset.close()
     zero_write = snapshot_tree(cache_root) == before
     return {
-        "scope": "limited lifecycle pilot; not full-cache validation",
+        "scope": "cache lifecycle build report (per-source-layer terminal accounting)",
         "source_count": source_count,
+        "ru_success_count": ru_accepted_count,
+        "ru_failed_count": ru_rejected_count,
         "ru_accepted_count": ru_accepted_count,
         "ru_rejected_count": ru_rejected_count,
         "ru_rejection_distribution": dict(sorted(Counter(
             row["failure_code"] for row in read_rejections(
-                trimer_root.parent / "ru_base" / "rejections.jsonl"
+                bundle_root / "ru_base" / "rejections.jsonl"
             ).values()).items())),
+        "topology_success_count": topo_accepted_count,
+        "topology_failed_count": topo_failed_count,
+        "topology_skipped_parent_failed": ru_rejected_count,
+        "topology_failure_distribution": failure_distribution(read_rejections(
+            bundle_root / "topology" / "rejections.jsonl")),
+        "trimer_success_count": accepted_count,
+        "trimer_failed_count": rejected_count,
+        "trimer_skipped_parent_failed": ru_rejected_count,
+        "unclassified_failure_count": unclassified_failure_count,
         "p_ru_accepted": ru_accepted_count / source_count,
+        "p_topology_accepted_given_ru": (
+            topo_accepted_count / ru_accepted_count if ru_accepted_count else None
+        ),
         "p_trimer_accepted_given_ru": (
             accepted_count / ru_accepted_count if ru_accepted_count else None
         ),
@@ -1029,6 +1403,7 @@ def _make_report(cache_root, store, manifests, rejections, staging_existed,
         "failure_distribution": failure_distribution(rejections),
         "accounting_ok": (
             source_count == ru_accepted_count + ru_rejected_count
+            and ru_accepted_count == topo_accepted_count + topo_failed_count
             and ru_accepted_count == accepted_count + rejected_count
         ),
         "resume_detected": bool(staging_existed),
@@ -1072,6 +1447,7 @@ def _make_report(cache_root, store, manifests, rejections, staging_existed,
         "full_rebuild_ready": bool(
             zero_write
             and source_count == ru_accepted_count + ru_rejected_count
+            and ru_accepted_count == topo_accepted_count + topo_failed_count
             and ru_accepted_count == accepted_count + rejected_count
             and staging_existed and phase_stats["resume_skipped_terminal"] > 0
         ),

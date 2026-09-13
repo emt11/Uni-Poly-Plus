@@ -878,8 +878,11 @@ def attach_finite_trimer_mcl(
     and never used for selection.
 
     Ordinary geometry failures raise :class:`TrimerGeometryRejection`
-    (the sample is excluded from the geometry-enabled cohort); identity or
-    contract corruption raises :class:`TrimerContractError` (hard stop).
+    (the sample is excluded from the geometry-enabled cohort).  Identity or
+    contract corruption raises :class:`TrimerContractError`.  Under the
+    formal SAMPLE_FAILURE_POLICY the production builder records both as
+    per-sample Trimer failures and continues; only infrastructure failures
+    abort the whole build.
     """
     # The semantic build-spec is the only parameter source for the formal
     # generator.  Legacy keyword overrides are accepted only when they repeat
@@ -932,8 +935,17 @@ def attach_finite_trimer_mcl(
         parameters.get("energy_ranking")
     ):
         raise ValueError("only first_valid/no-energy-ranking Trimer is supported")
-    if parameters.get("failure_policy") != "exclude_geometry_failure":
-        raise ValueError("Trimer geometry failures must be rejected")
+    policy = parameters.get("failure_policy")
+    if not (
+        isinstance(policy, dict)
+        and policy.get("sample_local_exception") == "record_and_continue"
+        and policy.get("parent_failure") == "skip_downstream"
+        and policy.get("system_failure") == "abort"
+    ):
+        raise ValueError(
+            "Trimer sample-local failures must be recorded and the build "
+            "continued (SAMPLE_FAILURE_POLICY)"
+        )
     seed_spec = parameters["seed_policy"]["geometry_seed_spec"]
     if int(seed_spec["repeat_units"]) != 3 or bool(seed_spec["close_periodic"]):
         raise ValueError("Trimer build_spec must describe an open three-RU molecule")

@@ -2,13 +2,13 @@
 
 These prove, on the real multi-worker spawn path:
 
-1. a worker contract error stops dispatch, keeps the staging bundle, and
-   never publishes or touches store.json (hard-stop semantics);
-2. the same command re-run without the fault resumes only the unresolved
-   samples and publishes atomically (terminal resume semantics);
-3. SIGTERM preserves staging without publishing;
-4. the full-source manifest mode counts raw/unique/duplicate/invalid rows
-   explicitly instead of assuming a size.
+1. a sample-local Trimer failure (including former contract errors) is
+   recorded as UNCLASSIFIED_SAMPLE_FAILURE and the build continues and
+   publishes (relaxed per-sample failure policy);
+2. SIGTERM preserves staging without publishing and a re-run resumes;
+3. the full-source manifest mode counts raw/unique/duplicate/invalid rows
+   explicitly instead of assuming a size;
+4. progress lines carry the per-layer accounting fields.
 """
 
 import json
@@ -64,7 +64,7 @@ def _assert_unpublished(cache_root: Path):
     assert not published, "nothing may be published after an aborted build"
 
 
-def test_multi_worker_contract_error_hard_stops_and_resume_publishes(tmp_path):
+def test_trimer_sample_failure_continues_and_publishes(tmp_path):
     from src.dataset.cache_lifecycle import load_source_rows
 
     source_csv = tmp_path / "tiny.csv"
@@ -73,35 +73,38 @@ def test_multi_worker_contract_error_hard_stops_and_resume_publishes(tmp_path):
     fault_key = rows[3]["sample_key"]
     cache_root = tmp_path / "cache"
 
-    first = _run_build(cache_root, source_csv,
-                       env_extra={"MTS_CACHE_FAULT_CONTRACT_KEY": fault_key})
-    assert first.returncode != 0, first.stdout[-2000:]
-    assert "injected_contract_error" in first.stderr + first.stdout
-    _assert_unpublished(cache_root)
-    staging_dirs = list((cache_root / "builds").glob("*.staging"))
-    assert staging_dirs, "staging bundle must be preserved for resume"
-    # the hard stop happened while samples were still unresolved: no
-    # rejection entry may exist for the faulted key
-    rejections = list(staging_dirs[0].glob("trimer/rejections.jsonl"))
-    if rejections[0].stat().st_size:
-        assert fault_key not in rejections[0].read_text(encoding="utf-8")
-
-    second = _run_build(cache_root, source_csv)
-    assert second.returncode == 0, second.stdout[-2000:]
+    result = _run_build(cache_root, source_csv,
+                        env_extra={"MTS_CACHE_FAULT_SAMPLE_KEY": fault_key})
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
     store = json.loads((cache_root / "store.json").read_text(encoding="utf-8"))
+    bundle = cache_root / "builds" / store["bundle_hash"]
     trimer_manifest = json.loads(
-        (cache_root / "builds" / store["bundle_hash"] / "trimer" / "manifest.json")
-        .read_text(encoding="utf-8")
+        (bundle / "trimer" / "manifest.json").read_text(encoding="utf-8")
     )
     assert trimer_manifest["source_count"] == 120
     assert trimer_manifest["source_count"] == (
         trimer_manifest["accepted_count"] + trimer_manifest["rejected_count"]
     )
-    # the faulted sample was processed fresh on resume (accepted or rejected,
-    # never silently dropped)
-    runtime = (cache_root / "builds" / store["bundle_hash"]
-               / "trimer" / "runtime.jsonl").read_text(encoding="utf-8")
+    assert trimer_manifest["rejected_count"] >= 1
+    # the faulted sample has an explicit terminal state, never silently
+    # dropped, and the failure is classified as an unclassified sample failure
+    runtime = (bundle / "trimer" / "runtime.jsonl").read_text(encoding="utf-8")
     assert fault_key in runtime
+    rejections = (bundle / "trimer" / "rejections.jsonl").read_text(
+        encoding="utf-8"
+    )
+    entry = next(
+        json.loads(line) for line in rejections.splitlines()
+        if fault_key in line
+    )
+    assert entry["failure_code"] == "UNCLASSIFIED_SAMPLE_FAILURE"
+    assert entry["exception_type"] == "ValueError"
+    assert entry["layer"] == "trimer"
+    # full traceback stored once in the dedup sidecar
+    tracebacks = (bundle / "trimer" / "failure_tracebacks.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "unexpected sample-local condition" in tracebacks
 
 
 def test_sigterm_preserves_staging_and_resume_publishes(tmp_path):
