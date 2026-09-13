@@ -41,18 +41,31 @@ NUM_BOND_TYPES = 5
 
 
 def _bond_chemistry(smiles: str):
-    """Read chemistry from the same open three-RU RDKit molecule as Trimer."""
+    """Read heavy-atom chemistry from the same open three-RU molecule as Trimer.
+
+    The construction molecule retains source-explicit isotope H (``[2H]``),
+    but the complete-Trimer GLT route is heavy-only: atom identities and
+    bonds are restricted to ``Z > 1`` so an explicit D never enters the 3D
+    graph while the canonical source mapping still carries it.
+    """
 
     molecule, metadata = build_periodic_multimer_mol(
         smiles, num_repeat_units=3, close_periodic=False
     )
     base_count = int(metadata["base_atom_count"])
+    heavy = {
+        index: (index % base_count, index // base_count - 1)
+        for index, atom in enumerate(molecule.GetAtoms())
+        if atom.GetAtomicNum() > 1
+    }
     chemistry = {}
     for bond in molecule.GetBonds():
         a = int(bond.GetBeginAtomIdx())
         b = int(bond.GetEndAtomIdx())
-        state_a = (a % base_count, a // base_count - 1)
-        state_b = (b % base_count, b // base_count - 1)
+        if a not in heavy or b not in heavy:
+            continue
+        state_a = heavy[a]
+        state_b = heavy[b]
         key = tuple(sorted((state_a, state_b)))
         chemistry[key] = {
             "bond_type": bond_type_index(bond),
@@ -61,8 +74,8 @@ def _bond_chemistry(smiles: str):
             "ring": int(bool(bond.IsInRing())),
             "features": bond_feature_vector(bond),
         }
-    identities = {(i % base_count, i // base_count - 1): atom.GetAtomicNum()
-                  for i, atom in enumerate(molecule.GetAtoms())}
+    identities = {state: molecule.GetAtomWithIdx(index).GetAtomicNum()
+                  for index, state in heavy.items()}
     return chemistry, identities
 
 
@@ -165,6 +178,43 @@ def build_complete_trimer_glt_sample(topology, trimer, smiles: str, *, identity=
     mapping = torch.as_tensor(raw_mapping).long().reshape(-1)
     topology_z = torch.as_tensor(raw_topology_z).long().reshape(-1)
 
+    # v9 records retain explicit H.  The existing complete-Trimer GLT route is
+    # intentionally heavy-only, so project the all-atom cache through its
+    # explicit identity table.  Legacy v8 records have no mask and are already
+    # heavy-only.
+    raw_heavy_indices = getattr(trimer, "trimer_heavy_indices", None)
+    if raw_heavy_indices is not None:
+        if (
+            positions.ndim != 2 or positions.size(1) != 3
+            or atomic.ndim != 1 or atomic.numel() != positions.size(0)
+            or base.ndim != 1 or base.numel() != positions.size(0)
+            or offsets.ndim != 1 or offsets.numel() != positions.size(0)
+            or edge.ndim != 2 or edge.size(0) != 2
+            or bond_codes.numel() != edge.size(1)
+            or (edge.numel() and (
+                int(edge.min()) < 0 or int(edge.max()) >= positions.size(0)
+            ))
+        ):
+            return empty_complete_trimer_row("trimer_identity_invalid")
+        heavy_indices = torch.as_tensor(raw_heavy_indices).long().reshape(-1)
+        if (
+            heavy_indices.numel() == 0
+            or torch.unique(heavy_indices).numel() != heavy_indices.numel()
+            or int(heavy_indices.min()) < 0
+            or int(heavy_indices.max()) >= positions.size(0)
+            or not bool((atomic[heavy_indices] > 1).all())
+        ):
+            return empty_complete_trimer_row("trimer_heavy_identity_invalid")
+        inverse = torch.full((positions.size(0),), -1, dtype=torch.long)
+        inverse[heavy_indices] = torch.arange(heavy_indices.numel())
+        keep = (inverse[edge[0]] >= 0) & (inverse[edge[1]] >= 0)
+        edge = inverse[edge[:, keep]]
+        bond_codes = bond_codes[keep]
+        positions = positions[heavy_indices]
+        atomic = atomic[heavy_indices]
+        base = base[heavy_indices]
+        offsets = offsets[heavy_indices]
+
     if (
         positions.ndim != 2 or positions.size(1) != 3
         or not bool(torch.isfinite(positions).all())
@@ -186,11 +236,17 @@ def build_complete_trimer_glt_sample(topology, trimer, smiles: str, *, identity=
         return empty_complete_trimer_row("real_bond_graph_invalid")
 
     base_to_canonical = {}
+    heavy_canonical_ids = []
     for canonical_id, base_id in enumerate(mapping.tolist()):
         base_id = int(base_id)
         if base_id in base_to_canonical:
             return empty_complete_trimer_row("canonical_base_duplicate")
         base_to_canonical[base_id] = int(canonical_id)
+        if int(topology_z[canonical_id]) <= 1:
+            # Canonical identity includes explicit isotope H; the heavy-only
+            # projection deliberately has no central state for it.
+            continue
+        heavy_canonical_ids.append(canonical_id)
         state = torch.nonzero(
             (base == base_id) & (offsets == 0), as_tuple=False
         ).flatten()
@@ -214,7 +270,9 @@ def build_complete_trimer_glt_sample(topology, trimer, smiles: str, *, identity=
     identities = list(zip(base.tolist(), offsets.tolist()))
     if len(identities) != len(expected_atoms) or set(identities) != set(expected_atoms):
         return empty_complete_trimer_row("physical_atom_identity_mismatch")
-    if set(mapping.tolist()) != {i for i, q in expected_atoms if q == 0}:
+    if {mapping.tolist()[canonical_id] for canonical_id in heavy_canonical_ids} != {
+        i for i, q in expected_atoms if q == 0
+    }:
         return empty_complete_trimer_row("canonical_base_coverage_mismatch")
     if any(int(atomic[i]) != expected_atoms[key] for i, key in enumerate(identities)):
         return empty_complete_trimer_row("physical_element_mismatch")

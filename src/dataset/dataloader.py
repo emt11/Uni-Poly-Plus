@@ -537,7 +537,9 @@ def mips_trimer_collate(data_list):
             trimer_edges.append(item.trimer_edge_index.long() + trimer_offset_global)
             trimer_bonds.append(item.trimer_bond_type.long())
             base_name = "trimer_base_ru_atom_id" if hasattr(item, "trimer_base_ru_atom_id") else "trimer_base_ru_atom_index"
-            trimer_base.append(getattr(item, base_name).long() + canonical_offset - canonical_count)
+            base_ids = getattr(item, base_name).long().clone()
+            base_ids[base_ids >= 0] += canonical_offset - canonical_count
+            trimer_base.append(base_ids)
             trimer_offset.append(item.trimer_ru_offset.long())
             trimer_central.append(item.trimer_central_ru_mask.bool())
             trimer_central_index.append(item.trimer_central_atom_index.long() + trimer_offset_global)

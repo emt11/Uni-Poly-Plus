@@ -384,6 +384,56 @@ def test_schema_failure_closes_both_layers(monkeypatch):
     assert closed == ['first', 'second']
 
 
+def test_trimer_lmdb_and_content_schema_must_be_consistently_bound(monkeypatch):
+    from src.dataset import lmdb_cache
+    from src.dataset.mips_trimer_contract import (
+        TOPOLOGY_LMDB_SCHEMA, TRIMER_LMDB_SCHEMA,
+    )
+    closed = []
+
+    class FakeStore:
+        def __init__(self, path):
+            self.path = path
+            self.schema = (
+                TOPOLOGY_LMDB_SCHEMA if path == 'topology' else TRIMER_LMDB_SCHEMA
+            )
+            self.meta = {
+                'trimer_content_schema': 'mips-trimer-scage-trimer-v8'
+            }
+
+        def close(self):
+            closed.append(self.path)
+
+    monkeypatch.setattr(lmdb_cache, 'LmdbLayerStore', FakeStore)
+    with pytest.raises(ValueError, match='schema binding'):
+        FrozenDualLayerSource('topology', 'trimer', [])
+    assert closed == ['topology', 'trimer']
+
+
+def test_legacy_v6_trimer_is_explicitly_read_only_compatible(monkeypatch):
+    from src.dataset import lmdb_cache
+    from src.dataset.mips_trimer_contract import (
+        LEGACY_TRIMER_CONTENT_SCHEMA, LEGACY_TRIMER_LMDB_SCHEMA,
+        TOPOLOGY_LMDB_SCHEMA,
+    )
+
+    class FakeStore:
+        def __init__(self, path):
+            self.schema = (
+                TOPOLOGY_LMDB_SCHEMA
+                if path == 'topology' else LEGACY_TRIMER_LMDB_SCHEMA
+            )
+            self.meta = {'trimer_content_schema': LEGACY_TRIMER_CONTENT_SCHEMA}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(lmdb_cache, 'LmdbLayerStore', FakeStore)
+    source = FrozenDualLayerSource('topology', 'trimer', [])
+    assert len(source) == 0
+    source.close()
+
+
 def test_close_attempts_both_layers():
     calls = []
     class Store:

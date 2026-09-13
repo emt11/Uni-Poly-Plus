@@ -25,6 +25,7 @@ from src.dataset.mips_cache_validation import validate_mcl_record
 from src.dataset.mips_trimer_contract import (
     BUILDER_VERSION,
     FEATURE_SCHEMA,
+    LEGACY_TRIMER_CONTENT_SCHEMA,
     MIGRATION_SCHEMA,
     TARGET_CONTRACT_SCHEMA,
     TOPOLOGY_LMDB_SCHEMA,
@@ -337,13 +338,20 @@ def _validate_trimer_record(topology, trimer, normalized=None):
         fallback_2d = bool(torch.as_tensor(getattr(trimer, "trimer_2d_fallback", False)).reshape(-1)[0].item())
         pos_value = getattr(trimer, "trimer_pos", None)
         pos = torch.as_tensor(pos_value) if pos_value is not None else None
-        if str(getattr(trimer, "trimer_mcl_schema", TRIMER_CONTENT_SCHEMA)) != TRIMER_CONTENT_SCHEMA:
+        content_schema = str(
+            getattr(trimer, "trimer_mcl_schema", TRIMER_CONTENT_SCHEMA)
+        )
+        supported_content = {
+            TRIMER_CONTENT_SCHEMA: TRIMER_SCHEMA_VERSION,
+            LEGACY_TRIMER_CONTENT_SCHEMA: 8,
+        }
+        if content_schema not in supported_content:
             failures.append("trimer_mcl_schema")
         try:
             version = int(torch.as_tensor(getattr(trimer, "trimer_mcl_schema_version", TRIMER_SCHEMA_VERSION)).reshape(-1)[0])
         except (TypeError, ValueError, RuntimeError, IndexError):
             version = -1
-        if version != TRIMER_SCHEMA_VERSION:
+        if version != supported_content.get(content_schema):
             failures.append("trimer_mcl_schema_version")
         if not graph_available:
             if geometry_valid or is_3d or fallback_2d:
@@ -352,13 +360,19 @@ def _validate_trimer_record(topology, trimer, normalized=None):
                 failures.append("graph_unavailable_nonfinite_coordinates")
             return failures
         expected_rows = 3 * n
+        is_all_atom = content_schema == TRIMER_CONTENT_SCHEMA
+        atomic = torch.as_tensor(
+            getattr(trimer, "trimer_atomic_number", []), dtype=torch.long
+        ).reshape(-1)
+        atom_count = int(atomic.numel())
+        identity_rows = atom_count if is_all_atom else expected_rows
         mapping = torch.as_tensor(getattr(trimer, "mips_to_trimer_central_index", []), dtype=torch.long).reshape(-1)
         central_mask = torch.as_tensor(getattr(trimer, "trimer_central_ru_mask", []), dtype=torch.bool).reshape(-1)
         if not (
             mapping.numel() == n
-            and central_mask.numel() == expected_rows
+            and central_mask.numel() == identity_rows
             and bool((mapping >= 0).all())
-            and bool((mapping < expected_rows).all())
+            and bool((mapping < identity_rows).all())
             and bool(central_mask[mapping].all())
         ):
             failures.append("trimer_mapping")
@@ -366,26 +380,50 @@ def _validate_trimer_record(topology, trimer, normalized=None):
             if fallback_2d:
                 failures.append("invalid_geometry_2d_fallback")
             return failures
-        if pos is None or pos.ndim != 2 or tuple(pos.shape) != (expected_rows, 3):
+        if pos is None or pos.ndim != 2 or tuple(pos.shape) != (identity_rows, 3):
             failures.append("trimer_pos_shape")
         elif not bool(torch.isfinite(pos).all()):
             failures.append("trimer_nonfinite_coordinates")
         if not is_3d or fallback_2d:
             failures.append("trimer_geometry_flags")
-        atomic = torch.as_tensor(getattr(trimer, "trimer_atomic_number", []), dtype=torch.long).reshape(-1)
         offsets = torch.as_tensor(getattr(trimer, "trimer_ru_offset", []), dtype=torch.long).reshape(-1)
         base = torch.as_tensor(getattr(trimer, "trimer_base_ru_atom_id", []), dtype=torch.long).reshape(-1)
         central_mask = torch.as_tensor(getattr(trimer, "trimer_central_ru_mask", []), dtype=torch.bool).reshape(-1)
         edge = torch.as_tensor(getattr(trimer, "trimer_edge_index", []), dtype=torch.long)
         bond = torch.as_tensor(getattr(trimer, "trimer_bond_type", []), dtype=torch.long).reshape(-1)
         bond_aromatic = torch.as_tensor(getattr(trimer, "trimer_bond_aromatic", []), dtype=torch.bool).reshape(-1)
-        if atomic.numel() != expected_rows:
+        if atomic.numel() != identity_rows:
             failures.append("trimer_atomic_shape")
-        if offsets.tolist() != ([-1] * n + [0] * n + [1] * n):
+        if is_all_atom:
+            heavy_indices = torch.as_tensor(
+                getattr(trimer, "trimer_heavy_indices", []), dtype=torch.long
+            ).reshape(-1)
+            heavy_mask = torch.as_tensor(
+                getattr(trimer, "trimer_heavy_mask", []), dtype=torch.bool
+            ).reshape(-1)
+            expected_heavy_indices = torch.nonzero(
+                atomic > 1, as_tuple=False
+            ).flatten()
+            if (
+                heavy_mask.numel() != identity_rows
+                or not torch.equal(heavy_indices, expected_heavy_indices)
+                or not torch.equal(heavy_mask, atomic > 1)
+            ):
+                failures.append("trimer_heavy_identity")
+                heavy_indices = torch.arange(
+                    min(expected_rows, identity_rows), dtype=torch.long
+                )
+        else:
+            heavy_indices = torch.arange(expected_rows, dtype=torch.long)
+        heavy_atomic = atomic[heavy_indices] if heavy_indices.numel() == expected_rows else torch.empty(0, dtype=torch.long)
+        heavy_offsets = offsets[heavy_indices] if offsets.numel() == identity_rows and heavy_indices.numel() == expected_rows else torch.empty(0, dtype=torch.long)
+        heavy_base = base[heavy_indices] if base.numel() == identity_rows and heavy_indices.numel() == expected_rows else torch.empty(0, dtype=torch.long)
+        heavy_central = central_mask[heavy_indices] if central_mask.numel() == identity_rows and heavy_indices.numel() == expected_rows else torch.empty(0, dtype=torch.bool)
+        if heavy_offsets.tolist() != ([-1] * n + [0] * n + [1] * n):
             failures.append("trimer_offsets")
-        if base.tolist() != list(range(n)) * 3:
+        if heavy_base.tolist() != list(range(n)) * 3:
             failures.append("trimer_base_ids")
-        if central_mask.numel() != expected_rows or central_mask.tolist() != ([False] * n + [True] * n + [False] * n):
+        if heavy_central.tolist() != ([False] * n + [True] * n + [False] * n):
             failures.append("trimer_central_mask")
         if edge.ndim != 2 or edge.size(0) != 2:
             failures.append("trimer_edge_shape")
@@ -394,23 +432,38 @@ def _validate_trimer_record(topology, trimer, normalized=None):
                 failures.append("edge_count_bond_type_count")
             if bond_aromatic.numel() != bond.numel():
                 failures.append("trimer_bond_aromatic_missing")
-            if edge.numel() and (int(edge.min()) < 0 or int(edge.max()) >= expected_rows):
+            if edge.numel() and (int(edge.min()) < 0 or int(edge.max()) >= identity_rows):
                 failures.append("trimer_edge_endpoint")
         canonical_z = torch.as_tensor(getattr(topology, "z", []), dtype=torch.long).reshape(-1)
-        if canonical_z.numel() == n and atomic.numel() == expected_rows and not torch.equal(atomic, canonical_z.repeat(3)):
+        if canonical_z.numel() == n and heavy_atomic.numel() == expected_rows and not torch.equal(heavy_atomic, canonical_z.repeat(3)):
             failures.append("trimer_atomic_identity")
         quality = validate_mcl_record(topology, trimer)
         if quality["mcl_valid"] and not failures:
-            for name in ("formal_charge", "is_aromatic", "chiral_tag", "attachment_role", "internal_degree"):
+            identity_names = [
+                "formal_charge", "is_aromatic", "chiral_tag", "attachment_role"
+            ]
+            if not is_all_atom:
+                identity_names.append("internal_degree")
+            for name in identity_names:
                 observed = torch.as_tensor(getattr(trimer, f"trimer_{name}", [])).reshape(-1)
-                if observed.numel() != expected_rows:
+                if observed.numel() != identity_rows:
                     failures.append(f"trimer_identity_{name}")
                     continue
+                observed = observed[heavy_indices]
                 if not (torch.equal(observed[:n], observed[n:2 * n]) and torch.equal(observed[n:2 * n], observed[2 * n:])):
                     failures.append(f"trimer_identity_{name}")
             expected_edges, edge_failures = _expected_trimer_edges_from_topology(topology, n)
             failures.extend(edge_failures)
             if expected_edges is not None and edge.ndim == 2:
+                if is_all_atom:
+                    inverse = torch.full((identity_rows,), -1, dtype=torch.long)
+                    inverse[heavy_indices] = torch.arange(expected_rows)
+                    keep = (inverse[edge[0]] >= 0) & (inverse[edge[1]] >= 0)
+                    edge = torch.stack(
+                        (inverse[edge[0, keep]], inverse[edge[1, keep]])
+                    )
+                    bond = bond[keep]
+                    bond_aromatic = bond_aromatic[keep]
                 observed_edges = defaultdict(list)
                 for column in range(edge.size(1)):
                     left, right = int(edge[0, column]), int(edge[1, column])

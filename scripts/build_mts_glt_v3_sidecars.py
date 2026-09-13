@@ -67,7 +67,7 @@ def dataset_for_build(args):
         mips_core="paper_corrected", mips_max_hops=2,
         mips_use_descriptors=False, mips_descriptor_protocol="source_star_sub",
         spatial_mode="trimer_scage", graph_geometry_mode="trimer_scage_mcl",
-        topology_representation="canonical_lifted", trimer_num_candidates=4,
+        topology_representation="canonical_lifted", trimer_num_candidates=8,
         trimer_max_heavy_atoms=384, modalities=("graph",),
         experiment_id="mts_glt_v3_sidecar_build", feature_config_hash="manual",
     )

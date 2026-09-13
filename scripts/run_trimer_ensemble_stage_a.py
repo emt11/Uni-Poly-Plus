@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build only the bounded 16/256 Stage-A multi-conformer pilot cache."""
+"""Historical v8 ensemble pilot tool (retired; reports remain immutable)."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from src.dataset.graph_data import build_periodic_multimer_mol
 from src.dataset.lmdb_cache import LmdbLayerStore, LmdbLayerWriter, sample_key_from_smiles
 from src.dataset.trimer_mcl import (
     TrimerContractError, attach_finite_trimer_mcl,
-    audit_double_bond_stereo_coordinates, fixed_identity_rmsd, iter_conformers,
+    audit_double_bond_stereo_coordinates,
 )
 
 SCHEMA = "mts-trimer-ensemble-stage-a"
@@ -292,6 +292,10 @@ def _report(root, rows):
 
 def main():
     args = _arguments()
+    raise RuntimeError(
+        "retired v8 ensemble command: it is incompatible with the active "
+        "single-conformer all-atom v9 contract and must not write new caches"
+    )
     correctness, pilot = _selection(args.source)
     root = Path(args.output_root)
     if args.phase == "correctness16":

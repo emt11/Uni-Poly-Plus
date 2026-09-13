@@ -212,13 +212,29 @@ class FrozenDualLayerSource(Dataset):
     """
     def __init__(self, topology_root, trimer_root, samples):
         from .lmdb_cache import LmdbLayerStore, sample_key_from_smiles
-        from .mips_trimer_contract import TOPOLOGY_LMDB_SCHEMA, TRIMER_LMDB_SCHEMA
+        from .mips_trimer_contract import (
+            LEGACY_TRIMER_CONTENT_SCHEMA, LEGACY_TRIMER_LMDB_SCHEMA,
+            SUPPORTED_TRIMER_LMDB_SCHEMAS, TOPOLOGY_LMDB_SCHEMA,
+            TRIMER_CONTENT_SCHEMA, TRIMER_LMDB_SCHEMA,
+        )
         self.topology = self.trimer = None
         try:
             self.topology = LmdbLayerStore(topology_root)
             self.trimer = LmdbLayerStore(trimer_root)
-            if self.topology.schema != TOPOLOGY_LMDB_SCHEMA or self.trimer.schema != TRIMER_LMDB_SCHEMA:
-                raise ValueError('frozen layers do not have current topology/Trimer semantics')
+            if (
+                self.topology.schema != TOPOLOGY_LMDB_SCHEMA
+                or self.trimer.schema not in SUPPORTED_TRIMER_LMDB_SCHEMAS
+            ):
+                raise ValueError('frozen layers do not have supported topology/Trimer semantics')
+            expected_content = {
+                TRIMER_LMDB_SCHEMA: TRIMER_CONTENT_SCHEMA,
+                LEGACY_TRIMER_LMDB_SCHEMA: LEGACY_TRIMER_CONTENT_SCHEMA,
+            }[self.trimer.schema]
+            observed_content = self.trimer.meta.get('trimer_content_schema')
+            if observed_content != expected_content:
+                raise ValueError(
+                    'Trimer LMDB schema/content schema binding is inconsistent'
+                )
             self.samples = list(samples)
             for key, smiles in self.samples:
                 if bytes(key) != sample_key_from_smiles(smiles):

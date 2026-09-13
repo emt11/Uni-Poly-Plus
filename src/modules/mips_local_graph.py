@@ -257,7 +257,7 @@ class MIPSLocalGraphEncoder(nn.Module):
         use_descriptors=True,
         spatial_mode="trimer_scage",
         graph_geometry_mode="trimer_scage_mcl",
-        trimer_num_candidates=4,
+        trimer_num_candidates=8,
         trimer_max_heavy_atoms=384,
         variant="O8",
         atom_feature_mode="mips137",
@@ -333,8 +333,10 @@ class MIPSLocalGraphEncoder(nn.Module):
             raise ValueError("retired O8 topology options are not supported")
         if abs(float(dropout) - 0.10) > 1e-12:
             raise ValueError("dropout must be 0.10")
-        if int(trimer_num_candidates) != 4 or int(trimer_max_heavy_atoms) != 384:
-            raise ValueError("Trimer contract requires 4 candidates/384 atoms")
+        if int(trimer_num_candidates) != 8 or int(trimer_max_heavy_atoms) != 384:
+            raise ValueError(
+                "Trimer contract requires 8 candidates per round/384 config sentinel"
+            )
         topology_attention_variant = str(topology_attention_variant)
         if topology_attention_variant != "o8":
             raise ValueError("MTS-GLT-v2 requires topology_attention_variant='o8'")

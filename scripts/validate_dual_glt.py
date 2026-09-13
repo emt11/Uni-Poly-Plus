@@ -23,6 +23,7 @@ from src.dataset.glt_dual import FrozenDualLayerSource, DualGLTDataset, dual_glt
 from src.dataset.graph_data import build_periodic_multimer_mol
 from src.dataset.glt_bond_chemistry import bond_feature_vector
 from src.dataset.canonical_periodic import resolve_normalized_identity
+from src.dataset.trimer_mcl import audit_tetrahedral_stereo_coordinates
 
 
 def check_result(status, reason='', **details):
@@ -476,21 +477,46 @@ def audit_record(topology, trimer, smiles):
     if not row['geometry_valid']:
         checks['stereo_coordinates'] = check_result('NOT_RUN', 'invalid frozen identity/geometry')
         return report
+    frozen_positions = torch.as_tensor(trimer.trimer_pos).double()
+    frozen_atomic = torch.as_tensor(trimer.trimer_atomic_number, dtype=torch.long)
     base = getattr(trimer, 'trimer_base_ru_atom_id', None)
     if base is None:
         base = trimer.trimer_base_ru_atom_index
-    identities = [(int(b), int(q)) for b, q in zip(base, trimer.trimer_ru_offset)]
-    expected = {(i, q) for i in range(size) for q in (-1, 0, 1)}
+    base = torch.as_tensor(base, dtype=torch.long)
+    offsets = torch.as_tensor(trimer.trimer_ru_offset, dtype=torch.long)
+    heavy_indices = getattr(trimer, 'trimer_heavy_indices', None)
+    if heavy_indices is not None:
+        heavy_indices = torch.as_tensor(heavy_indices, dtype=torch.long).reshape(-1)
+        frozen_positions = frozen_positions[heavy_indices]
+        frozen_atomic = frozen_atomic[heavy_indices]
+        base = base[heavy_indices]
+        offsets = offsets[heavy_indices]
+    identities = [(int(b), int(q)) for b, q in zip(base, offsets)]
+    # v10 records project away source-explicit isotope H (Z==1); the expected
+    # heavy state set is therefore derived from the construction molecule's
+    # heavy atoms, not from all source atoms.
+    heavy_expected = {
+        (base_id, q)
+        for q, unit in enumerate(meta['unit_atoms'])
+        for base_id, atom_index in enumerate(unit)
+        if mol.GetAtomWithIdx(atom_index).GetAtomicNum() > 1
+    }
+    expected = {(base_id, q - 1) for base_id, q in heavy_expected}
     if len(identities) != len(expected) or set(identities) != expected:
         checks['identity'] = check_result('ANOMALY', 'physical atom identities are not a bijection')
         checks['stereo_coordinates'] = check_result('NOT_RUN', 'invalid identity')
         return report
     lookup = {identity: i for i, identity in enumerate(identities)}
     def point(i):
-        return trimer.trimer_pos[lookup[i % size, i // size - 1]].double()
+        return frozen_positions[lookup[i % size, i // size - 1]]
+    heavy_mol_atoms = {
+        atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1
+    }
     for atom in mol.GetAtoms():
+        if atom.GetIdx() not in heavy_mol_atoms:
+            continue
         i = atom.GetIdx()
-        if int(trimer.trimer_atomic_number[lookup[i % size, i // size - 1]]) != atom.GetAtomicNum():
+        if int(frozen_atomic[lookup[i % size, i // size - 1]]) != atom.GetAtomicNum():
             checks['identity'] = check_result('ANOMALY', 'physical element mismatch')
             checks['stereo_coordinates'] = check_result('NOT_RUN', 'invalid identity')
             return report
@@ -501,7 +527,7 @@ def audit_record(topology, trimer, smiles):
         for center, partner in ((i, j), (j, i)):
             for neighbor in mol.GetAtomWithIdx(center).GetNeighbors():
                 k = neighbor.GetIdx()
-                if k == partner:
+                if k == partner or k not in heavy_mol_atoms:
                     continue
                 u, v = point(k) - point(center), point(partner) - point(center)
                 denominator = float(u.norm() * v.norm())
@@ -517,10 +543,15 @@ def audit_record(topology, trimer, smiles):
     )
     if checks['source_stereo']['status'] == 'PASS':
         try:
-            count = audit_frozen_stereo(
-                trimer, smiles, topology=topology, identity=identity
+            counts = audit_frozen_stereo(
+                trimer, smiles, topology=topology, identity=identity,
+                return_details=True,
             )
-            checks['stereo_coordinates'] = check_result('PASS' if count else 'NOT_APPLICABLE', checked_bonds=count)
+            checks['stereo_coordinates'] = check_result(
+                'PASS' if counts['total'] else 'NOT_APPLICABLE',
+                checked_bonds=counts['double_bonds'],
+                checked_tetrahedral_centers=counts['tetrahedral_centers'],
+            )
         except ValueError as exc:
             checks['stereo_coordinates'] = check_result('ANOMALY', str(exc))
     try:
@@ -532,7 +563,9 @@ def audit_record(topology, trimer, smiles):
     return report
 
 
-def audit_frozen_stereo(trimer, smiles, *, topology=None, identity=None):
+def audit_frozen_stereo(
+    trimer, smiles, *, topology=None, identity=None, return_details=False
+):
     """Check every retained specified E/Z copy against frozen coordinates.
 
     The chemical graph is rebuilt from the normalized identity, while the
@@ -579,8 +612,30 @@ def audit_frozen_stereo(trimer, smiles, *, topology=None, identity=None):
         or atomic.numel() != positions.size(0)
     ):
         raise ValueError('frozen Trimer identity/coordinates have invalid shape')
+    heavy_indices = getattr(trimer, 'trimer_heavy_indices', None)
+    tetrahedral_retained = 0
+    if heavy_indices is not None:
+        heavy_indices = torch.as_tensor(heavy_indices, dtype=torch.long).reshape(-1)
+        if (
+            heavy_indices.numel() == 0
+            or torch.unique(heavy_indices).numel() != heavy_indices.numel()
+            or int(heavy_indices.min()) < 0
+            or int(heavy_indices.max()) >= positions.size(0)
+            or not bool((atomic[heavy_indices] > 1).all())
+        ):
+            raise ValueError('frozen Trimer heavy identity is invalid')
+        positions = positions[heavy_indices]
+        base = base[heavy_indices]
+        offsets = offsets[heavy_indices]
+        atomic = atomic[heavy_indices]
     size = int(meta['base_atom_count'])
-    expected_states = {(base_id, q) for q in (-1, 0, 1) for base_id in range(size)}
+    heavy_base_ids = {
+        base_id
+        for unit in meta['unit_atoms']
+        for base_id, atom_index in enumerate(unit)
+        if mol.GetAtomWithIdx(atom_index).GetAtomicNum() > 1
+    }
+    expected_states = {(base_id, q) for q in (-1, 0, 1) for base_id in heavy_base_ids}
     states = {(int(base_id), int(q)) for base_id, q in zip(base, offsets)}
     if states != expected_states or len(states) != positions.size(0):
         raise ValueError('frozen Trimer physical identities are not a bijection')
@@ -661,19 +716,76 @@ def audit_frozen_stereo(trimer, smiles, *, topology=None, identity=None):
             f'{len(failures)} frozen stereo coordinate checks failed; '
             + '; '.join(failures[:8])
         )
-    return retained
+    if heavy_indices is not None:
+        all_atom = Chem.AddHs(Chem.Mol(mol))
+        raw_atom_ids = torch.as_tensor(
+            getattr(trimer, 'trimer_atom_id', []), dtype=torch.long
+        ).reshape(-1)
+        expected_atomic = torch.tensor(
+            [atom.GetAtomicNum() for atom in all_atom.GetAtoms()], dtype=torch.long
+        )
+        raw_atomic = torch.as_tensor(
+            trimer.trimer_atomic_number, dtype=torch.long
+        ).reshape(-1)
+        raw_positions = torch.as_tensor(trimer.trimer_pos).double()
+        if (
+            raw_positions.size(0) != all_atom.GetNumAtoms()
+            or raw_atom_ids.tolist() != list(range(all_atom.GetNumAtoms()))
+            or not torch.equal(raw_atomic, expected_atomic)
+        ):
+            raise ValueError(
+                'all-atom frozen identity does not match independent normalized Trimer'
+            )
+        try:
+            tetrahedral_retained = audit_tetrahedral_stereo_coordinates(
+                all_atom, raw_positions
+            )
+        except RuntimeError as exc:
+            raise ValueError(f'frozen tetrahedral stereo audit failed: {exc}') from exc
+    if return_details:
+        return {
+            'double_bonds': retained,
+            'tetrahedral_centers': tetrahedral_retained,
+            'total': retained + tetrahedral_retained,
+        }
+    return retained + tetrahedral_retained
 
 
 def renumber_frozen(topology, trimer, smiles):
     changed = copy.deepcopy(trimer)
     order = torch.arange(trimer.trimer_pos.size(0) - 1, -1, -1)
     inverse = torch.argsort(order)
-    for name in ('trimer_pos', 'trimer_atomic_number', 'trimer_base_ru_atom_id',
-                 'trimer_base_ru_atom_index', 'trimer_ru_offset'):
+    for name in (
+        'trimer_pos', 'trimer_atomic_number', 'trimer_atomic_numbers',
+        'trimer_base_ru_atom_id', 'trimer_base_ru_atom_index',
+        'trimer_ru_offset', 'trimer_central_ru_mask', 'trimer_heavy_mask',
+        'trimer_formal_charge', 'trimer_is_aromatic', 'trimer_chiral_tag',
+        'trimer_attachment_role', 'trimer_internal_degree',
+        'trimer_isotope', 'is_source_atom', 'is_source_explicit_h',
+        'is_added_h',
+    ):
         value = getattr(trimer, name, None)
         if value is not None:
             setattr(changed, name, value[order])
     changed.trimer_edge_index = inverse[trimer.trimer_edge_index]
+    if hasattr(trimer, 'trimer_bonds'):
+        changed.trimer_bonds = inverse[trimer.trimer_bonds]
+    for name in (
+        'mips_to_trimer_central_index', 'canonical_to_trimer_central_index',
+        'o8_to_trimer_atom', 'trimer_central_atom_index',
+        'trimer_central_ru_atom_index', 'trimer_heavy_indices',
+        'o8_heavy_indices',
+    ):
+        value = getattr(trimer, name, None)
+        if value is not None:
+            setattr(changed, name, inverse[value])
+    if hasattr(trimer, 'h_parent_heavy_index'):
+        parent = trimer.h_parent_heavy_index[order].clone()
+        present = parent >= 0
+        parent[present] = inverse[parent[present]]
+        changed.h_parent_heavy_index = parent
+    if hasattr(trimer, 'trimer_atom_id'):
+        changed.trimer_atom_id = torch.arange(order.numel(), dtype=torch.long)
     return build_dual_sample(topology, changed, smiles)
 
 
@@ -792,8 +904,13 @@ def main():
         centers = torch.bincount(batch.bond_batch[batch.bond_center], minlength=len(records))
         if not batch.geometry_valid.all() or not (centers > 0).any():
             raise RuntimeError('model smoke needs at least one valid graph with center bonds')
-        checked = sum(entry['checks']['stereo_coordinates'].get('checked_bonds', 0)
-                      for entry in report['samples'])
+        checked = sum(
+            entry['checks']['stereo_coordinates'].get('checked_bonds', 0)
+            + entry['checks']['stereo_coordinates'].get(
+                'checked_tetrahedral_centers', 0
+            )
+            for entry in report['samples']
+        )
         renumbered = dual_glt_collate([renumber_frozen(*record) for record in records])
         if not renumbered.geometry_valid.all():
             raise RuntimeError('renumbering invalidated real geometry')

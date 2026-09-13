@@ -798,3 +798,67 @@ RDKit ETKDG，未调用 `Compute2DCoords`，0 conformer 被正常分类为 gener
 fallback pilot：`Stereo-correct RU initial geometry assembly → full Trimer → whole-Trimer
 MMFF94 relaxation`；本轮没有实现。Stage B、全量缓存、模型 forward/backward、预训练
 和微调均未启动。
+
+## 2026-09-13：完整 Trimer 单构象显式氢协议（已实现，未重建缓存）
+
+当前正式离线生成已替换 2026-09-12 的 v8 四构象 ensemble 协议。历史 Stage A/A2
+结果和缓存仍作为只读记录保留，但对应两个脚本已显式退役，不能再写入新缓存。新
+Trimer content/LMDB schema 分别为 `mips-trimer-scage-trimer-v9` 和
+`mips-trimer-scage-trimer-lmdb-v7`；冻结读取入口可显式读取 v7 或历史 v6，二者不会
+被当作同一内容 schema。生产写入和完整冻结验收只接受当前 v7。
+
+v9 对开放 finite heavy Trimer 完成原子、三 RU 内部键、两条跨 RU 键及 O8 canonical
+映射检查后执行 `AddHs`，并在 embedding 前检查 MMFF94 参数支持。每轮固定请求最多
+8 个 ETKDGv3 候选，全部采用 `useRandomCoords=True`、`enforceChirality=True`、
+`maxIterations=200`、单线程及关闭 RMSD pruning。首轮会处理完所有返回候选；只在
+首轮最终有效候选为 0 时使用由 identity 和 round id 派生的新确定性 seed 再执行一轮，
+总预算最多 16 个。每个候选依次检查 MMFF 前有限坐标及已声明 Stereo、MMFF94 最多
+200 steps、有限能量与坐标、float64 Stereo、转为 float32 后 Stereo。明确双键
+E/Z/cis/trans 与明确四面体 `@/@@` 均审计，未声明 Stereo 不推断。
+
+成功轮次优先在已收敛候选中选择最终有限 MMFF94 能量最低者；完全没有已收敛候选
+时才允许选择通过其余检查的最低有限能量候选，并记录 `selected_converged=False`。
+这只是有限步局部松弛选择，不代表全局最低能构象。最终只保存
+`trimer_pos[N_all,3]`，同时保存显式 H、全原子物理键、唯一 atom id、RU offset、
+heavy mask/index、H parent 和独立的 O8-to-heavy mapping；不存在 K=1 伪 ensemble、
+Kabsch/RMSD 去重或为补足目标数而追加轮次。无法可靠区分同一 parent 上等价的
+terminal-cap H，因此本 schema 没有写入可疑的 `terminal_cap_mask`。
+
+普通的 MMFF unsupported、bounded embedding/stereo/finite failure 写成完整空
+placeholder，并保留失败分类与逐轮诊断；identity、bond、Stereo reference contract
+错误及未知程序异常仍为 fatal。显式氢记录进入既有 heavy-only complete-GLT 时，必须
+通过 `trimer_heavy_indices` 投影，不能把 H 当作 O8/bond-path token；其他全原子 Trimer
+消费路径保留 H。
+
+本轮局部回归实际执行：
+`PYTHONPATH=.:tests pytest -q tests/test_trimer_mmff_acceptance.py tests/test_complete_trimer_glt.py tests/test_dual_glt_audit.py tests/test_mips_lmdb_cache.py tests/test_mts_canonical_full_validation.py -x`，
+结果为 `101 passed, 6 warnings`（新增 source→Trimer→冻结坐标的 3 个明确四面体
+副本回归后，相关文件单独复跑为 `19 passed, 1 warning`）。另执行显式氢 mixed-batch sentinel、两种 heavy-only
+投影及 v6/v7 schema binding 的 4 项定向用例，结果为 `4 passed, 1 warning`（其中
+complete-GLT 投影和 schema 两项也包含在上述 100 项中）。覆盖两轮触发、整轮筛选、收敛优先、MMFF unsupported、
+显式氢身份/键/H-parent、失败 placeholder、E/Z 与四面体正确/镜像/重编号/未声明、LMDB
+round-trip、heavy-only GLT 投影及历史 v8 record validation。本轮未运行真实记录 pilot、
+全量缓存重建、模型、预训练或微调；因此没有新成功率、吞吐或模型可用性结论。
+
+## 2026-09-13：Trimer v9 真实 300-record pilot（第 54 条硬阻断）
+
+按 deterministic selection 启动了 300 条 CPU pilot，使用历史 Stage-A deterministic
+256 条加 44 条 downstream hash-ranked 唯一真实记录。当前 `data/raw` 没有真实
+`@/@@` P-SMILES，因此 tetra-only 与 double+tetra 分层实际为 0，未用人工样本补足。
+任务运行在 `tmux Uni-Poly:trimer_v9_pilot`，日志为
+`logs/trimer_v9_pilot_20260913.run.log`。
+
+前 53 条完成后，第 54 条真实 PI1M 记录
+`*CC(*)(C)C(=O)OCC([2H])(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F`
+触发 `TRIMER_CONTRACT_ERROR: o8_base_identity_contains_non_heavy_atom`，任务按合同错误
+停止，exit code 1，未写 `PILOT_COMPLETE`。原因是 canonical Topology/O8 当前把显式
+氘 `[2H]` 作为非 dummy base node，而 v9 又要求 pre-AddHs base 全为 `Z>1` 且 O8
+mapping 只落在 heavy mask；两者无法同时成立。PI1M 中约 12,806 行含显式同位素 H
+表达，不应降级为普通 geometry failure 或静默删除。
+
+部分结果仅覆盖前 53 条：50 成功、1 MMFF unsupported、2 条两轮均 0 embedded；
+MMFF eligible 中 Round-0 为 50/52，retry 0/2 恢复。部分报告为
+`logs/trimer_v9_pilot_20260913/pilot_partial_report.md`。这些数值不可外推为 300 条
+success rate；候选 Parquet、完整 Stereo/retry/旧几何比较均未完成。当前决策为
+“3. 当前存在必须先修复的问题”，在 explicit isotope-H 的 O8/base/heavy identity
+定义确认前，不继续 pilot，不进入全量缓存重建。

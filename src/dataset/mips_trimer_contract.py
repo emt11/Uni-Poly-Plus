@@ -13,8 +13,20 @@ LEGACY_FEATURE_SCHEMA = "mips-trimer-scage-feature-v4"
 # canonical periodic topology contract.  Keep these as single-source
 # constants: changing a builder or config independently would make a cache
 # appear reusable while its mapping semantics had changed.
-TRIMER_CONTENT_SCHEMA = "mips-trimer-scage-trimer-v8"
-TRIMER_LMDB_SCHEMA = "mips-trimer-scage-trimer-lmdb-v6"
+LEGACY_TRIMER_CONTENT_SCHEMA = "mips-trimer-scage-trimer-v8"
+LEGACY_TRIMER_LMDB_SCHEMA = "mips-trimer-scage-trimer-lmdb-v6"
+# v9 allowed explicit H in the all-atom payload but still assumed
+# base == heavy; v10 decouples source/base identity (which may contain
+# explicit isotope H) from the Z>1 heavy subset.  The serialized mapping
+# semantics changed, so the content and LMDB schema names move together.
+OBSOLETE_TRIMER_CONTENT_SCHEMA = "mips-trimer-scage-trimer-v9"
+OBSOLETE_TRIMER_LMDB_SCHEMA = "mips-trimer-scage-trimer-lmdb-v7"
+TRIMER_CONTENT_SCHEMA = "mips-trimer-scage-trimer-v10"
+TRIMER_LMDB_SCHEMA = "mips-trimer-scage-trimer-lmdb-v8"
+SUPPORTED_TRIMER_LMDB_SCHEMAS = (
+    TRIMER_LMDB_SCHEMA,
+    LEGACY_TRIMER_LMDB_SCHEMA,
+)
 CACHE_LAYOUT_SCHEMA = "mips-trimer-scage-lmdb-layout-v2"
 CHECKPOINT_SCHEMA = "mts-model-v3"
 # Historical cache-migration checkpoints keep the v3 identity above.  Fresh
@@ -42,14 +54,14 @@ CANONICAL_CHECKPOINT_SCHEMA = CHECKPOINT_SCHEMA
 CANONICAL_PERIODIC_TOPOLOGY_SCHEMA = TOPOLOGY_LMDB_SCHEMA
 MTS_CANONICAL_PERIODIC_FEATURE_SCHEMA = FEATURE_SCHEMA
 MTS_CANONICAL_PERIODIC_TOPOLOGY_LMDB_SCHEMA = TOPOLOGY_LMDB_SCHEMA
-TRIMER_SCHEMA_VERSION = 8
+TRIMER_SCHEMA_VERSION = 10
 TRIMER_BUILDER_VERSION = BUILDER_VERSION
-TRIMER_PROTOCOL = "etkdgv3x4-mmff94-relax200-lowest-finite-v1"
+TRIMER_PROTOCOL = "etkdgv3-randomcoords-8x2-mmff94-allatom-lowest-finite-v2"
 TRIMER_MMFF_VARIANT = "MMFF94"
 TRIMER_MMFF_RELAX_MAX_ITERATIONS = 200
 TRIMER_REQUIRE_MMFF_CONVERGENCE = False
-TRIMER_ACCEPTANCE = "finite_3d_coordinates_and_finite_mmff_energy"
-TRIMER_SELECTION = "lowest_finite_post_relaxation_energy"
+TRIMER_ACCEPTANCE = "declared_stereo_correct_finite_all_atom_coordinates_and_finite_mmff_energy"
+TRIMER_SELECTION = "converged_first_then_lowest_finite_post_relaxation_energy"
 
 # Public route/stage identity.  The underscore form remains the stable Python
 # backend selector for compatibility with Dataset/model internals; user-facing
@@ -152,7 +164,7 @@ def validate_runtime_args(args) -> None:
         "graph_geometry_mode": "trimer_scage_mcl",
         "mips_fusion_mode": "none",
         "projection_mode": "plain",
-        "trimer_num_candidates": 4,
+        "trimer_num_candidates": 8,
         "trimer_max_heavy_atoms": 384,
     }
     for name, expected in fixed.items():

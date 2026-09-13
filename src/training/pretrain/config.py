@@ -175,7 +175,7 @@ def _apply_glt_v2_config(args, config_path):
     args.spatial_mode = "trimer_scage"
     args.graph_geometry_mode = "trimer_scage_mcl"
     args.topology_representation = "canonical_lifted"
-    args.trimer_num_candidates = 4
+    args.trimer_num_candidates = 8
     args.trimer_max_heavy_atoms = 384
     args.mips_variant = "O8"
     args.finite_variant = "none"
@@ -260,7 +260,7 @@ def _apply_glt_v3_config(args, path, payload):
     args.mips_use_descriptors, args.mips_descriptor_protocol = True, "source_star_sub"
     args.spatial_mode, args.graph_geometry_mode = "trimer_scage", "trimer_scage_mcl"
     args.topology_representation = "canonical_lifted"
-    args.trimer_num_candidates, args.trimer_max_heavy_atoms = 4, 384
+    args.trimer_num_candidates, args.trimer_max_heavy_atoms = 8, 384
     args.mips_variant, args.finite_variant = "O8", "none"
     args.conformer_mode, args.field_layout, args.field_channels = "none", "none", "none"
     args.modalities, args.max_grad_norm = ["graph"], 1.0
@@ -370,7 +370,7 @@ def _apply_nomd_config(args, path, payload):
     args.mips_use_descriptors, args.mips_descriptor_protocol = True, "source_star_sub"
     args.spatial_mode, args.graph_geometry_mode = "trimer_scage", "trimer_scage_mcl"
     args.topology_representation = "canonical_lifted"
-    args.trimer_num_candidates, args.trimer_max_heavy_atoms = 4, 384
+    args.trimer_num_candidates, args.trimer_max_heavy_atoms = 8, 384
     args.mips_variant, args.finite_variant = "O8", "none"
     args.conformer_mode, args.field_layout, args.field_channels = "none", "none", "none"
     args.modalities, args.max_grad_norm = ["graph"], 1.0

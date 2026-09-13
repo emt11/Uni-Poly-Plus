@@ -10,6 +10,8 @@ from rdkit import Chem
 from torch_geometric.data import Data
 
 from src.dataset.graph_data import build_periodic_multimer_mol
+from src.dataset.dataset import _compute_ru_base_layer, _compute_topology_layer
+from src.dataset.trimer_mcl import attach_finite_trimer_mcl
 from src.dataset.dataloader import mips_trimer_collate
 from src.dataset.periodic_line_glt_complete import (
     BOND_FEATURE_DIM,
@@ -107,6 +109,24 @@ def test_complete_row_contains_all_physical_bonds_and_features():
     assert row["tokens"]["token_bond_features"].shape == (5, BOND_FEATURE_DIM)
     assert np.isfinite(row["tokens"]["token_distance"]).all()
     assert row["relations"]["relation_source"].size > 0
+
+
+def test_explicit_h_cache_projects_to_legacy_heavy_only_glt_semantics():
+    smiles = "*CC*"
+    ru = _compute_ru_base_layer(smiles)
+    topology = _compute_topology_layer(smiles, ru, max_hops=2)
+    topology.smiles = smiles
+    trimer = attach_finite_trimer_mcl(
+        topology.clone(), smiles, num_candidates=1, max_rounds=1,
+        sample_key="all-atom-complete-glt",
+    )
+    assert trimer.trimer_geometry_valid
+    assert trimer.trimer_pos.size(0) > trimer.trimer_heavy_indices.numel()
+    row = build_complete_trimer_glt_sample(topology, trimer, smiles)
+    assert row["geometry_valid"]
+    assert len(row["tokens"]["token_atom_a"]) == 5
+    assert 1 not in row["tokens"]["token_endpoint_z_a"]
+    assert 1 not in row["tokens"]["token_endpoint_z_b"]
 
 
 def test_bond_feature_order_ring_and_unknown_stereo_are_distinct():

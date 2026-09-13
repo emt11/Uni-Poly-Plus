@@ -129,7 +129,7 @@ def _build_dataset() -> UniDataset:
         spatial_mode="trimer_scage",
         graph_geometry_mode="trimer_scage_mcl",
         topology_representation="canonical_lifted",
-        trimer_num_candidates=4,
+        trimer_num_candidates=8,
         trimer_max_heavy_atoms=384,
         mips_variant="O8",
         modalities=("graph",),

@@ -141,6 +141,43 @@ def _prepare_trimer(trimer, topology=None):
         or bond.ndim != 1 or bond.numel() != edge.size(1)
     ):
         return None, "mapping_invalid"
+    # Legacy v8 records carry no heavy table and are already heavy-only;
+    # their canonical mapping doubles as the heavy mapping.
+    heavy_mapping = mapping
+    raw_heavy_indices = getattr(trimer, "trimer_heavy_indices", None)
+    if raw_heavy_indices is not None:
+        if edge.numel() and (
+            int(edge.min()) < 0 or int(edge.max()) >= positions.size(0)
+        ):
+            return None, "real_bond_graph_invalid"
+        heavy_indices = torch.as_tensor(
+            raw_heavy_indices, dtype=torch.long
+        ).reshape(-1)
+        if (
+            heavy_indices.numel() == 0
+            or torch.unique(heavy_indices).numel() != heavy_indices.numel()
+            or int(heavy_indices.min()) < 0
+            or int(heavy_indices.max()) >= positions.size(0)
+            or not bool((atomic[heavy_indices] > 1).all())
+        ):
+            return None, "trimer_heavy_identity_invalid"
+        inverse = torch.full((positions.size(0),), -1, dtype=torch.long)
+        inverse[heavy_indices] = torch.arange(heavy_indices.numel())
+        # v10 records may map a canonical node to an explicit isotope H
+        # (Z==1).  The heavy-only projection excludes those nodes: their
+        # compact target is -1 by design, while every heavy canonical node
+        # must still resolve into the projected heavy graph.
+        heavy_mapping = inverse[mapping]
+        if bool(((heavy_mapping < 0) & (atomic[mapping] > 1)).any()):
+            return None, "canonical_trimer_mapping_mismatch"
+        keep = (inverse[edge[0]] >= 0) & (inverse[edge[1]] >= 0)
+        edge = inverse[edge[:, keep]]
+        bond = bond[keep]
+        positions = positions[heavy_indices]
+        atomic = atomic[heavy_indices]
+        base = base[heavy_indices]
+        offsets = offsets[heavy_indices]
+        central = central[heavy_indices]
     state_to_local = {}
     for index in range(int(positions.size(0))):
         state = (int(base[index]), int(offsets[index]))
@@ -158,7 +195,13 @@ def _prepare_trimer(trimer, topology=None):
         for canonical_id in range(int(topology_z.numel())):
             base_id = int(canonical_to_trimer[canonical_id])
             local = state_to_local.get((base_id, 0))
-            if local is None or int(mapping[canonical_id]) != int(local):
+            if int(topology_z[canonical_id]) <= 1:
+                # Canonical identity includes explicit isotope H, but the
+                # heavy-only 3D projection must not contain it.
+                if local is not None:
+                    return None, "canonical_trimer_mapping_mismatch"
+                continue
+            if local is None or int(heavy_mapping[canonical_id]) != int(local):
                 return None, "canonical_trimer_mapping_mismatch"
             if int(atomic[local]) != int(topology_z[canonical_id]):
                 return None, "canonical_trimer_atomic_mismatch"

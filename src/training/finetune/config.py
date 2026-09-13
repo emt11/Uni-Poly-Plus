@@ -113,7 +113,7 @@ def parse_arguments(argv=None):
     parser.add_argument("--spatial_mode", choices=["trimer_scage"], default="trimer_scage")
     parser.add_argument("--graph_geometry_mode", choices=["trimer_scage_mcl"], default="trimer_scage_mcl")
     parser.add_argument("--topology_representation", choices=["canonical_lifted"], default="canonical_lifted")
-    parser.add_argument("--trimer_num_candidates", type=int, choices=[4], default=4)
+    parser.add_argument("--trimer_num_candidates", type=int, choices=[8], default=8)
     parser.add_argument("--trimer_max_heavy_atoms", type=int, choices=[384], default=384)
     parser.add_argument("--star_rbf_upper", type=float, default=3.0)
     parser.add_argument("--periodic_line_glt_sidecar", default=None)

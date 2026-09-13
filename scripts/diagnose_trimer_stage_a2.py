@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage A2 diagnostics for the frozen 256-record Trimer ensemble pilot."""
+"""Historical v8 Stage-A2 ensemble diagnostic (retired)."""
 
 from __future__ import annotations
 
@@ -31,12 +31,9 @@ from src.dataset.trimer_mcl import (
     _calculate_mmff_energy,
     _conformer_coordinates_are_finite_3d,
     _coordinates,
-    _deduplicate,
-    _EnsembleCandidate,
     _round_seed,
     attach_finite_trimer_mcl,
     audit_double_bond_stereo_coordinates,
-    fixed_identity_rmsd,
 )
 
 
@@ -371,6 +368,10 @@ def choose_probes(failures, count):
 
 def main():
     args = parse_args()
+    raise RuntimeError(
+        "retired v8 ensemble diagnostic: it is incompatible with the active "
+        "single-conformer all-atom v9 contract"
+    )
     pilot_root = Path(args.pilot_root)
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=False)

@@ -75,3 +75,10 @@ def test_o8_invalid_geometry_keeps_finite_exact_path():
         graph, nodes = encoder(batch)
     assert torch.equal(graph, torch.zeros_like(graph))
     assert torch.equal(nodes, torch.zeros_like(nodes))
+
+
+def test_explicit_h_base_identity_sentinel_survives_mixed_batch_offsets():
+    batch = mips_trimer_collate([_sample("*CCO*"), _sample("*CO*")])
+    hydrogen = batch.trimer_atomic_number == 1
+    assert bool(hydrogen.any())
+    assert bool((batch.trimer_base_ru_atom_id[hydrogen] == -1).all())

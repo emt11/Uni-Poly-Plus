@@ -87,7 +87,7 @@ def build_task_dataset(task):
         mips_core="paper_corrected", mips_max_hops=2,
         mips_use_descriptors=True, mips_descriptor_protocol="source_star_sub",
         spatial_mode="trimer_scage", graph_geometry_mode="trimer_scage_mcl",
-        topology_representation="canonical_lifted", trimer_num_candidates=4,
+        topology_representation="canonical_lifted", trimer_num_candidates=8,
         trimer_max_heavy_atoms=384, mips_variant="O8",
         finite_variant="none", conformer_mode="none", field_layout="none",
         field_channels="none", experiment_id="mts_c0_transfer_optimization",

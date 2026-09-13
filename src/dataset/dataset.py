@@ -74,8 +74,6 @@ from .diagnostics import (
 )
 from .trimer_mcl import (
     TRIMER_ETKDG_MAX_ITERATIONS,
-    TRIMER_ETKDG_RETRY_CANDIDATES,
-    TRIMER_ETKDG_RETRY_MAX_ITERATIONS,
     TRIMER_ETKDG_TIMEOUT_SECONDS,
     TRIMER_MCL_BUILDER_VERSION,
     TRIMER_MCL_PROTOCOL,
@@ -358,12 +356,22 @@ def _split_mips_feature_layers(data):
         "smiles", "input_ids_smiles", "attention_mask_smiles", "fp",
     }
     trimer_names = {
-        "trimer_pos", "trimer_atomic_number", "trimer_edge_index",
-        "trimer_bond_type", "trimer_base_ru_atom_id", "trimer_base_ru_atom_index",
+        "trimer_pos", "trimer_atomic_number", "trimer_atomic_numbers",
+        "trimer_atom_id", "trimer_edge_index", "trimer_bond_type",
+        "trimer_bond_aromatic",
+        "trimer_formal_charge", "trimer_is_aromatic", "trimer_chiral_tag",
+        "trimer_attachment_role", "trimer_internal_degree",
+        "trimer_bonds", "trimer_bond_types",
+        "trimer_base_ru_atom_id", "trimer_base_ru_atom_index",
         "trimer_ru_offset",
         "trimer_central_ru_mask", "trimer_central_atom_index",
         "trimer_central_ru_atom_index",
         "canonical_to_trimer_central_index", "mips_to_trimer_central_index",
+        "o8_to_trimer_atom", "o8_heavy_mask", "o8_heavy_indices",
+        "trimer_heavy_mask", "trimer_heavy_indices",
+        "trimer_isotope", "trimer_source_atom_count",
+        "is_source_atom", "is_source_explicit_h", "is_added_h",
+        "h_parent_heavy_index",
         "trimer_geometry_valid",
         "trimer_geometry_is_3d", "trimer_2d_fallback",
         "trimer_geometry_source",
@@ -374,9 +382,8 @@ def _split_mips_feature_layers(data):
         "migration_status", "source_trimer_content_hash",
         "source_trimer_done_hash", "trimer_mapping_digest",
         "geometry_payload_digest", "regeneration_reason",
-        "conformer_positions", "conformer_energies",
-        "conformer_round_ids", "conformer_candidate_ids",
-        "num_conformers", "target_conformers", "target_met",
+        "trimer_conformer_round_id", "trimer_conformer_candidate_id",
+        "selected_converged",
         "search_stop_reason", "generation_diagnostics", "multi_conformer",
     }
     layers = {
@@ -1310,7 +1317,7 @@ def _compute_smiles_features_from_config(
     field_channels="none",
     graph_geometry_mode="trimer_scage_mcl",
     topology_representation=TOPOLOGY_CANONICAL,
-    trimer_num_candidates=4,
+    trimer_num_candidates=8,
     trimer_max_heavy_atoms=384,
 ):
     if str(graph_encoder_type).lower() == "scage":
@@ -1471,12 +1478,22 @@ def _compute_smiles_features_from_config(
 
 
 _LMDB_TRIMER_FIELDS = {
-    "trimer_pos", "trimer_atomic_number", "trimer_edge_index",
-    "trimer_bond_type", "trimer_base_ru_atom_id", "trimer_base_ru_atom_index",
+    "trimer_pos", "trimer_atomic_number", "trimer_atomic_numbers",
+    "trimer_atom_id", "trimer_edge_index", "trimer_bond_type",
+    "trimer_bond_aromatic",
+    "trimer_formal_charge", "trimer_is_aromatic", "trimer_chiral_tag",
+    "trimer_attachment_role", "trimer_internal_degree",
+    "trimer_bonds", "trimer_bond_types",
+    "trimer_base_ru_atom_id", "trimer_base_ru_atom_index",
     "trimer_ru_offset",
     "trimer_central_ru_mask", "trimer_central_atom_index",
     "trimer_central_ru_atom_index",
     "canonical_to_trimer_central_index", "mips_to_trimer_central_index",
+    "o8_to_trimer_atom", "o8_heavy_mask", "o8_heavy_indices",
+    "trimer_heavy_mask", "trimer_heavy_indices",
+    "trimer_isotope", "trimer_source_atom_count",
+    "is_source_atom", "is_source_explicit_h", "is_added_h",
+    "h_parent_heavy_index",
     "trimer_geometry_valid",
     "trimer_geometry_is_3d", "trimer_2d_fallback",
     "trimer_geometry_source", "trimer_failure_code",
@@ -1487,9 +1504,8 @@ _LMDB_TRIMER_FIELDS = {
     "migration_status", "source_trimer_content_hash",
     "source_trimer_done_hash", "trimer_mapping_digest",
     "geometry_payload_digest", "regeneration_reason",
-    "conformer_positions", "conformer_energies",
-    "conformer_round_ids", "conformer_candidate_ids",
-    "num_conformers", "target_conformers", "target_met",
+    "trimer_conformer_round_id", "trimer_conformer_candidate_id",
+    "selected_converged",
     "search_stop_reason", "generation_diagnostics", "multi_conformer",
 }
 
@@ -1808,7 +1824,7 @@ def _compute_trimer_layer(
     ru_base,
     topology,
     *,
-    num_candidates=4,
+    num_candidates=8,
     max_heavy_atoms=384,
     force_unavailable=None,
 ):
@@ -1898,7 +1914,7 @@ def _compute_lmdb_layers_worker(payload):
             smiles,
             ru_base,
             topology,
-            num_candidates=payload.get("trimer_num_candidates", 4),
+            num_candidates=payload.get("trimer_num_candidates", 8),
             max_heavy_atoms=payload.get("trimer_max_heavy_atoms", 384),
             force_unavailable=payload.get("force_trimer_unavailable"),
         )
@@ -2099,7 +2115,7 @@ class UniDataset(Dataset):
         field_channels='none',
         graph_geometry_mode='trimer_scage_mcl',
         topology_representation=TOPOLOGY_CANONICAL,
-        trimer_num_candidates=4,
+        trimer_num_candidates=8,
         trimer_max_heavy_atoms=384,
         modalities=None,
         experiment_id='manual',
@@ -2249,8 +2265,8 @@ class UniDataset(Dataset):
         if self.graph_geometry_mode == "trimer_scage_mcl":
             if self.graph_encoder_type != "mips_trimer_scage":
                 raise ValueError("Trimer geometry is only valid for the MTS-GLT-v2 route")
-            if self.trimer_num_candidates != 4:
-                raise ValueError("MTS-GLT-v2 Trimer requires 4 candidates")
+            if self.trimer_num_candidates != 8:
+                raise ValueError("MTS-GLT-v2 Trimer requires 8 candidates per round")
             if self.trimer_max_heavy_atoms != 384:
                 raise ValueError("MTS-GLT-v2 Trimer requires max 384 heavy atoms")
         self.mips_variant = "O8"
@@ -3622,11 +3638,11 @@ class UniDataset(Dataset):
                 False if self.graph_geometry_mode == "trimer_scage_mcl" else None
             ),
             "trimer_acceptance": (
-                "finite_3d_coordinates_and_finite_mmff_energy"
+                "declared_stereo_correct_finite_all_atom_coordinates_and_finite_mmff_energy"
                 if self.graph_geometry_mode == "trimer_scage_mcl" else None
             ),
             "trimer_selection": (
-                "lowest_finite_post_relaxation_energy"
+                "converged_first_then_lowest_finite_post_relaxation_energy"
                 if self.graph_geometry_mode == "trimer_scage_mcl" else None
             ),
             "trimer_num_candidates": (
@@ -3714,24 +3730,21 @@ class UniDataset(Dataset):
                 "outer_attachment_cap": "implicit_h_via_AddHs",
                 "num_candidates": self.trimer_num_candidates,
                 "builder_version": TRIMER_MCL_BUILDER_VERSION,
-                "etkdg_use_random_coords": False,
+                "etkdg_use_random_coords": True,
                 "etkdg_max_iterations": TRIMER_ETKDG_MAX_ITERATIONS,
                 "etkdg_timeout_seconds": TRIMER_ETKDG_TIMEOUT_SECONDS,
-                "etkdg_failure_retry": {
-                    "num_candidates": TRIMER_ETKDG_RETRY_CANDIDATES,
-                    "use_random_coords": True,
-                    "max_iterations": TRIMER_ETKDG_RETRY_MAX_ITERATIONS,
-                },
+                "max_rounds": 2,
                 "optimizer": "MMFF94",
                 "mmff_relax_max_iterations": TRIMER_MMFF_RELAX_MAX_ITERATIONS,
-                "conformer_selection": "lowest-finite-mmff-energy",
+                "conformer_selection": "converged-first-lowest-finite-mmff-energy",
+                "coordinate_payload": "single-conformer-explicit-all-atom",
                 "worker_hard_timeout_seconds": self.feature_cache_item_timeout,
                 "allow_2d_for_mcl": False,
                 "max_heavy_atoms": self.trimer_max_heavy_atoms,
                 "large_molecule_policy": (
-                    "rdkit_2d_diagnostic_mcl_star3d_disabled"
+                    "attempt_randomcoords_without_atom_count_rejection"
                 ),
-                "seed_rule": "sha256_schema_smiles_int31",
+                "seed_rule": "sha256_schema_identity_round_int31",
             }
         specs = {}
         for name, config in configs.items():
