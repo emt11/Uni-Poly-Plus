@@ -68,6 +68,21 @@ canonical atom mean + MD200 + graph adapter + regression head
 
 上述缓存均为只读输入。GLT-v2 在运行时从保留的 line sidecar 计算 observation moments、identity self relations 和 canonical atom incidence，不重写缓存。缓存的 `.done`、manifest、LMDB 元数据和固定 split 必须存在且匹配；发现不匹配时停止启动。
 
+### 2.1 缓存工程原则（2026-09-13 重构后生效）
+
+正式缓存工程只回答三个问题：这个 sample 是谁（canonical sample key）、这份 artifact 是怎么构建的（build_spec_hash）、它现在是否可以安全读取（`.frozen`）。**本项目缓存工程不使用人工版本号**（schema/builder/protocol/revision/generation 等一律不作为缓存身份、兼容性、目录选择或生命周期依据）。
+
+1. canonical key 决定 sample identity：RDKit canonical P-SMILES → SHA256，同一分子跨 fold/task 只有一份 topology/Trimer 记录；
+2. build_spec/hash 决定 artifact identity：真实算法参数的 canonical JSON 的 SHA256；参数变化 → hash 自然变化；fold/split 永远不进入 build_spec；
+3. whole-dataset preprocessing once：全量数据离线构建一次，所有 fold/task 通过 index/key 选择复用，fold 不产生独立缓存；
+4. frozen cache，training read only：正式训练只经 `store.json` → `.frozen` artifact → readonly LMDB 按 key 读取；cache miss、未冻结、无绑定一律报错，绝不在训练路径在线重建、修复或迁移；
+5. identity corruption hard fail：sample identity 不匹配、topology↔trimer join 错误、O8 映射越界/不指向中心 RU、required fields 缺失，直接 raise 停止；
+6. geometry failure placeholder + fallback：ETKDG/MMFF/超时等普通几何失败记为 `geometry_valid=False` 的显式占位记录并继续，不停整库。
+
+代码实现参考 MIPS 官方 GitHub（`github.com/wjxts/MIPS`）的 whole-dataset caching（`vemol/dataset/mol_graph_dataset.py::smiles2graphs` 的 `total_graphs → use_idxs` 思路）、index-based split reuse（`get_use_idxs`）、LMDB random access 与 read-only training data path（`init_on_disk_dataset`/`get_data_item_on_disk` 的 `readonly, lock=False, readahead=False` 模式与 SHA256 key）；本项目保留 canonical P-SMILES 身份（不用 MIPS 的 exact raw SMILES key）并继续使用多层 LMDB（不引入 MIPS 的小数据 `graph.pt` 路径）。
+
+入口：`scripts/create_cache_store.py`（离线注册冻结 artifact → `data/processed/mips_trimer_scage/store.json`，唯一 active-artifact 入口）；读取实现在 `src/dataset/cache_spec.py` 与 `src/dataset/frozen_store.py`；正式训练路径（`finetune/engine`、`pretrain/glt_distill_engine`、`c0_transfer`、W-CAMR runtimes）均要求 `require_frozen_store`。历史 artifact 目录原地保留；当前注册结果：ru_base/topology/md200 与当前路线 build_spec 一致，trimer 现存冻结 artifact（4 候选 v6 协议）与当前路线（8 候选显式氢 v10 协议）build_spec 不匹配，正式训练该层保持阻断，待明确授权后按新流程重建。
+
 ## 3. O8 输入
 
 数据缓存继续保存 `mips_x=[N,137]` 与 `mips_backbone_mask=[N]`，其中前者的

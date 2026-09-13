@@ -348,6 +348,7 @@ def run_finetune_job(config=None, task=None, seed=None, fold=None):
             cache_layers=args.cache_layers,
             cache_validate=args.cache_validate,
             cache_commit_size=args.cache_commit_size,
+            require_frozen_store=True,
             embed_tries_multiplier=args.embed_tries_multiplier,
             conformer_3d_count=args.conformer_3d_count,
             conformer_keep_count=args.conformer_keep_count,

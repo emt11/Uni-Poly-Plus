@@ -279,6 +279,7 @@ def _dataset(config):
         _apply_nomd_config(args, Path(config["config_path"]), config)
         kwargs = dataset_kwargs_from_args(args)
         kwargs["periodic_line_glt_sidecar"] = None
+        kwargs["require_frozen_store"] = True
         # ``cache_layers`` is explicitly topology-only for this route.  It
         # therefore never opens or materialises a descriptor/geometry sidecar.
         return UniDataset(**kwargs)
@@ -298,6 +299,7 @@ def _dataset(config):
     }
     args = _apply_glt_v3_config(args, Path(config["config_path"]), template)
     kwargs = dataset_kwargs_from_args(args)
+    kwargs["require_frozen_store"] = True
     if config["version"] == "none":
         kwargs["periodic_line_glt_sidecar"] = None
     return DatasetWithMD200(UniDataset(**kwargs), config["md200_sidecar_root"])

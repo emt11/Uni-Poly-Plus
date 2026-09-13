@@ -991,9 +991,14 @@ def _upgrade_cohort_manifest_integrity(
 
 
 def build_or_load_cohort(
-    cache_root, dataset_name, source_csv, *, load_text=True, verify_integrity=True
+    cache_root, dataset_name, source_csv, *, load_text=True, verify_integrity=True,
+    allow_build=True,
 ):
-    """Create an ordered, label-independent cohort manifest."""
+    """Create an ordered, label-independent cohort manifest.
+
+    ``allow_build=False`` is the formal-reader mode: a missing or stale
+    cohort pointer is an error, never an online million-row rebuild.
+    """
 
     source_csv = str(source_csv)
     pointer_dir = Path(cache_root) / "cohorts" / str(dataset_name)
@@ -1033,6 +1038,11 @@ def build_or_load_cohort(
     # A missing/stale pointer must be rebuilt from the source CSV.  This is
     # intentionally after the fast frozen-cache path above so normal training
     # never pays this scan.
+    if not allow_build:
+        raise RuntimeError(
+            f"cohort pointer for {dataset_name!r} is missing or unusable "
+            f"under {cache_root}; run the offline cohort build explicitly"
+        )
     source_hash = _sha256_file(source_csv)
 
     frame = pd.read_csv(source_csv)

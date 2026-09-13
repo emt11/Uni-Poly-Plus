@@ -80,6 +80,7 @@ def build_task_dataset(task):
         feature_cache_workers=0, feature_cache_chunksize=4,
         feature_cache_partial_every=200, feature_cache_item_timeout=45,
         cache_layers="ru_base,topology,trimer,md200", cache_validate="sample",
+        require_frozen_store=True,
         cache_commit_size=128, embed_tries_multiplier=8,
         conformer_3d_count=4, conformer_keep_count=4,
         conformer_profile="full", scage_distance_mode="mips_dual",

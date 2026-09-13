@@ -67,6 +67,11 @@ from .lmdb_cache import (
     sample_key_from_normalized,
     sample_key_from_smiles,
 )
+from .cache_spec import StoreError as CacheStoreError
+from .frozen_store import (
+    FrozenFeatureStore,
+    open_frozen_feature_store,
+)
 from .diagnostics import (
     print_dataset_diagnostics,
     summarize_feature_cache,
@@ -2096,6 +2101,8 @@ class UniDataset(Dataset):
         cache_layers=None,
         cache_validate="sample",
         cache_commit_size=128,
+        require_frozen_store=False,
+        cache_route_check=True,
         embed_tries_multiplier=8,
         conformer_3d_count=8,
         conformer_keep_count=4,
@@ -2192,6 +2199,11 @@ class UniDataset(Dataset):
         if self.cache_validate not in {"sample", "full"}:
             raise ValueError("cache_validate must be sample or full")
         self.cache_commit_size = max(1, int(cache_commit_size))
+        # Formal training path: when store.json exists (or the caller demands
+        # it) the dataset opens store.json-bound frozen artifacts read-only
+        # and never builds, repairs or migrates anything.
+        self.require_frozen_store = bool(require_frozen_store)
+        self.cache_route_check = bool(cache_route_check)
         self.embed_tries_multiplier = max(1, int(embed_tries_multiplier))
         self.conformer_profile = str(conformer_profile).lower()
         if self.conformer_profile not in {'fast', 'full', 'quality'}:
@@ -2390,7 +2402,17 @@ class UniDataset(Dataset):
     ):
         self.feature_source_dataset = feature_source_dataset or self.dataset
         self.max_smiles_length = 0
-        self.feature_source_dataset = feature_source_dataset or self.dataset
+        store_path = os.path.join(
+            self.root, "processed", "mips_trimer_scage", "store.json"
+        )
+        if self.require_frozen_store or os.path.isfile(store_path):
+            return self._init_with_frozen_store(
+                processed_dir=processed_dir,
+                graph_tag=graph_tag,
+                geom_tag=geom_tag,
+                fp_tag=fp_tag,
+                rebuild_feature_cache=bool(rebuild_feature_cache),
+            )
         return self._init_with_lmdb_feature_cache(
             processed_dir=processed_dir,
             graph_tag=graph_tag,
@@ -3369,6 +3391,105 @@ class UniDataset(Dataset):
         ):
             raise RuntimeError("graph-only MIPS tokenizer bypass invariant failed")
 
+    def _init_with_frozen_store(
+        self,
+        *,
+        processed_dir,
+        graph_tag,
+        geom_tag,
+        fp_tag,
+        rebuild_feature_cache,
+    ):
+        """Open store.json-bound frozen artifacts strictly read-only.
+
+        This is the formal training data path: no online builder, no cache
+        repair, no RDKit/ETKDG/MMFF execution, no migration.  A missing key
+        or an unfrozen artifact is an error, never a rebuild trigger.
+        """
+
+        if rebuild_feature_cache:
+            raise RuntimeError(
+                "the frozen store path never rebuilds caches; run the "
+                "offline build/freeze tooling explicitly"
+            )
+        cache_root = os.path.join(
+            self.root, "processed", "mips_trimer_scage"
+        )
+        source_csv = os.path.join(
+            self.root, "raw", f"{self.feature_source_dataset}.csv"
+        )
+        cohort = build_or_load_cohort(
+            cache_root,
+            self.feature_source_dataset,
+            source_csv,
+            load_text=not bool(self.is_graph_only_mips_route),
+            verify_integrity=False,
+            allow_build=False,
+        )
+        feature_store, store = open_frozen_feature_store(
+            cache_root,
+            self.cache_layers,
+            cohort=cohort,
+            validate_route=self.cache_route_check,
+            validate_coverage=self.cache_validate,
+        )
+        artifacts = store["artifacts"]
+        self.topology_cache_hash = artifacts["topology"]["build_spec_hash"]
+        self.topology_cache_artifact_hash = artifacts["topology"][
+            "artifact_hash"
+        ]
+        if len(self.topology_cache_artifact_hash) != 64:
+            raise RuntimeError("invalid Topology cache artifact hash")
+        trimer_binding = artifacts.get("trimer")
+        self.trimer_cache_hash = (
+            trimer_binding["build_spec_hash"] if trimer_binding else None
+        )
+        self.trimer_cache_artifact_hash = (
+            trimer_binding["artifact_hash"] if trimer_binding else None
+        )
+        self.feature_cohort_hash = cohort["manifest"]["cohort_hash"]
+        self.feature_cache_path = os.path.join(
+            cohort["root"], "manifest.json"
+        )
+        self.use_sharded_feature_cache = False
+        self.feature_shard_root = None
+        meta = self._feature_cache_meta()
+        feature_cache = {
+            "meta": {
+                **meta,
+                "cache_layout_schema": CACHE_LAYOUT_SCHEMA,
+                "cohort_hash": cohort["manifest"]["cohort_hash"],
+                "cache_layers": list(self.cache_layers),
+                "store_bindings": {
+                    name: {
+                        "build_spec_hash": binding["build_spec_hash"],
+                        "artifact_hash": binding["artifact_hash"],
+                    }
+                    for name, binding in artifacts.items()
+                    if name in self.cache_layers
+                },
+            },
+            "features": feature_store,
+            "failures": [],
+        }
+        self._cohort = cohort
+        self._write_feature_cache_diagnostics(
+            feature_cache,
+            processed_dir,
+            graph_tag,
+            geom_tag,
+            fp_tag,
+            reuse_existing=True,
+        )
+        task_csv = os.path.join(
+            self.root, "raw", f"{self.dataset}.csv"
+        )
+        self._build_labeled_data_list(feature_cache, task_csv)
+        if self.is_graph_only_mips_route and (
+            self.smiles_tokenizer is not None or self.max_smiles_length != 0
+        ):
+            raise RuntimeError("graph-only MIPS tokenizer bypass invariant failed")
+
     def _migrate_model_dependent_scage_cache(self, processed_dir, graph_tag, geom_tag, fp_tag):
         raise RuntimeError(
             "legacy SCAGE/O/S/G feature-cache migration was removed; "
@@ -3487,12 +3608,16 @@ class UniDataset(Dataset):
             return
         if isinstance(
             feature_cache["features"],
-            (ShardedFeatureStore, LayeredFeatureStore, LmdbFeatureStore),
+            (ShardedFeatureStore, LayeredFeatureStore, LmdbFeatureStore,
+             FrozenFeatureStore),
         ):
             summary = {
                 "schema": (
                     CACHE_LAYOUT_SCHEMA
-                    if isinstance(feature_cache["features"], LmdbFeatureStore)
+                    if isinstance(
+                        feature_cache["features"],
+                        (LmdbFeatureStore, FrozenFeatureStore),
+                    )
                     else "layered-sharded-feature-cache-diagnostics-v2"
                 ),
                 "total": len(feature_cache["features"]),
@@ -3510,7 +3635,10 @@ class UniDataset(Dataset):
                 ),
                 "storage": (
                     "lmdb-single-record"
-                    if isinstance(feature_cache["features"], LmdbFeatureStore)
+                    if isinstance(
+                        feature_cache["features"],
+                        (LmdbFeatureStore, FrozenFeatureStore),
+                    )
                     else "torch-shard-2048"
                 ),
             }
@@ -4370,7 +4498,7 @@ class UniDataset(Dataset):
         if (
             self.is_graph_only_mips_route
             and self.dataset == self.feature_source_dataset == "PI1M_v2"
-            and isinstance(features, LmdbFeatureStore)
+            and isinstance(features, (LmdbFeatureStore, FrozenFeatureStore))
             and getattr(self, "_cohort", None) is not None
             and int(self._cohort["manifest"].get("unique_count", -1))
             == len(self._cohort["keys_array"])
@@ -4392,7 +4520,8 @@ class UniDataset(Dataset):
             features
             if isinstance(
                 features,
-                (ShardedFeatureStore, LayeredFeatureStore, LmdbFeatureStore),
+                (ShardedFeatureStore, LayeredFeatureStore, LmdbFeatureStore,
+                 FrozenFeatureStore),
             )
             else None
         )
@@ -4404,7 +4533,7 @@ class UniDataset(Dataset):
         cache_misses = 0
         cached_failures = 0
         direct_cohort_lookup = (
-            isinstance(features, LmdbFeatureStore)
+            isinstance(features, (LmdbFeatureStore, FrozenFeatureStore))
             and getattr(self, "_cohort", None) is not None
             and self.dataset == self.feature_source_dataset
             and len(self._cohort["row_keys_array"]) == len(df)
@@ -4421,7 +4550,7 @@ class UniDataset(Dataset):
             smiles = str(raw_smiles).strip()
             y = float(raw_target)
             if (
-                isinstance(features, LmdbFeatureStore)
+                isinstance(features, (LmdbFeatureStore, FrozenFeatureStore))
                 and getattr(self, "_cohort", None) is not None
                 and self.dataset == self.feature_source_dataset
                 and row_index < len(self._cohort["row_keys_array"])
@@ -4432,7 +4561,7 @@ class UniDataset(Dataset):
             else:
                 lookup_key = (
                     sample_key_from_smiles(smiles)
-                    if isinstance(features, LmdbFeatureStore)
+                    if isinstance(features, (LmdbFeatureStore, FrozenFeatureStore))
                     else smiles
                 )
 
@@ -4678,7 +4807,10 @@ class UniDataset(Dataset):
         lookup_key_for_hash = None
         if (
             self._cohort_row_mode
-            and isinstance(self._lazy_feature_store, LmdbFeatureStore)
+            and isinstance(
+                self._lazy_feature_store,
+                (LmdbFeatureStore, FrozenFeatureStore),
+            )
         ):
             lookup_key = self._cohort["row_keys_array"][int(idx)]
             lookup_key_for_hash = bytes(lookup_key)

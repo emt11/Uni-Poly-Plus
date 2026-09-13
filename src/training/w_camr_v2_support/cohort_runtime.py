@@ -115,6 +115,7 @@ def _build_dataset() -> UniDataset:
         fp_mode="disabled",
         cache_layers="ru_base,topology,trimer",
         cache_validate="sample",
+        require_frozen_store=True,
         feature_cache_workers=0,
         feature_cache_item_timeout=240,
         conformer_3d_count=4,
