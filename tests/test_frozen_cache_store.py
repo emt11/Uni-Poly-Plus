@@ -32,11 +32,12 @@ from src.dataset.cache_spec import (
 from src.dataset.frozen_store import (
     ArtifactIdentityError,
     ArtifactNotFrozen,
+    CacheMissingDerivedArtifact,
     CacheMissError,
     FrozenArtifact,
     StoreError,
-    ensure_md200_array,
     open_frozen_feature_store,
+    resolve_md200_paths,
 )
 from src.dataset.lmdb_cache import sample_key_from_smiles
 
@@ -137,7 +138,7 @@ def write_artifact(root: Path, artifact_type: str, build_spec: dict, records: di
         "rdkit_version": "2026.03.2",
     }, sort_keys=True), encoding="utf-8")
     (root / "manifest.json").write_text(json.dumps({
-        "record_count": len(records),
+        "count": len(records),
     }, sort_keys=True), encoding="utf-8")
     (root / ".done").write_text("a" * 64 + "\n", encoding="utf-8")
     if frozen:
@@ -180,6 +181,26 @@ def cohort_from_keys(keys, *, root="cohort_test"):
     }
 
 
+def _write_md200_array(cohort, cache_root: Path, build_spec_hash: str):
+    """Offline materialization fixture equivalent (what
+    scripts/materialize_cache_derived.py produces)."""
+
+    out = Path(cohort["root"]) / f"md200_{build_spec_hash}"
+    out.mkdir(parents=True, exist_ok=True)
+    np.save(out / "md200.npy",
+            np.zeros((len(cohort["keys_array"]), 200), dtype=np.float32))
+    np.save(out / "md200_valid.npy",
+            np.ones(len(cohort["keys_array"]), dtype=bool))
+    (out / "md200_metadata.json").write_text(json.dumps({
+        "cohort_hash": cohort["manifest"]["cohort_hash"],
+        "ordered_sample_key_hash": cohort["manifest"]["ordered_sample_key_hash"],
+        "build_spec_hash": build_spec_hash,
+        "shape": [len(cohort["keys_array"]), 200],
+        "dtype": "float32",
+    }, sort_keys=True), encoding="utf-8")
+    return out
+
+
 @pytest.fixture()
 def frozen_world(tmp_path):
     """One whole-dataset frozen store binding topology+trimer+md200+ru_base."""
@@ -205,6 +226,7 @@ def frozen_world(tmp_path):
         bindings[name] = _binding(f"{dirname}/artifact-a", spec, len(keys))
     make_store(tmp_path, bindings)
     cohort = cohort_from_keys(keys, root=tmp_path / "cohorts" / "test")
+    _write_md200_array(cohort, tmp_path, bindings["md200"]["build_spec_hash"])
     return {"tmp": tmp_path, "keys": keys, "bindings": bindings, "cohort": cohort}
 
 
@@ -237,7 +259,7 @@ def test_3_same_build_spec_same_hash():
 
 def test_4_key_parameter_change_changes_hash():
     changed = json.loads(json.dumps(ROUTE_BUILD_SPECS["trimer"]))
-    changed["parameters"]["num_candidates_per_round"] = 4
+    changed["parameters"]["num_candidates_per_round"] = 2
     assert build_spec_hash(ROUTE_BUILD_SPECS["trimer"]) != build_spec_hash(changed)
 
 
@@ -475,38 +497,323 @@ def test_13_derived_parent_binding(frozen_world):
     assert build_spec_hash(changed_ru) != build_spec_hash(ROUTE_BUILD_SPECS["ru_base"])
 
     # md200: a registered materialized array with matching cohort metadata is
-    # reused; a stale one is rebuilt under md200_<build_spec_hash>/
+    # reused; a stale or missing one is a hard error and nothing is written.
     cache_root = frozen_world["tmp"]
     md_binding = dict(frozen_world["bindings"]["md200"])
     cohort = frozen_world["cohort"]
-    materialized_dir = cache_root / "cohorts" / "test" / "md200_registered"
-    materialized_dir.mkdir(parents=True, exist_ok=True)
-    metadata = {
-        "cohort_hash": cohort["manifest"]["cohort_hash"],
-        "ordered_sample_key_hash": cohort["manifest"]["ordered_sample_key_hash"],
-        "shape": [len(cohort["keys_array"]), 200],
-        "dtype": "float32",
-    }
-    (materialized_dir / "md200_metadata.json").write_text(
-        json.dumps(metadata), encoding="utf-8"
-    )
-    np.save(materialized_dir / "md200.npy",
-            np.zeros((len(cohort["keys_array"]), 200), dtype=np.float32))
-    np.save(materialized_dir / "md200_valid.npy",
-            np.ones(len(cohort["keys_array"]), dtype=bool))
-    md_binding["materialized"] = {"test": str(materialized_dir.relative_to(cache_root))}
     artifact = FrozenArtifact(cache_root, "md200", md_binding, validate_route=False)
-    values, _ = ensure_md200_array(cohort, artifact, cache_root)
-    assert Path(values).parent == materialized_dir
+    values, _ = resolve_md200_paths(cohort, artifact)
+    assert Path(values).name == "md200.npy"
     artifact.close()
 
     stale_dir = cache_root / "cohorts" / "test" / "md200_stale"
     stale_dir.mkdir(parents=True, exist_ok=True)
-    bad_metadata = dict(metadata, ordered_sample_key_hash="f" * 64)
+    bad_metadata = {
+        "cohort_hash": cohort["manifest"]["cohort_hash"],
+        "ordered_sample_key_hash": "f" * 64,
+        "shape": [len(cohort["keys_array"]), 200],
+        "dtype": "float32",
+    }
     (stale_dir / "md200_metadata.json").write_text(json.dumps(bad_metadata), encoding="utf-8")
     md_binding2 = dict(md_binding)
     md_binding2["materialized"] = {"test": str(stale_dir.relative_to(cache_root))}
     artifact2 = FrozenArtifact(cache_root, "md200", md_binding2, validate_route=False)
-    values2, _ = ensure_md200_array(cohort, artifact2, cache_root)
-    assert Path(values2).parent.name == f"md200_{artifact2.build_spec_hash}"
+    with pytest.raises(CacheMissingDerivedArtifact):
+        resolve_md200_paths(cohort, artifact2)
     artifact2.close()
+
+
+# ---------------------------------------------------------------------------
+# Finish-up tests (round 2): semantic build specs, geometry seeds,
+# zero-write reader, active-only store
+# ---------------------------------------------------------------------------
+
+import re
+
+import src.dataset.cache_spec as cache_spec
+from src.dataset.cache_spec import (
+    MD200_BUILD_SPEC,
+    ROUTE_BUILD_SPEC_HASHES,
+    RU_BASE_BUILD_SPEC,
+    TRIMER_SEED_POLICY,
+    canonical_json as spec_canonical_json,
+)
+from src.dataset.trimer_mcl import GEOMETRY_SEED_SPEC, _geometry_seed
+
+_VERSION_KEY_PATTERN = re.compile(
+    r"(_version$|^schema$|schema$|^builder$|^generation$|^revision$|^epoch$"
+    r"|^format_level$|descriptor_schema|lga_schema)"
+)
+_VERSION_VALUE_PATTERN = re.compile(r"_v\d+$")
+
+
+def _walk_spec(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield str(key), value
+            yield from _walk_spec(value)
+    elif isinstance(node, (list, tuple)):
+        for value in node:
+            yield from _walk_spec(value)
+
+
+def test_f1_no_version_tokens_in_active_build_specs():
+    for name, spec in ROUTE_BUILD_SPECS.items():
+        for key, value in _walk_spec(spec):
+            assert not _VERSION_KEY_PATTERN.search(key), (name, key)
+            if isinstance(value, str):
+                assert not _VERSION_VALUE_PATTERN.search(value), (name, key, value)
+        # serialization must not contain legacy version tokens at all
+        blob = spec_canonical_json(spec)
+        for token in ("descriptor_schema", "lga_schema", "builder_version",
+                      "rdkit_canonical_psmiles_v1", "schema_version"):
+            assert token not in blob, (name, token)
+    # module seed spec and build_spec seed policy agree exactly
+    assert GEOMETRY_SEED_SPEC == TRIMER_SEED_POLICY["geometry_seed_spec"]
+
+
+def test_f2_md200_descriptor_is_semantic():
+    assert "descriptor" in MD200_BUILD_SPEC["parameters"]
+    descriptor = MD200_BUILD_SPEC["parameters"]["descriptor"]
+    for key in ("family", "dimension", "source_transform",
+                "nonfinite_policy", "drop_first_return_value"):
+        assert key in descriptor, key
+    assert descriptor["dimension"] == 200
+    assert descriptor["source_transform"] == "star_sub"
+    for banned in ("descriptor_schema", "components", "protocol"):
+        assert banned not in MD200_BUILD_SPEC["parameters"]
+
+
+def test_f3_canonicalization_is_semantic():
+    params = RU_BASE_BUILD_SPEC["parameters"]
+    assert "normalization" not in params
+    canonicalization = params["canonicalization"]
+    for key in ("toolkit", "canonical_output_smiles", "isomeric",
+                "invalid_identity_policy"):
+        assert key in canonicalization, key
+
+
+def test_f4_seed_stable_for_same_geometry_semantics():
+    identity = "canonical-trimer-identity"
+    expected_material = ":".join((
+        spec_canonical_json(TRIMER_SEED_POLICY["geometry_seed_spec"]),
+        identity, "0",
+    ))
+    expected = int.from_bytes(
+        hashlib.sha256(expected_material.encode()).digest()[:4], "little"
+    ) & 0x7FFFFFFF
+    assert _geometry_seed(identity, 0) == expected
+    assert _geometry_seed(identity, 0) == _geometry_seed(identity, 0)
+
+
+def test_f5_seed_changes_with_sample_identity():
+    assert _geometry_seed("identity-a", 0) != _geometry_seed("identity-b", 0)
+
+
+def test_f6_seed_rounds_differ():
+    seeds = {_geometry_seed("identity-a", round_id) for round_id in (-1, 0, 1)}
+    assert len(seeds) == 3
+
+
+def test_f7_seed_changes_with_geometry_parameters():
+    identity, round_id = "identity-a", 0
+    base_material = ":".join((
+        spec_canonical_json(GEOMETRY_SEED_SPEC), identity, str(round_id),
+    ))
+    changed_spec = json.loads(json.dumps(GEOMETRY_SEED_SPEC))
+    changed_spec["candidates_per_round"] = 4
+    changed_material = ":".join((
+        spec_canonical_json(changed_spec), identity, str(round_id),
+    ))
+    derive = lambda material: int.from_bytes(
+        hashlib.sha256(material.encode()).digest()[:4], "little"
+    ) & 0x7FFFFFFF
+    assert derive(base_material) != derive(changed_material)
+    # and the real trimer route hash changes with the seed policy
+    changed_policy = json.loads(json.dumps(TRIMER_SEED_POLICY))
+    changed_policy["geometry_seed_spec"]["candidates_per_round"] = 4
+    changed_spec_full = json.loads(json.dumps(ROUTE_BUILD_SPECS["trimer"]))
+    changed_spec_full["parameters"]["seed_policy"] = changed_policy
+    assert build_spec_hash(ROUTE_BUILD_SPECS["trimer"]) != build_spec_hash(
+        changed_spec_full
+    )
+
+
+def test_f8_fold_split_never_affects_seed_or_spec():
+    blob = spec_canonical_json(GEOMETRY_SEED_SPEC)
+    for token in ("fold", "split", "scaffold", "use_idxs", "worker", "time"):
+        assert f'"{token}"' not in blob
+    assert not any(
+        "fold" in item or "split" in item or "scaffold" in item
+        for item in TRIMER_SEED_POLICY["material"]
+    )
+    with pytest.raises(SpecError):
+        validate_build_spec({"artifact_type": "trimer", "fold": 1})
+
+
+def test_f9_reader_zero_write_on_frozen_world(frozen_world):
+    cache_root = frozen_world["tmp"]
+
+    def snapshot():
+        state = {}
+        for base, _, files in os.walk(cache_root):
+            for name in files:
+                path = Path(base) / name
+                stat = path.stat()
+                state[str(path.relative_to(cache_root))] = (
+                    stat.st_size, stat.st_mtime_ns,
+                )
+        return state
+
+    before = snapshot()
+    store, _ = open_frozen_feature_store(
+        cache_root, ("ru_base", "topology", "trimer", "md200"),
+        cohort=frozen_world["cohort"], validate_coverage="full",
+    )
+    for key in frozen_world["keys"]:
+        _ = store[key]
+    store.close()
+    assert snapshot() == before  # zero creation/modification
+
+
+def test_f10_missing_derived_array_fails_without_materialization(tmp_path):
+    keys = [sample_key_from_smiles("*CC*")]
+    spec = ROUTE_BUILD_SPECS["md200"]
+    md_dir = tmp_path / "md200" / "artifact-a"
+    write_artifact(md_dir, "md200", spec,
+                   {keys[0]: make_md200_record()})
+    topo_dir = tmp_path / "topology" / "artifact-a"
+    write_artifact(topo_dir, "topology", ROUTE_BUILD_SPECS["topology"],
+                   {keys[0]: make_topology_record(keys[0])})
+    make_store(tmp_path, {
+        "topology": _binding("topology/artifact-a",
+                             ROUTE_BUILD_SPECS["topology"], 1),
+        "md200": _binding("md200/artifact-a", spec, 1),
+    })
+    cohort = cohort_from_keys(keys, root=tmp_path / "cohorts" / "test")
+    with pytest.raises(CacheMissingDerivedArtifact):
+        open_frozen_feature_store(tmp_path, ("topology", "md200"), cohort=cohort)
+    # nothing was materialized on the read path
+    assert not (tmp_path / "cohorts" / "test" / f"md200_{build_spec_hash(spec)}").exists()
+
+
+def _register(tmp_path, layers_spec_records, extra_metadata=None):
+    """Registration fixture using HISTORICAL-format build_config metadata
+    (same shape as the real artifacts on disk), so the semantic alias path
+    in build_spec_from_metadata is exercised."""
+
+    legacy_build_configs = {
+        "ru_base": {
+            "attachment_site_policy": "two_sites_shared_boundary_allowed",
+            "boundary_distance_algorithm": "expanded_graph_shortest_path",
+            "mismatched_bond_policy": "single",
+            "molecule_binary": "rdkit_mol_binary",
+            "multimer_builder_version": 2,
+            "normalization": "rdkit_canonical_psmiles_v1",
+        },
+        "topology": {
+            "atom_features": "mips137_topology_only_trimer_central_ru",
+            "boundary_distance_algorithm": "diagnostic_only_canonical_ru",
+            "boundary_threshold": 5,
+            "builder_version": 12,
+            "feature_content_schema": "mts-canonical-periodic-feature-v3",
+            "lga_schema": 2,
+            "max_hops": 2,
+            "max_model_atoms": 384,
+            "max_repeat_units": 1,
+            "mismatched_bond_policy": "single",
+            "ru_base_feature_config_hash": "0" * 64,
+            "topology_representation": "single_canonical_ru_lifted_relations",
+        },
+        "trimer": {
+            "allow_2d_for_mcl": False,
+            "attachment_site_policy": "two_sites_shared_boundary_allowed",
+            "builder_version": 12,
+            "conformer_selection": "lowest-finite-mmff-energy",
+            "etkdg_max_iterations": 42,
+            "etkdg_retry_candidates": 2,
+            "etkdg_retry_max_iterations": 200,
+            "max_heavy_atoms": 384,
+            "mismatched_bond_policy": "single",
+            "mmff_relax_max_iterations": 200,
+            "mmff_variant": "MMFF94",
+            "multimer_builder_version": 2,
+            "num_candidates": 4,
+            "protocol": "etkdgv3x4-mmff94-relax200-lowest-finite-v1",
+            "ru_base_feature_config_hash": "0" * 64,
+            "topology_feature_config_hash": "0" * 64,
+            "trimer_content_schema": "mips-trimer-scage-trimer-v8",
+            "trimer_schema_version": 8,
+            "worker_hard_timeout_seconds": 240,
+        },
+        "md200": {
+            "components": ["RDKit2DNormalized200"],
+            "descriptor_schema": 5,
+            "embedding": "none",
+            "optimizer": "none",
+            "protocol": "source_star_sub",
+        },
+    }
+    bindings = {}
+    for name, (dirname, spec, records, metadata_extra) in layers_spec_records.items():
+        artifact_dir = tmp_path / dirname / "artifact-a"
+        write_artifact(artifact_dir, name, spec, records)
+        # replace builder-style metadata with the historical metadata shape
+        metadata = {
+            "artifact_type": name,
+            "build_config": dict(legacy_build_configs[name]),
+            "rdkit_version": "2026.03.2",
+        }
+        metadata.update(metadata_extra or {})
+        (artifact_dir / "metadata.json").write_text(json.dumps(metadata))
+        (artifact_dir / ".done").unlink(missing_ok=True)  # .done is optional
+        bindings[name] = (dirname, spec)
+    from scripts.create_cache_store import collect_active_bindings
+    return collect_active_bindings(tmp_path, {})
+
+
+def test_f11_legacy_inferred_build_config_is_not_registrable(tmp_path):
+    keys = [sample_key_from_smiles("*CC*")]
+    layers = {
+        "ru_base": ("ru_base", ROUTE_BUILD_SPECS["ru_base"],
+                    {keys[0]: make_ru_base_record(keys[0])}, None),
+        "topology": ("topology", ROUTE_BUILD_SPECS["topology"],
+                     {keys[0]: make_topology_record(keys[0])}, None),
+    }
+    with pytest.raises(StoreError, match="explicit build_spec"):
+        _register(tmp_path, layers)
+
+
+def test_f12_legacy_scanner_does_not_infer_incompatible_artifact(tmp_path):
+    keys = [sample_key_from_smiles("*CC*")]
+    retired_spec = json.loads(json.dumps(ROUTE_BUILD_SPECS["trimer"]))
+    retired_spec["parameters"]["num_candidates_per_round"] = 4
+    layers = {
+        "ru_base": ("ru_base", ROUTE_BUILD_SPECS["ru_base"],
+                    {keys[0]: make_ru_base_record(keys[0])}, None),
+        "topology": ("topology", ROUTE_BUILD_SPECS["topology"],
+                     {keys[0]: make_topology_record(keys[0])}, None),
+        "trimer": ("trimer", retired_spec,
+                   {keys[0]: make_trimer_record(keys[0])}, None),
+    }
+    with pytest.raises(StoreError, match="explicit build_spec"):
+        _register(tmp_path, layers)
+
+
+def test_f13_legacy_version_strings_do_not_restore_compatibility(tmp_path):
+    keys = [sample_key_from_smiles("*CC*")]
+    legacy_metadata = {
+        "schema": "mts-canonical-periodic-topology-lmdb-v3",
+        "feature_schema": "mts-canonical-periodic-feature-v3",
+        "builder_version": 12,
+        "cache_layout_schema": "mips-trimer-scage-lmdb-layout-v2",
+        "migration_schema": "mts-canonical-cache-migration-v3",
+    }
+    layers = {
+        "ru_base": ("ru_base", ROUTE_BUILD_SPECS["ru_base"],
+                    {keys[0]: make_ru_base_record(keys[0])}, None),
+        "topology": ("topology", ROUTE_BUILD_SPECS["topology"],
+                     {keys[0]: make_topology_record(keys[0])}, legacy_metadata),
+    }
+    with pytest.raises(StoreError, match="explicit build_spec"):
+        _register(tmp_path, layers)

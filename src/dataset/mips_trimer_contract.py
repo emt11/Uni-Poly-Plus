@@ -56,12 +56,12 @@ MTS_CANONICAL_PERIODIC_FEATURE_SCHEMA = FEATURE_SCHEMA
 MTS_CANONICAL_PERIODIC_TOPOLOGY_LMDB_SCHEMA = TOPOLOGY_LMDB_SCHEMA
 TRIMER_SCHEMA_VERSION = 10
 TRIMER_BUILDER_VERSION = BUILDER_VERSION
-TRIMER_PROTOCOL = "etkdgv3-randomcoords-8x2-mmff94-allatom-lowest-finite-v2"
+TRIMER_PROTOCOL = "etkdgv3-randomcoords-4x2-mmff94-allatom-first-valid"
 TRIMER_MMFF_VARIANT = "MMFF94"
 TRIMER_MMFF_RELAX_MAX_ITERATIONS = 200
 TRIMER_REQUIRE_MMFF_CONVERGENCE = False
 TRIMER_ACCEPTANCE = "declared_stereo_correct_finite_all_atom_coordinates_and_finite_mmff_energy"
-TRIMER_SELECTION = "converged_first_then_lowest_finite_post_relaxation_energy"
+TRIMER_SELECTION = "first_valid_no_energy_ranking"
 
 # Public route/stage identity.  The underscore form remains the stable Python
 # backend selector for compatibility with Dataset/model internals; user-facing
@@ -164,7 +164,7 @@ def validate_runtime_args(args) -> None:
         "graph_geometry_mode": "trimer_scage_mcl",
         "mips_fusion_mode": "none",
         "projection_mode": "plain",
-        "trimer_num_candidates": 8,
+        "trimer_num_candidates": 4,
         "trimer_max_heavy_atoms": 384,
     }
     for name, expected in fixed.items():

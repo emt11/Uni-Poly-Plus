@@ -24,11 +24,9 @@ any future build produced with the same envelope.
 
 from __future__ import annotations
 
-import hashlib
 import io
 import os
 import threading
-import time
 from pathlib import Path
 
 import lmdb
@@ -59,6 +57,12 @@ class ArtifactIdentityError(RuntimeError):
 
 class StoreRouteMismatch(RuntimeError):
     """A bound artifact was built with a different build_spec than the route."""
+
+
+class CacheMissingDerivedArtifact(StoreError):
+    """A derived array (e.g. MD200 mmap) is absent and will NOT be
+    generated on the training path.  Run the explicit offline
+    materialization command (scripts/materialize_cache_derived.py)."""
 
 
 def _coerce_key(key) -> bytes:
@@ -486,10 +490,16 @@ def open_frozen_feature_store(cache_root, cache_layers, *, cohort,
         name for name in ("ru_base", "topology", "trimer", "md200")
         if name in tuple(cache_layers)
     ]
+    if "topology" not in requested:
+        raise StoreError(
+            "the frozen reader always binds the topology artifact; requested "
+            f"layers were: {sorted(requested)}"
+        )
     for name in requested:
         if name not in artifacts:
             raise StoreError(
-                f"store.json has no binding for the requested layer: {name}"
+                f"active {name} artifact missing: store.json has no binding "
+                f"for it (rebuild and re-run scripts/create_cache_store.py)"
             )
     if validate_route:
         mismatches = route_mismatches(store)
@@ -510,9 +520,7 @@ def open_frozen_feature_store(cache_root, cache_layers, *, cohort,
     try:
         md_path = md_valid_path = None
         if md200 is not None:
-            md_path, md_valid_path = ensure_md200_array(
-                cohort, md200, Path(cache_root)
-            )
+            md_path, md_valid_path = resolve_md200_paths(cohort, md200)
         feature_store = FrozenFeatureStore(
             cohort=cohort,
             topology=topology,
@@ -551,11 +559,22 @@ def validate_coverage_keys(feature_store, cohort, *, mode="sample"):
             )
 
 
-def ensure_md200_array(cohort, md_artifact: FrozenArtifact, cache_root: Path):
-    """Return (values, valid) mmap paths for this cohort's MD200 rows.
+def _md200_metadata_ok(metadata, cohort_hash, ordered_hash, count) -> bool:
+    return (
+        metadata.get("cohort_hash") == cohort_hash
+        and metadata.get("ordered_sample_key_hash") == ordered_hash
+        and metadata.get("shape") == [count, 200]
+        and metadata.get("dtype") == "float32"
+    )
 
-    Reuses an array registered in the store binding when its metadata matches
-    the cohort; otherwise materialises one under ``md200_<build_spec_hash>/``.
+
+def resolve_md200_paths(cohort, md_artifact: FrozenArtifact):
+    """Locate this cohort's materialized MD200 mmap pair.  Read-only.
+
+    Lookup order: the store binding's registered array, then the
+    deterministic ``md200_<build_spec_hash>/`` directory.  A missing or
+    inconsistent array is a hard error — the training path never
+    materializes anything.
     """
 
     import json
@@ -564,81 +583,51 @@ def ensure_md200_array(cohort, md_artifact: FrozenArtifact, cache_root: Path):
     cohort_hash = str(cohort["manifest"]["cohort_hash"])
     ordered_hash = cohort["manifest"]["ordered_sample_key_hash"]
     count = len(cohort["keys_array"])
+    # Registered arrays are keyed by cohort NAME; the cohort root itself is
+    # the content-addressed hash directory.
+    cohort_name = str(cohort["manifest"].get("dataset_name") or "")
+    if not cohort_name:
+        parts = cohort_dir.parts
+        cohort_name = (
+            parts[parts.index("cohorts") + 1]
+            if "cohorts" in parts else cohort_dir.parent.name
+        )
 
+    candidates = []
     registered = md_artifact.binding.get("materialized") or {}
-    relative = registered.get(str(cohort_dir.name))
+    relative = registered.get(cohort_name)
     if relative:
-        metadata_path = cache_root / relative / "md200_metadata.json"
-        if metadata_path.is_file():
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if (
-                metadata.get("cohort_hash") == cohort_hash
-                and metadata.get("ordered_sample_key_hash") == ordered_hash
-                and metadata.get("shape") == [count, 200]
-                and metadata.get("dtype") == "float32"
-            ):
-                values_path = metadata_path.parent / "md200.npy"
-                valid_path = metadata_path.parent / "md200_valid.npy"
-                if values_path.is_file() and valid_path.is_file():
-                    return str(values_path), str(valid_path)
+        candidates.append((cache_root_of(md_artifact)) / relative)
+    candidates.append(cohort_dir / f"md200_{md_artifact.build_spec_hash}")
 
-    output_dir = cohort_dir / f"md200_{md_artifact.build_spec_hash}"
-    values_path = output_dir / "md200.npy"
-    valid_path = output_dir / "md200_valid.npy"
-    metadata_path = output_dir / "md200_metadata.json"
-    if metadata_path.is_file() and values_path.is_file() and valid_path.is_file():
+    last_checked = None
+    for position, directory in enumerate(candidates):
+        metadata_path = directory / "md200_metadata.json"
+        values_path = directory / "md200.npy"
+        valid_path = directory / "md200_valid.npy"
+        if not (metadata_path.is_file() and values_path.is_file()
+                and valid_path.is_file()):
+            if position == 0 and relative:
+                # The store binding explicitly registered this array; a
+                # missing file is binding corruption, not a fallback case.
+                raise CacheMissingDerivedArtifact(
+                    f"registered MD200 array is incomplete: {directory}"
+                )
+            continue
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if (
-            metadata.get("cohort_hash") == cohort_hash
-            and metadata.get("ordered_sample_key_hash") == ordered_hash
-            and metadata.get("shape") == [count, 200]
-        ):
+        if _md200_metadata_ok(metadata, cohort_hash, ordered_hash, count):
             return str(values_path), str(valid_path)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    values_tmp = output_dir / "md200.npy.tmp"
-    valid_tmp = output_dir / "md200_valid.npy.tmp"
-    values = np.lib.format.open_memmap(
-        values_tmp, mode="w+", dtype=np.float32, shape=(count, 200)
+        raise CacheMissingDerivedArtifact(
+            f"registered MD200 array for cohort {cohort_name} does not "
+            f"match the cohort identity: {directory}"
+        )
+    raise CacheMissingDerivedArtifact(
+        f"no materialized MD200 array for cohort {cohort_name} "
+        f"(expected md200_<build_spec_hash>/md200.npy under {cohort_dir}); "
+        "run scripts/materialize_cache_derived.py offline — the training "
+        "reader never materializes"
     )
-    validity = np.lib.format.open_memmap(
-        valid_tmp, mode="w+", dtype=np.bool_, shape=(count,)
-    )
-    for index, key in enumerate(cohort["keys_array"]):
-        data = md_artifact.get(key)
-        vector = getattr(data, "mips_md", None)
-        if not torch.is_tensor(vector) or vector.numel() != 200:
-            raise ArtifactIdentityError(
-                f"invalid MD200 cache row for {bytes(key).hex()[:16]}…"
-            )
-        values[index] = vector.detach().cpu().float().numpy()
-        validity[index] = bool(getattr(data, "mips_md_valid", False))
-    values.flush()
-    validity.flush()
-    del values, validity
-    os.replace(values_tmp, values_path)
-    os.replace(valid_tmp, valid_path)
 
-    def _sha256(path):
-        digest = hashlib.sha256()
-        with open(path, "rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
 
-    metadata = {
-        "cohort_hash": cohort_hash,
-        "ordered_sample_key_hash": ordered_hash,
-        "build_spec_hash": md_artifact.build_spec_hash,
-        "shape": [count, 200],
-        "dtype": "float32",
-        "values_sha256": _sha256(values_path),
-        "valid_sha256": _sha256(valid_path),
-        "created_at": time.time(),
-    }
-    temporary = metadata_path.with_suffix(".json.tmp")
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, sort_keys=True, indent=2)
-        handle.write("\n")
-    os.replace(temporary, metadata_path)
-    return str(values_path), str(valid_path)
+def cache_root_of(artifact: FrozenArtifact) -> Path:
+    return artifact.root.parents[1]

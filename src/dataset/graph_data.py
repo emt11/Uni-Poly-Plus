@@ -526,7 +526,12 @@ def count_attachment_points(smiles):
     return sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 0)
 
 
-def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=True):
+def build_periodic_multimer_mol(
+    smiles_or_mol,
+    num_repeat_units,
+    close_periodic=True,
+    terminal_capping="missing_seam_bond_order_hydrogen_equivalents",
+):
     """Build an ordered m-RU chain or its translational periodic quotient graph.
 
     The atom order is deterministic: all non-dummy atoms of RU 0, followed by
@@ -632,6 +637,38 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
         # molecule would create an artificial finite ring and can invalidate
         # aromaticity/kekulization. Keep it as an explicit virtual graph edge.
         periodic_edge = (right, left)
+
+    # An open oligomer is H-terminated at the two missing seam bonds.  Most
+    # neutral atoms recover these hydrogens implicitly during sanitization,
+    # but atoms such as aromatic [n+] have no implicit-H permission.  Without
+    # an explicit cap declaration RDKit therefore kekulizes only the terminal
+    # copy, making three chemically identical RUs appear to have different
+    # internal bond types.  Declare the missing valence before sanitization;
+    # Chem.AddHs later materializes these hydrogens as ordinary physical atoms.
+    terminal_cap_hydrogens = []
+    if not close_periodic:
+        if terminal_capping != "missing_seam_bond_order_hydrogen_equivalents":
+            raise ValueError(f"unsupported open-chain terminal capping: {terminal_capping}")
+        cap_count = {
+            Chem.rdchem.BondType.SINGLE: 1,
+            Chem.rdchem.BondType.DOUBLE: 2,
+            Chem.rdchem.BondType.TRIPLE: 3,
+        }.get(connection_bond_type)
+        if cap_count is None:
+            raise ValueError(
+                "open multimer cannot H-cap the selected connection bond type"
+            )
+        for side, atom_idx in (
+            ("left", int(atom_maps[0][left_base])),
+            ("right", int(atom_maps[-1][right_base])),
+        ):
+            atom = combined.GetAtomWithIdx(atom_idx)
+            atom.SetNumExplicitHs(atom.GetNumExplicitHs() + int(cap_count))
+            terminal_cap_hydrogens.append({
+                "side": side,
+                "atom": atom_idx,
+                "count": int(cap_count),
+            })
 
     # Restore bond metadata from the ORIGINAL bonds only after all real seam
     # neighbors exist. AddBond copies the order, not direction/stereo atoms.
@@ -781,6 +818,7 @@ def build_periodic_multimer_mol(smiles_or_mol, num_repeat_units, close_periodic=
         "source_attachment_neighbors": [int(idx) for idx in neighbors],
         "stereo_restore_failures": stereo_restore_failures,
         "terminal_stereo_unset": terminal_stereo_unset,
+        "terminal_cap_hydrogens": terminal_cap_hydrogens,
         "inter_unit_edges": inter_unit_edges,
         "periodic_edge": periodic_edge,
         "attachment_bond_type": connection_bond_type,

@@ -866,7 +866,7 @@ class LmdbLayerWriter:
         if self.environment is not None:
             self.environment.sync(True)
 
-    def finalize(self, *, cohort_hashes=None, failure_count=0):
+    def finalize(self, *, cohort_hashes=None, failure_count=0, extra_stats=None):
         self.flush()
         count = int(self.environment.stat()["entries"])
         transaction_id = int(self.environment.info()["last_txnid"])
@@ -883,6 +883,8 @@ class LmdbLayerWriter:
             )),
             "completed_at": time.time(),
         }
+        if extra_stats:
+            manifest.update(extra_stats)
         _atomic_json(self.manifest_path, manifest)
         temporary = f"{self.done_path}.tmp"
         with open(temporary, "w", encoding="utf-8") as handle:
@@ -1155,11 +1157,12 @@ def load_cohort(cohort_dir, *, load_text=True, verify_integrity=True):
     cohort_dir = Path(cohort_dir)
     with open(cohort_dir / "manifest.json", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    # Upgrade old v1 manifests in place.  The cohort identity is the key
-    # ordering/hash and is deliberately unchanged by this integrity metadata.
-    manifest = _upgrade_cohort_manifest_integrity(
-        cohort_dir, manifest, verify=verify_integrity
-    )
+    # Manifest integrity upgrades are an offline QC write.  Training readers
+    # (verify_integrity=False) never modify the cohort directory.
+    if verify_integrity:
+        manifest = _upgrade_cohort_manifest_integrity(
+            cohort_dir, manifest, verify=True
+        )
     keys_array = np.load(cohort_dir / "sample_keys.npy", mmap_mode="r")
     row_keys_array = np.load(
         cohort_dir / "source_row_keys.npy", mmap_mode="r"

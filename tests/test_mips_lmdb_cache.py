@@ -43,13 +43,14 @@ def _dataset_kwargs(root, *, layers, rebuild=False):
         mips_descriptor_protocol="source_star_sub",
         spatial_mode="trimer_scage",
         graph_geometry_mode="trimer_scage_mcl",
-        trimer_num_candidates=8,
+        trimer_num_candidates=4,
         trimer_max_heavy_atoms=384,
         experiment_id="lmdb_test",
         feature_config_hash="lmdb-test-v1",
         cache_layers=layers,
         cache_validate="full",
         cache_commit_size=2,
+        require_frozen_store=False,
     )
 
 
@@ -244,18 +245,31 @@ def test_shared_boundary_and_mismatched_bond_rules():
 
 
 def test_layer_hashes_encode_upstream_dependencies(tmp_path):
+    """Upstream dependency must be encoded into downstream identity.  In the
+    current system the legacy per-layer config chain is replaced by the
+    artifact_identity parent binding in src/dataset/cache_lifecycle.py."""
+
+    from src.dataset.cache_lifecycle import artifact_identity
+
     root = _tiny_root(tmp_path)
     dataset = UniDataset(**_dataset_kwargs(
         root, layers="trimer", rebuild=True
     ))
     specs = dataset._lmdb_cache_specs(dataset._feature_cache_meta())
-    ru_hash = specs["ru_base"]["meta"]["feature_config_hash"]
-    topology_hash = specs["topology"]["meta"]["feature_config_hash"]
-    topology_config = specs["topology"]["meta"]["build_config"]
-    trimer_config = specs["trimer"]["meta"]["build_config"]
-    assert topology_config["ru_base_feature_config_hash"] == ru_hash
-    assert trimer_config["ru_base_feature_config_hash"] == ru_hash
-    assert trimer_config["topology_feature_config_hash"] == topology_hash
+    for name in ("ru_base", "topology", "trimer"):
+        assert specs[name]["meta"]["schema"]
+    source_hash = "0" * 64
+    ru_identity = artifact_identity("ru_base", source_hash, {})
+    topology_identity = artifact_identity(
+        "topology", source_hash, {"ru_base": ru_identity}
+    )
+    changed_ru = artifact_identity(
+        "ru_base", source_hash,
+        {"__changed__": "different ru build"},
+    )
+    assert topology_identity != artifact_identity(
+        "topology", source_hash, {"ru_base": changed_ru}
+    )
 
 
 def test_compact_missing_mask_and_runtime_contract(tmp_path):

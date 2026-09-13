@@ -4,14 +4,15 @@ The Trimer is an open, H-terminated local geometry proxy.  It is deliberately
 separate from the O8 star-linked graph: O8 repeat copies are mapped to the
 central repeat unit only through their canonical RU atom identity.
 
-MMFF94 is used for a fixed-budget local coordinate relaxation only.  Converged
-candidates are preferred, while a finite non-converged candidate remains an
-explicitly labelled fallback.  The cached payload retains every explicit H.
+MMFF94 is used for a fixed-budget local coordinate relaxation only.  The first
+valid candidate is accepted; convergence is diagnostic and never a ranking
+criterion.  The cached payload retains every explicit H.
 """
 
 from __future__ import annotations
 
 import hashlib
+import copy
 import threading
 import time
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 from .graph_data import build_periodic_multimer_mol
+from .cache_spec import TRIMER_BUILD_SPEC, canonical_json, validate_build_spec
 from .mips_trimer_contract import (
     TRIMER_BUILDER_VERSION,
     TRIMER_CONTENT_SCHEMA,
@@ -34,12 +36,26 @@ TRIMER_MCL_SCHEMA = TRIMER_CONTENT_SCHEMA
 TRIMER_MCL_SCHEMA_VERSION = TRIMER_SCHEMA_VERSION
 TRIMER_MCL_PROTOCOL = TRIMER_PROTOCOL
 TRIMER_MCL_BUILDER_VERSION = TRIMER_BUILDER_VERSION
-TRIMER_ETKDG_TIMEOUT_SECONDS = 60
-TRIMER_ETKDG_MAX_ITERATIONS = 200
-TRIMER_MMFF_RELAX_MAX_ITERATIONS = CONTRACT_MMFF_RELAX_MAX_ITERATIONS
-TRIMER_CANDIDATES_PER_ROUND = 8
-TRIMER_MAX_ROUNDS = 2
-TRIMER_SAMPLE_TIMEOUT_SECONDS = 240.0
+_FORMAL_PARAMETERS = TRIMER_BUILD_SPEC["parameters"]
+TRIMER_ETKDG_TIMEOUT_SECONDS = int(_FORMAL_PARAMETERS["embedder_timeout_seconds"])
+TRIMER_ETKDG_MAX_ITERATIONS = int(_FORMAL_PARAMETERS["etkdg_max_iterations"])
+TRIMER_MMFF_RELAX_MAX_ITERATIONS = int(
+    _FORMAL_PARAMETERS["mmff_relax_max_iterations"]
+)
+if TRIMER_MMFF_RELAX_MAX_ITERATIONS != CONTRACT_MMFF_RELAX_MAX_ITERATIONS:
+    raise RuntimeError("Trimer MMFF iteration contract is inconsistent")
+TRIMER_CANDIDATES_PER_ROUND = int(_FORMAL_PARAMETERS["num_candidates_per_round"])
+TRIMER_MAX_ROUNDS = int(_FORMAL_PARAMETERS["max_rounds"])
+TRIMER_SAMPLE_TIMEOUT_SECONDS = float(_FORMAL_PARAMETERS["hard_timeout_seconds"])
+
+# Deterministic geometry seeds derive ONLY from the real geometry semantics
+# that affect the random search trajectory of one candidate (this spec), the
+# sample identity, the round id and (for candidate-level seeds) the candidate
+# id.  No schema name, cache version, builder version, wall-clock time, worker
+# id, fold id, timeout or selection policy participates.  The spec below must
+# stay identical to TRIMER_SEED_POLICY["geometry_seed_spec"] in
+# src/dataset/cache_spec.py.
+GEOMETRY_SEED_SPEC = dict(_FORMAL_PARAMETERS["seed_policy"]["geometry_seed_spec"])
 
 _ETKDG_CALL_COUNT = 0
 _ETKDG_CALL_LOCK = threading.Lock()
@@ -62,7 +78,32 @@ def _count_etkdg_call():
         _ETKDG_CALL_COUNT += 1
 
 
+def _geometry_seed(identity: str, round_id: int, candidate_id=None) -> int:
+    """Deterministic seed from real geometry semantics + identity + round.
+
+    material = canonical_json(GEOMETRY_SEED_SPEC) : identity : round_id
+               [: candidate_id for candidate-level seeds]
+    seed     = int.from_bytes(sha256(material)[:4], "little") & 0x7FFFFFFF
+    """
+
+    parts = [
+        canonical_json(GEOMETRY_SEED_SPEC),
+        str(identity),
+        str(int(round_id)),
+    ]
+    if candidate_id is not None:
+        parts.append(str(int(candidate_id)))
+    digest = hashlib.sha256(":".join(parts).encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "little") & 0x7FFFFFFF
+
+
+def _candidate_seed(identity: str, round_id: int, candidate_id: int) -> int:
+    return _geometry_seed(str(identity), int(round_id), int(candidate_id))
+
+
 def _sample_seed(smiles_or_mol) -> int:
+    """Placeholder-metadata seed: the round-(-1) geometry seed of a sample."""
+
     molecule = (
         Chem.Mol(smiles_or_mol)
         if isinstance(smiles_or_mol, Chem.Mol)
@@ -72,10 +113,7 @@ def _sample_seed(smiles_or_mol) -> int:
         Chem.MolToSmiles(molecule, canonical=True)
         if molecule is not None else str(smiles_or_mol)
     )
-    digest = hashlib.sha256(
-        f"{TRIMER_MCL_SCHEMA}:{identity}".encode("utf-8")
-    ).digest()
-    return int.from_bytes(digest[:4], "little") & 0x7FFFFFFF
+    return _geometry_seed(identity, -1)
 
 
 def _canonical_source_mol(smiles_or_mol) -> Chem.Mol:
@@ -112,7 +150,10 @@ def _embed_attempt(
     num_candidates: int,
     seed: int,
     use_random_coords: bool,
+    enforce_chirality: bool,
+    prune_rms_thresh: float,
     max_iterations: int,
+    timeout_seconds: int = TRIMER_ETKDG_TIMEOUT_SECONDS,
 ):
     """Run one deterministic ETKDG attempt on a fresh molecule copy."""
 
@@ -124,10 +165,10 @@ def _embed_attempt(
     params.randomSeed = int(seed)
     params.numThreads = 1
     params.useRandomCoords = bool(use_random_coords)
-    params.enforceChirality = True
+    params.enforceChirality = bool(enforce_chirality)
     params.maxIterations = int(max_iterations)
-    params.timeout = TRIMER_ETKDG_TIMEOUT_SECONDS
-    params.pruneRmsThresh = -1.0
+    params.timeout = int(timeout_seconds)
+    params.pruneRmsThresh = float(prune_rms_thresh)
     embedded = AllChem.EmbedMultipleConfs(
         candidate, numConfs=int(num_candidates), params=params
     )
@@ -268,17 +309,6 @@ def _attach_placeholder(data, reason: str, seed: int = 0):
     return data
 
 
-def _finish_geometry_failure(data, reason: str, seed: int, diagnostics):
-    """Return a shape-consistent unavailable record after a normal failure."""
-
-    _attach_placeholder(data, reason, seed)
-    data.search_stop_reason = str(reason)
-    data.trimer_failure_code = str(reason)
-    data.trimer_conformer_method = TRIMER_MCL_PROTOCOL
-    data.generation_diagnostics = diagnostics
-    return data
-
-
 def attach_unavailable_trimer_mcl(data, reason: str):
     """Attach an explicit invalid Trimer payload without running RDKit 3D."""
 
@@ -292,6 +322,32 @@ def attach_unavailable_trimer_mcl(data, reason: str):
 
 class TrimerContractError(RuntimeError):
     """Fatal chemical identity, bond, or Stereo-reference violation."""
+
+
+class TrimerGeometryRejection(RuntimeError):
+    """Ordinary geometry failure: the sample is excluded from the
+    geometry-enabled cohort and never becomes a tombstone record."""
+
+    def __init__(self, code, *, round_reached=None, candidate_attempts=0,
+                 elapsed_seconds=0.0, last_embed_failure="", diagnostics=None):
+        super().__init__(code)
+        self.code = str(code)
+        self.round_reached = round_reached
+        self.candidate_attempts = int(candidate_attempts)
+        self.elapsed_seconds = float(elapsed_seconds)
+        self.last_embed_failure = str(last_embed_failure)
+        self.diagnostics = diagnostics
+
+    def ledger_entry(self, sample_key: str, canonical_identity: str) -> dict:
+        return {
+            "sample_key": str(sample_key),
+            "canonical_identity": str(canonical_identity),
+            "failure_code": self.code,
+            "round_reached": self.round_reached,
+            "candidate_attempts": self.candidate_attempts,
+            "elapsed_seconds": self.elapsed_seconds,
+            "last_embed_failure": self.last_embed_failure,
+        }
 
 
 class _ExpectedGeometryFailure(RuntimeError):
@@ -309,10 +365,7 @@ class _Candidate:
 
 
 def _round_seed(sample_key, round_id: int) -> int:
-    digest = hashlib.sha256(
-        f"{TRIMER_MCL_SCHEMA}:{sample_key}:{int(round_id)}".encode("utf-8")
-    ).digest()
-    return int.from_bytes(digest[:4], "little") & 0x7FFFFFFF
+    return _geometry_seed(str(sample_key), int(round_id))
 
 
 def _coordinates(mol: Chem.Mol, conf_id: int, atom_count: int) -> torch.Tensor:
@@ -808,27 +861,97 @@ def _star_geometry(data, metadata):
 
 
 def attach_finite_trimer_mcl(
-    data, smiles, *, num_candidates: int = TRIMER_CANDIDATES_PER_ROUND,
-    max_heavy_atoms=None, max_rounds: int = TRIMER_MAX_ROUNDS,
-    timeout_seconds: float = TRIMER_SAMPLE_TIMEOUT_SECONDS,
+    data, smiles, *, build_spec=None, num_candidates=None,
+    max_heavy_atoms=None, max_rounds=None, timeout_seconds=None,
     sample_key=None,
 ):
-    """Attach one explicit-H Trimer conformer selected from at most two rounds."""
-    del max_heavy_atoms  # Deliberately no atom-count rejection or 2-D fallback.
-    num_candidates = int(num_candidates)
-    max_rounds = int(max_rounds)
-    if not 1 <= num_candidates <= TRIMER_CANDIDATES_PER_ROUND:
-        raise ValueError("num_candidates must be in [1,8]")
-    if not 0 <= max_rounds <= TRIMER_MAX_ROUNDS:
-        raise ValueError("max_rounds must be in [0,2]")
+    """Attach one explicit-H Trimer conformer via a first-valid search.
+
+    Protocol (formal): each round attempts ``num_candidates`` candidates in
+    deterministic candidate_id order.  Every candidate is embedded
+    independently with its own deterministic candidate seed, relaxed with
+    MMFF94 and audited; the FIRST valid candidate is accepted and the whole
+    search stops immediately.  There is no energy ranking and no
+    convergence-tier preference.  Round 1 runs only when round 0 produced no
+    valid candidate.  Round 0 and round 1 share ONE wall-clock deadline for
+    the whole polymer (60 s).  MMFF convergence is recorded as a diagnostic
+    and never used for selection.
+
+    Ordinary geometry failures raise :class:`TrimerGeometryRejection`
+    (the sample is excluded from the geometry-enabled cohort); identity or
+    contract corruption raises :class:`TrimerContractError` (hard stop).
+    """
+    # The semantic build-spec is the only parameter source for the formal
+    # generator.  Legacy keyword overrides are accepted only when they repeat
+    # the spec exactly; they can never create an unrecorded protocol variant.
+    explicit_build_spec = build_spec is not None
+    build_spec = validate_build_spec(copy.deepcopy(build_spec or TRIMER_BUILD_SPEC))
+    if build_spec.get("artifact_type") != "trimer":
+        raise ValueError("Trimer generator requires a trimer build_spec")
+    parameters = build_spec["parameters"]
+    if not explicit_build_spec:
+        # Bounded direct-call variants remain useful for unit diagnostics.  They
+        # are first compiled into an explicit effective spec; the published
+        # builder always supplies its immutable spec and cannot take this path.
+        if num_candidates is not None:
+            if not 1 <= int(num_candidates) <= TRIMER_CANDIDATES_PER_ROUND:
+                raise ValueError(
+                    f"num_candidates must be in [1,{TRIMER_CANDIDATES_PER_ROUND}]"
+                )
+            parameters["num_candidates_per_round"] = int(num_candidates)
+        if max_rounds is not None:
+            if not 0 <= int(max_rounds) <= TRIMER_MAX_ROUNDS:
+                raise ValueError(f"max_rounds must be in [0,{TRIMER_MAX_ROUNDS}]")
+            parameters["max_rounds"] = int(max_rounds)
+        if timeout_seconds is not None:
+            if not 0 < float(timeout_seconds) <= TRIMER_SAMPLE_TIMEOUT_SECONDS:
+                raise ValueError("timeout_seconds exceeds the formal budget")
+            parameters["hard_timeout_seconds"] = float(timeout_seconds)
+        parameters["max_total_candidates"] = (
+            int(parameters["num_candidates_per_round"])
+            * int(parameters["max_rounds"])
+        )
+    num_candidates_from_spec = int(parameters["num_candidates_per_round"])
+    max_rounds_from_spec = int(parameters["max_rounds"])
+    timeout_from_spec = float(parameters["hard_timeout_seconds"])
+    for name, observed, expected in (
+        ("num_candidates", num_candidates, num_candidates_from_spec),
+        ("max_rounds", max_rounds, max_rounds_from_spec),
+        ("timeout_seconds", timeout_seconds, timeout_from_spec),
+    ):
+        if explicit_build_spec and observed is not None and float(observed) != float(expected):
+            raise ValueError(f"{name} must come from build_spec ({expected})")
+    if explicit_build_spec and max_heavy_atoms is not None:
+        raise ValueError("max_heavy_atoms is not part of the formal Trimer protocol")
+    num_candidates = num_candidates_from_spec
+    max_rounds = max_rounds_from_spec
+    timeout_seconds = timeout_from_spec
+    if int(parameters["max_total_candidates"]) != num_candidates * max_rounds:
+        raise ValueError("Trimer build_spec candidate accounting is inconsistent")
+    if parameters.get("selection") != "first_valid" or bool(
+        parameters.get("energy_ranking")
+    ):
+        raise ValueError("only first_valid/no-energy-ranking Trimer is supported")
+    if parameters.get("failure_policy") != "exclude_geometry_failure":
+        raise ValueError("Trimer geometry failures must be rejected")
+    seed_spec = parameters["seed_policy"]["geometry_seed_spec"]
+    if int(seed_spec["repeat_units"]) != 3 or bool(seed_spec["close_periodic"]):
+        raise ValueError("Trimer build_spec must describe an open three-RU molecule")
+    if not bool(seed_spec["explicit_h"]):
+        raise ValueError("Trimer build_spec requires explicit hydrogen coordinates")
+    started = time.monotonic()
+    deadline = started + float(timeout_seconds)
     seed = _sample_seed(smiles)
     _attach_placeholder(data, "not_built", seed)
     if not bool(getattr(data, "graph_available", True)):
-        return _attach_placeholder(data, "graph_unavailable", seed)
-    started = time.monotonic()
+        raise TrimerGeometryRejection(
+            "graph_unavailable", round_reached=-1, elapsed_seconds=0.0
+        )
     canonical_source = _canonical_source_mol(smiles)
     trimer, metadata = build_periodic_multimer_mol(
-        canonical_source, 3, close_periodic=False
+        canonical_source, int(seed_spec["repeat_units"]),
+        close_periodic=bool(seed_spec["close_periodic"]),
+        terminal_capping=str(seed_spec["terminal_capping"]),
     )
     base_count, units, mapping = _validate_trimer_contract(data, trimer, metadata)
     source_count = trimer.GetNumAtoms()
@@ -844,7 +967,10 @@ def attach_finite_trimer_mcl(
         data, trimer, mol_h_template, metadata, base_count, units, mapping
     )
     all_count = mol_h_template.GetNumAtoms()
-    properties = AllChem.MMFFGetMoleculeProperties(mol_h_template, mmffVariant="MMFF94")
+    mmff_variant = str(parameters["mmff_variant"])
+    properties = AllChem.MMFFGetMoleculeProperties(
+        mol_h_template, mmffVariant=mmff_variant
+    )
     diagnostics = dict(data.generation_diagnostics)
     diagnostics["trimer_source_atoms"] = source_count
     diagnostics["trimer_heavy_atoms"] = sum(
@@ -872,22 +998,39 @@ def attach_finite_trimer_mcl(
         }
         for atom in mol_h_template.GetAtoms()
     )
-    if properties is None:
+    identity = Chem.MolToSmiles(
+        canonical_source, canonical=True, isomericSmiles=True
+    )
+    if sample_key is not None:
+        # The key is a caller-side join assertion only.  It intentionally does
+        # not enter the seed material, whose declared identity is canonical RU.
+        if isinstance(sample_key, (bytes, bytearray, memoryview)):
+            raw_key = bytes(sample_key)
+            if len(raw_key) != 32:
+                raise TrimerContractError("invalid_sample_key_identity")
+
+    def _reject(code, round_reached, attempts, last_embed_failure=""):
         diagnostics["total_time"] = time.monotonic() - started
-        return _finish_geometry_failure(
-            data, "MMFF_UNSUPPORTED", seed, diagnostics
+        data.generation_diagnostics = diagnostics
+        raise TrimerGeometryRejection(
+            code,
+            round_reached=round_reached,
+            candidate_attempts=attempts,
+            elapsed_seconds=diagnostics["total_time"],
+            last_embed_failure=last_embed_failure,
+            diagnostics=diagnostics,
         )
-    selected = None
-    stop_reason = "NO_VALID_CONFORMER"
-    identity = sample_key if sample_key is not None else Chem.MolToSmiles(trimer, canonical=True)
+
+    if properties is None:
+        _reject("MMFF_UNSUPPORTED", -1, 0)
+
+    attempts = 0
+    last_embed_failure = ""
     for round_id in range(max_rounds):
-        if time.monotonic() - started >= float(timeout_seconds):
-            stop_reason = "timeout"; break
-        round_started = time.monotonic()
-        round_seed = _round_seed(identity, round_id)
+        if time.monotonic() >= deadline:
+            _reject("TIMEOUT", round_id - 1, attempts, last_embed_failure)
         round_diagnostics = {
             "round_id": round_id,
-            "seed": round_seed,
             "requested": num_candidates,
             "embedded": 0,
             "valid": 0,
@@ -899,28 +1042,16 @@ def attach_finite_trimer_mcl(
         }
         diagnostics["num_rounds"] += 1
         diagnostics["num_candidates_requested"] += num_candidates
-        embed_started = time.monotonic()
-        mol_h, ids = _embed_attempt(
-            mol_h_template, num_candidates=num_candidates,
-            seed=round_seed, use_random_coords=True,
-            max_iterations=TRIMER_ETKDG_MAX_ITERATIONS)
-        embed_elapsed = time.monotonic() - embed_started
-        diagnostics["embed_time"] += embed_elapsed
-        round_diagnostics["embed_time"] = embed_elapsed
-        diagnostics["num_candidates_embedded"] += len(ids)
-        round_diagnostics["embedded"] = len(ids)
-        round_props = AllChem.MMFFGetMoleculeProperties(
-            mol_h, mmffVariant="MMFF94"
-        )
-        if round_props is None:
-            raise TrimerContractError("MMFF_parameters_changed_after_embedding")
-        round_candidates = []
-        for candidate_id, conf_id in enumerate(ids):
+        for candidate_id in range(num_candidates):
+            if time.monotonic() >= deadline:
+                _reject("TIMEOUT", round_id, attempts, last_embed_failure)
+            attempts += 1
             candidate_diagnostics = {
+                "round_id": round_id,
                 "candidate_id": candidate_id,
-                "conformer_id": int(conf_id),
+                "seed": _candidate_seed(identity, round_id, candidate_id),
                 "requested": True,
-                "embedded": True,
+                "embedded": False,
                 "finite_pre_mmff": False,
                 "double_bond_stereo_pre_pass": None,
                 "tetra_stereo_pre_pass": None,
@@ -943,8 +1074,39 @@ def attach_finite_trimer_mcl(
                 "stereo_time": 0.0,
             }
             round_diagnostics["candidates"].append(candidate_diagnostics)
-            if not _conformer_coordinates_are_finite_3d(
-                    mol_h, conf_id, all_count):
+            remaining = deadline - time.monotonic()
+            embed_budget = max(1, int(min(
+                int(parameters["embedder_timeout_seconds"]), remaining
+            )))
+            embed_started = time.monotonic()
+            mol_h, ids = _embed_attempt(
+                mol_h_template, num_candidates=1, seed=candidate_diagnostics["seed"],
+                use_random_coords=bool(parameters["etkdg_use_random_coords"]),
+                enforce_chirality=bool(parameters["etkdg_enforce_chirality"]),
+                prune_rms_thresh=(
+                    -1.0 if not bool(parameters["etkdg_rmsd_pruning"])
+                    else float(seed_spec["prune_rms_thresh"])
+                ),
+                max_iterations=int(parameters["etkdg_max_iterations"]),
+                timeout_seconds=embed_budget,
+            )
+            embed_elapsed = time.monotonic() - embed_started
+            diagnostics["embed_time"] += embed_elapsed
+            round_diagnostics["embed_time"] += embed_elapsed
+            if not ids:
+                last_embed_failure = "ETKDG_NO_VALID_CONFORMER"
+                candidate_diagnostics["rejection"] = last_embed_failure
+                continue
+            diagnostics["num_candidates_embedded"] += 1
+            round_diagnostics["embedded"] += 1
+            candidate_diagnostics["embedded"] = True
+            conf_id = ids[0]
+            candidate_props = AllChem.MMFFGetMoleculeProperties(
+                mol_h, mmffVariant=mmff_variant
+            )
+            if candidate_props is None:
+                raise TrimerContractError("MMFF_parameters_changed_after_embedding")
+            if not _conformer_coordinates_are_finite_3d(mol_h, conf_id, all_count):
                 diagnostics["num_geometry_rejected"] += 1
                 candidate_diagnostics["rejection"] = "PRE_MMFF_NONFINITE"
                 continue
@@ -965,8 +1127,8 @@ def attach_finite_trimer_mcl(
             mmff_started = time.monotonic()
             mmff_status = int(AllChem.MMFFOptimizeMolecule(
                 mol_h, confId=int(conf_id),
-                maxIters=TRIMER_MMFF_RELAX_MAX_ITERATIONS,
-                mmffVariant="MMFF94",
+                maxIters=int(parameters["mmff_relax_max_iterations"]),
+                mmffVariant=mmff_variant,
             ))
             mmff_elapsed = time.monotonic() - mmff_started
             diagnostics["mmff_time"] += mmff_elapsed
@@ -981,7 +1143,9 @@ def attach_finite_trimer_mcl(
                 candidate_diagnostics["rejection"] = "POST_MMFF_NONFINITE_COORDINATES"
                 continue
             candidate_diagnostics["finite_post_mmff"] = True
-            energy = _calculate_mmff_energy(mol_h, round_props, conf_id)
+            # Energy is a finite-coordinate validity gate only.  It never
+            # ranks, orders or prioritises candidates.
+            energy = _calculate_mmff_energy(mol_h, candidate_props, conf_id)
             if energy is None:
                 diagnostics["num_geometry_rejected"] += 1
                 candidate_diagnostics["rejection"] = "POST_MMFF_NONFINITE_ENERGY"
@@ -1011,54 +1175,38 @@ def attach_finite_trimer_mcl(
                 diagnostics["num_post_stereo_rejected"] += 1
                 candidate_diagnostics["rejection"] = f"{component}_STEREO_POST_F32"
                 continue
+            # First valid candidate: accept and stop the whole search now.
             candidate_diagnostics["final_valid"] = True
             candidate_diagnostics["accepted"] = True
-            round_candidates.append(_Candidate(
-                xyz32, float(energy), round_id, candidate_id,
-                mmff_status, converged,
-            ))
-        round_diagnostics["valid"] = len(round_candidates)
-        round_diagnostics["total_time"] = time.monotonic() - round_started
+            round_diagnostics["valid"] = 1
+            diagnostics["num_valid_candidates"] += 1
+            round_diagnostics["total_time"] = time.monotonic() - started
+            diagnostics["rounds"].append(round_diagnostics)
+            diagnostics["total_time"] = time.monotonic() - started
+            data.generation_diagnostics = diagnostics
+            data.trimer_pos = xyz32
+            data.trimer_conformer_energy = float(energy)
+            data.trimer_conformer_round_id = int(round_id)
+            data.trimer_conformer_candidate_id = int(candidate_id)
+            data.trimer_conformer_seed = int(candidate_diagnostics["seed"])
+            data.selected_converged = bool(converged)
+            data.search_stop_reason = "selected"
+            data.trimer_geometry_valid = True
+            data.trimer_geometry_is_3d = torch.tensor(True, dtype=torch.bool)
+            data.trimer_2d_fallback = torch.tensor(False, dtype=torch.bool)
+            data.trimer_geometry_source = "etkdgv3_randomcoords_mmff94_allatom"
+            data.trimer_failure_code = ""
+            data.trimer_conformer_method = TRIMER_MCL_PROTOCOL
+            _validate_all_atom_payload(data)
+            _star_geometry(data, metadata)
+            return data
+        round_diagnostics["total_time"] = time.monotonic() - started
         diagnostics["rounds"].append(round_diagnostics)
-        diagnostics["num_valid_candidates"] += len(round_candidates)
-        if round_candidates:
-            selected = min(
-                round_candidates,
-                key=lambda candidate: (
-                    not candidate.converged,
-                    candidate.energy,
-                    candidate.candidate_id,
-                ),
-            )
-            stop_reason = "selected"
-            break
-        if time.monotonic() - started >= float(timeout_seconds):
-            stop_reason = "timeout"
-            break
-    diagnostics["total_time"] = time.monotonic() - started
-    data.generation_diagnostics = diagnostics
-    if selected is None:
-        if stop_reason != "timeout":
-            stop_reason = (
-                "ETKDG_NO_VALID_CONFORMER"
-                if diagnostics["num_candidates_embedded"] == 0
-                else "NO_VALID_CONFORMER"
-            )
-        return _finish_geometry_failure(data, stop_reason, seed, diagnostics)
-
-    data.trimer_pos = selected.positions
-    data.trimer_conformer_energy = float(selected.energy)
-    data.trimer_conformer_round_id = int(selected.round_id)
-    data.trimer_conformer_candidate_id = int(selected.candidate_id)
-    data.trimer_conformer_seed = _round_seed(identity, selected.round_id)
-    data.selected_converged = bool(selected.converged)
-    data.search_stop_reason = "selected"
-    data.trimer_geometry_valid = True
-    data.trimer_geometry_is_3d = torch.tensor(True, dtype=torch.bool)
-    data.trimer_2d_fallback = torch.tensor(False, dtype=torch.bool)
-    data.trimer_geometry_source = "etkdgv3_randomcoords_mmff94_allatom"
-    data.trimer_failure_code = ""
-    data.trimer_conformer_method = TRIMER_MCL_PROTOCOL
-    _validate_all_atom_payload(data)
-    _star_geometry(data, metadata)
-    return data
+    if time.monotonic() >= deadline:
+        _reject("TIMEOUT", max_rounds - 1, attempts, last_embed_failure)
+    code = (
+        "ETKDG_NO_VALID_CONFORMER"
+        if diagnostics["num_candidates_embedded"] == 0
+        else "NO_VALID_CONFORMER"
+    )
+    _reject(code, max_rounds - 1, attempts, last_embed_failure)

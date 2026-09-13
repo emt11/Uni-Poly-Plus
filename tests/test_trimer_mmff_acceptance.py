@@ -53,24 +53,27 @@ def test_formal_embedding_uses_randomcoords_and_stops_after_success(monkeypatch)
 
     monkeypatch.setattr(module, "_embed_attempt", wrapped)
     result = attach_finite_trimer_mcl(
-        _topology(), "*CCO*", num_candidates=2, max_rounds=2,
+        _topology(), "*CCO*", num_candidates=4, max_rounds=2,
         timeout_seconds=60, sample_key="randomcoords-contract",
     )
     assert result.trimer_geometry_valid
+    # first-valid early stop: exactly ONE candidate embed (candidate 0)
     assert len(calls) == 1
     assert calls[0]["use_random_coords"] is True
     assert calls[0]["max_iterations"] == 200
+    assert calls[0]["num_candidates"] == 1
     assert result.generation_diagnostics["num_rounds"] == 1
     candidate_rows = result.generation_diagnostics["rounds"][0]["candidates"]
-    assert len(candidate_rows) == 2
-    assert all(row["finite_pre_mmff"] for row in candidate_rows)
-    assert all(row["double_bond_stereo_pre_pass"] is True for row in candidate_rows)
-    assert all(row["tetra_stereo_pre_pass"] is True for row in candidate_rows)
-    assert all(row["mmff_energy_finite"] for row in candidate_rows)
-    assert all(row["finite_post_mmff"] for row in candidate_rows)
-    assert all(row["double_bond_stereo_post_f64_pass"] is True for row in candidate_rows)
-    assert all(row["tetra_stereo_post_f32_pass"] is True for row in candidate_rows)
-    assert all(row["final_valid"] for row in candidate_rows)
+    assert len(candidate_rows) == 1
+    assert candidate_rows[0]["candidate_id"] == 0
+    assert candidate_rows[0]["finite_pre_mmff"] is True
+    assert candidate_rows[0]["double_bond_stereo_pre_pass"] is True
+    assert candidate_rows[0]["tetra_stereo_pre_pass"] is True
+    assert candidate_rows[0]["mmff_energy_finite"] is True
+    assert candidate_rows[0]["finite_post_mmff"] is True
+    assert candidate_rows[0]["double_bond_stereo_post_f64_pass"] is True
+    assert candidate_rows[0]["tetra_stereo_post_f32_pass"] is True
+    assert candidate_rows[0]["final_valid"] is True
     assert result.generation_diagnostics["stereo_time"] >= 0
 
 
@@ -96,37 +99,44 @@ def test_second_round_runs_only_when_first_has_no_final_valid_candidate(monkeypa
     assert len(calls) == 2
     assert calls[0]["seed"] != calls[1]["seed"]
     assert all(call["use_random_coords"] is True for call in calls)
+    assert result.trimer_conformer_round_id == 1
+    assert result.trimer_conformer_candidate_id == 0
 
 
-def test_successful_round_processes_all_candidates_and_prefers_converged(monkeypatch):
+def test_first_valid_accepts_candidate0_and_never_ranks_energy(monkeypatch):
+    """First-valid protocol: candidate 0 is accepted even when a later
+    candidate would be 'better' (converged / lower energy); the remaining
+    candidates are never attempted and no energy comparator runs."""
     from src.dataset import trimer_mcl as module
-    original_embed = module._embed_attempt
     optimize_calls = []
-
-    def embed_two(molecule, **kwargs):
-        return original_embed(
-            molecule, num_candidates=2, seed=kwargs["seed"],
-            use_random_coords=True, max_iterations=200,
-        )
+    energy_calls = []
 
     def optimize(_mol, *, confId, **_kwargs):
         optimize_calls.append(int(confId))
-        return 1 if int(confId) == 0 else 0
+        return 1  # candidate 0 is NON-converged
 
-    monkeypatch.setattr(module, "_embed_attempt", embed_two)
+    def energy(_mol, _props, conf_id):
+        energy_calls.append(int(conf_id))
+        return 100.0  # deliberately terrible energy
+
     monkeypatch.setattr(AllChem, "MMFFOptimizeMolecule", optimize)
-    monkeypatch.setattr(
-        module, "_calculate_mmff_energy",
-        lambda _mol, _props, conf_id: 1.0 if int(conf_id) == 0 else 10.0,
-    )
+    monkeypatch.setattr(module, "_calculate_mmff_energy", energy)
     result = attach_finite_trimer_mcl(
-        _topology(), "*CCO*", num_candidates=2, max_rounds=2,
-        sample_key="convergence-priority",
+        _topology(), "*CCO*", num_candidates=4, max_rounds=2,
+        sample_key="first-valid-contract",
     )
-    assert optimize_calls == [0, 1]
-    assert result.selected_converged is True
-    assert result.trimer_conformer_candidate_id == 1
-    assert result.trimer_conformer_energy == 10.0
+    # candidate 0 accepted despite being non-converged with high energy
+    assert result.trimer_geometry_valid
+    assert result.trimer_conformer_candidate_id == 0
+    assert result.trimer_conformer_round_id == 0
+    assert result.selected_converged is False
+    assert result.trimer_conformer_energy == 100.0
+    # early stop: candidate 1/2/3 and round 1 never executed
+    assert optimize_calls == [0]
+    assert energy_calls == [0]
+    rows = result.generation_diagnostics["rounds"][0]["candidates"]
+    assert len(rows) == 1
+    assert result.generation_diagnostics["num_rounds"] == 1
 
 
 def test_finite_nonconverged_candidate_is_explicit_fallback(monkeypatch):
@@ -140,20 +150,15 @@ def test_finite_nonconverged_candidate_is_explicit_fallback(monkeypatch):
     assert result.generation_diagnostics["rounds"][0]["candidates"][0]["mmff_status"] == 1
 
 
-def test_mmff_unsupported_stops_before_embedding(monkeypatch):
+def test_mmff_unsupported_is_ordinary_rejection(monkeypatch):
     from src.dataset import trimer_mcl as module
     monkeypatch.setattr(AllChem, "MMFFGetMoleculeProperties", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         module, "_embed_attempt",
         lambda *args, **kwargs: pytest.fail("embedding must not run"),
     )
-    result = attach_finite_trimer_mcl(_topology(), "*CCO*")
-    assert not result.trimer_geometry_valid
-    assert result.search_stop_reason == "MMFF_UNSUPPORTED"
-    assert result.generation_diagnostics["num_rounds"] == 0
-    assert result.trimer_pos.shape == (0, 3)
-    assert result.trimer_atomic_numbers.numel() == 0
-    assert result.trimer_edge_index.shape == (2, 0)
+    with pytest.raises(module.TrimerGeometryRejection, match="MMFF_UNSUPPORTED"):
+        attach_finite_trimer_mcl(_topology(), "*CCO*")
 
 
 def test_all_atom_payload_keeps_hydrogens_and_physical_bonds():
@@ -188,6 +193,62 @@ def test_all_atom_payload_keeps_hydrogens_and_physical_bonds():
     assert not hasattr(result, "conformer_positions")
     from src.dataset.mts_cache_integrity import _validate_trimer_record
     assert _validate_trimer_record(topology, result) == []
+
+
+def test_open_h_caps_preserve_charged_aromatic_attachment_ru_bonds():
+    """A terminal aromatic [n+] needs an explicit H-cap declaration.
+
+    This is the real pilot structure that previously made only RU+1 lose
+    aromaticity during sanitization and triggered the internal-bond contract.
+    """
+    smiles = (
+        "*COc1ccc(CSC(=O)c2ccc(C(=O)OCCCCOC(=O)"
+        "c3ccc[n+](*)c3)cc2)cc1"
+    )
+    trimer, metadata = build_periodic_multimer_mol(
+        smiles, num_repeat_units=3, close_periodic=False
+    )
+
+    unit_bonds = []
+    for unit in metadata["unit_atoms"]:
+        reverse = {atom_index: base_id for base_id, atom_index in enumerate(unit)}
+        unit_bonds.append({
+            (
+                min(reverse[bond.GetBeginAtomIdx()], reverse[bond.GetEndAtomIdx()]),
+                max(reverse[bond.GetBeginAtomIdx()], reverse[bond.GetEndAtomIdx()]),
+                str(bond.GetBondType()),
+                bool(bond.GetIsAromatic()),
+            )
+            for bond in trimer.GetBonds()
+            if bond.GetBeginAtomIdx() in reverse
+            and bond.GetEndAtomIdx() in reverse
+        })
+    assert unit_bonds[0] == unit_bonds[1] == unit_bonds[2]
+
+    right_terminal = trimer.GetAtomWithIdx(metadata["unit_right_boundaries"][-1])
+    assert right_terminal.GetSymbol() == "N"
+    assert right_terminal.GetFormalCharge() == 1
+    assert right_terminal.GetIsAromatic()
+    assert right_terminal.GetNumExplicitHs() == 1
+    assert metadata["terminal_cap_hydrogens"] == [
+        {
+            "side": "left",
+            "atom": metadata["unit_left_boundaries"][0],
+            "count": 1,
+        },
+        {
+            "side": "right",
+            "atom": metadata["unit_right_boundaries"][-1],
+            "count": 1,
+        },
+    ]
+    with_hydrogens = Chem.AddHs(trimer)
+    capped_nitrogen = with_hydrogens.GetAtomWithIdx(
+        metadata["unit_right_boundaries"][-1]
+    )
+    assert sum(
+        neighbor.GetAtomicNum() == 1 for neighbor in capped_nitrogen.GetNeighbors()
+    ) == 1
 
 
 def test_equivalent_noncanonical_input_uses_same_canonical_identity():
@@ -276,20 +337,20 @@ def test_fatal_identity_mapping_is_not_downgraded():
         attach_finite_trimer_mcl(data, "*CCO*", max_rounds=0)
 
 
-def test_total_embedding_failure_is_single_conformer_unavailable(monkeypatch):
+def test_total_embedding_failure_is_ordinary_rejection(monkeypatch):
     from src.dataset import trimer_mcl as module
     monkeypatch.setattr(
         module, "_embed_attempt", lambda mol, **kwargs: (Chem.Mol(mol), [])
     )
-    result = attach_finite_trimer_mcl(
-        _topology(), "*CCO*", num_candidates=8, max_rounds=2,
-    )
-    assert not result.trimer_geometry_valid
-    assert result.search_stop_reason == "ETKDG_NO_VALID_CONFORMER"
-    assert result.trimer_pos.shape == (0, 3)
-    assert result.trimer_atomic_numbers.numel() == 0
-    assert result.trimer_edge_index.shape == (2, 0)
-    assert result.generation_diagnostics["num_candidates_requested"] == 16
+    with pytest.raises(module.TrimerGeometryRejection) as excinfo:
+        attach_finite_trimer_mcl(
+            _topology(), "*CCO*", num_candidates=4, max_rounds=2,
+        )
+    rejection = excinfo.value
+    assert rejection.code == "ETKDG_NO_VALID_CONFORMER"
+    assert rejection.candidate_attempts == 8      # 4 + 4
+    assert rejection.round_reached == 1
+    assert rejection.last_embed_failure == "ETKDG_NO_VALID_CONFORMER"
 
 
 def test_unknown_embed_exception_remains_fatal(monkeypatch):
@@ -371,10 +432,9 @@ def test_over_384_heavy_atoms_enters_randomcoords_without_2d(monkeypatch):
         AllChem, "Compute2DCoords",
         lambda *args, **kwargs: pytest.fail("2-D fallback called"),
     )
-    result = attach_finite_trimer_mcl(
-        data, source, num_candidates=8, max_rounds=1, timeout_seconds=60,
-    )
+    with pytest.raises(module.TrimerGeometryRejection):
+        attach_finite_trimer_mcl(
+            data, source, num_candidates=4, max_rounds=1, timeout_seconds=60,
+        )
     assert called["use_random_coords"] is True
     assert called["max_iterations"] == 200
-    assert not result.trimer_geometry_valid
-    assert not bool(result.trimer_2d_fallback)

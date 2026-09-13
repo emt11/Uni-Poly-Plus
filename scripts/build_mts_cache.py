@@ -1,0 +1,1092 @@
+#!/usr/bin/env python3
+"""Build, audit, freeze and atomically publish one new-protocol MTS bundle.
+
+This command never scans or reuses historical cache artifacts.  Re-running the
+same command resumes only its content-addressed ``.staging`` bundle.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import multiprocessing as mp
+import os
+import pickle
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+import lmdb
+import numpy as np
+import torch
+from rdkit import Chem, rdBase
+from torch_geometric.data import Data
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.dataset.cache_lifecycle import (  # noqa: E402
+    CacheAuditError,
+    CacheLifecycleError,
+    IntentionalBuildInterrupt,
+    PublishedCacheDataset,
+    StagingWriter,
+    append_jsonl,
+    artifact_identity,
+    atomic_json,
+    bundle_identity,
+    deserialize_record,
+    failure_distribution,
+    json_hash,
+    load_source_rows,
+    ordered_key_hash,
+    read_rejections,
+    select_record_fields,
+    serialize_record,
+    sha256_file,
+    snapshot_tree,
+)
+from src.dataset.cache_spec import (  # noqa: E402
+    RECORD_FIELDS,
+    REQUIRED_FIELDS,
+    ROUTE_BUILD_SPECS,
+    build_spec_hash,
+)
+from src.dataset.dataset import (  # noqa: E402
+    _compute_ru_base_layer,
+    _compute_topology_layer_impl,
+)
+from src.dataset.graph_data import build_periodic_multimer_mol  # noqa: E402
+from src.dataset.trimer_mcl import (  # noqa: E402
+    TrimerContractError,
+    TrimerGeometryRejection,
+    attach_finite_trimer_mcl,
+)
+
+
+def _metadata(layer, artifact_hash, source_manifest_hash, parents):
+    spec = ROUTE_BUILD_SPECS[layer]
+    return {
+        "artifact_type": layer,
+        "artifact_hash": artifact_hash,
+        "build_spec": spec,
+        "build_spec_hash": build_spec_hash(spec),
+        "source_manifest_hash": source_manifest_hash,
+        "parents": dict(sorted(parents.items())),
+        "record_fields": list(RECORD_FIELDS[layer]),
+        "toolchain": {"rdkit": rdBase.rdkitVersion, "torch": torch.__version__},
+    }
+
+
+def _write_source(staging, rows, manifest):
+    root = staging / "source"
+    root.mkdir(parents=True, exist_ok=True)
+    records_path = root / "records.jsonl"
+    expected = "".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+        for row in rows
+    )
+    if records_path.exists():
+        if records_path.read_text(encoding="utf-8") != expected:
+            raise CacheLifecycleError("staging source records mismatch")
+    else:
+        records_path.write_text(expected, encoding="utf-8")
+    observed = {**manifest, "records_file_sha256": sha256_file(records_path)}
+    manifest_path = root / "manifest.json"
+    if manifest_path.exists():
+        if json.loads(manifest_path.read_text(encoding="utf-8")) != observed:
+            raise CacheLifecycleError("staging source manifest mismatch")
+    else:
+        atomic_json(manifest_path, observed)
+
+
+def _progress_line(phase, processed, total, accepted, rejected, failure_counts,
+                   started_wall):
+    elapsed = max(time.monotonic() - started_wall, 1e-9)
+    remaining = max(0, total - processed)
+    print(json.dumps({
+        "phase": phase, "processed": processed, "total": total,
+        "accepted": accepted, "rejected": rejected,
+        "unresolved": remaining,
+        "samples_per_second": round(processed / elapsed, 3),
+        "eta_seconds": round(remaining / max(processed / elapsed, 1e-9), 1)
+        if processed else None,
+        "failure_counts": dict(sorted(failure_counts.items())),
+    }), flush=True)
+
+
+def _run_struct(staging, rows, metadata, workers):
+    """Compute RU + Topology records through the shared worker pool.
+
+    Scheduling-only parallelisation of the pilot-verified serial phase: the
+    scientific generators are unchanged and the parent remains the single
+    writer for both layers.  Resume skips samples already present in both
+    layers.  Identity corruption is a hard stop (never a rejection).
+    """
+
+    ru_writer = StagingWriter(staging / "ru_base", metadata["ru_base"])
+    topology_writer = StagingWriter(staging / "topology", metadata["topology"])
+    processed_new = 0
+    writer_seconds = 0.0
+    total = len(rows)
+    started_wall = time.monotonic()
+    last_report = 0.0
+
+    def progress(force=False):
+        nonlocal last_report
+        now = time.monotonic()
+        if not force and now - last_report < 30.0:
+            return
+        last_report = now
+        _progress_line("struct", processed_new, total, processed_new, 0,
+                       {}, started_wall)
+
+    def commit_result(result):
+        nonlocal processed_new, writer_seconds
+        key = bytes.fromhex(result["sample_key"])
+        status = result["status"]
+        if status == "contract_error":
+            raise TrimerContractError(
+                f"sample_key={result['sample_key']}:{result['error']}"
+            )
+        if status == "program_error":
+            raise CacheLifecycleError(
+                f"sample_key={result['sample_key']}:{result['error']}"
+            )
+        if key in ru_writer or key in topology_writer:
+            raise CacheLifecycleError("duplicate struct write")
+        ru_data = deserialize_record(result.pop("ru_payload"), key)
+        topology_data = deserialize_record(result.pop("topology_payload"), key)
+        inserted_ru, _, elapsed_ru = ru_writer.put(key, ru_data)
+        inserted_topo, _, elapsed_topo = topology_writer.put(key, topology_data)
+        if not inserted_ru or not inserted_topo:
+            raise CacheLifecycleError("duplicate struct LMDB write")
+        writer_seconds += elapsed_ru + elapsed_topo
+        processed_new += 1
+        progress()
+
+    jobs = [
+        {**row, "phase": "struct"} for row in rows
+        if bytes.fromhex(row["sample_key"]) not in ru_writer
+        or bytes.fromhex(row["sample_key"]) not in topology_writer
+    ]
+    struct_timeout = 600.0
+
+    if int(workers) <= 1 or len(jobs) <= 1:
+        try:
+            for job in jobs:
+                commit_result(_build_struct_one(job))
+            ru_writer.sync()
+            topology_writer.sync()
+        finally:
+            ru_writer.close()
+            topology_writer.close()
+        progress(force=True)
+        return {"struct_new": processed_new,
+                "struct_writer_seconds": writer_seconds}
+
+    context = mp.get_context("spawn")
+
+    def start_worker():
+        parent, child = context.Pipe(duplex=True)
+        process = context.Process(target=_worker_loop, args=(child,))
+        process.start()
+        child.close()
+        return {"process": process, "connection": parent, "job": None,
+                "job_id": None, "started": 0.0}
+
+    def stop_worker(state):
+        try:
+            state["connection"].close()
+        except Exception:
+            pass
+        process = state["process"]
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+
+    states = [start_worker() for _ in range(min(int(workers), len(jobs)))]
+    iterator = iter(jobs)
+    next_job_id = 0
+    retried = {}
+
+    def assign(state):
+        nonlocal next_job_id
+        try:
+            job = next(iterator)
+        except StopIteration:
+            state["job"] = None
+            return False
+        next_job_id += 1
+        state.update(job=job, job_id=next_job_id, started=time.monotonic())
+        state["connection"].send((next_job_id, job))
+        return True
+
+    for state in states:
+        assign(state)
+    try:
+        while any(state["job"] is not None for state in states):
+            progressed = False
+            for index, state in enumerate(states):
+                if state["job"] is None:
+                    continue
+                if state["connection"].poll():
+                    returned, result = pickle.loads(
+                        state["connection"].recv_bytes()
+                    )
+                    if returned != state["job_id"]:
+                        raise CacheLifecycleError("worker job identity mismatch")
+                    commit_result(result)
+                    assign(state)
+                    progressed = True
+                    continue
+                if not state["process"].is_alive():
+                    raise CacheLifecycleError(
+                        f"struct worker crashed for "
+                        f"{state['job']['sample_key']}"
+                    )
+                if time.monotonic() - state["started"] >= struct_timeout:
+                    timed_out = state["job"]
+                    stop_worker(state)
+                    states[index] = start_worker()
+                    if retried.get(timed_out["sample_key"]):
+                        raise CacheLifecycleError(
+                            f"struct job exceeded timeout twice: "
+                            f"{timed_out['sample_key']}"
+                        )
+                    retried[timed_out["sample_key"]] = True
+                    assign(states[index])
+                    progressed = True
+            if not progressed:
+                time.sleep(0.01)
+    finally:
+        try:
+            ru_writer.sync()
+            topology_writer.sync()
+        finally:
+            ru_writer.close()
+            topology_writer.close()
+            for state in states:
+                try:
+                    if state["process"].is_alive():
+                        state["connection"].send(None)
+                except Exception:
+                    pass
+            for state in states:
+                stop_worker(state)
+    progress(force=True)
+    return {"struct_new": processed_new,
+            "struct_writer_seconds": writer_seconds}
+
+
+def _trimer_identity_carrier(normalized_smiles: str) -> Data:
+    molecule = Chem.MolFromSmiles(str(normalized_smiles))
+    if molecule is None:
+        raise TrimerContractError("source_identity_corruption")
+    ru, metadata = build_periodic_multimer_mol(
+        molecule, num_repeat_units=1, close_periodic=False
+    )
+    count = int(metadata["base_atom_count"])
+    carrier = Data()
+    carrier.num_nodes = count
+    carrier.canonical_ru_atom_index = torch.arange(count, dtype=torch.long)
+    carrier.canonical_to_trimer_base_atom_id = torch.arange(count, dtype=torch.long)
+    carrier.z = torch.tensor(
+        [atom.GetAtomicNum() for atom in ru.GetAtoms()], dtype=torch.long
+    )
+    carrier.graph_available = True
+    return carrier
+
+
+def _build_struct_one(payload):
+    """Compute the RU and Topology records for one sample inside a worker.
+
+    Scheduling only: the scientific generators are the same functions the
+    serial pilot path used, and the parent remains the single LMDB writer.
+    """
+
+    try:
+        ru = _compute_ru_base_layer(payload["source_smiles"])
+        if not bool(getattr(ru, "ru_base_valid", False)):
+            return {
+                "status": "contract_error", "sample_key": payload["sample_key"],
+                "error": "source_identity_corruption",
+            }
+        topology = _compute_topology_layer_impl(
+            payload["source_smiles"], ru, max_hops=int(
+                ROUTE_BUILD_SPECS["topology"]["parameters"]["max_hops"]
+            )
+        )
+        return {
+            "status": "ok", "sample_key": payload["sample_key"],
+            "ru_payload": serialize_record(
+                bytes.fromhex(payload["sample_key"]),
+                select_record_fields("ru_base", ru),
+            ),
+            "topology_payload": serialize_record(
+                bytes.fromhex(payload["sample_key"]),
+                select_record_fields("topology", topology),
+            ),
+        }
+    except TrimerContractError as exc:
+        return {
+            "status": "contract_error", "sample_key": payload["sample_key"],
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+    except BaseException as exc:
+        return {
+            "status": "program_error", "sample_key": payload["sample_key"],
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+
+
+def _build_trimer_one(payload):
+    started = time.monotonic()
+    # Test-only fault injection (integration tests prove the multi-worker
+    # hard-stop path).  Inert unless the environment variable is set.
+    fault_key = os.environ.get("MTS_CACHE_FAULT_CONTRACT_KEY")
+    if fault_key and payload["sample_key"] == fault_key:
+        return {
+            "status": "contract_error", "sample_key": payload["sample_key"],
+            "error": "test_fault:injected_contract_error",
+        }
+    try:
+        carrier = _trimer_identity_carrier(payload["normalized_smiles"])
+        attach_finite_trimer_mcl(
+            carrier,
+            payload["normalized_smiles"],
+            build_spec=ROUTE_BUILD_SPECS["trimer"],
+            sample_key=bytes.fromhex(payload["sample_key"]),
+        )
+        diagnostics = dict(getattr(carrier, "generation_diagnostics", {}))
+        data = select_record_fields("trimer", carrier)
+        return {
+            "status": "accepted", "sample_key": payload["sample_key"],
+            "payload": serialize_record(bytes.fromhex(payload["sample_key"]), data),
+            "elapsed_seconds": time.monotonic() - started,
+            "candidate_attempts": sum(
+                len(row.get("candidates", []))
+                for row in diagnostics.get("rounds", [])
+            ),
+            "round_reached": int(getattr(carrier, "trimer_conformer_round_id", -1)),
+        }
+    except TrimerGeometryRejection as exc:
+        return {
+            "status": "rejected", "sample_key": payload["sample_key"],
+            "failure_code": exc.code,
+            "candidate_attempts": int(exc.candidate_attempts),
+            "elapsed_seconds": float(exc.elapsed_seconds),
+            "round_reached": int(exc.round_reached if exc.round_reached is not None else -1),
+        }
+    except TrimerContractError as exc:
+        return {
+            "status": "contract_error", "sample_key": payload["sample_key"],
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+    except BaseException as exc:
+        return {
+            "status": "program_error", "sample_key": payload["sample_key"],
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+
+
+def _worker_loop(connection):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    torch.set_num_threads(1)
+    try:
+        while True:
+            message = connection.recv()
+            if message is None:
+                return
+            job_id, payload = message
+            if payload.get("phase") == "struct":
+                result = _build_struct_one(payload)
+            else:
+                result = _build_trimer_one(payload)
+            connection.send_bytes(pickle.dumps((job_id, result), protocol=5))
+    except (EOFError, BrokenPipeError, KeyboardInterrupt):
+        return
+    finally:
+        connection.close()
+
+
+def _stop_worker(state):
+    try:
+        state["connection"].close()
+    except Exception:
+        pass
+    process = state["process"]
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+    if process.is_alive():
+        process.kill()
+    process.join(timeout=2)
+
+
+def _run_trimer(staging, rows, metadata, workers, interrupt_after):
+    writer = StagingWriter(staging / "trimer", metadata["trimer"])
+    rejection_path = staging / "trimer" / "rejections.jsonl"
+    runtime_path = staging / "trimer" / "runtime.jsonl"
+    rejection_path.touch(exist_ok=True)
+    runtime_path.touch(exist_ok=True)
+    rejections = read_rejections(rejection_path)
+    runtime = {}
+    if runtime_path.is_file():
+        for line in runtime_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                item = json.loads(line)
+                key = bytes.fromhex(item["sample_key"])
+                if key in runtime:
+                    raise CacheLifecycleError("duplicate runtime ledger key")
+                runtime[key] = item
+    accepted_existing = {
+        bytes.fromhex(row["sample_key"]) for row in rows
+        if bytes.fromhex(row["sample_key"]) in writer
+    }
+    if accepted_existing & set(rejections):
+        raise CacheLifecycleError("accepted/rejected staging overlap")
+    jobs = []
+    ru_environment = _raw_artifact(staging / "ru_base")
+    try:
+        with ru_environment.begin(buffers=False) as transaction:
+            for row in rows:
+                key = bytes.fromhex(row["sample_key"])
+                if key in accepted_existing or key in rejections:
+                    continue
+                payload = transaction.get(key)
+                if payload is None:
+                    raise CacheLifecycleError("Trimer parent RU record is missing")
+                ru = deserialize_record(bytes(payload), key)
+                normalized = str(ru.normalized_polymer_smiles)
+                if normalized != row["normalized_smiles"]:
+                    raise TrimerContractError("source_to_RU_identity_corruption")
+                jobs.append({**row, "normalized_smiles": normalized})
+    finally:
+        ru_environment.close()
+    resume = bool(accepted_existing or rejections)
+    hard_timeout = float(
+        ROUTE_BUILD_SPECS["trimer"]["parameters"]["hard_timeout_seconds"]
+    )
+    processed_new = 0
+    writer_seconds = 0.0
+    started_wall = time.monotonic()
+    last_progress = 0.0
+
+    def commit_result(result):
+        nonlocal processed_new, writer_seconds, last_progress
+        key = bytes.fromhex(result["sample_key"])
+        status = result["status"]
+        if status == "contract_error":
+            raise TrimerContractError(
+                f"sample_key={result['sample_key']}:{result['error']}"
+            )
+        if status == "program_error":
+            raise CacheLifecycleError(
+                f"sample_key={result['sample_key']}:{result['error']}"
+            )
+        if status == "accepted":
+            data = deserialize_record(result.pop("payload"), key)
+            inserted, payload_bytes, elapsed = writer.put(key, data)
+            if not inserted:
+                raise CacheLifecycleError("duplicate accepted Trimer write")
+            writer_seconds += elapsed
+            runtime_row = {
+                "sample_key": key.hex(), "status": "accepted",
+                "elapsed_seconds": float(result["elapsed_seconds"]),
+                "candidate_attempts": int(result["candidate_attempts"]),
+                "round_reached": int(result["round_reached"]),
+                "record_bytes": int(payload_bytes),
+                "writer_seconds": float(elapsed),
+            }
+        else:
+            rejection = {
+                "sample_key": key.hex(),
+                "failure_code": str(result["failure_code"]),
+                "candidate_attempts": int(result["candidate_attempts"]),
+                "elapsed_seconds": float(result["elapsed_seconds"]),
+                "round_reached": int(result["round_reached"]),
+            }
+            append_jsonl(rejection_path, rejection)
+            rejections[key] = rejection
+            runtime_row = {
+                "sample_key": key.hex(), "status": "rejected",
+                "elapsed_seconds": float(result["elapsed_seconds"]),
+                "candidate_attempts": int(result["candidate_attempts"]),
+                "round_reached": int(result["round_reached"]),
+                "record_bytes": 0, "writer_seconds": 0.0,
+            }
+        if key not in runtime:
+            append_jsonl(runtime_path, runtime_row)
+            runtime[key] = runtime_row
+        processed_new += 1
+        if (processed_new % 500 == 0 or time.monotonic() - last_progress >= 30.0):
+            last_progress = time.monotonic()
+            accepted_now = sum(
+                1 for row in runtime.values() if row["status"] == "accepted"
+            )
+            rejected_now = len(rejections)
+            _progress_line(
+                "trimer", len(runtime), len(rows), accepted_now, rejected_now,
+                Counter(row["failure_code"] for row in rejections.values()),
+                started_wall,
+            )
+        if interrupt_after and processed_new >= int(interrupt_after):
+            writer.sync()
+            raise IntentionalBuildInterrupt(
+                f"intentional interrupt after {processed_new} new terminal keys"
+            )
+
+    if int(workers) <= 1:
+        try:
+            for job in jobs:
+                commit_result(_build_trimer_one(job))
+        finally:
+            writer.close()
+        return resume, processed_new, writer_seconds
+
+    context = mp.get_context("spawn")
+
+    def start_worker():
+        parent, child = context.Pipe(duplex=True)
+        process = context.Process(target=_worker_loop, args=(child,))
+        process.start()
+        child.close()
+        return {"process": process, "connection": parent, "job": None,
+                "job_id": None, "started": 0.0}
+
+    states = [start_worker() for _ in range(min(int(workers), len(jobs)))]
+    iterator = iter(jobs)
+    next_job_id = 0
+
+    def assign(state):
+        nonlocal next_job_id
+        try:
+            job = next(iterator)
+        except StopIteration:
+            state["job"] = None
+            return False
+        next_job_id += 1
+        state.update(job=job, job_id=next_job_id, started=time.monotonic())
+        state["connection"].send((next_job_id, job))
+        return True
+
+    for state in states:
+        assign(state)
+    try:
+        while any(state["job"] is not None for state in states):
+            progressed = False
+            for index, state in enumerate(states):
+                if state["job"] is None:
+                    continue
+                if state["connection"].poll():
+                    returned, result = pickle.loads(state["connection"].recv_bytes())
+                    if returned != state["job_id"]:
+                        raise CacheLifecycleError("worker job identity mismatch")
+                    commit_result(result)
+                    assign(state)
+                    progressed = True
+                    continue
+                if not state["process"].is_alive():
+                    raise CacheLifecycleError(
+                        f"Trimer worker crashed for {state['job']['sample_key']}"
+                    )
+                if time.monotonic() - state["started"] >= hard_timeout:
+                    timed_out = state["job"]
+                    _stop_worker(state)
+                    states[index] = start_worker()
+                    commit_result({
+                        "status": "rejected", "sample_key": timed_out["sample_key"],
+                        "failure_code": "TIMEOUT", "candidate_attempts": 0,
+                        "elapsed_seconds": hard_timeout, "round_reached": -1,
+                    })
+                    assign(states[index])
+                    progressed = True
+            if not progressed:
+                time.sleep(0.01)
+    finally:
+        try:
+            writer.close()
+        finally:
+            for state in states:
+                try:
+                    if state["process"].is_alive():
+                        state["connection"].send(None)
+                except Exception:
+                    pass
+            for state in states:
+                _stop_worker(state)
+    return resume, processed_new, writer_seconds
+
+
+def _raw_artifact(root):
+    environment = lmdb.open(
+        str(root / "data.lmdb"), subdir=True, readonly=True, lock=False,
+        readahead=False, meminit=False,
+    )
+    return environment
+
+
+def _check_fields(layer, data, key):
+    keys = set(data.keys())
+    allowed = set(RECORD_FIELDS[layer])
+    if layer == "topology":
+        # select_record_fields writes the derived node count explicitly; it
+        # is a scalar projection of mips_x, not an unrecorded alias.
+        allowed.add("num_nodes")
+    if not keys <= allowed:
+        raise CacheAuditError(f"{layer} record has aliases/extra fields: {sorted(keys-allowed)}")
+    required = set(REQUIRED_FIELDS[layer])
+    if layer == "topology":
+        required.discard("x")
+        required.add("mips_x")
+    missing = required - keys
+    if missing:
+        raise CacheAuditError(f"{layer} record missing required fields: {sorted(missing)}")
+    if layer == "ru_base":
+        z = torch.as_tensor(data.ru_atomic_number)
+        edge = torch.as_tensor(data.ru_edge_index)
+        if z.ndim != 1 or edge.ndim != 2 or edge.size(0) != 2:
+            raise CacheAuditError("invalid RU record shape")
+    elif layer == "topology":
+        x, z = torch.as_tensor(data.mips_x), torch.as_tensor(data.z)
+        relation = torch.as_tensor(data.lga_edge_index)
+        path = torch.as_tensor(data.lga_path_index)
+        if x.ndim != 2 or x.size(1) != 137 or z.shape != (x.size(0),):
+            raise CacheAuditError("invalid Topology atom shape")
+        if relation.ndim != 2 or relation.size(0) != 2 or path.size(0) != relation.size(1):
+            raise CacheAuditError("invalid Topology relation shape")
+    else:
+        pos = torch.as_tensor(data.trimer_pos)
+        z = torch.as_tensor(data.trimer_atomic_number)
+        edge = torch.as_tensor(data.trimer_edge_index)
+        if pos.ndim != 2 or pos.size(1) != 3 or z.shape != (pos.size(0),):
+            raise CacheAuditError("invalid Trimer atom shape")
+        if not bool(torch.isfinite(pos).all()):
+            raise CacheAuditError("non-finite Trimer coordinates")
+        if edge.ndim != 2 or edge.size(0) != 2:
+            raise CacheAuditError("invalid Trimer edge shape")
+        if not bool(data.trimer_geometry_valid) or not bool(data.trimer_geometry_is_3d):
+            raise CacheAuditError("accepted Trimer has invalid geometry flags")
+
+
+def _audit_layer(root, layer, source_keys, expected_keys, source_manifest_hash,
+                 artifact_hash, build_spec, parents, rejected_keys=()):
+    metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+    expected_metadata = _metadata(layer, artifact_hash, source_manifest_hash, parents)
+    if metadata != expected_metadata:
+        raise CacheAuditError(f"{layer} metadata differs from generator build_spec")
+    environment = _raw_artifact(root)
+    digest = __import__("hashlib").sha256()
+    observed = []
+    payload_bytes = 0
+    try:
+        with environment.begin(buffers=False) as txn:
+            cursor = txn.cursor()
+            for key, payload in cursor:
+                key, payload = bytes(key), bytes(payload)
+                observed.append(key)
+                digest.update(key)
+                digest.update(len(payload).to_bytes(8, "little"))
+                digest.update(payload)
+                payload_bytes += len(payload)
+                data = deserialize_record(payload, key)
+                _check_fields(layer, data, key)
+            lmdb_count = int(txn.stat()["entries"])
+    finally:
+        environment.close()
+    if len(observed) != len(set(observed)) or lmdb_count != len(observed):
+        raise CacheAuditError(f"{layer} LMDB key uniqueness/count failure")
+    if set(observed) != set(expected_keys):
+        raise CacheAuditError(f"{layer} LMDB key coverage failure")
+    rejected_keys = list(rejected_keys)
+    manifest = {
+        "artifact_type": layer,
+        "artifact_hash": artifact_hash,
+        "build_spec_hash": build_spec_hash(build_spec),
+        "source_manifest_hash": source_manifest_hash,
+        "parents": dict(sorted(parents.items())),
+        "source_count": len(source_keys),
+        "record_count": len(observed),
+        "accepted_count": len(expected_keys),
+        "rejected_count": len(rejected_keys),
+        "ordered_accepted_key_hash": ordered_key_hash(expected_keys),
+        "ordered_rejected_key_hash": ordered_key_hash(rejected_keys),
+        "data_digest": digest.hexdigest(),
+        "payload_bytes": payload_bytes,
+        "data_file_sha256": sha256_file(root / "data.lmdb" / "data.mdb"),
+    }
+    return manifest
+
+
+def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
+                          artifact_hashes, metadata):
+    source_keys = [bytes.fromhex(row["sample_key"]) for row in rows]
+    rejection_path = staging / "trimer" / "rejections.jsonl"
+    rejections = read_rejections(rejection_path)
+    trimer_env = _raw_artifact(staging / "trimer")
+    try:
+        with trimer_env.begin(buffers=False) as txn:
+            accepted_set = {bytes(key) for key, _ in txn.cursor()}
+    finally:
+        trimer_env.close()
+    rejected_set = set(rejections)
+    source_set = set(source_keys)
+    if accepted_set & rejected_set:
+        raise CacheAuditError("accepted/rejected are not disjoint")
+    if accepted_set | rejected_set != source_set:
+        raise CacheAuditError("accepted/rejected do not cover source")
+    accepted = [key for key in source_keys if key in accepted_set]
+    rejected = [key for key in source_keys if key in rejected_set]
+    if len(source_keys) != len(accepted) + len(rejected):
+        raise CacheAuditError("terminal accounting mismatch")
+    runtime_rows = []
+    runtime_keys = set()
+    runtime_path = staging / "trimer" / "runtime.jsonl"
+    for line in runtime_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        key = bytes.fromhex(item["sample_key"])
+        if key in runtime_keys:
+            raise CacheAuditError("runtime ledger contains duplicate keys")
+        runtime_keys.add(key)
+        runtime_rows.append(item)
+    if runtime_keys != source_set:
+        raise CacheAuditError("runtime ledger does not cover terminal source keys")
+
+    manifests = {}
+    parent_map = {
+        "ru_base": {},
+        "topology": {"ru_base": artifact_hashes["ru_base"]},
+        "trimer": {"ru_base": artifact_hashes["ru_base"]},
+    }
+    for layer in ("ru_base", "topology", "trimer"):
+        expected = source_keys if layer != "trimer" else accepted
+        rejected_for_layer = rejected if layer == "trimer" else []
+        manifest = _audit_layer(
+            staging / layer, layer, source_keys, expected,
+            source_manifest["source_manifest_hash"], artifact_hashes[layer],
+            ROUTE_BUILD_SPECS[layer], parent_map[layer], rejected_for_layer,
+        )
+        if layer == "trimer":
+            accepted_array = np.frombuffer(b"".join(accepted), dtype=np.uint8).reshape(-1, 32)
+            rejected_array = np.frombuffer(b"".join(rejected), dtype=np.uint8).reshape(-1, 32)
+            for name, values in (("accepted_keys.npy", accepted_array),
+                                 ("rejected_keys.npy", rejected_array)):
+                temporary = staging / layer / f"{name}.tmp.{os.getpid()}"
+                with temporary.open("wb") as handle:
+                    np.save(handle, values, allow_pickle=False)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, staging / layer / name)
+            manifest["accepted_keys_file_sha256"] = sha256_file(
+                staging / layer / "accepted_keys.npy"
+            )
+            manifest["rejected_keys_file_sha256"] = sha256_file(
+                staging / layer / "rejected_keys.npy"
+            )
+            manifest["rejections_file_sha256"] = sha256_file(
+                staging / layer / "rejections.jsonl"
+            )
+            manifest["runtime_file_sha256"] = sha256_file(
+                staging / layer / "runtime.jsonl"
+            )
+        manifests[layer] = manifest
+
+    # Join audit is independent of generation: exact published Topology and
+    # Trimer records must agree on central atom identity for every accepted key.
+    topo_env = _raw_artifact(staging / "topology")
+    tri_env = _raw_artifact(staging / "trimer")
+    try:
+        with topo_env.begin() as topo_txn, tri_env.begin() as tri_txn:
+            for key in accepted:
+                topology = deserialize_record(bytes(topo_txn.get(key)), key)
+                trimer = deserialize_record(bytes(tri_txn.get(key)), key)
+                mapping = torch.as_tensor(trimer.mips_to_trimer_central_index).long()
+                positions = torch.as_tensor(trimer.trimer_pos)
+                central = torch.as_tensor(trimer.trimer_central_ru_mask).bool()
+                if mapping.numel() != torch.as_tensor(topology.mips_x).size(0):
+                    raise CacheAuditError("O8/Trimer mapping length mismatch")
+                if mapping.numel() and (
+                    int(mapping.min()) < 0 or int(mapping.max()) >= positions.size(0)
+                    or not bool(central[mapping].all())
+                    or not torch.equal(
+                        torch.as_tensor(topology.z).long(),
+                        torch.as_tensor(trimer.trimer_atomic_number).long()[mapping],
+                    )
+                ):
+                    raise CacheAuditError("O8/Trimer atom identity corruption")
+    finally:
+        topo_env.close()
+        tri_env.close()
+
+    for layer, manifest in manifests.items():
+        atomic_json(staging / layer / "manifest.json", manifest)
+    # Only after every layer and the cross-layer join have passed do markers
+    # appear.  Each marker binds exactly one final manifest hash.
+    for layer, manifest in manifests.items():
+        lock_path = staging / layer / ".writer.lock"
+        if lock_path.exists():
+            lock_path.unlink()
+        atomic_json(
+            staging / layer / ".frozen",
+            {"manifest_hash": json_hash(manifest)},
+        )
+    bundle_manifest = {
+        "bundle_hash": final.name,
+        "source_manifest_hash": source_manifest["source_manifest_hash"],
+        "artifacts": {
+            layer: {
+                "artifact_hash": artifact_hashes[layer],
+                "manifest_hash": json_hash(manifests[layer]),
+            }
+            for layer in manifests
+        },
+    }
+    atomic_json(staging / "bundle_manifest.json", bundle_manifest)
+    if final.exists():
+        raise CacheLifecycleError(f"published bundle already exists: {final}")
+    os.replace(staging, final)
+
+    artifacts = {}
+    for layer, manifest in manifests.items():
+        artifacts[layer] = {
+            "path": str((final / layer).relative_to(cache_root)),
+            "artifact_hash": artifact_hashes[layer],
+            "manifest_hash": json_hash(manifest),
+            "build_spec": ROUTE_BUILD_SPECS[layer],
+            "build_spec_hash": build_spec_hash(ROUTE_BUILD_SPECS[layer]),
+            "source_manifest_hash": source_manifest["source_manifest_hash"],
+            "ordered_accepted_key_hash": manifest["ordered_accepted_key_hash"],
+            "record_count": manifest["record_count"],
+            "parents": manifest["parents"],
+        }
+    store = {
+        "bundle_hash": final.name,
+        "source": {
+            "path": str((final / "source").relative_to(cache_root)),
+            "source_manifest_hash": source_manifest["source_manifest_hash"],
+            "source_count": len(source_keys),
+        },
+        "artifacts": artifacts,
+    }
+    atomic_json(cache_root / "store.json", store)
+    return store, manifests, rejections
+
+
+def _existing_bundle(cache_root, final):
+    store_path = cache_root / "store.json"
+    if not final.is_dir() or not store_path.is_file():
+        return False
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    if "bundle_hash" not in store:
+        # Legacy pre-lifecycle active-store binding: production publish will
+        # supersede it atomically; historical artifact directories stay.
+        print("legacy-format store.json present; publish will supersede it")
+        return False
+    if store.get("bundle_hash") != final.name:
+        raise CacheLifecycleError("published bundle exists but is not active")
+    before = snapshot_tree(cache_root)
+    dataset = PublishedCacheDataset(cache_root)
+    try:
+        if len(dataset):
+            _ = dataset[0]
+    finally:
+        dataset.close()
+    if snapshot_tree(cache_root) != before:
+        raise CacheLifecycleError("readonly duplicate execution modified cache")
+    print(f"existing published bundle verified read-only: {final}")
+    return True
+
+
+def _make_report(cache_root, store, manifests, rejections, staging_existed,
+                 phase_stats, build_started, source_rows):
+    trimer_root = cache_root / store["artifacts"]["trimer"]["path"]
+    runtime = [
+        json.loads(line) for line in (trimer_root / "runtime.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines() if line.strip()
+    ]
+    elapsed = [float(row["elapsed_seconds"]) for row in runtime]
+    accepted_runtime = [row for row in runtime if row["status"] == "accepted"]
+    source_count = len(source_rows)
+    accepted_count = manifests["trimer"]["accepted_count"]
+    rejected_count = manifests["trimer"]["rejected_count"]
+    total_wall = time.monotonic() - build_started
+    full_rows = 1_000_000
+    acceptance = accepted_count / source_count
+    mean_cpu = float(np.mean(elapsed)) if elapsed else 0.0
+    workers = int(phase_stats["workers"])
+    projected_cpu_hours = mean_cpu * full_rows / 3600.0
+    efficiency = 0.85
+    projected_wall_hours = projected_cpu_hours / max(1, workers) / efficiency
+    data_bytes = sum(
+        (cache_root / binding["path"] / "data.lmdb" / "data.mdb").stat().st_size
+        for binding in store["artifacts"].values()
+    )
+    before = snapshot_tree(cache_root)
+    dataset = PublishedCacheDataset(cache_root)
+    try:
+        for index in range(min(8, len(dataset))):
+            _ = dataset[index]
+    finally:
+        dataset.close()
+    zero_write = snapshot_tree(cache_root) == before
+    return {
+        "scope": "limited lifecycle pilot; not full-cache validation",
+        "source_count": source_count,
+        "accepted_count": accepted_count,
+        "rejected_count": rejected_count,
+        "failure_distribution": failure_distribution(rejections),
+        "accounting_ok": source_count == accepted_count + rejected_count,
+        "resume_detected": bool(staging_existed),
+        "resume_skipped_terminal": int(phase_stats["resume_skipped_terminal"]),
+        "duplicate_keys": 0,
+        "runtime_seconds": {
+            "median": float(np.median(elapsed)) if elapsed else None,
+            "p90": float(np.percentile(elapsed, 90)) if elapsed else None,
+            "p95": float(np.percentile(elapsed, 95)) if elapsed else None,
+        },
+        "bytes": {
+            "accepted_record_mean": (
+                float(np.mean([row["record_bytes"] for row in accepted_runtime]))
+                if accepted_runtime else None
+            ),
+            "lmdb_bytes_per_source": data_bytes / source_count,
+            "total_lmdb_bytes": data_bytes,
+            "manifest_sidecar_overhead": sum(
+                path.stat().st_size for path in cache_root.rglob("*")
+                if path.is_file() and "data.lmdb" not in path.parts
+            ),
+        },
+        "throughput_samples_per_second": {
+            "generation_cpu_equivalent": source_count / max(sum(elapsed), 1e-9),
+            "end_to_end_wall": source_count / max(total_wall, 1e-9),
+            "writer": accepted_count / max(
+                sum(float(row["writer_seconds"]) for row in accepted_runtime), 1e-9
+            ),
+        },
+        "estimates_for_1m_raw_rows": {
+            "accepted": int(round(full_rows * acceptance)),
+            "rejected": int(round(full_rows * (1.0 - acceptance))),
+            "disk_bytes": int(round(data_bytes / source_count * full_rows)),
+            "cpu_hours": projected_cpu_hours,
+            "wall_hours_at_pilot_workers_and_85pct_efficiency": projected_wall_hours,
+            "assumption": "linear extrapolation from this fixed pilot; canonical dedup not applied to 1m estimate",
+        },
+        "recommended_workers": workers,
+        "recommended_layout": "one LMDB per RU/Topology/Trimer layer; no extra sharding at projected size",
+        "zero_write_ok": bool(zero_write),
+        "full_rebuild_ready": bool(
+            zero_write and source_count == accepted_count + rejected_count
+            and staging_existed and phase_stats["resume_skipped_terminal"] > 0
+        ),
+        "store": store,
+        "manifests": manifests,
+    }
+
+
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def main(argv=None):
+    import signal
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cache-root", type=Path, required=True)
+    parser.add_argument("--source-csv", type=Path, required=True)
+    parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--interrupt-after", type=int, default=0)
+    parser.add_argument("--report-json", type=Path)
+    args = parser.parse_args(argv)
+    if args.limit != 0 and not 100 <= args.limit <= 5000:
+        parser.error("--limit must be 0 (full production source) or in [100, 5000]")
+    cache_root = args.cache_root.resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    rows, source_manifest = load_source_rows(args.source_csv, args.limit)
+    source_hash = source_manifest["source_manifest_hash"]
+    artifact_hashes = {}
+    artifact_hashes["ru_base"] = artifact_identity("ru_base", source_hash, {})
+    artifact_hashes["topology"] = artifact_identity(
+        "topology", source_hash, {"ru_base": artifact_hashes["ru_base"]}
+    )
+    artifact_hashes["trimer"] = artifact_identity(
+        "trimer", source_hash, {"ru_base": artifact_hashes["ru_base"]}
+    )
+    bundle_hash = bundle_identity(source_hash, artifact_hashes)
+    builds_root = cache_root / "builds"
+    builds_root.mkdir(exist_ok=True)
+    staging = builds_root / f"{bundle_hash}.staging"
+    final = builds_root / bundle_hash
+    if _existing_bundle(cache_root, final):
+        return 0
+    staging_existed = staging.exists()
+    staging.mkdir(exist_ok=True)
+    _write_source(staging, rows, source_manifest)
+    parents = {
+        "ru_base": {},
+        "topology": {"ru_base": artifact_hashes["ru_base"]},
+        "trimer": {"ru_base": artifact_hashes["ru_base"]},
+    }
+    metadata = {
+        layer: _metadata(layer, artifact_hashes[layer], source_hash, parents[layer])
+        for layer in ("ru_base", "topology", "trimer")
+    }
+    build_started = time.monotonic()
+    try:
+        phase_stats = _run_struct(staging, rows, metadata, args.workers)
+        progress = _progress_line("struct", len(rows), len(rows), len(rows),
+                                  0, {}, build_started)
+        trimer_root = staging / "trimer"
+        pre_terminal = 0
+        if trimer_root.exists():
+            counter_writer = StagingWriter(trimer_root, metadata["trimer"])
+            try:
+                pre_terminal = counter_writer.count()
+            finally:
+                counter_writer.close()
+            pre_terminal += len(read_rejections(trimer_root / "rejections.jsonl"))
+        resume, processed_new, writer_seconds = _run_trimer(
+            staging, rows, metadata, args.workers, args.interrupt_after
+        )
+        phase_stats.update({
+            "workers": int(args.workers),
+            "trimer_new_terminal": int(processed_new),
+            "trimer_writer_seconds": float(writer_seconds),
+            "resume_skipped_terminal": int(pre_terminal if resume else 0),
+        })
+        store, manifests, rejections = _audit_freeze_publish(
+            cache_root, staging, final, rows, source_manifest,
+            artifact_hashes, metadata,
+        )
+        report = _make_report(
+            cache_root, store, manifests, rejections,
+            staging_existed or resume, phase_stats, build_started, rows,
+        )
+        if args.report_json:
+            args.report_json.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json(args.report_json.resolve(), report)
+        print(json.dumps(report, sort_keys=True, indent=2))
+        # Exit code reflects build success and accounting integrity.  The
+        # resume-evidence flag stays in the report: a first full run cannot
+        # have resumed anything by definition.
+        return 0 if report["accounting_ok"] and report["zero_write_ok"] else 2
+    except (IntentionalBuildInterrupt, KeyboardInterrupt) as exc:
+        print(f"interrupted; staging preserved, nothing published: {exc}",
+              file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

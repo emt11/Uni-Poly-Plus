@@ -45,7 +45,7 @@ def _specs(project_root: Path):
     dataset = object.__new__(UniDataset)
     dataset.root = str(project_root / "data")
     dataset.mips_max_hops = 2
-    dataset.trimer_num_candidates = 8
+    dataset.trimer_num_candidates = 4
     dataset.trimer_max_heavy_atoms = 384
     dataset.feature_cache_item_timeout = 240
     # Resolve all immutable layers so finalize can bind/freeze the downstream

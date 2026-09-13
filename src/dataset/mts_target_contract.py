@@ -11,6 +11,12 @@ import hashlib
 import json
 from copy import deepcopy
 
+from .cache_spec import (
+    TOPOLOGY_BUILD_SPEC,
+    TRIMER_BUILD_SPEC,
+    build_spec_hash,
+)
+
 from .mips_trimer_contract import (
     BUILDER_VERSION,
     CACHE_LAYOUT_SCHEMA,
@@ -58,59 +64,27 @@ def make_topology_metadata(*, ru_base_hash: str, rdkit_version: str,
         rdkit_version=rdkit_version,
         random_seed=random_seed,
     )
-    meta["build_config"] = {
-        "feature_content_schema": FEATURE_SCHEMA,
-        "ru_base_feature_config_hash": str(ru_base_hash),
-        "max_hops": 2,
-        "boundary_threshold": 5,
-        "max_repeat_units": 1,
-        "max_model_atoms": 384,
-        "boundary_distance_algorithm": "diagnostic_only_canonical_ru",
-        "topology_representation": "single_canonical_ru_lifted_relations",
-        "mismatched_bond_policy": "single",
-        "atom_features": "mips137_topology_only_trimer_central_ru",
-        "lga_schema": 2,
-        "builder_version": BUILDER_VERSION,
-    }
+    meta["build_spec"] = deepcopy(TOPOLOGY_BUILD_SPEC)
+    meta["build_spec_hash"] = build_spec_hash(TOPOLOGY_BUILD_SPEC)
+    meta["build_config"] = deepcopy(TOPOLOGY_BUILD_SPEC["parameters"])
     meta["feature_config_hash"] = contract_hash(meta)
     return meta
 
 
 def make_trimer_metadata(*, ru_base_hash: str, topology_hash: str,
                          rdkit_version: str, random_seed: int = 42) -> dict:
+    del topology_hash  # Trimer and Topology are sibling artifacts over RU/source.
     meta = _base_metadata(
         schema=TRIMER_LMDB_SCHEMA,
         ru_base_hash=ru_base_hash,
         rdkit_version=rdkit_version,
         random_seed=random_seed,
     )
-    meta["topology_content_hash"] = str(topology_hash)
     meta["trimer_content_schema"] = TRIMER_CONTENT_SCHEMA
     meta["trimer_schema_version"] = TRIMER_SCHEMA_VERSION
-    meta["build_config"] = {
-        "trimer_content_schema": TRIMER_CONTENT_SCHEMA,
-        "trimer_schema_version": TRIMER_SCHEMA_VERSION,
-        "ru_base_feature_config_hash": str(ru_base_hash),
-        "topology_feature_config_hash": str(topology_hash),
-        "protocol": TRIMER_PROTOCOL,
-        "builder_version": BUILDER_VERSION,
-        "multimer_builder_version": 2,
-        "attachment_site_policy": "two_sites_shared_boundary_allowed",
-        "mismatched_bond_policy": "single",
-        "num_candidates_per_round": 8,
-        "max_rounds": 2,
-        "max_heavy_atoms": 384,
-        "worker_hard_timeout_seconds": 240,
-        "etkdg_use_random_coords": True,
-        "etkdg_enforce_chirality": True,
-        "etkdg_max_iterations": 200,
-        "etkdg_rmsd_pruning": False,
-        "mmff_variant": "MMFF94",
-        "mmff_relax_max_iterations": 200,
-        "conformer_selection": "converged-first-lowest-finite-mmff-energy",
-        "coordinate_payload": "single-conformer-explicit-all-atom",
-        "allow_2d_for_mcl": False,
-    }
+    meta["build_spec"] = deepcopy(TRIMER_BUILD_SPEC)
+    meta["build_spec_hash"] = build_spec_hash(TRIMER_BUILD_SPEC)
+    meta["build_config"] = deepcopy(TRIMER_BUILD_SPEC["parameters"])
     meta["feature_config_hash"] = contract_hash(meta)
     return meta
 

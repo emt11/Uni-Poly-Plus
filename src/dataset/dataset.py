@@ -86,6 +86,8 @@ from .trimer_mcl import (
     TRIMER_MMFF_RELAX_MAX_ITERATIONS,
     attach_finite_trimer_mcl,
     attach_unavailable_trimer_mcl,
+    TrimerContractError,
+    TrimerGeometryRejection,
 )
 from .mips_cache_validation import validate_mcl_record
 from .periodic_line_glt import (
@@ -1322,7 +1324,7 @@ def _compute_smiles_features_from_config(
     field_channels="none",
     graph_geometry_mode="trimer_scage_mcl",
     topology_representation=TOPOLOGY_CANONICAL,
-    trimer_num_candidates=8,
+    trimer_num_candidates=4,
     trimer_max_heavy_atoms=384,
 ):
     if str(graph_encoder_type).lower() == "scage":
@@ -1342,7 +1344,7 @@ def _compute_smiles_features_from_config(
         data.smiles = str(smiles)
         data.mips_atom_feature_source = "topology_only_trimer_central_ru"
         if str(graph_geometry_mode) == "trimer_scage_mcl":
-            trimer = _compute_trimer_layer(
+            trimer, trimer_rejection = _compute_trimer_layer(
                 getattr(
                     ru_base, "normalized_polymer_smiles", str(smiles)
                 ),
@@ -1350,8 +1352,13 @@ def _compute_smiles_features_from_config(
                 num_candidates=int(trimer_num_candidates),
                 max_heavy_atoms=int(trimer_max_heavy_atoms),
             )
-            for name in trimer.keys():
-                data[name] = trimer[name]
+            if trimer_rejection is not None:
+                # Legacy in-process path keeps explicit unavailable records;
+                # the formal LMDB builder path excludes instead (see worker).
+                attach_unavailable_trimer_mcl(data, trimer_rejection.code)
+            else:
+                for name in trimer.keys():
+                    data[name] = trimer[name]
         elif str(graph_geometry_mode) == "trimer_unavailable":
             attach_unavailable_trimer_mcl(data, "feature_timeout_fallback")
         if bool(mips_use_descriptors):
@@ -1829,10 +1836,19 @@ def _compute_trimer_layer(
     ru_base,
     topology,
     *,
-    num_candidates=8,
+    num_candidates=4,
     max_heavy_atoms=384,
     force_unavailable=None,
 ):
+    """Compute the Trimer layer fields for one sample.
+
+    Returns ``(fields, rejection)``.  Ordinary geometry failures (and
+    upstream unavailability) return ``(None, TrimerGeometryRejection)`` so
+    the caller EXCLUDES the sample from the geometry-enabled cohort instead
+    of writing a tombstone record.  Identity/contract corruption raises
+    ``TrimerContractError`` (hard stop).
+    """
+
     carrier = Data()
     carrier.smiles = str(smiles)
     carrier.x = topology.x
@@ -1848,24 +1864,30 @@ def _compute_trimer_layer(
     carrier.graph_available = bool(
         getattr(topology, "graph_available", True)
     )
-    if not carrier.graph_available:
-        attach_unavailable_trimer_mcl(carrier, "graph_unavailable")
-    elif not bool(getattr(ru_base, "ru_base_valid", False)):
-        attach_unavailable_trimer_mcl(carrier, "ru_base_unavailable")
-    elif force_unavailable:
-        attach_unavailable_trimer_mcl(carrier, str(force_unavailable))
-    else:
-        normalized, _ = normalize_polymer_smiles(smiles)
-        trimer_source = Chem.MolFromSmiles(str(normalized))
-        if trimer_source is None:
-            trimer_source = _mol_from_ru_base(ru_base)
-        attach_finite_trimer_mcl(
-            carrier,
-            trimer_source,
-            num_candidates=int(num_candidates),
-            max_heavy_atoms=int(max_heavy_atoms),
+
+    def _unavailable(code):
+        return TrimerGeometryRejection(
+            str(code), round_reached=-1, candidate_attempts=0,
+            elapsed_seconds=0.0,
         )
-    return _select_data_fields(carrier, _LMDB_TRIMER_FIELDS)
+
+    if not carrier.graph_available:
+        return None, _unavailable("graph_unavailable")
+    if not bool(getattr(ru_base, "ru_base_valid", False)):
+        return None, _unavailable("ru_base_unavailable")
+    if force_unavailable:
+        return None, _unavailable(force_unavailable)
+    normalized, _ = normalize_polymer_smiles(smiles)
+    trimer_source = Chem.MolFromSmiles(str(normalized))
+    if trimer_source is None:
+        trimer_source = _mol_from_ru_base(ru_base)
+    attach_finite_trimer_mcl(
+        carrier,
+        trimer_source,
+        num_candidates=int(num_candidates),
+        max_heavy_atoms=int(max_heavy_atoms),
+    )
+    return _select_data_fields(carrier, _LMDB_TRIMER_FIELDS), None
 
 
 def _compute_md200_layer(smiles, ru_base):
@@ -1915,22 +1937,34 @@ def _compute_lmdb_layers_worker(payload):
     if "trimer" in required:
         if topology is None:
             raise RuntimeError("Trimer computation requires cached O8 topology")
-        output["trimer"] = _compute_trimer_layer(
-            smiles,
-            ru_base,
-            topology,
-            num_candidates=payload.get("trimer_num_candidates", 8),
-            max_heavy_atoms=payload.get("trimer_max_heavy_atoms", 384),
-            force_unavailable=payload.get("force_trimer_unavailable"),
-        )
+        try:
+            trimer, rejection = _compute_trimer_layer(
+                smiles,
+                ru_base,
+                topology,
+                num_candidates=payload.get("trimer_num_candidates", 4),
+                max_heavy_atoms=payload.get("trimer_max_heavy_atoms", 384),
+                force_unavailable=payload.get("force_trimer_unavailable"),
+            )
+        except TrimerGeometryRejection as caught:
+            trimer, rejection = None, caught
+        if rejection is not None:
+            # Ordinary geometry failure -> exclusion: no Trimer record at all.
+            output["trimer_rejection"] = rejection.ledger_entry(
+                bytes(payload["sample_key"]).hex(), str(smiles)
+            )
+        else:
+            output["trimer"] = trimer
     if "md200" in required:
         output["md200"] = _compute_md200_layer(smiles, ru_base)
+    rejection_entry = output.pop("trimer_rejection", None)
     return {
         "smiles": smiles,
         "sample_key": payload["sample_key"],
         "layer_payloads": {
             name: _data_to_pickle_payload(data) for name, data in output.items()
         },
+        "trimer_rejection": rejection_entry,
         "ok": True,
         "error": "",
     }
@@ -1942,6 +1976,10 @@ def _compute_smiles_features_worker(payload):
     try:
         with rdBase.BlockLogs():
             return _compute_lmdb_layers_worker(payload)
+    except TrimerContractError:
+        # Identity/contract corruption must hard-stop the build; it must
+        # never be converted into a placeholder or a rejection entry.
+        raise
     except Exception as exc:
         # Preserve a cache record for the failing sample so the immutable
         # cohort remains complete and the next run can reuse all successes.
@@ -1960,12 +1998,12 @@ def _compute_smiles_features_worker(payload):
                 )
                 if "topology" in required else None
             )
-            trimer = (
+            trimer, trimer_rejection = (
                 _compute_trimer_layer(
                     smiles, ru_base, topology,
                     force_unavailable=f"cache_worker_error:{error_reason}"[:240],
                 )
-                if "trimer" in required else None
+                if "trimer" in required else (None, None)
             )
             md200 = (
                 _compute_md200_layer(smiles, ru_base)
@@ -1974,10 +2012,9 @@ def _compute_smiles_features_worker(payload):
             layers = {
                 "ru_base": ru_base,
                 "topology": topology,
-                "trimer": trimer,
                 "md200": md200,
             }
-            return {
+            result = {
                 "smiles": smiles,
                 "sample_key": payload.get("sample_key"),
                 "layer_payloads": {
@@ -1987,6 +2024,11 @@ def _compute_smiles_features_worker(payload):
                 "ok": True,
                 "error": error_reason,
             }
+            if trimer_rejection is not None:
+                result["trimer_rejection"] = trimer_rejection.ledger_entry(
+                    bytes(payload.get("sample_key") or b"").hex(), str(smiles)
+                )
+            return result
         except Exception:
             return {
                 "smiles": smiles,
@@ -2097,11 +2139,11 @@ class UniDataset(Dataset):
         feature_cache_workers=0,
         feature_cache_chunksize=4,
         feature_cache_partial_every=200,
-        feature_cache_item_timeout=45,
+        feature_cache_item_timeout=75,
         cache_layers=None,
         cache_validate="sample",
         cache_commit_size=128,
-        require_frozen_store=False,
+        require_frozen_store=True,
         cache_route_check=True,
         embed_tries_multiplier=8,
         conformer_3d_count=8,
@@ -2122,7 +2164,7 @@ class UniDataset(Dataset):
         field_channels='none',
         graph_geometry_mode='trimer_scage_mcl',
         topology_representation=TOPOLOGY_CANONICAL,
-        trimer_num_candidates=8,
+        trimer_num_candidates=4,
         trimer_max_heavy_atoms=384,
         modalities=None,
         experiment_id='manual',
@@ -2199,9 +2241,10 @@ class UniDataset(Dataset):
         if self.cache_validate not in {"sample", "full"}:
             raise ValueError("cache_validate must be sample or full")
         self.cache_commit_size = max(1, int(cache_commit_size))
-        # Formal training path: when store.json exists (or the caller demands
-        # it) the dataset opens store.json-bound frozen artifacts read-only
-        # and never builds, repairs or migrates anything.
+        # Formal training data path is frozen-store only by default: without
+        # store.json this is an error, never a legacy fallback.  Offline
+        # tooling and tests pass require_frozen_store=False explicitly to
+        # reach the historical reader/builder path.
         self.require_frozen_store = bool(require_frozen_store)
         self.cache_route_check = bool(cache_route_check)
         self.embed_tries_multiplier = max(1, int(embed_tries_multiplier))
@@ -2277,8 +2320,8 @@ class UniDataset(Dataset):
         if self.graph_geometry_mode == "trimer_scage_mcl":
             if self.graph_encoder_type != "mips_trimer_scage":
                 raise ValueError("Trimer geometry is only valid for the MTS-GLT-v2 route")
-            if self.trimer_num_candidates != 8:
-                raise ValueError("MTS-GLT-v2 Trimer requires 8 candidates per round")
+            if self.trimer_num_candidates != 4:
+                raise ValueError("MTS-GLT Trimer requires 4 candidates per round")
             if self.trimer_max_heavy_atoms != 384:
                 raise ValueError("MTS-GLT-v2 Trimer requires max 384 heavy atoms")
         self.mips_variant = "O8"
@@ -2540,7 +2583,7 @@ class UniDataset(Dataset):
             data = _pickle_payload_to_data(payload)
             writers[name].add(key, data)
             decoded[name] = data
-        return decoded
+        return result.get("trimer_rejection"), decoded
 
     def _run_lmdb_jobs(self, jobs, writers, parts, total_jobs=None):
         """Run layer-selective jobs with parent-owned hard timeouts."""
@@ -2549,6 +2592,9 @@ class UniDataset(Dataset):
         if total_jobs <= 0:
             return {"failure_count": 0, "failure_counts": {}}
         failure_counts = Counter()
+        rejection_counts = Counter()
+        rejections = []
+        trimer_jobs = 0
         completed = 0
         graph_valid = 0
         graph_unavailable = 0
@@ -2584,8 +2630,12 @@ class UniDataset(Dataset):
 
         def record_result(result, key, smiles):
             nonlocal completed, graph_valid, graph_unavailable
-            nonlocal trimer_valid, trimer_unavailable
-            decoded = self._commit_lmdb_worker_result(result, writers)
+            nonlocal trimer_valid, trimer_unavailable, trimer_jobs
+            rejection, decoded = self._commit_lmdb_worker_result(result, writers)
+            if rejection is not None:
+                rejections.append(rejection)
+                rejection_counts[str(rejection.get("failure_code", "unknown"))] += 1
+                trimer_unavailable += 1
             topology = decoded.get("topology")
             if topology is not None:
                 available = bool(getattr(topology, "graph_available", False))
@@ -2598,6 +2648,7 @@ class UniDataset(Dataset):
                     failure_counts[f"graph:{reason[:80]}"] += 1
             trimer = decoded.get("trimer")
             if trimer is not None:
+                trimer_jobs += 1
                 available = bool(getattr(
                     trimer, "trimer_geometry_valid", False
                 ))
@@ -2679,6 +2730,9 @@ class UniDataset(Dataset):
             return {
                 "failure_count": int(trimer_unavailable),
                 "failure_counts": dict(failure_counts),
+                "rejections": rejections,
+                "rejection_counts": dict(rejection_counts),
+                "trimer_jobs": int(trimer_jobs),
             }
 
         context = mp.get_context("spawn")
@@ -2864,6 +2918,9 @@ class UniDataset(Dataset):
         return {
             "failure_count": int(trimer_unavailable),
             "failure_counts": dict(failure_counts),
+            "rejections": rejections,
+            "rejection_counts": dict(rejection_counts),
+            "trimer_jobs": int(trimer_jobs),
         }
 
     def _build_lmdb_layers(self, cohort, specs, rebuild):
@@ -2943,6 +3000,12 @@ class UniDataset(Dataset):
             job_stats = self._run_lmdb_jobs(
                 jobs(), writers, parts, total_jobs=total_jobs
             )
+            rejections = list(job_stats.get("rejections", []))
+            if rejections and "trimer" in writers:
+                ledger_path = os.path.join(writers["trimer"].root, "rejections.jsonl")
+                with open(ledger_path, "a", encoding="utf-8") as handle:
+                    for item in rejections:
+                        handle.write(json.dumps(item, sort_keys=True) + "\n")
             stores = {
                 name: part
                 for name, part in parts.items()
@@ -2954,6 +3017,20 @@ class UniDataset(Dataset):
                     failure_count=(
                         int(job_stats.get("failure_count", 0))
                         if name == "trimer" else 0
+                    ),
+                    extra_stats=(
+                        {
+                            "source_count": (
+                                int(job_stats.get("trimer_jobs", 0))
+                                + len(rejections)
+                            ),
+                            "accepted_count": int(job_stats.get("trimer_jobs", 0)),
+                            "rejected_count": len(rejections),
+                            "rejection_counts": dict(
+                                job_stats.get("rejection_counts", {})
+                            ),
+                        }
+                        if name == "trimer" else None
                     ),
                 )
                 for name, writer in writers.items()
@@ -3125,6 +3202,24 @@ class UniDataset(Dataset):
         finite_coordinate_failure = 0
         two_d_mcl = 0
         mcl_valid = 0
+        geometry_excluded = 0
+        # Ordinary geometry failures are EXCLUDED from the Trimer layer: a
+        # missing Trimer record is acceptable only when the key is recorded
+        # in the rejection ledger of this artifact.
+        excluded_keys = set()
+        trimer_root = None
+        if "trimer" in specs:
+            trimer_root = Path(specs["trimer"]["root"])
+        ledger_path = (trimer_root / "rejections.jsonl") if trimer_root else None
+        if ledger_path is not None and ledger_path.is_file():
+            with open(ledger_path, encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        excluded_keys.add(
+                            bytes.fromhex(
+                                json.loads(line)["sample_key"]
+                            )
+                        )
         temporary = f"{failure_path}.tmp"
         with open(temporary, "w", encoding="utf-8") as failure_handle:
             failure_handle.write("[\n")
@@ -3133,6 +3228,9 @@ class UniDataset(Dataset):
                 decoded = {}
                 for name, store in stores.items():
                     if key not in store:
+                        if name == "trimer" and bytes(key) in excluded_keys:
+                            geometry_excluded += 1
+                            continue
                         raise RuntimeError(
                             f"LMDB cache validation found a missing {name} key: "
                             f"{bytes(key).hex()}"
@@ -3218,6 +3316,7 @@ class UniDataset(Dataset):
             "mapping_failure": mapping_failure,
             "finite_coordinate_failure": finite_coordinate_failure,
             "two_d_mcl": two_d_mcl,
+            "geometry_excluded": geometry_excluded,
             "validation_timestamp": time.time(),
         }
         temporary_validation = f"{validation_path}.tmp"
@@ -3249,10 +3348,23 @@ class UniDataset(Dataset):
         if self.cache_validate == "full" and specs is not None:
             self._validate_and_export_lmdb_cache(cohort, stores, specs)
             return
+        excluded_keys = set()
+        trimer_spec = (specs or {}).get("trimer")
+        if trimer_spec is not None:
+            ledger_path = Path(trimer_spec["root"]) / "rejections.jsonl"
+            if ledger_path.is_file():
+                with open(ledger_path, encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            excluded_keys.add(
+                                bytes.fromhex(json.loads(line)["sample_key"])
+                            )
         keys = cohort["keys"][:min(128, len(cohort["keys"]))]
         for key in keys:
             for name, store in stores.items():
                 if key not in store:
+                    if name == "trimer" and bytes(key) in excluded_keys:
+                        continue
                     raise RuntimeError(
                         f"LMDB cache validation found a missing {name} key: "
                         f"{bytes(key).hex()}"
@@ -3473,14 +3585,8 @@ class UniDataset(Dataset):
             "failures": [],
         }
         self._cohort = cohort
-        self._write_feature_cache_diagnostics(
-            feature_cache,
-            processed_dir,
-            graph_tag,
-            geom_tag,
-            fp_tag,
-            reuse_existing=True,
-        )
+        # Zero-write guarantee: the frozen path never creates or updates any
+        # file (no diagnostics, no derived arrays, no manifest touch).
         task_csv = os.path.join(
             self.root, "raw", f"{self.dataset}.csv"
         )
