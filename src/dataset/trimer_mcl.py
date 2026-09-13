@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
+import copy
 from dataclasses import dataclass
 
 import torch
@@ -38,6 +40,11 @@ TRIMER_ETKDG_TIMEOUT_SECONDS = 60
 TRIMER_ETKDG_RETRY_CANDIDATES = 2
 TRIMER_ETKDG_RETRY_MAX_ITERATIONS = 200
 TRIMER_MMFF_RELAX_MAX_ITERATIONS = CONTRACT_MMFF_RELAX_MAX_ITERATIONS
+TRIMER_TARGET_CONFORMERS = 4
+TRIMER_CANDIDATES_PER_ROUND = 8
+TRIMER_MAX_ROUNDS = 4
+TRIMER_RMSD_THRESHOLD = 0.3
+TRIMER_SAMPLE_TIMEOUT_SECONDS = 240.0
 
 _ETKDG_CALL_COUNT = 0
 _ETKDG_CALL_LOCK = threading.Lock()
@@ -311,6 +318,31 @@ def _attach_placeholder(data, reason: str, seed: int = 0):
     data.trimer_conformer_method = TRIMER_MCL_PROTOCOL
     data.trimer_mcl_schema = TRIMER_MCL_SCHEMA
     data.trimer_mcl_schema_version = TRIMER_MCL_SCHEMA_VERSION
+    data.conformer_positions = torch.empty((0, 0, 3), dtype=torch.float32)
+    data.conformer_energies = torch.empty((0,), dtype=torch.float32)
+    data.conformer_round_ids = torch.empty((0,), dtype=torch.long)
+    data.conformer_candidate_ids = torch.empty((0,), dtype=torch.long)
+    data.num_conformers = 0
+    data.target_conformers = TRIMER_TARGET_CONFORMERS
+    data.target_met = False
+    data.search_stop_reason = str(reason)[:240]
+    data.generation_diagnostics = {
+        "num_rounds": 0,
+        "num_candidates_requested": 0,
+        "num_candidates_embedded": 0,
+        "num_pre_stereo_rejected": 0,
+        "num_post_stereo_rejected": 0,
+        "num_geometry_rejected": 0,
+        "num_duplicate_rejected": 0,
+        "num_valid_candidates": 0,
+        "num_final_conformers": 0,
+        "embed_time": 0.0,
+        "mmff_time": 0.0,
+        "total_time": 0.0,
+        "trimer_heavy_atoms": 0,
+        "trimer_atoms_with_h": 0,
+    }
+    data.multi_conformer = True
     return data
 
 
@@ -325,241 +357,373 @@ def attach_unavailable_trimer_mcl(data, reason: str):
 #  Main entry point
 # ---------------------------------------------------------------------------
 
+class TrimerContractError(RuntimeError):
+    """Fatal chemical identity, bond, or Stereo-reference violation."""
+
+
+class _ExpectedGeometryFailure(RuntimeError):
+    """Expected bounded 3-D generation failure which may produce K=0."""
+
+
+@dataclass(frozen=True)
+class _EnsembleCandidate:
+    positions: torch.Tensor
+    energy: float
+    round_id: int
+    candidate_id: int
+
+
+def _round_seed(sample_key, round_id: int) -> int:
+    digest = hashlib.sha256(
+        f"{sample_key}:{int(round_id)}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:4], "little") & 0x7FFFFFFF
+
+
+def fixed_identity_rmsd(left, right) -> float:
+    """Kabsch RMSD with fixed atom identity and proper rotations only."""
+    x = torch.as_tensor(left, dtype=torch.float64)
+    y = torch.as_tensor(right, dtype=torch.float64)
+    if x.shape != y.shape or x.ndim != 2 or x.size(1) != 3 or x.size(0) == 0:
+        raise ValueError("fixed-identity RMSD requires matching [N,3] arrays")
+    x = x - x.mean(dim=0)
+    y = y - y.mean(dim=0)
+    u, _, vh = torch.linalg.svd(x.T @ y)
+    rotation = u @ vh
+    if float(torch.linalg.det(rotation)) < 0.0:
+        u[:, -1] *= -1.0
+        rotation = u @ vh
+    delta = x @ rotation - y
+    return float(torch.sqrt(torch.mean(torch.sum(delta * delta, dim=1))))
+
+
+def _coordinates(mol: Chem.Mol, conf_id: int, atom_count: int) -> torch.Tensor:
+    conformer = mol.GetConformer(int(conf_id))
+    return torch.tensor([
+        [float(conformer.GetAtomPosition(i).x), float(conformer.GetAtomPosition(i).y),
+         float(conformer.GetAtomPosition(i).z)]
+        for i in range(int(atom_count))
+    ], dtype=torch.float64)
+
+
+def audit_double_bond_stereo_coordinates(
+    mol: Chem.Mol, positions, *, epsilon: float = 1e-12
+) -> int:
+    """Validate every explicitly retained E/Z or cis/trans bond by sign."""
+    xyz = torch.as_tensor(positions, dtype=torch.float64)
+    if xyz.shape != (mol.GetNumAtoms(), 3) or not bool(torch.isfinite(xyz).all()):
+        raise _ExpectedGeometryFailure("INVALID_COORDINATES")
+    checked = 0
+    for bond in mol.GetBonds():
+        stereo = bond.GetStereo()
+        if stereo not in {
+            Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ,
+            Chem.BondStereo.STEREOCIS, Chem.BondStereo.STEREOTRANS,
+        }:
+            continue
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        refs = tuple(int(v) for v in bond.GetStereoAtoms())
+        if len(refs) != 2:
+            raise TrimerContractError("STEREO_ATOMS_MISSING")
+        if (mol.GetBondBetweenAtoms(i, refs[0]) is None
+                or mol.GetBondBetweenAtoms(j, refs[1]) is None):
+            raise TrimerContractError("STEREO_ATOMS_NOT_NEIGHBORS")
+        axis = xyz[j] - xyz[i]
+        axis_norm = torch.linalg.vector_norm(axis)
+        if not bool(torch.isfinite(axis_norm)) or float(axis_norm) <= epsilon:
+            raise _ExpectedGeometryFailure("STEREO_UNDETERMINED")
+        axis = axis / axis_norm
+        u, v = xyz[refs[0]] - xyz[i], xyz[refs[1]] - xyz[j]
+        u = u - torch.dot(u, axis) * axis
+        v = v - torch.dot(v, axis) * axis
+        denominator = torch.linalg.vector_norm(u) * torch.linalg.vector_norm(v)
+        if not bool(torch.isfinite(denominator)) or float(denominator) <= epsilon:
+            raise _ExpectedGeometryFailure("STEREO_UNDETERMINED")
+        cosine = float(torch.dot(u, v) / denominator)
+        if not torch.isfinite(torch.tensor(cosine)):
+            raise _ExpectedGeometryFailure("STEREO_UNDETERMINED")
+        expected = -1.0 if stereo in {
+            Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOTRANS,
+        } else 1.0
+        signed_cosine = expected * cosine
+        if signed_cosine == 0.0:
+            raise _ExpectedGeometryFailure("STEREO_UNDETERMINED")
+        if signed_cosine < 0.0:
+            raise _ExpectedGeometryFailure("STEREO_MISMATCH")
+        checked += 1
+    return checked
+
+
+def _validate_trimer_contract(data, trimer, metadata):
+    base_count = int(metadata["base_atom_count"])
+    units = metadata["unit_atoms"]
+    if len(units) != 3 or any(len(unit) != base_count for unit in units):
+        raise TrimerContractError("invalid_trimer_unit_mapping")
+    if trimer.GetNumAtoms() != 3 * base_count:
+        raise TrimerContractError("trimer_atom_count_mismatch")
+    reference = [trimer.GetAtomWithIdx(i).GetAtomicNum() for i in units[0]]
+    if any([trimer.GetAtomWithIdx(i).GetAtomicNum() for i in unit] != reference
+           for unit in units[1:]):
+        raise TrimerContractError("trimer_copy_atomic_number_mismatch")
+    unit_bonds = []
+    for unit in units:
+        reverse = {int(atom): base_id for base_id, atom in enumerate(unit)}
+        unit_bonds.append({
+            (min(reverse[bond.GetBeginAtomIdx()], reverse[bond.GetEndAtomIdx()]),
+             max(reverse[bond.GetBeginAtomIdx()], reverse[bond.GetEndAtomIdx()]),
+             _bond_code(bond))
+            for bond in trimer.GetBonds()
+            if bond.GetBeginAtomIdx() in reverse and bond.GetEndAtomIdx() in reverse
+        })
+    if any(observed != unit_bonds[0] for observed in unit_bonds[1:]):
+        raise TrimerContractError("trimer_ru_internal_bond_contract")
+    inter_edges = {tuple(sorted(map(int, edge))) for edge in metadata["inter_unit_edges"]}
+    observed = {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx())))
+                for b in trimer.GetBonds()}
+    if len(inter_edges) != 2 or not inter_edges <= observed:
+        raise TrimerContractError("trimer_inter_ru_bond_contract")
+    canonical = torch.as_tensor(data.canonical_ru_atom_index, dtype=torch.long).reshape(-1)
+    mapping = torch.as_tensor(getattr(data, "canonical_to_trimer_base_atom_id", canonical),
+                              dtype=torch.long).reshape(-1)
+    if canonical.numel() != int(data.num_nodes) or mapping.numel() != int(data.num_nodes):
+        raise TrimerContractError("o8_canonical_mapping_length_mismatch")
+    if mapping.numel() and (int(mapping.min()) < 0 or int(mapping.max()) + 1 != base_count):
+        raise TrimerContractError("o8_trimer_canonical_count_mismatch")
+    if hasattr(data, "z"):
+        z = torch.as_tensor(data.z, dtype=torch.long)
+        for base_id, expected in enumerate(reference):
+            found = torch.unique(z[mapping == base_id])
+            if found.numel() != 1 or int(found.item()) != int(expected):
+                raise TrimerContractError("o8_trimer_canonical_atomic_number_mismatch")
+    return base_count, units, mapping
+
+
+def _attach_shared_topology(data, trimer, metadata, base_count, units, mapping):
+    sources, targets, types = [], [], []
+    for bond in trimer.GetBonds():
+        i, j, code = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), _bond_code(bond)
+        sources.extend((i, j)); targets.extend((j, i)); types.extend((code, code))
+    central = torch.tensor(units[1], dtype=torch.long)
+    data.trimer_atomic_number = torch.tensor(
+        [atom.GetAtomicNum() for atom in trimer.GetAtoms()], dtype=torch.long)
+    data.trimer_edge_index = torch.tensor([sources, targets], dtype=torch.long)
+    data.trimer_bond_type = torch.tensor(types, dtype=torch.long)
+    data.trimer_base_ru_atom_id = torch.arange(base_count, dtype=torch.long).repeat(3)
+    data.trimer_base_ru_atom_index = data.trimer_base_ru_atom_id
+    data.trimer_ru_offset = torch.repeat_interleave(
+        torch.tensor([-1, 0, 1], dtype=torch.long), base_count)
+    data.trimer_central_ru_mask = data.trimer_ru_offset == 0
+    data.trimer_central_atom_index = central
+    data.trimer_central_ru_atom_index = central
+    data.mips_to_trimer_central_index = central[mapping]
+
+
+def _deduplicate(candidates, target=4, threshold=0.3):
+    kept = []
+    duplicates = 0
+    for candidate in sorted(candidates, key=lambda c: (c.energy, c.round_id, c.candidate_id)):
+        if all(fixed_identity_rmsd(candidate.positions, old.positions) >= float(threshold)
+               for old in kept):
+            kept.append(candidate)
+            if len(kept) == int(target):
+                break
+        else:
+            duplicates += 1
+    return kept, duplicates
+
+
 def attach_finite_trimer_mcl(
-    data,
-    smiles,
-    *,
-    num_candidates: int = 4,
-    max_heavy_atoms: int = 384,
+    data, smiles, *, num_candidates: int = TRIMER_CANDIDATES_PER_ROUND,
+    max_heavy_atoms=None, max_rounds: int = TRIMER_MAX_ROUNDS,
+    target_conformers: int = TRIMER_TARGET_CONFORMERS,
+    rmsd_threshold: float = TRIMER_RMSD_THRESHOLD,
+    timeout_seconds: float = TRIMER_SAMPLE_TIMEOUT_SECONDS,
+    sample_key=None,
 ):
-    """Attach the lowest finite MMFF94-relaxed open-Trimer conformer.
-
-    Geometry failures never remove the sample.  Instead a shape-safe invalid
-    payload is attached so the graph encoder can fall back exactly to O8.
-    """
-
+    """Attach a bounded, deterministic ensemble; contract errors remain fatal."""
+    del max_heavy_atoms  # Deliberately no atom-count rejection or 2-D fallback.
     seed = _sample_seed(smiles)
     _attach_placeholder(data, "not_built", seed)
     if not bool(getattr(data, "graph_available", True)):
         return _attach_placeholder(data, "graph_unavailable", seed)
-    try:
-        trimer, metadata = build_periodic_multimer_mol(
-            smiles, num_repeat_units=3, close_periodic=False
-        )
-        base_count = int(metadata["base_atom_count"])
-        unit_atoms = metadata["unit_atoms"]
-        if len(unit_atoms) != 3 or any(len(unit) != base_count for unit in unit_atoms):
-            raise ValueError("invalid_trimer_unit_mapping")
-        heavy_count = int(trimer.GetNumAtoms())
-        if heavy_count != 3 * base_count:
-            raise ValueError("trimer_atom_count_mismatch")
-        use_2d_fallback = heavy_count > int(max_heavy_atoms)
-
-        reference_atomic_numbers = [
-            int(trimer.GetAtomWithIdx(idx).GetAtomicNum())
-            for idx in unit_atoms[0]
-        ]
-        for unit in unit_atoms[1:]:
-            observed = [
-                int(trimer.GetAtomWithIdx(idx).GetAtomicNum()) for idx in unit
-            ]
-            if observed != reference_atomic_numbers:
-                raise ValueError("trimer_copy_atomic_number_mismatch")
-
-        internal_bonds = []
-        for unit in unit_atoms:
-            reverse = {int(atom): base for base, atom in enumerate(unit)}
-            bonds = {
-                (
-                    min(reverse[bond.GetBeginAtomIdx()],
-                        reverse[bond.GetEndAtomIdx()]),
-                    max(reverse[bond.GetBeginAtomIdx()],
-                        reverse[bond.GetEndAtomIdx()]),
-                )
-                for bond in trimer.GetBonds()
-                if (
-                    bond.GetBeginAtomIdx() in reverse
-                    and bond.GetEndAtomIdx() in reverse
-                )
-            }
-            internal_bonds.append(bonds)
-        if any(bonds != internal_bonds[0] for bonds in internal_bonds[1:]):
-            raise ValueError("trimer_central_ru_internal_connectivity_mismatch")
-
-        inter_edges = {
-            tuple(sorted((int(left), int(right))))
-            for left, right in metadata["inter_unit_edges"]
-        }
-        if len(inter_edges) != 2:
-            raise ValueError("trimer_requires_two_inter_ru_bonds")
-        observed_edges = {
-            tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())))
-            for bond in trimer.GetBonds()
-        }
-        if not inter_edges <= observed_edges:
-            raise ValueError("trimer_inter_ru_bond_missing")
-        left_boundaries = metadata["unit_left_boundaries"]
-        right_boundaries = metadata["unit_right_boundaries"]
-        left_inter = (
-            int(right_boundaries[0]), int(left_boundaries[1])
-        )
-        right_inter = (
-            int(right_boundaries[1]), int(left_boundaries[2])
-        )
-        expected_bond_code = _bond_code(
-            trimer.GetBondBetweenAtoms(*left_inter)
-        )
-        right_bond = trimer.GetBondBetweenAtoms(*right_inter)
-        if right_bond is None or _bond_code(right_bond) != expected_bond_code:
-            raise ValueError("trimer_inter_ru_bond_type_mismatch")
-
-        canonical = data.canonical_ru_atom_index.long()
-        canonical_to_trimer = getattr(
-            data, "canonical_to_trimer_base_atom_id", canonical
-        )
-        canonical_to_trimer = torch.as_tensor(
-            canonical_to_trimer, dtype=torch.long
-        ).reshape(-1)
-        if canonical.numel() != int(data.num_nodes) or canonical_to_trimer.numel() != int(data.num_nodes):
-            raise ValueError("o8_canonical_mapping_length_mismatch")
-        if canonical_to_trimer.numel() and (
-            int(canonical_to_trimer.min()) < 0
-            or int(canonical_to_trimer.max()) + 1 != base_count
-        ):
-            raise ValueError(
-                "o8_trimer_canonical_count_mismatch:"
-                f"{int(canonical_to_trimer.max()) + 1}!={base_count}"
-            )
-        if hasattr(data, "z"):
-            o8_atomic_numbers = data.z.long()
-            for canonical_id, expected_z in enumerate(
-                reference_atomic_numbers
-            ):
-                observed_z = torch.unique(
-                    o8_atomic_numbers[canonical_to_trimer == canonical_id]
-                )
-                if (
-                    observed_z.numel() != 1
-                    or int(observed_z.item()) != int(expected_z)
-                ):
-                    raise ValueError(
-                        "o8_trimer_canonical_atomic_number_mismatch"
-                    )
-
-        if use_2d_fallback:
-            coordinate_mol = Chem.Mol(trimer)
-            AllChem.Compute2DCoords(coordinate_mol, canonOrient=True)
-            conformer = coordinate_mol.GetConformer()
-            energy = float("nan")
-            geometry_is_3d = False
-            geometry_source = "rdkit_2d_large_molecule_mcl_disabled"
-        else:
-            mol_h, conformer_ids = _embed_with_targeted_retry(
-                Chem.AddHs(Chem.Mol(trimer)),
-                num_candidates=int(num_candidates),
-                seed=int(seed),
-            )
-            selection = _optimize_mmff_and_select_lowest_finite(
-                mol_h,
-                conformer_ids,
-                max_iterations=TRIMER_MMFF_RELAX_MAX_ITERATIONS,
-            )
-            conformer_id = int(selection.conf_id)
-            energy = float(selection.energy)
-            coordinate_mol = Chem.RemoveHs(mol_h)
-            if coordinate_mol.GetNumAtoms() != heavy_count:
-                raise ValueError("remove_hs_heavy_atom_count_mismatch")
-            conformer = coordinate_mol.GetConformer(conformer_id)
-            geometry_is_3d = True
-            geometry_source = "etkdgv3_mmff94_relax200"
-
-        positions = torch.tensor(
-            [
-                [
-                    float(conformer.GetAtomPosition(idx).x),
-                    float(conformer.GetAtomPosition(idx).y),
-                    float(conformer.GetAtomPosition(idx).z),
-                ]
-                for idx in range(heavy_count)
-            ],
-            dtype=torch.float,
-        )
-        if not bool(torch.isfinite(positions).all()):
-            raise ValueError("trimer_nonfinite_coordinates")
-        if geometry_is_3d:
-            d_left = torch.linalg.vector_norm(
-                positions[left_inter[0]] - positions[left_inter[1]]
-            )
-            d_right = torch.linalg.vector_norm(
-                positions[right_inter[0]] - positions[right_inter[1]]
-            )
-            star_distance = 0.5 * (d_left + d_right)
-            star_asymmetry = torch.abs(d_left - d_right)
-            star_valid = bool(
-                torch.isfinite(star_distance)
-                and torch.isfinite(star_asymmetry)
-                and float(star_asymmetry) <= 0.15
-            )
-        else:
-            star_distance = positions.new_tensor(0.0)
-            star_asymmetry = positions.new_tensor(float("inf"))
-            star_valid = False
-
-        sources, targets, bond_types = [], [], []
-        for bond in trimer.GetBonds():
-            left = int(bond.GetBeginAtomIdx())
-            right = int(bond.GetEndAtomIdx())
-            code = _bond_code(bond)
-            sources.extend((left, right))
-            targets.extend((right, left))
-            bond_types.extend((code, code))
-
-        central = torch.tensor(unit_atoms[1], dtype=torch.long)
-        base_ids = torch.arange(base_count, dtype=torch.long).repeat(3)
-        ru_offsets = torch.repeat_interleave(
-            torch.tensor([-1, 0, 1], dtype=torch.long), base_count
-        )
-        central_mask = ru_offsets == 0
-        mapping = central[canonical_to_trimer]
-        if mapping.numel() != int(data.num_nodes) or bool((mapping < 0).any()):
-            raise ValueError("incomplete_o8_to_trimer_mapping")
-
-        data.trimer_pos = positions
-        data.trimer_atomic_number = torch.tensor(
-            [atom.GetAtomicNum() for atom in trimer.GetAtoms()],
-            dtype=torch.long,
-        )
-        data.trimer_edge_index = torch.tensor(
-            [sources, targets], dtype=torch.long
-        )
-        data.trimer_bond_type = torch.tensor(bond_types, dtype=torch.long)
-        data.trimer_base_ru_atom_id = base_ids
-        data.trimer_base_ru_atom_index = data.trimer_base_ru_atom_id
-        data.trimer_ru_offset = ru_offsets
-        data.trimer_central_ru_mask = central_mask
-        data.trimer_central_atom_index = central
-        data.trimer_central_ru_atom_index = central
-        data.mips_to_trimer_central_index = mapping
-        data.trimer_geometry_valid = bool(geometry_is_3d)
-        data.trimer_geometry_is_3d = torch.tensor(
-            geometry_is_3d, dtype=torch.bool
-        )
-        data.trimer_2d_fallback = torch.tensor(
-            not geometry_is_3d, dtype=torch.bool
-        )
-        data.trimer_geometry_source = geometry_source
-        data.star_3d_distance = star_distance.float()
-        data.star_3d_asymmetry = star_asymmetry.float()
-        data.star_3d_valid = torch.tensor(star_valid, dtype=torch.bool)
-        data.trimer_failure_code = (
-            "" if geometry_is_3d else "large_trimer_2d_mcl_disabled"
-        )
-        data.trimer_conformer_energy = float(energy)
-        data.trimer_conformer_seed = int(seed)
-        data.trimer_conformer_method = TRIMER_MCL_PROTOCOL
-        data.trimer_mcl_schema = TRIMER_MCL_SCHEMA
-        data.trimer_mcl_schema_version = TRIMER_MCL_SCHEMA_VERSION
+    started = time.monotonic()
+    trimer, metadata = build_periodic_multimer_mol(smiles, 3, close_periodic=False)
+    base_count, units, mapping = _validate_trimer_contract(data, trimer, metadata)
+    _attach_shared_topology(data, trimer, metadata, base_count, units, mapping)
+    heavy_count = trimer.GetNumAtoms()
+    # Building must have propagated all StereoAtoms before any coordinates exist.
+    for bond in trimer.GetBonds():
+        if bond.GetStereo() in {Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ,
+                               Chem.BondStereo.STEREOCIS, Chem.BondStereo.STEREOTRANS}:
+            refs = tuple(bond.GetStereoAtoms())
+            if len(refs) != 2:
+                raise TrimerContractError("source_to_trimer_stereo_propagation")
+    mol_h_template = Chem.AddHs(Chem.Mol(trimer))
+    properties = AllChem.MMFFGetMoleculeProperties(mol_h_template, mmffVariant="MMFF94")
+    diagnostics = dict(data.generation_diagnostics)
+    diagnostics["trimer_heavy_atoms"] = heavy_count
+    diagnostics["trimer_atoms_with_h"] = mol_h_template.GetNumAtoms()
+    if properties is None:
+        data.conformer_positions = torch.empty((0, heavy_count, 3), dtype=torch.float32)
+        data.search_stop_reason = data.trimer_failure_code = "MMFF_UNSUPPORTED"
+        data.generation_diagnostics = diagnostics
         return data
-    except Exception as exc:
-        reason = f"{type(exc).__name__}:{exc}"
-        return _attach_placeholder(data, reason, seed)
+    candidates = []
+    stop_reason = "max_rounds"
+    identity = sample_key if sample_key is not None else Chem.MolToSmiles(trimer, canonical=True)
+    for round_id in range(int(max_rounds)):
+        if time.monotonic() - started >= float(timeout_seconds):
+            stop_reason = "timeout"; break
+        diagnostics["num_rounds"] += 1
+        diagnostics["num_candidates_requested"] += int(num_candidates)
+        embed_started = time.monotonic()
+        mol_h, ids = _embed_attempt(
+            mol_h_template, num_candidates=int(num_candidates),
+            seed=_round_seed(identity, round_id), use_random_coords=False,
+            max_iterations=200)
+        diagnostics["embed_time"] += time.monotonic() - embed_started
+        diagnostics["num_candidates_embedded"] += len(ids)
+        if not ids:
+            continue
+        pre_valid = []
+        for candidate_id, conf_id in enumerate(ids):
+            if not _conformer_coordinates_are_finite_3d(
+                    mol_h, conf_id, mol_h.GetNumAtoms()):
+                diagnostics["num_geometry_rejected"] += 1
+                continue
+            try:
+                audit_double_bond_stereo_coordinates(
+                    trimer, _coordinates(mol_h, conf_id, heavy_count))
+                pre_valid.append((candidate_id, conf_id))
+            except _ExpectedGeometryFailure:
+                diagnostics["num_pre_stereo_rejected"] += 1
+        if not pre_valid:
+            continue
+        valid_conf_ids = {conf_id for _, conf_id in pre_valid}
+        for conf in list(mol_h.GetConformers()):
+            if conf.GetId() not in valid_conf_ids:
+                mol_h.RemoveConformer(conf.GetId())
+        mmff_started = time.monotonic()
+        AllChem.MMFFOptimizeMoleculeConfs(
+            mol_h, numThreads=1, maxIters=TRIMER_MMFF_RELAX_MAX_ITERATIONS,
+            mmffVariant="MMFF94")
+        diagnostics["mmff_time"] += time.monotonic() - mmff_started
+        round_props = AllChem.MMFFGetMoleculeProperties(mol_h, mmffVariant="MMFF94")
+        if round_props is None:
+            raise TrimerContractError("MMFF_parameters_changed_after_embedding")
+        heavy_mol = Chem.RemoveHs(mol_h)
+        if heavy_mol.GetNumAtoms() != heavy_count:
+            raise TrimerContractError("remove_hs_heavy_atom_count_mismatch")
+        for candidate_id, conf_id in pre_valid:
+            energy = _calculate_mmff_energy(mol_h, round_props, conf_id)
+            if energy is None or not _conformer_coordinates_are_finite_3d(
+                    heavy_mol, conf_id, heavy_count):
+                diagnostics["num_geometry_rejected"] += 1; continue
+            xyz64 = _coordinates(heavy_mol, conf_id, heavy_count)
+            try:
+                audit_double_bond_stereo_coordinates(trimer, xyz64)
+            except _ExpectedGeometryFailure:
+                diagnostics["num_post_stereo_rejected"] += 1; continue
+            xyz32 = xyz64.to(torch.float32)
+            try:
+                audit_double_bond_stereo_coordinates(trimer, xyz32)
+            except _ExpectedGeometryFailure:
+                diagnostics["num_post_stereo_rejected"] += 1; continue
+            candidates.append(_EnsembleCandidate(xyz32, float(energy), round_id, candidate_id))
+        kept, _ = _deduplicate(candidates, target_conformers, rmsd_threshold)
+        if len(kept) >= int(target_conformers):
+            stop_reason = "target_met"; break
+    kept, duplicate_count = _deduplicate(candidates, target_conformers, rmsd_threshold)
+    diagnostics["num_duplicate_rejected"] = duplicate_count
+    diagnostics["num_valid_candidates"] = len(candidates)
+    diagnostics["num_final_conformers"] = len(kept)
+    ordered_candidates = sorted(
+        candidates, key=lambda c: (c.energy, c.round_id, c.candidate_id))
+    diagnostics["valid_candidate_order"] = [
+        {"energy": c.energy, "round_id": c.round_id,
+         "candidate_id": c.candidate_id} for c in ordered_candidates]
+    diagnostics["valid_candidate_rmsd"] = [
+        [fixed_identity_rmsd(left.positions, right.positions)
+         for right in ordered_candidates] for left in ordered_candidates]
+    diagnostics["total_time"] = time.monotonic() - started
+    k = len(kept)
+    data.conformer_positions = (torch.stack([c.positions for c in kept]) if kept
+                                else torch.empty((0, heavy_count, 3), dtype=torch.float32))
+    data.conformer_energies = torch.tensor([c.energy for c in kept], dtype=torch.float32)
+    data.conformer_round_ids = torch.tensor([c.round_id for c in kept], dtype=torch.long)
+    data.conformer_candidate_ids = torch.tensor([c.candidate_id for c in kept], dtype=torch.long)
+    data.num_conformers = k
+    data.target_conformers = int(target_conformers)
+    data.target_met = k == int(target_conformers)
+    if k:
+        data.search_stop_reason = stop_reason
+    elif stop_reason == "timeout":
+        data.search_stop_reason = "timeout"
+    elif diagnostics["num_candidates_embedded"] == 0:
+        data.search_stop_reason = "ETKDG_NO_VALID_CONFORMER"
+    else:
+        data.search_stop_reason = "NO_VALID_CONFORMER"
+    data.generation_diagnostics = diagnostics
+    data.trimer_geometry_valid = bool(k)
+    data.trimer_geometry_is_3d = torch.tensor(bool(k), dtype=torch.bool)
+    data.trimer_2d_fallback = torch.tensor(False, dtype=torch.bool)
+    data.trimer_geometry_source = "etkdgv3_multiround_mmff94_ensemble" if k else "unavailable"
+    data.trimer_failure_code = "" if k else data.search_stop_reason
+    data.trimer_conformer_method = "etkdgv3-8x4-mmff94-fixed-identity-rmsd0.3"
+    # Ensemble records intentionally have no implicit trimer_pos/conformer-0 view.
+    if hasattr(data, "trimer_pos"):
+        del data.trimer_pos
+    return data
+
+
+def _validate_ensemble_record(record):
+    if not bool(getattr(record, "multi_conformer", False)):
+        raise ValueError("record is not a multi-conformer Trimer cache record")
+    positions = torch.as_tensor(getattr(record, "conformer_positions", None))
+    if positions.ndim != 3 or positions.size(-1) != 3:
+        raise ValueError("conformer_positions must have shape [K,N,3]")
+    k = int(getattr(record, "num_conformers", -1))
+    if k != positions.size(0):
+        raise ValueError("num_conformers does not match conformer_positions")
+    for name in ("conformer_energies", "conformer_round_ids", "conformer_candidate_ids"):
+        if torch.as_tensor(getattr(record, name, None)).numel() != k:
+            raise ValueError(f"{name} length mismatch")
+    return positions, k
+
+
+def select_conformer(record, index: int):
+    """Return an explicit non-mutating single-conformer view."""
+    positions, k = _validate_ensemble_record(record)
+    index = int(index)
+    if index < 0 or index >= k:
+        raise IndexError(index)
+    selected = copy.copy(record)
+    selected.trimer_pos = positions[index].clone()
+    selected.trimer_conformer_energy = float(record.conformer_energies[index])
+    selected.selected_conformer_index = index
+    selected.trimer_geometry_valid = True
+    selected.trimer_geometry_is_3d = torch.tensor(True, dtype=torch.bool)
+    edges = torch.as_tensor(selected.trimer_edge_index, dtype=torch.long)
+    base = torch.as_tensor(selected.trimer_base_ru_atom_id, dtype=torch.long)
+    offsets = torch.as_tensor(selected.trimer_ru_offset, dtype=torch.long)
+    seam_lengths = []
+    for column in range(0, edges.size(1), 2):
+        i, j = int(edges[0, column]), int(edges[1, column])
+        if int(offsets[i]) != int(offsets[j]):
+            seam_lengths.append(torch.linalg.vector_norm(selected.trimer_pos[i] - selected.trimer_pos[j]))
+    if len(seam_lengths) != 2:
+        raise TrimerContractError("selected conformer does not have two inter-RU bonds")
+    selected.star_3d_distance = torch.stack(seam_lengths).mean().float()
+    selected.star_3d_asymmetry = torch.abs(seam_lengths[0] - seam_lengths[1]).float()
+    selected.star_3d_valid = torch.tensor(
+        bool(torch.isfinite(selected.star_3d_distance)
+             and torch.isfinite(selected.star_3d_asymmetry)
+             and float(selected.star_3d_asymmetry) <= 0.15), dtype=torch.bool)
+    return selected
+
+
+def iter_conformers(record):
+    """Iterate explicit single-conformer views without changing sample identity."""
+    _, k = _validate_ensemble_record(record)
+    for index in range(k):
+        yield select_conformer(record, index)

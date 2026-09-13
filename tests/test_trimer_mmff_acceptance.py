@@ -1,377 +1,261 @@
-"""Tests for the new MMFF94 relax-then-select Trimer conformer protocol.
+"""Stage-A contract tests for deterministic multi-conformer Trimers."""
 
-These tests verify that:
-
-* MMFF convergence status is deliberately ignored;
-* the lowest finite post-relaxation energy candidate is selected;
-* non-finite energy / coordinates are rejected;
-* 2-D conformers do not enter MCL geometry;
-* missing MMFF parameters produce a clear failure code;
-* shared boundaries correctly construct open Trimers;
-* ``star_3d_valid`` and ``trimer_geometry_valid`` are independent;
-* single-conformer retry (``MMFFOptimizeMolecule``) is never called.
-"""
-
-import os
+import copy
 
 import pytest
 import torch
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from torch_geometric.data import Data
 
-from src.dataset.graph_data import (
-    build_mips_local_structure,
-    build_periodic_multimer_mol,
-)
+from src.dataset.dataset import _compute_ru_base_layer, _compute_topology_layer
+from src.dataset.graph_data import build_periodic_multimer_mol
 from src.dataset.trimer_mcl import (
-    TRIMER_MCL_PROTOCOL,
-    TRIMER_MCL_SCHEMA,
-    TRIMER_MCL_SCHEMA_VERSION,
-    TRIMER_MMFF_RELAX_MAX_ITERATIONS,
-    _MMFFConformerSelection,
-    _attach_placeholder,
-    _bond_code,
-    _calculate_mmff_energy,
-    _conformer_coordinates_are_finite_3d,
-    _embed_with_targeted_retry,
-    _optimize_mmff_and_select_lowest_finite,
-    _validate_conformer_ids,
-    attach_finite_trimer_mcl,
-    attach_unavailable_trimer_mcl,
+    TrimerContractError, _EnsembleCandidate, _attach_placeholder, _deduplicate,
+    _round_seed, attach_finite_trimer_mcl,
+    audit_double_bond_stereo_coordinates, fixed_identity_rmsd,
+    iter_conformers, select_conformer,
 )
 
 
-# ---------------------------------------------------------------------------
-#  Unit helpers
-# ---------------------------------------------------------------------------
-
-def _make_trimer_data(smiles="*CCO*"):
-    """Construct a minimal O8 sample for ``attach_finite_trimer_mcl``.
-
-    Uses the real topology layer so that ``canonical_ru_atom_index``,
-    ``z``, and ``num_nodes`` match what the Trimer builder expects.
-    """
-    from src.dataset.dataset import _compute_ru_base_layer, _compute_topology_layer
+def _topology(smiles="*CCO*"):
     ru = _compute_ru_base_layer(smiles)
     top = _compute_topology_layer(smiles, ru, max_hops=2)
-    if not bool(top.graph_available):
-        raise ValueError(f"test SMILES {smiles} must be graph-valid")
     top.smiles = smiles
-    return top, smiles
+    return top
 
 
-# ---------------------------------------------------------------------------
-#  _conformer_coordinates_are_finite_3d
-# ---------------------------------------------------------------------------
-
-def test_conformer_finite_3d_accepts_valid():
-    mol = Chem.MolFromSmiles("CCO")
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-    AllChem.MMFFOptimizeMolecule(mol, mmffVariant="MMFF94")
-    mol = Chem.RemoveHs(mol)
-    assert _conformer_coordinates_are_finite_3d(mol, 0, mol.GetNumAtoms())
-
-
-def test_conformer_2d_is_rejected():
-    mol = Chem.MolFromSmiles("CCO")
-    AllChem.Compute2DCoords(mol)
-    assert not _conformer_coordinates_are_finite_3d(mol, 0, mol.GetNumAtoms())
+def _ensemble(k, n=5):
+    record = Data()
+    record.multi_conformer = True
+    record.num_conformers = k
+    record.conformer_positions = torch.arange(k * n * 3, dtype=torch.float32).reshape(k, n, 3)
+    record.conformer_energies = torch.arange(k, dtype=torch.float32)
+    record.conformer_round_ids = torch.zeros(k, dtype=torch.long)
+    record.conformer_candidate_ids = torch.arange(k, dtype=torch.long)
+    record.trimer_edge_index = torch.tensor([[0, 1, 2, 3], [1, 0, 3, 2]])
+    record.trimer_base_ru_atom_id = torch.arange(n)
+    record.trimer_ru_offset = torch.tensor([-1, 0, 0, 1, 1])
+    return record
 
 
-def test_conformer_nonfinite_position_is_rejected(monkeypatch):
-    mol = Chem.MolFromSmiles("CCO")
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-    mol = Chem.RemoveHs(mol)
-
-    def _fake_isfinite(_val):
-        return False
-
-    monkeypatch.setattr(torch, "isfinite", lambda t: torch.tensor(False))
-    assert not _conformer_coordinates_are_finite_3d(mol, 0, mol.GetNumAtoms())
-
-
-# ---------------------------------------------------------------------------
-#  _calculate_mmff_energy
-# ---------------------------------------------------------------------------
-
-def test_calculate_mmff_energy_valid():
-    mol = Chem.MolFromSmiles("CCO")
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-    mol = Chem.RemoveHs(mol)
-    props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94")
-    assert props is not None
-    energy = _calculate_mmff_energy(mol, props, 0)
-    assert energy is not None
-    assert torch.isfinite(torch.tensor(energy))
+@pytest.mark.parametrize("k", range(5))
+def test_ensemble_k_shapes_and_explicit_selection(k):
+    record = _ensemble(k)
+    before = copy.deepcopy(record)
+    assert len(list(iter_conformers(record))) == k
+    assert torch.equal(record.conformer_positions, before.conformer_positions)
+    assert not hasattr(record, "trimer_pos")
+    if k:
+        view = select_conformer(record, k - 1)
+        assert view.trimer_pos.shape == (5, 3)
+        assert view.selected_conformer_index == k - 1
+    else:
+        with pytest.raises(IndexError):
+            select_conformer(record, 0)
 
 
-def test_calculate_mmff_energy_none_for_missing_params():
-    mol = Chem.MolFromSmiles("[He]")
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-    mol = Chem.RemoveHs(mol)
-    props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94")
-    if props is None:
-        pytest.skip("helium has no MMFF params, which is expected")
-    energy = _calculate_mmff_energy(mol, props, 0)
-    assert energy is None
+def test_old_single_conformer_record_is_not_silently_upgraded():
+    with pytest.raises(ValueError, match="not a multi-conformer"):
+        select_conformer(Data(trimer_pos=torch.zeros(3, 3)), 0)
 
 
-# ---------------------------------------------------------------------------
-#  _validate_conformer_ids
-# ---------------------------------------------------------------------------
-
-def test_validate_conformer_ids_ok():
-    mol = Chem.MolFromSmiles("CCO")
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMultipleConfs(mol, numConfs=2, params=AllChem.ETKDGv3())
-    _validate_conformer_ids(mol, [0, 1])
+def test_round_seed_is_deterministic_and_round_specific():
+    assert _round_seed("abc", 1) == _round_seed("abc", 1)
+    assert _round_seed("abc", 1) != _round_seed("abc", 2)
 
 
-def test_validate_conformer_ids_mismatch():
-    mol = Chem.MolFromSmiles("CCO")
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMultipleConfs(mol, numConfs=2, params=AllChem.ETKDGv3())
-    with pytest.raises(ValueError, match="mmff94_conformer_id_mapping_mismatch"):
-        _validate_conformer_ids(mol, [0])
-
-
-# ---------------------------------------------------------------------------
-#  _optimize_mmff_and_select_lowest_finite
-# ---------------------------------------------------------------------------
-
-def test_selects_lowest_finite_mmff_energy():
-    mol = Chem.MolFromSmiles("CCO")
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMultipleConfs(mol, numConfs=4, params=AllChem.ETKDGv3())
-    mol = Chem.RemoveHs(mol)
-    properties = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94")
-    assert properties is not None
-    AllChem.MMFFOptimizeMoleculeConfs(
-        mol, numThreads=1, maxIters=200, mmffVariant="MMFF94",
-    )
-    energies = [
-        _calculate_mmff_energy(mol, properties, cid) for cid in range(4)
+def test_stable_energy_round_candidate_sorting_and_dedup():
+    base = torch.tensor([[0., 0., 0.], [1., 0., 0.], [0., 2., 0.], [0., 0., 3.]])
+    distinct = base.clone(); distinct[3, 0] = 4.0
+    candidates = [
+        _EnsembleCandidate(distinct, 1.0, 1, 0),
+        _EnsembleCandidate(base + 8.0, 1.0, 0, 2),
+        _EnsembleCandidate(base, 1.0, 0, 1),
     ]
-    energies = [e for e in energies if e is not None]
-    assert energies, "at least one conformer must have finite energy"
-
-    # Re-embed fresh molecule to avoid prior MMFF side-effects
-    mol2 = Chem.MolFromSmiles("CCO")
-    mol2 = Chem.AddHs(mol2)
-    AllChem.EmbedMultipleConfs(mol2, numConfs=4, params=AllChem.ETKDGv3())
-    mol2 = Chem.RemoveHs(mol2)
-
-    selection = _optimize_mmff_and_select_lowest_finite(
-        mol2, list(range(4)), max_iterations=200,
-    )
-    assert isinstance(selection, _MMFFConformerSelection)
-    assert torch.isfinite(torch.tensor(selection.energy))
-    assert 0 <= selection.conf_id < 4
+    kept, duplicates = _deduplicate(candidates, target=4, threshold=0.3)
+    assert [(c.round_id, c.candidate_id) for c in kept] == [(0, 1), (1, 0)]
+    assert duplicates == 1
 
 
-def test_all_nonfinite_rejected():
-    mol = Chem.MolFromSmiles("CCO")
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMultipleConfs(mol, numConfs=2, params=AllChem.ETKDGv3())
-    mol = Chem.RemoveHs(mol)
-
-    def _fake_select(*_args, **_kwargs):
-        raise ValueError("mmff94_no_finite_relaxed_3d_conformer")
-
-    with pytest.raises(ValueError, match="mmff94_no_finite_relaxed_3d_conformer"):
-        _fake_select()
+def test_fixed_identity_rmsd_translation_rotation_invariant():
+    xyz = torch.tensor([[0., 0., 0.], [1., 0., 0.], [0., 2., 0.], [0., 0., 3.]])
+    rotation = torch.tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+    assert fixed_identity_rmsd(xyz, xyz @ rotation + 4.0) < 1e-6
 
 
-def test_mmff_parameters_missing_raises():
-    mol = Chem.MolFromSmiles("[He]")
-    mol = Chem.AddHs(mol)
-    with pytest.raises(ValueError, match="mmff94_parameters_unavailable"):
-        _optimize_mmff_and_select_lowest_finite(
-            mol, [0], max_iterations=200,
-        )
+def test_fixed_identity_rmsd_forbids_reflection_and_permutation():
+    xyz = torch.tensor([[0., 0., 0.], [1., 0., 0.], [0., 2., 0.], [0., 0., 3.]])
+    reflected = xyz.clone(); reflected[:, 2] *= -1
+    assert fixed_identity_rmsd(xyz, reflected) > 0.3
+    assert fixed_identity_rmsd(xyz, xyz[[3, 1, 2, 0]]) > 0.3
 
 
-def test_no_etkdg_conformers_raises():
-    mol = Chem.MolFromSmiles("CCO")
-    mol = Chem.AddHs(mol)
-    with pytest.raises(ValueError, match="mmff94_no_conformers_to_relax"):
-        _optimize_mmff_and_select_lowest_finite(mol, [], max_iterations=200)
+def test_fixed_identity_rmsd_forbids_ru_swap():
+    xyz = torch.tensor([[0., 0., 0.], [1., 0., 0.], [3., 1., 0.], [7., 1., 2.]])
+    assert fixed_identity_rmsd(xyz, xyz[[2, 3, 0, 1]]) > 0.3
 
 
-# ---------------------------------------------------------------------------
-#  MMFFOptimizeMolecule (single-conf retry) is never called
-# ---------------------------------------------------------------------------
-
-def test_single_conf_retry_is_never_called(monkeypatch):
-    from src.dataset import trimer_mcl as tmod
-
-    call_count = 0
-    _original = AllChem.MMFFOptimizeMolecule
-
-    def _tracking(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return _original(*args, **kwargs)
-
-    monkeypatch.setattr(AllChem, "MMFFOptimizeMolecule", _tracking)
-
-    data, smiles = _make_trimer_data("*CCO*")
-    result = attach_finite_trimer_mcl(data, smiles)
-    assert call_count == 0, (
-        f"MMFFOptimizeMolecule was called {call_count} times; expected 0"
-    )
-    assert hasattr(result, "trimer_geometry_valid")
+def test_explicit_ez_is_retained_in_all_preservable_ru_copies():
+    mol, _ = build_periodic_multimer_mol("*C/C=C/C*", 3, close_periodic=False)
+    defined = [b for b in mol.GetBonds() if b.GetStereo() in {
+        Chem.BondStereo.STEREOE, Chem.BondStereo.STEREOZ,
+        Chem.BondStereo.STEREOCIS, Chem.BondStereo.STEREOTRANS}]
+    assert len(defined) == 3
+    assert all(len(tuple(b.GetStereoAtoms())) == 2 for b in defined)
 
 
-# ---------------------------------------------------------------------------
-#  Full attach_finite_trimer_mcl
-# ---------------------------------------------------------------------------
-
-def test_plain_trimer_produces_valid_geometry():
-    data, smiles = _make_trimer_data("*CCO*")
-    result = attach_finite_trimer_mcl(data, smiles)
-    assert result.trimer_geometry_valid
-    assert result.trimer_geometry_is_3d
-    assert not result.trimer_2d_fallback
-    assert result.trimer_mcl_schema == TRIMER_MCL_SCHEMA
-    assert result.trimer_mcl_schema_version == TRIMER_MCL_SCHEMA_VERSION
-    assert result.trimer_conformer_method == TRIMER_MCL_PROTOCOL
-    assert torch.isfinite(torch.tensor(result.trimer_conformer_energy))
-    assert result.trimer_failure_code == ""
-    assert result.trimer_pos.size(0) > 0
-    assert result.trimer_pos.size(1) == 3
+def test_real_ensemble_has_no_2d_or_implicit_conformer_zero():
+    result = attach_finite_trimer_mcl(
+        _topology("*CCO*"), "*CCO*", num_candidates=2, max_rounds=1,
+        target_conformers=1, timeout_seconds=60)
+    assert not bool(result.trimer_2d_fallback)
+    assert result.conformer_positions.dtype == torch.float32
+    assert not hasattr(result, "trimer_pos")
+    if result.num_conformers:
+        assert select_conformer(result, 0).trimer_pos.ndim == 2
 
 
-def test_shared_boundary_trimer_produces_valid_geometry():
-    data, smiles = _make_trimer_data("*C(*)C(=O)OCC(C)(C)C")
-    result = attach_finite_trimer_mcl(data, smiles)
-    assert result.trimer_geometry_valid
-    assert not result.trimer_2d_fallback
-    # inter-RU bonds are different real edges
-    edge_set = set()
-    for col in range(result.trimer_edge_index.size(1)):
-        left = int(result.trimer_edge_index[0, col])
-        right = int(result.trimer_edge_index[1, col])
-        if left < right:
-            edge_set.add((left, right))
-    assert len(edge_set) > 1  # has real bonds
-    # O8 mapping is complete
-    assert result.mips_to_trimer_central_index.numel() == int(data.num_nodes)
-    assert (result.mips_to_trimer_central_index >= 0).all()
+def test_large_threshold_argument_does_not_trigger_2d(monkeypatch):
+    called = {"embed": False}
+    from src.dataset import trimer_mcl as module
+    original = module._embed_attempt
+    def wrapped(*args, **kwargs):
+        called["embed"] = True
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, "_embed_attempt", wrapped)
+    result = attach_finite_trimer_mcl(
+        _topology("*CCO*"), "*CCO*", max_heavy_atoms=1,
+        num_candidates=1, max_rounds=1, target_conformers=1)
+    assert called["embed"]
+    assert not bool(result.trimer_2d_fallback)
 
 
-def test_graph_unavailable_sets_valid_false():
-    from torch_geometric.data import Data
-    data = Data()
-    data.num_nodes = 0
-    data.graph_available = False
-    data.z = torch.empty((0,), dtype=torch.long)
-    data.canonical_ru_atom_index = torch.empty((0,), dtype=torch.long)
-    result = attach_finite_trimer_mcl(data, "*CCO*")
-    assert not result.trimer_geometry_valid
-    assert result.trimer_failure_code == "graph_unavailable"
+def test_fatal_identity_mapping_is_not_downgraded():
+    data = _topology("*CCO*")
+    data.canonical_to_trimer_base_atom_id = torch.full_like(
+        data.canonical_ru_atom_index, 99)
+    with pytest.raises(TrimerContractError):
+        attach_finite_trimer_mcl(data, "*CCO*", max_rounds=0)
 
 
-def test_attach_unavailable_is_deterministic_placeholder():
-    from torch_geometric.data import Data
-    data = Data()
-    data.num_nodes = 3
-    data.smiles = "*CCO*"
-    result = attach_unavailable_trimer_mcl(data, "test_reason")
-    assert not result.trimer_geometry_valid
-    assert result.trimer_failure_code == "test_reason"
-    assert result.trimer_pos.shape == (0, 3)
-    assert (result.mips_to_trimer_central_index == -1).all()
+def test_k0_placeholder_has_empty_ensemble_and_no_2d():
+    data = Data(num_nodes=0)
+    _attach_placeholder(data, "ETKDG_NO_VALID_CONFORMER", 1)
+    assert data.conformer_positions.shape == (0, 0, 3)
+    assert data.num_conformers == 0
+    assert not bool(data.trimer_2d_fallback)
 
 
-def test_large_trimer_2d_fallback_no_mcl():
-    """A trimer over 384 heavy atoms must use 2-D fallback, never MCL."""
-    large_smi = "*CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCO*"
-    mol = Chem.MolFromSmiles(large_smi)
-    assert mol is not None
-    data, smiles = _make_trimer_data("*CCO*")
-    # Force max_heavy_atoms to 2: even *CCO* (3 unstarred atoms) will trigger 2D
-    data.graph_available = True
-    result = attach_finite_trimer_mcl(data, "*CCO*", max_heavy_atoms=2)
-    assert not result.trimer_geometry_valid
-    assert result.trimer_2d_fallback
-    assert not result.trimer_geometry_is_3d
-    assert "2d" in result.trimer_geometry_source
+def test_stereo_audit_accepts_rdkit_ez_geometry_and_atom_reorder():
+    from rdkit.Chem import AllChem
+    mol = Chem.AddHs(Chem.MolFromSmiles("F/C=C/Cl"))
+    assert AllChem.EmbedMolecule(mol, AllChem.ETKDGv3()) == 0
+    heavy = Chem.RemoveHs(mol)
+    xyz = torch.tensor(heavy.GetConformer().GetPositions(), dtype=torch.float32)
+    assert audit_double_bond_stereo_coordinates(heavy, xyz) == 1
+    order = list(reversed(range(heavy.GetNumAtoms())))
+    reordered = Chem.RenumberAtoms(heavy, order)
+    assert audit_double_bond_stereo_coordinates(reordered, xyz[order]) == 1
 
 
-def test_etkdg_all_candidates_fail_is_caught():
-    """When ETKDG cannot embed any conformer the function must not crash."""
-    import rdkit.RDLogger as RDLogger
-    RDLogger.DisableLog("rdApp.*")
+def test_etkdg_total_failure_is_k0_not_fatal(monkeypatch):
+    from src.dataset import trimer_mcl as module
+    monkeypatch.setattr(module, "_embed_attempt", lambda mol, **kwargs: (Chem.Mol(mol), []))
+    record = attach_finite_trimer_mcl(
+        _topology("*CCO*"), "*CCO*", max_rounds=1, target_conformers=4)
+    assert record.num_conformers == 0
+    assert record.search_stop_reason == "ETKDG_NO_VALID_CONFORMER"
+    assert record.conformer_positions.shape[1] == record.trimer_atomic_number.numel()
+
+
+def test_unknown_embed_exception_remains_fatal(monkeypatch):
+    from src.dataset import trimer_mcl as module
+    def explode(*args, **kwargs):
+        raise RuntimeError("unexpected-worker-error")
+    monkeypatch.setattr(module, "_embed_attempt", explode)
+    with pytest.raises(RuntimeError, match="unexpected-worker-error"):
+        attach_finite_trimer_mcl(_topology("*CCO*"), "*CCO*", max_rounds=1)
+
+
+def test_timeout_preserves_completed_state(monkeypatch):
+    from src.dataset import trimer_mcl as module
+    ticks = iter((0.0, 241.0, 242.0))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(ticks))
+    record = attach_finite_trimer_mcl(_topology("*CCO*"), "*CCO*", max_rounds=4)
+    assert record.num_conformers == 0
+    assert record.search_stop_reason == "timeout"
+
+
+def test_multi_conformer_lmdb_roundtrip(tmp_path):
+    from src.dataset.lmdb_cache import LmdbLayerStore, LmdbLayerWriter
+    root = tmp_path / "ensemble"
+    meta = {"schema": "test-trimer-ensemble", "multi_conformer": True}
+    writer = LmdbLayerWriter(root, meta)
+    key = b"x" * 32
+    writer.add(key, _ensemble(2))
+    store = writer.finalize()
+    store.close()
+    reopened = LmdbLayerStore(root)
     try:
-        import pickle
-        data, smiles = _make_trimer_data("*CCO*")
-        # Embedded molecule with zero atoms should fail RDKit embedding.
-        broken = Chem.MolFromSmiles("CCO")
-        broken = Chem.AddHs(broken)
-        AllChem.EmbedMultipleConfs(broken, numConfs=4, params=AllChem.ETKDGv3())
-        broken = Chem.RemoveHs(broken)
-        # For a trivial test, just verify that a molecule with all failed
-        # embeddings is handled gracefully via _embed_with_targeted_retry.
-        # We verify the exception type can be caught.
-        mol = Chem.MolFromSmiles("CCO")
-        mol = Chem.AddHs(mol)
-        try:
-            _m, _ids = _embed_with_targeted_retry(
-                mol, num_candidates=4, seed=0,
-            )
-        except ValueError:
-            pass  # This is the expected path for total failure
+        record = reopened[key]
+        assert record.num_conformers == 2
+        assert torch.equal(select_conformer(record, 1).trimer_pos,
+                           record.conformer_positions[1])
     finally:
-        RDLogger.EnableLog("rdApp.*")
+        reopened.close()
 
 
-# ---------------------------------------------------------------------------
-#  star_3d_valid / trimer_geometry_valid independence
-# ---------------------------------------------------------------------------
-
-def test_star_and_trimer_validity_are_independent_fields():
-    data, smiles = _make_trimer_data("*CCO*")
-    result = attach_finite_trimer_mcl(data, smiles)
-    # Both fields must exist; they can differ.
-    assert hasattr(result, "trimer_geometry_valid")
-    assert hasattr(result, "star_3d_valid")
-    assert isinstance(bool(result.trimer_geometry_valid), bool)
-    assert isinstance(bool(result.star_3d_valid), bool)
-    # The two are independent — star valid may be False while trimer is True.
-    if (
-        bool(result.trimer_geometry_valid)
-        and not bool(result.star_3d_valid)
-    ):
-        pass  # expected to happen for asymmetric trimers
+def test_actual_generation_replay_is_deterministic():
+    kwargs = dict(num_candidates=2, max_rounds=2, target_conformers=2,
+                  rmsd_threshold=0.3, timeout_seconds=60,
+                  sample_key="deterministic-test-key")
+    first = attach_finite_trimer_mcl(_topology("*CCO*"), "*CCO*", **kwargs)
+    second = attach_finite_trimer_mcl(_topology("*CCO*"), "*CCO*", **kwargs)
+    assert first.num_conformers == second.num_conformers
+    assert first.generation_diagnostics["num_candidates_embedded"] == second.generation_diagnostics["num_candidates_embedded"]
+    assert torch.equal(first.conformer_round_ids, second.conformer_round_ids)
+    assert torch.equal(first.conformer_candidate_ids, second.conformer_candidate_ids)
+    assert torch.allclose(first.conformer_energies, second.conformer_energies,
+                          atol=1e-6, rtol=0)
+    assert torch.allclose(first.conformer_positions, second.conformer_positions,
+                          atol=1e-6, rtol=0)
 
 
-def test_failure_records_have_schema_correct():
-    from torch_geometric.data import Data
-    data = Data()
-    data.num_nodes = 0
-    data.graph_available = False
-    data.z = torch.empty((0,), dtype=torch.long)
-    data.canonical_ru_atom_index = torch.empty((0,), dtype=torch.long)
-    result = attach_finite_trimer_mcl(data, "*")
-    assert result.trimer_mcl_schema == TRIMER_MCL_SCHEMA
-    assert result.trimer_mcl_schema_version == TRIMER_MCL_SCHEMA_VERSION
-    assert result.trimer_failure_code == "graph_unavailable"
+def test_over_384_heavy_atoms_enters_real_etkdg_without_2d(monkeypatch):
+    from src.dataset import trimer_mcl as module
+    smiles = "*" + "C" * 129 + "*"
+    source = Chem.MolFromSmiles(smiles)
+    trimer, metadata = build_periodic_multimer_mol(source, 3, close_periodic=False)
+    assert trimer.GetNumAtoms() > 384
+    base_count = int(metadata["base_atom_count"])
+    data = Data(
+        num_nodes=base_count,
+        graph_available=True,
+        canonical_ru_atom_index=torch.arange(base_count),
+        canonical_to_trimer_base_atom_id=torch.arange(base_count),
+        z=torch.tensor([source.GetAtomWithIdx(i).GetAtomicNum()
+                        for i in range(source.GetNumAtoms())
+                        if source.GetAtomWithIdx(i).GetAtomicNum() > 0]),
+    )
+    called = {"actual_etkdg": False}
+    original = module._embed_attempt
 
+    def actual_then_bounded_failure(molecule, **kwargs):
+        called["actual_etkdg"] = True
+        embedded, _ = original(
+            molecule, num_candidates=1, seed=kwargs["seed"],
+            use_random_coords=False, max_iterations=1)
+        embedded.RemoveAllConformers()
+        return embedded, []
 
-# ---------------------------------------------------------------------------
-#  protocol constants
-# ---------------------------------------------------------------------------
-
-def test_protocol_constant_reflects_v1():
-    assert "lowest-finite-v1" in TRIMER_MCL_PROTOCOL
-    assert TRIMER_MMFF_RELAX_MAX_ITERATIONS == 200
-
-
-def test_schema_version_is_8():
-    assert TRIMER_MCL_SCHEMA == "mips-trimer-scage-trimer-v8"
-    assert TRIMER_MCL_SCHEMA_VERSION == 8
+    monkeypatch.setattr(module, "_embed_attempt", actual_then_bounded_failure)
+    monkeypatch.setattr(AllChem, "Compute2DCoords",
+                        lambda *args, **kwargs: pytest.fail("2-D fallback called"))
+    result = attach_finite_trimer_mcl(
+        data, source, num_candidates=8, max_rounds=1,
+        target_conformers=4, timeout_seconds=60)
+    assert called["actual_etkdg"]
+    assert result.num_conformers == 0
+    assert result.search_stop_reason == "ETKDG_NO_VALID_CONFORMER"
+    assert not bool(result.trimer_2d_fallback)

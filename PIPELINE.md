@@ -718,3 +718,83 @@ validation 选模及权重恢复，不访问 outer-test。通过后按正式授�
 
 本次仅修改入口要求、相关回归和文档，未执行测试、模型或训练。历史 107 passed
 不能视作本次新补丁已通过；已知 E/Z 异常仍待定性及处置。
+
+## 2026-09-12：完整 Trimer 四构象 Stage A（已完成，已停止）
+
+本轮只完成新的独立多构象数据 pilot，没有覆盖历史单构象缓存，也没有执行模型
+forward/backward、预训练、微调或 Stage B。新记录将 topology/identity/physical bonds
+保存一次，几何保存为 `conformer_positions[K,N,3]`（float32）、energy、round id 与
+candidate id；`K` 允许 0–4。读取必须显式调用 `select_conformer(record,index)` 或
+`iter_conformers(record)`，旧单构象记录不会被自动升级，新 ensemble 记录也不提供
+隐式 conformer-0 的 `trimer_pos`。
+
+生成协议为最多 4 rounds、每轮 8 个 ETKDGv3 候选，所有轮次均使用
+`useRandomCoords=False`、`enforceChirality=True`、`maxIterations=200`、单线程且关闭
+RDKit RMSD pruning；每轮 seed 由 sample key 与 round id 确定。MMFF94 最多松弛
+200 steps，不依据 convergence flag 拒绝。明确 E/Z/cis/trans 在 MMFF 前、MMFF 后和
+RemoveHs 后最终 float32 坐标上按严格符号检查；未声明双键不推断 Stereo。固定身份
+whole-Trimer heavy-atom RMSD 只允许平移和 proper rotation，0.3 Å 去重，不做反射、
+RU 交换、原子 permutation 或 symmetry matching。没有 384 原子拒绝，也没有 2D、
+UFF 或 xTB fallback。identity/bond/Stereo-reference 与未知程序错误保持 fatal。
+
+相关回归最终为 `44 passed, 1 warning`，命令及日志见
+`logs/trimer_stage_a_20260912/tests_after_terminal_fix.log`。首次组合命令因 tests 目录
+未加入 `PYTHONPATH` 在 collection 阶段退出（不是用例失败）；修正环境后的结果才是
+本轮有效证据。16 条真实 correctness 缓存在
+`data/processed/trimer_ensemble_stage_a_20260912/correctness16/cache`：
+`K={0:2,1:3,3:1,4:10}`；已知旧异常
+`*C1=C(/C=C/c2ccc(*)cc2)C=C1` 得到 4 个最终 Stereo 正确构象。缓存后从规范化结构
+独立重建原子、物理边与 Stereo 坐标检查，共检查 20 个明确 Stereo bond。一次 fatal
+定位证明有限链末端羰基可发生合法共轭变化，因此 RU 内部身份合同检查物理边和
+BondType，不把末端 Conjugation 差异误判为原子/键映射损坏。
+
+256 条指定真实记录 pilot 复用上述 16 条，来源为 PI1M 255 条和 downstream
+`smi_all.csv` 1 条，不是任务均衡样本。结果为
+`K={0:89,1:8,2:6,3:5,4:148}`，148/256 达到 K=4；停止原因是
+81 条 `ETKDG_NO_VALID_CONFORMER`、8 条 `MMFF_UNSUPPORTED`、19 条预算结束后 K=1–3，
+无 timeout。最终缓存后独立 Stereo 审计检查 192 个明确 bond；MMFF 后拒绝 2 个
+Stereo 不符候选。运行时间 P50/P90/P95/max 为 2.02/5.73/6.46/8.64 秒，缓存约
+19.8 MB，Trimer 重原子范围 3–186，本轮没有真实 >384 原子记录。0.3 和 0.5 Å 在
+已生成候选池上的 K 分布相同；1.0 Å 使一条记录由 K=4 变为 K=2，总体分布变化为
+`K={0:89,1:8,2:7,3:5,4:147}`。完整限定范围报告位于
+`data/processed/trimer_ensemble_stage_a_20260912/pilot256/report.json`，仅代表这
+256 条指定记录。
+
+Stage B 当前保持未授权且未启动。参数建议仅供用户决定：0.3 与 0.5 Å 在本 pilot
+无覆盖差异，保留 0.3 Å 可维持计划定义；8×4 搜索虽无超时且成本较低，但 89/256
+为 K=0、仅 148/256 达到目标，不能据此直接批准全量重建。正式参数确认前应先决定
+该 3D 可用率是否可接受，或另行授权针对 81 条 ETKDG 全失败样本的受控生成策略研究；
+不得通过复制构象、2D fallback、放宽 Stereo 或把其他力场结果混入来提高覆盖率。
+
+## 2026-09-12：完整 Trimer 多构象 Stage A2（诊断完成，Stage B 继续阻断）
+
+本轮只重放 Stage A pilot 中 81 条 `ETKDG_NO_VALID_CONFORMER`，没有修改 Stereo、
+K target、RMSD、round/candidate budget、MMFF 或训练/collate，也没有写回 Stage A
+缓存。RDKit 2026.03.2 的轻量 `trackFailures` 显示 81/81 均为 `EMBED_ZERO`：324/324
+个 full-Trimer rounds、2,592 个请求构象全部返回 0。内部 518,400 次 embedding
+attempt 中 518,398 次停在 `INITIAL_COORDS`，另有 `BAD_DOUBLE_BOND_STEREO` 和
+`ETK_MINIMIZATION` 各 1 次；没有候选进入项目的 pre-Stereo 或 MMFF gate。
+
+相同 81 条的规范化单 RU 在 attachment dummy 原位 H 封端后，以相同 ETKDGv3 参数、
+8 candidates 和对应 seed 检查，81/81 均得到至少一个有限构象（648 个请求返回 635）。
+因此失败与 whole-Trimer embedding complexity 相关，而不是 source RU 本身无法嵌入。
+结构比较排除 8 条 MMFF unsupported，比较 81 条失败与 167 条 K>=1：失败/成功的
+Trimer heavy-atom median 为 105/54，rotatable-bond median 为 51/20；failure rate 从
+`<30 heavy: 0%`、`30–59: 4.2%` 升至 `90–119: 71.7%`、`>=120: 82.1%`，并从
+`<20 rotatable: 0%` 升至 `>=60: 100%`。ring 和 explicit Stereo 有边际集中，但
+Stereo gate 实际拒绝为 0；全部失败没有 macrocycle，cross-RU bond 全为 single，
+attachment 类型未显示独立于大小/柔性的确定因果。
+
+新增两个缺失覆盖测试并实际执行：同 sample key 的 K=4/K=1/failure/历史 Stereo
+四类两次真实 replay 在 1e-6 容差内均一致；387-heavy-atom physical Trimer 实际进入
+RDKit ETKDG，未调用 `Compute2DCoords`，0 conformer 被正常分类为 generation failure。
+相关测试为 `23 passed, 1 warning`，日志在
+`logs/trimer_stage_a2_20260912/tests_retry.log`；81 条诊断用时 254.88 秒、exit 0，日志
+在 `logs/trimer_stage_a2_20260912/diagnostic.log`。完整 A–J 报告为
+`data/processed/trimer_stage_a2_20260912/stage_a2_report.md`。
+
+不同的 4 个 round seed 仍全部失败，且每个请求构象都耗尽 200 attempts，因此当前
+证据不支持优先扩大普通同类 candidate budget。下一步仅建议另行授权小规模 matched
+fallback pilot：`Stereo-correct RU initial geometry assembly → full Trimer → whole-Trimer
+MMFF94 relaxation`；本轮没有实现。Stage B、全量缓存、模型 forward/backward、预训练
+和微调均未启动。

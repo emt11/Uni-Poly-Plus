@@ -374,6 +374,10 @@ def _split_mips_feature_layers(data):
         "migration_status", "source_trimer_content_hash",
         "source_trimer_done_hash", "trimer_mapping_digest",
         "geometry_payload_digest", "regeneration_reason",
+        "conformer_positions", "conformer_energies",
+        "conformer_round_ids", "conformer_candidate_ids",
+        "num_conformers", "target_conformers", "target_met",
+        "search_stop_reason", "generation_diagnostics", "multi_conformer",
     }
     layers = {
         "input": _copy_data_fields(data, lambda key: key in input_names),
@@ -1483,6 +1487,10 @@ _LMDB_TRIMER_FIELDS = {
     "migration_status", "source_trimer_content_hash",
     "source_trimer_done_hash", "trimer_mapping_digest",
     "geometry_payload_digest", "regeneration_reason",
+    "conformer_positions", "conformer_energies",
+    "conformer_round_ids", "conformer_candidate_ids",
+    "num_conformers", "target_conformers", "target_met",
+    "search_stop_reason", "generation_diagnostics", "multi_conformer",
 }
 
 
