@@ -127,6 +127,9 @@ def _run_struct(staging, rows, metadata, workers):
 
     ru_writer = StagingWriter(staging / "ru_base", metadata["ru_base"])
     topology_writer = StagingWriter(staging / "topology", metadata["topology"])
+    rejection_path = staging / "ru_base" / "rejections.jsonl"
+    rejection_path.touch(exist_ok=True)
+    ru_rejections = read_rejections(rejection_path)
     processed_new = 0
     writer_seconds = 0.0
     total = len(rows)
@@ -139,8 +142,12 @@ def _run_struct(staging, rows, metadata, workers):
         if not force and now - last_report < 30.0:
             return
         last_report = now
-        _progress_line("struct", processed_new, total, processed_new, 0,
-                       {}, started_wall)
+        _progress_line("struct", processed_new, total,
+                       processed_new - len(ru_rejections),
+                       len(ru_rejections),
+                       Counter(row["failure_code"]
+                               for row in ru_rejections.values()),
+                       started_wall)
 
     def commit_result(result):
         nonlocal processed_new, writer_seconds
@@ -154,6 +161,21 @@ def _run_struct(staging, rows, metadata, workers):
             raise CacheLifecycleError(
                 f"sample_key={result['sample_key']}:{result['error']}"
             )
+        if status == "rejected":
+            if key in ru_rejections:
+                raise CacheLifecycleError("duplicate RU rejection")
+            rejection = {
+                "sample_key": key.hex(),
+                "failure_code": str(result["failure_code"]),
+                "candidate_attempts": int(result["candidate_attempts"]),
+                "elapsed_seconds": float(result["elapsed_seconds"]),
+                "round_reached": int(result["round_reached"]),
+            }
+            append_jsonl(rejection_path, rejection)
+            ru_rejections[key] = rejection
+            processed_new += 1
+            progress()
+            return
         if key in ru_writer or key in topology_writer:
             raise CacheLifecycleError("duplicate struct write")
         ru_data = deserialize_record(result.pop("ru_payload"), key)
@@ -168,8 +190,9 @@ def _run_struct(staging, rows, metadata, workers):
 
     jobs = [
         {**row, "phase": "struct"} for row in rows
-        if bytes.fromhex(row["sample_key"]) not in ru_writer
-        or bytes.fromhex(row["sample_key"]) not in topology_writer
+        if bytes.fromhex(row["sample_key"]) not in ru_rejections
+        and (bytes.fromhex(row["sample_key"]) not in ru_writer
+             or bytes.fromhex(row["sample_key"]) not in topology_writer)
     ]
     struct_timeout = 600.0
 
@@ -312,6 +335,17 @@ def _build_struct_one(payload):
     try:
         ru = _compute_ru_base_layer(payload["source_smiles"])
         if not bool(getattr(ru, "ru_base_valid", False)):
+            failure_code = str(getattr(ru, "ru_base_failure_code", "") or "")
+            if failure_code.startswith("RU_BUILD_UNSUPPORTED"):
+                # Builder capability boundary on a canonical, parseable
+                # source: ordinary RU rejection, the build continues.
+                return {
+                    "status": "rejected", "sample_key": payload["sample_key"],
+                    "failure_code": "RU_BUILD_UNSUPPORTED",
+                    "candidate_attempts": 0,
+                    "elapsed_seconds": 0.0,
+                    "round_reached": -1,
+                }
             return {
                 "status": "contract_error", "sample_key": payload["sample_key"],
                 "error": "source_identity_corruption",
@@ -454,6 +488,7 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
     }
     if accepted_existing & set(rejections):
         raise CacheLifecycleError("accepted/rejected staging overlap")
+    ru_rejections = read_rejections(staging / "ru_base" / "rejections.jsonl")
     jobs = []
     ru_environment = _raw_artifact(staging / "ru_base")
     try:
@@ -462,6 +497,8 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
                 key = bytes.fromhex(row["sample_key"])
                 if key in accepted_existing or key in rejections:
                     continue
+                if key in ru_rejections:
+                    continue  # RU capability boundary: never reaches Trimer
                 payload = transaction.get(key)
                 if payload is None:
                     raise CacheLifecycleError("Trimer parent RU record is missing")
@@ -730,6 +767,20 @@ def _audit_layer(root, layer, source_keys, expected_keys, source_manifest_hash,
 def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
                           artifact_hashes, metadata):
     source_keys = [bytes.fromhex(row["sample_key"]) for row in rows]
+    source_set = set(source_keys)
+
+    # RU layer: capability-boundary rejections exclude a sample from RU,
+    # Topology and Trimer entirely.
+    ru_rejection_path = staging / "ru_base" / "rejections.jsonl"
+    ru_rejection_path.touch(exist_ok=True)
+    ru_rejections = read_rejections(ru_rejection_path)
+    ru_rejected_set = set(ru_rejections)
+    if ru_rejected_set - source_set:
+        raise CacheAuditError("RU rejection ledger contains foreign keys")
+    ru_accepted = [key for key in source_keys if key not in ru_rejected_set]
+    ru_rejected = [key for key in source_keys if key in ru_rejected_set]
+    ru_accepted_set = set(ru_accepted)
+
     rejection_path = staging / "trimer" / "rejections.jsonl"
     rejections = read_rejections(rejection_path)
     trimer_env = _raw_artifact(staging / "trimer")
@@ -739,14 +790,15 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
     finally:
         trimer_env.close()
     rejected_set = set(rejections)
-    source_set = set(source_keys)
     if accepted_set & rejected_set:
         raise CacheAuditError("accepted/rejected are not disjoint")
-    if accepted_set | rejected_set != source_set:
-        raise CacheAuditError("accepted/rejected do not cover source")
-    accepted = [key for key in source_keys if key in accepted_set]
-    rejected = [key for key in source_keys if key in rejected_set]
-    if len(source_keys) != len(accepted) + len(rejected):
+    if accepted_set | rejected_set != ru_accepted_set:
+        raise CacheAuditError(
+            "Trimer accepted/rejected do not cover the RU-accepted cohort"
+        )
+    accepted = [key for key in ru_accepted if key in accepted_set]
+    rejected = [key for key in ru_accepted if key in rejected_set]
+    if len(ru_accepted) != len(accepted) + len(rejected):
         raise CacheAuditError("terminal accounting mismatch")
     runtime_rows = []
     runtime_keys = set()
@@ -760,8 +812,10 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
             raise CacheAuditError("runtime ledger contains duplicate keys")
         runtime_keys.add(key)
         runtime_rows.append(item)
-    if runtime_keys != source_set:
-        raise CacheAuditError("runtime ledger does not cover terminal source keys")
+    if runtime_keys != ru_accepted_set:
+        raise CacheAuditError(
+            "runtime ledger does not cover the RU-accepted cohort"
+        )
 
     manifests = {}
     parent_map = {
@@ -769,34 +823,46 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
         "topology": {"ru_base": artifact_hashes["ru_base"]},
         "trimer": {"ru_base": artifact_hashes["ru_base"]},
     }
+    layer_expected = {
+        "ru_base": (source_keys, ru_accepted, ru_rejected, source_keys),
+        "topology": (ru_accepted, ru_accepted, [], []),
+        "trimer": (ru_accepted, accepted, rejected, ru_accepted),
+    }
     for layer in ("ru_base", "topology", "trimer"):
-        expected = source_keys if layer != "trimer" else accepted
-        rejected_for_layer = rejected if layer == "trimer" else []
+        cohort, expected, rejected_for_layer, terminal = layer_expected[layer]
         manifest = _audit_layer(
-            staging / layer, layer, source_keys, expected,
+            staging / layer, layer, cohort, expected,
             source_manifest["source_manifest_hash"], artifact_hashes[layer],
             ROUTE_BUILD_SPECS[layer], parent_map[layer], rejected_for_layer,
         )
-        if layer == "trimer":
-            accepted_array = np.frombuffer(b"".join(accepted), dtype=np.uint8).reshape(-1, 32)
-            rejected_array = np.frombuffer(b"".join(rejected), dtype=np.uint8).reshape(-1, 32)
-            for name, values in (("accepted_keys.npy", accepted_array),
-                                 ("rejected_keys.npy", rejected_array)):
-                temporary = staging / layer / f"{name}.tmp.{os.getpid()}"
-                with temporary.open("wb") as handle:
-                    np.save(handle, values, allow_pickle=False)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, staging / layer / name)
-            manifest["accepted_keys_file_sha256"] = sha256_file(
-                staging / layer / "accepted_keys.npy"
-            )
-            manifest["rejected_keys_file_sha256"] = sha256_file(
-                staging / layer / "rejected_keys.npy"
-            )
+        # Every rejecting layer publishes its ordered accepted/rejected key
+        # cohorts; topology is a pure pass-through of the RU cohort.
+        accepted_for_layer = [key for key in cohort if key in set(expected)]
+        accepted_array = np.frombuffer(
+            b"".join(accepted_for_layer), dtype=np.uint8
+        ).reshape(-1, 32)
+        rejected_array = np.frombuffer(
+            b"".join(rejected_for_layer), dtype=np.uint8
+        ).reshape(-1, 32)
+        for name, values in (("accepted_keys.npy", accepted_array),
+                             ("rejected_keys.npy", rejected_array)):
+            temporary = staging / layer / f"{name}.tmp.{os.getpid()}"
+            with temporary.open("wb") as handle:
+                np.save(handle, values, allow_pickle=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, staging / layer / name)
+        manifest["accepted_keys_file_sha256"] = sha256_file(
+            staging / layer / "accepted_keys.npy"
+        )
+        manifest["rejected_keys_file_sha256"] = sha256_file(
+            staging / layer / "rejected_keys.npy"
+        )
+        if layer != "topology":
             manifest["rejections_file_sha256"] = sha256_file(
                 staging / layer / "rejections.jsonl"
             )
+        if layer == "trimer":
             manifest["runtime_file_sha256"] = sha256_file(
                 staging / layer / "runtime.jsonl"
             )
@@ -923,6 +989,9 @@ def _make_report(cache_root, store, manifests, rejections, staging_existed,
     rejected_count = manifests["trimer"]["rejected_count"]
     total_wall = time.monotonic() - build_started
     full_rows = 1_000_000
+    ru_manifest = manifests["ru_base"]
+    ru_accepted_count = ru_manifest["accepted_count"]
+    ru_rejected_count = ru_manifest["rejected_count"]
     acceptance = accepted_count / source_count
     mean_cpu = float(np.mean(elapsed)) if elapsed else 0.0
     workers = int(phase_stats["workers"])
@@ -944,10 +1013,24 @@ def _make_report(cache_root, store, manifests, rejections, staging_existed,
     return {
         "scope": "limited lifecycle pilot; not full-cache validation",
         "source_count": source_count,
+        "ru_accepted_count": ru_accepted_count,
+        "ru_rejected_count": ru_rejected_count,
+        "ru_rejection_distribution": dict(sorted(Counter(
+            row["failure_code"] for row in read_rejections(
+                trimer_root.parent / "ru_base" / "rejections.jsonl"
+            ).values()).items())),
+        "p_ru_accepted": ru_accepted_count / source_count,
+        "p_trimer_accepted_given_ru": (
+            accepted_count / ru_accepted_count if ru_accepted_count else None
+        ),
+        "p_geometry": accepted_count / source_count,
         "accepted_count": accepted_count,
         "rejected_count": rejected_count,
         "failure_distribution": failure_distribution(rejections),
-        "accounting_ok": source_count == accepted_count + rejected_count,
+        "accounting_ok": (
+            source_count == ru_accepted_count + ru_rejected_count
+            and ru_accepted_count == accepted_count + rejected_count
+        ),
         "resume_detected": bool(staging_existed),
         "resume_skipped_terminal": int(phase_stats["resume_skipped_terminal"]),
         "duplicate_keys": 0,
@@ -987,7 +1070,9 @@ def _make_report(cache_root, store, manifests, rejections, staging_existed,
         "recommended_layout": "one LMDB per RU/Topology/Trimer layer; no extra sharding at projected size",
         "zero_write_ok": bool(zero_write),
         "full_rebuild_ready": bool(
-            zero_write and source_count == accepted_count + rejected_count
+            zero_write
+            and source_count == ru_accepted_count + ru_rejected_count
+            and ru_accepted_count == accepted_count + rejected_count
             and staging_existed and phase_stats["resume_skipped_terminal"] > 0
         ),
         "store": store,
@@ -1046,8 +1131,6 @@ def main(argv=None):
     build_started = time.monotonic()
     try:
         phase_stats = _run_struct(staging, rows, metadata, args.workers)
-        progress = _progress_line("struct", len(rows), len(rows), len(rows),
-                                  0, {}, build_started)
         trimer_root = staging / "trimer"
         pre_terminal = 0
         if trimer_root.exists():

@@ -46,6 +46,7 @@ from .canonical_periodic import (
     build_canonical_periodic_topology,
     find_atom_graph_mapping,
     find_base_atom_mapping,
+    RuBuildUnsupported,
 )
 from .mips_trimer_contract import (
     TOPOLOGY_CANONICAL,
@@ -1591,6 +1592,11 @@ def _compute_ru_base_layer(smiles):
                     ),
                 })
             data.source_to_normalized_attachment_map = source_attachments
+        except RuBuildUnsupported as exc:
+            # Builder capability boundary for a canonical, parseable source:
+            # the mapping search ran and validated zero isomorphisms.  This
+            # is an ordinary RU rejection, never a data corruption.
+            identity_failure = f"RU_BUILD_UNSUPPORTED:{exc}"[:240]
         except Exception as exc:
             # A syntactically valid ordinary SMILES (or a malformed P-SMILES)
             # remains an explicit unavailable RU row.  Do not invent a

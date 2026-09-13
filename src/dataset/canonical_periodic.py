@@ -124,6 +124,13 @@ def _validate_full_atom_mapping(source, target, match):
     return True
 
 
+class RuBuildUnsupported(ValueError):
+    """The RU builder searched normally but found no validated graph
+    isomorphism (validated_mapping_count == 0) for a canonical, parseable
+    P-SMILES.  This is a builder capability boundary — an ordinary RU
+    rejection — not a data or program corruption."""
+
+
 def find_atom_graph_mapping(source, target):
     """Return a deterministic ``source_atom_id -> target_atom_id`` mapping.
 
@@ -160,7 +167,9 @@ def find_atom_graph_mapping(source, target):
         if _validate_full_atom_mapping(source, target, match)
     ]
     if not valid:
-        raise ValueError("atom mapping failed: no validated graph isomorphism")
+        raise RuBuildUnsupported(
+            "atom mapping failed: no validated graph isomorphism"
+        )
     return torch.tensor(min(valid), dtype=torch.long)
 
 

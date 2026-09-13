@@ -202,6 +202,13 @@ RU_BASE_BUILD_SPEC = validate_build_spec({
             "dummy_atom_policy": "preserve",
             "invalid_identity_policy": "INVALID::{source}",
         },
+        # The RU mapping search runs normally and validates zero graph
+        # isomorphisms for some canonical, parseable sources: that is a
+        # builder capability boundary and an ordinary RU rejection — never a
+        # data corruption and never a hard stop.
+        "failure_policy": {
+            "no_validated_graph_isomorphism": "reject",
+        },
         "mismatched_bond_policy": "single",
         "molecule_serialization": "rdkit_mol_binary",
     },
