@@ -1048,7 +1048,9 @@ def _audit_layer(root, layer, source_keys, expected_keys, source_manifest_hash,
     try:
         with environment.begin(buffers=False) as txn:
             cursor = txn.cursor()
-            for key, payload in cursor:
+            lmdb_count = int(txn.stat()["entries"])
+            for index, item in enumerate(cursor, 1):
+                key, payload = item
                 key, payload = bytes(key), bytes(payload)
                 observed.append(key)
                 digest.update(key)
@@ -1057,7 +1059,11 @@ def _audit_layer(root, layer, source_keys, expected_keys, source_manifest_hash,
                 payload_bytes += len(payload)
                 data = deserialize_record(payload, key)
                 _check_fields(layer, data, key)
-            lmdb_count = int(txn.stat()["entries"])
+                if index % 100000 == 0:
+                    print(json.dumps({
+                        "phase": "audit", "layer": layer,
+                        "records": index, "total": lmdb_count,
+                    }), flush=True)
     finally:
         environment.close()
     if len(observed) != len(set(observed)) or lmdb_count != len(observed):
@@ -1180,7 +1186,8 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
         )
         # Every rejecting layer publishes its ordered accepted/rejected key
         # cohorts; topology is a pure pass-through of the RU cohort.
-        accepted_for_layer = [key for key in cohort if key in set(expected)]
+        expected_set = set(expected)
+        accepted_for_layer = [key for key in cohort if key in expected_set]
         accepted_array = np.frombuffer(
             b"".join(accepted_for_layer), dtype=np.uint8
         ).reshape(-1, 32)
