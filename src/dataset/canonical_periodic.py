@@ -181,12 +181,17 @@ def _base_atom_order(molecule):
     ]
 
 
-def find_base_atom_mapping(source, target):
-    """Map non-dummy RU atom ranks between two equivalent P-SMILES graphs."""
+def find_base_atom_mapping(source, target, *, full=None):
+    """Map non-dummy RU atom ranks between two equivalent P-SMILES graphs.
+
+    ``full`` may carry an already validated full-graph permutation for the same
+    (source, target) pair; the search is then a pure projection of it.
+    """
 
     source = _as_mol(source)
     target = _as_mol(target)
-    full = find_atom_graph_mapping(source, target)
+    if full is None:
+        full = find_atom_graph_mapping(source, target)
     source_order = _base_atom_order(source)
     target_order = _base_atom_order(target)
     target_rank = {atom_idx: rank for rank, atom_idx in enumerate(target_order)}
@@ -233,17 +238,30 @@ def resolve_normalized_identity(topology, source_smiles, *, require_fields=None)
         )
 
     source_to_normalized_atom = find_atom_graph_mapping(source, normalized)
-    source_to_normalized_base = find_base_atom_mapping(source, normalized)
+    source_to_normalized_base = find_base_atom_mapping(
+        source, normalized, full=source_to_normalized_atom
+    )
 
     # The persisted mapping describes the source spelling used when the
     # frozen topology was written.  A caller may later provide a different,
     # non-canonical spelling with the same normalized sample key, so validate
     # the persisted table against ``topology.smiles`` while returning a fresh
-    # caller->normalized permutation for the current audit/model call.
+    # caller->normalized permutation for the current audit/model call.  When
+    # the caller spelling IS the persisted spelling, both permutations are the
+    # same pure function of the same inputs: re-searching is pure waste.
     cached_source_text = getattr(topology, "smiles", None)
-    cached_source = _as_mol(cached_source_text) if cached_source_text else source
-    cached_atom = find_atom_graph_mapping(cached_source, normalized)
-    cached_base = find_base_atom_mapping(cached_source, normalized)
+    if cached_source_text is not None and str(cached_source_text) == str(source_smiles):
+        cached_source = source
+        cached_atom = source_to_normalized_atom
+        cached_base = source_to_normalized_base
+    else:
+        cached_source = (
+            _as_mol(cached_source_text) if cached_source_text else source
+        )
+        cached_atom = find_atom_graph_mapping(cached_source, normalized)
+        cached_base = find_base_atom_mapping(
+            cached_source, normalized, full=cached_atom
+        )
     observed_atom = getattr(topology, "source_to_normalized_atom_id", None)
     observed_base = getattr(
         topology, "source_to_normalized_canonical_atom_id", None

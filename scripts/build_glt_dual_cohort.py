@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 
-from src.dataset.cache_lifecycle import CacheLifecycleError, atomic_json, json_hash, snapshot_tree
+from src.dataset.cache_lifecycle import (CacheLifecycleError, atomic_json,
+                                          json_hash, zero_write_snapshot)
 from src.dataset.canonical_periodic import resolve_normalized_identity
 from src.dataset.glt_dual_cache import (
     DualFrozenBundle, load_active_dual_store, load_dual_cohort,
@@ -94,13 +95,13 @@ def _strict_read_audit(bundle: DualFrozenBundle, records: list[dict]) -> dict:
 def build(cache_root: Path, output: Path, expected_count: int) -> dict:
     cache_root = cache_root.resolve()
     output = output.resolve()
-    before = snapshot_tree(cache_root)
+    before = zero_write_snapshot(cache_root)
     store = load_active_dual_store(cache_root)
     if output.exists():
         cohort = load_dual_cohort(output, cache_root)
         if expected_count and len(cohort["records"]) != expected_count:
             raise CacheLifecycleError("existing cohort count differs from expectation")
-        if snapshot_tree(cache_root) != before:
+        if zero_write_snapshot(cache_root) != before:
             raise CacheLifecycleError("repeat cohort read modified the main cache")
         return {
             "status": "PASS", "repeat_zero_write": True,
@@ -164,7 +165,7 @@ def build(cache_root: Path, output: Path, expected_count: int) -> dict:
         }
         atomic_json(staging / "manifest.json", manifest)
         atomic_json(staging / ".frozen", {"manifest_hash": json_hash(manifest)})
-        if snapshot_tree(cache_root) != before:
+        if zero_write_snapshot(cache_root) != before:
             raise CacheLifecycleError(
                 "cohort construction observed a main-cache change before publish"
             )
@@ -172,7 +173,7 @@ def build(cache_root: Path, output: Path, expected_count: int) -> dict:
     finally:
         bundle.close()
     cohort = load_dual_cohort(output, cache_root)
-    zero_write = snapshot_tree(cache_root) == before
+    zero_write = zero_write_snapshot(cache_root) == before
     if not zero_write:
         raise CacheLifecycleError("cohort publish observed a main-cache change")
     return {

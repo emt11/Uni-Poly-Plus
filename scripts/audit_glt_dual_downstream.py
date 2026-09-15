@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from src.dataset.cache_lifecycle import CacheLifecycleError, snapshot_tree
+from src.dataset.cache_lifecycle import CacheLifecycleError, zero_write_snapshot
 from src.dataset.glt_dual import build_dual_sample
 from src.dataset.glt_dual_cache import sha256_file
 from src.training.glt_dual_runtime import open_source, write_json
@@ -30,7 +30,7 @@ def main():
     torch.set_num_threads(1)
     cache_root = Path(args.cache_root).resolve()
     split_root = Path(args.split_root).resolve()
-    before = snapshot_tree(cache_root)
+    before = zero_write_snapshot(cache_root)
     source, frame = open_source(args.cohort_root, cache_root)
     failures = []
     try:
@@ -85,7 +85,7 @@ def main():
                 break
     finally:
         source.close()
-    zero_write = snapshot_tree(cache_root) == before
+    zero_write = zero_write_snapshot(cache_root) == before
     if not zero_write:
         raise CacheLifecycleError("downstream exhaustive audit modified cache")
     report = {

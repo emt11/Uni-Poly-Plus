@@ -15,7 +15,8 @@ from torch.nn.parallel import DistributedDataParallel
 from src.dataset.glt_dual_pretrain import prepare_pretrain_sample, pretrain_collate
 from src.modules.glt_dual_pretrain import DualPretrainer, global_objective, deployment_package
 from src.training.glt_dual_runtime import (require_tmux, open_source, save_checkpoint, write_json,
-                                         rng_state, restore_rng, scheduled_lr, move_labels, OrderedSampleStream)
+                                         rng_state, restore_rng, scheduled_lr, move_labels,
+                                         OrderedSampleStream, RankMicrobatchStream)
 from src.utils import set_global_seed
 
 
@@ -24,6 +25,9 @@ def main():
     for name in ('config', 'cohort-root', 'cache-root', 'output'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--resume')
+    parser.add_argument('--prep-workers', type=int, default=0,
+                        help='DataLoader workers per rank for input prefetch '
+                             '(0 = inline preparation, the exact original path)')
     args = parser.parse_args()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
@@ -94,17 +98,37 @@ def main():
         if rank == 0:
             write_json(output / 'run.json', dict(identity=identity, command=sys.argv, accumulation=accumulation))
         stream = OrderedSampleStream(len(source), config['seed'])
+        # Optional CPU prefetch.  The prepared items are identical to the
+        # inline path (pure function of sample and absolute position); only
+        # where they are built changes.  Workers are forked, so the read-only
+        # frozen source (LMDB opened with lock=False) is inherited instead of
+        # re-loaded, and workers never touch CUDA.
+        prefetch = None
+        if int(args.prep_workers) > 0:
+            dataset = RankMicrobatchStream(
+                source, seed=config['seed'], world=world, rank=rank,
+                microbatch=micro, accumulation=accumulation,
+                start_step=start, max_steps=config['max_optimizer_steps'],
+                sigma=config['noise_sigma'], ratio=config['atom_mask_ratio'],
+            )
+            prefetch = iter(torch.utils.data.DataLoader(
+                dataset, batch_size=None, num_workers=int(args.prep_workers),
+                prefetch_factor=4, persistent_workers=False, pin_memory=False,
+            ))
         for step in range(start, config['max_optimizer_steps']):
-            prepared = []
-            for offset in range(accumulation):
-                rows = []
-                for local in range(micro):
-                    position = step * batch_size + offset * world * micro + rank * micro + local
-                    index = stream.index_at(position)
-                    rows.append(prepare_pretrain_sample(*source[index], seed=config['seed'],
-                        key=source.samples[index][0].hex(), position=position,
-                        sigma=config['noise_sigma'], ratio=config['atom_mask_ratio']))
-                prepared.append(pretrain_collate(rows))
+            if prefetch is not None:
+                prepared = [next(prefetch) for _ in range(accumulation)]
+            else:
+                prepared = []
+                for offset in range(accumulation):
+                    rows = []
+                    for local in range(micro):
+                        position = step * batch_size + offset * world * micro + rank * micro + local
+                        index = stream.index_at(position)
+                        rows.append(prepare_pretrain_sample(*source[index], seed=config['seed'],
+                            key=source.samples[index][0].hex(), position=position,
+                            sigma=config['noise_sigma'], ratio=config['atom_mask_ratio']))
+                    prepared.append(pretrain_collate(rows))
             counts = torch.zeros(3, device=device)
             for data, labels in prepared:
                 masked = torch.bincount(data.canonical_graph_index[labels['atom_mask']], minlength=data.graph_available.numel())

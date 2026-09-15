@@ -432,6 +432,14 @@ class LmdbLayerWriter:
         preserve_done=False,
     ):
         self.root = str(root)
+        # A published/frozen artifact is immutable.  Opening a writer on it
+        # would at best mutate reader bookkeeping (lock.mdb) and at worst
+        # corrupt frozen records; frozen layers are read through
+        # LmdbLayerStore/ReadonlyArtifact instead.
+        if os.path.isfile(os.path.join(self.root, ".frozen")):
+            raise RuntimeError(
+                f"refusing to open a writer on a frozen artifact: {self.root}"
+            )
         self._writer_lock_handle = None
         self._writer_lock_path = os.path.join(self.root, ".writer.lock")
         self._lifecycle_lock_handle = None

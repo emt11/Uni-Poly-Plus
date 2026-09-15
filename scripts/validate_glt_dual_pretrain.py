@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from src.dataset.cache_lifecycle import snapshot_tree
+from src.dataset.cache_lifecycle import zero_write_snapshot
 from src.dataset.glt_dual import build_dual_sample, dual_glt_collate
 from src.dataset.glt_dual_pretrain import prepare_pretrain_sample, pretrain_collate
 from src.modules.glt_dual import build_dual_glt_model
@@ -67,7 +67,7 @@ def main():
             raise RuntimeError("CUDA smoke requested without CUDA")
         torch.cuda.set_device(device)
     cache_root = Path(args.cache_root).resolve()
-    before = snapshot_tree(cache_root)
+    before = zero_write_snapshot(cache_root)
     source, _ = open_source(args.cohort_root, cache_root)
     try:
         indices = args.index
@@ -143,7 +143,7 @@ def main():
         cohort_hash = source.cohort["manifest_hash"]
     finally:
         source.close()
-    if snapshot_tree(cache_root) != before:
+    if zero_write_snapshot(cache_root) != before:
         raise RuntimeError("runtime smoke modified the frozen cache")
     report = {
         "status": "PASS", "scope": "real-record local runtime smoke",

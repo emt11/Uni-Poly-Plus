@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from src.dataset.cache_lifecycle import snapshot_tree
+from src.dataset.cache_lifecycle import zero_write_snapshot
 from src.dataset.glt_dual import build_dual_sample
 from src.dataset.glt_dual_pretrain import chemical_targets, prepare_pretrain_sample
 from src.training.glt_dual_runtime import open_source, write_json
@@ -44,7 +44,7 @@ def main():
         parser.error("--samples must be positive")
     torch.set_num_threads(1)
     cache_root = Path(args.cache_root).resolve()
-    before = snapshot_tree(cache_root)
+    before = zero_write_snapshot(cache_root)
     opened = time.perf_counter()
     source, _ = open_source(args.cohort_root, cache_root)
     open_seconds = time.perf_counter() - opened
@@ -81,7 +81,7 @@ def main():
             prepare_times.append(time.perf_counter() - started)
     finally:
         source.close()
-    zero_write = snapshot_tree(cache_root) == before
+    zero_write = zero_write_snapshot(cache_root) == before
     if not zero_write:
         raise RuntimeError("runtime profile modified the frozen cache")
     clean = _summary(clean_times)

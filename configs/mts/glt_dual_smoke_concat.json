@@ -1,0 +1,23 @@
+{
+  "fusion_mode": "concat",
+  "dataset_name": "PI1M_v2",
+  "seed": 20260915,
+  "use_md200": false,
+  "microbatch": 8,
+  "global_batch": 72,
+  "max_optimizer_steps": 60,
+  "save_every": 30,
+  "lr": 0.0002,
+  "warmup_steps": 0,
+  "schedule_total_steps": 200,
+  "end_lr": 1e-9,
+  "weight_decay": 0,
+  "amp_dtype": "bf16",
+  "atom_mask_ratio": 0.3,
+  "noise_sigma": 0.03,
+  "loss_weights": [
+    1,
+    1,
+    0.1
+  ]
+}

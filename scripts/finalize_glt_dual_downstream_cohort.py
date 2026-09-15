@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 
-from src.dataset.cache_lifecycle import CacheLifecycleError, atomic_json, json_hash, snapshot_tree
+from src.dataset.cache_lifecycle import (CacheLifecycleError, atomic_json,
+                                          json_hash, zero_write_snapshot)
 from src.dataset.glt_dual_cache import (
     DualFrozenBundle, load_active_dual_store, load_dual_cohort,
     ordered_key_hash, sha256_file,
@@ -58,7 +59,7 @@ def build(union_root: Path, cache_root: Path, output: Path) -> dict:
     )
     if output.exists() or output.with_name(output.name + ".staging").exists():
         raise FileExistsError(f"downstream cohort output already exists: {output}")
-    before = snapshot_tree(cache_root)
+    before = zero_write_snapshot(cache_root)
     union, rows = _load_union(union_root)
     store = load_active_dual_store(cache_root)
     bundle = DualFrozenBundle(cache_root, expected_bundle_hash=store["bundle_hash"])
@@ -111,7 +112,7 @@ def build(union_root: Path, cache_root: Path, output: Path) -> dict:
     atomic_json(staging / ".frozen", {"manifest_hash": json_hash(manifest)})
     os.replace(staging, output)
     cohort = load_dual_cohort(output, cache_root)
-    if snapshot_tree(cache_root) != before:
+    if zero_write_snapshot(cache_root) != before:
         raise CacheLifecycleError("downstream cohort reader modified frozen bundle")
     return {
         "status": "PASS", "sample_count": len(cohort["records"]),

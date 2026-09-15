@@ -452,6 +452,27 @@ def snapshot_tree(root: Path) -> dict:
     }
 
 
+# Reader bookkeeping: LMDB creates/updates ``lock.mdb`` whenever an environment
+# is opened with locking enabled.  It carries no artifact content and no
+# identity binding, so it is excluded from the formal zero-write definition.
+# Everything that defines the artifact — data.mdb, metadata/manifest.json,
+# bundle_manifest.json, .frozen, store.json, accepted/rejected key arrays —
+# stays inside the write set.
+READER_BOOKKEEPING_NAMES = frozenset({"lock.mdb"})
+
+
+def zero_write_snapshot(root: Path, *, ignore=READER_BOOKKEEPING_NAMES) -> dict:
+    """Artifact-defining files only; see :data:`READER_BOOKKEEPING_NAMES`."""
+
+    skipped = frozenset(ignore or ())
+    root = Path(root)
+    return {
+        str(path.relative_to(root)): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and path.name not in skipped
+    }
+
+
 def failure_distribution(rejections: dict) -> dict:
     return dict(sorted(Counter(
         str(row["failure_code"]) for row in rejections.values()

@@ -163,8 +163,15 @@ def _validate_geometry_fallback_carrier(topology, trimer):
         raise ValueError("geometry fallback structural identity is corrupt")
 
 
-def build_dual_sample(topology, trimer, smiles):
-    """Build only model-required fields; never carry MD/coordinate tensors into a batch."""
+def build_dual_sample(topology, trimer, smiles, *, identity=None,
+                      bond_path_features=None):
+    """Build only model-required fields; never carry MD/coordinate tensors into a batch.
+
+    ``identity`` and ``bond_path_features`` are pure functions of
+    ``(topology, smiles)``: a caller that builds the clean and noisy views of
+    one sample may resolve/construct them once and reuse them here instead of
+    paying for a second graph-isomorphism search.
+    """
     result = Data()
     required = (
         "mips_x", "mips_backbone_mask", "canonical_ru_atom_index",
@@ -178,9 +185,10 @@ def build_dual_sample(topology, trimer, smiles):
         )
     if not torch.equal(topology.canonical_ru_atom_index.long(), torch.arange(topology.mips_x.size(0))):
         raise ValueError('dual route requires one canonical state per atom')
-    identity = resolve_normalized_identity(
-        topology, smiles, require_fields=True
-    )
+    if identity is None:
+        identity = resolve_normalized_identity(
+            topology, smiles, require_fields=True
+        )
     for name in ('mips_x', 'mips_backbone_mask', 'lga_edge_index', 'lga_spd',
                  'lga_path_index', 'lga_path_mask', 'lga_path_shift',
                  'lga_source_image_shift'):
@@ -188,9 +196,14 @@ def build_dual_sample(topology, trimer, smiles):
     result.graph_available = bool(topology.graph_available)
     if hasattr(topology, 'lga_relation_mask'):
         result.lga_relation_mask = topology.lga_relation_mask.clone()
-    result.bond_path_features, result.bond_path_mask = bond_paths(
-        topology, smiles, identity=identity
-    )
+    if bond_path_features is None:
+        result.bond_path_features, result.bond_path_mask = bond_paths(
+            topology, smiles, identity=identity
+        )
+    else:
+        # Clone so clean and noisy views never alias one tensor.
+        result.bond_path_features = bond_path_features[0].clone()
+        result.bond_path_mask = bond_path_features[1].clone()
     if not bool(getattr(trimer, "trimer_geometry_valid", False)):
         _validate_geometry_fallback_carrier(topology, trimer)
     row = build_complete_trimer_glt_sample(

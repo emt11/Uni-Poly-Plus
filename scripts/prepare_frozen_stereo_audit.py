@@ -17,7 +17,8 @@ import numpy as np
 import torch
 from rdkit import Chem
 
-from src.dataset.cache_lifecycle import CacheLifecycleError, atomic_json, snapshot_tree
+from src.dataset.cache_lifecycle import (CacheLifecycleError, atomic_json,
+                                          zero_write_snapshot)
 from src.dataset.glt_dual_cache import load_active_dual_store
 
 
@@ -55,7 +56,7 @@ def build(cache_root: Path, output: Path, workers: int) -> dict:
     cache_root, output = cache_root.resolve(), output.resolve()
     if output.exists() or output.with_name(output.name + ".staging").exists():
         raise FileExistsError(f"Stereo audit cohort already exists: {output}")
-    before = snapshot_tree(cache_root)
+    before = zero_write_snapshot(cache_root)
     store = load_active_dual_store(cache_root)
     bundle_root = cache_root / "builds" / store["bundle_hash"]
     accepted_array = np.load(bundle_root / "trimer" / "accepted_keys.npy", mmap_mode="r")
@@ -146,7 +147,7 @@ def build(cache_root: Path, output: Path, workers: int) -> dict:
         "declared_double_bonds": int(counts["defined_double_bonds"]),
         "declared_tetrahedral_centers": int(counts["defined_tetrahedral_centers"]),
         "workers": int(workers),
-        "cache_zero_write": snapshot_tree(cache_root) == before,
+        "cache_zero_write": zero_write_snapshot(cache_root) == before,
     }
     if not snapshot["cache_zero_write"]:
         raise CacheLifecycleError("Stereo cohort preparation modified frozen cache")

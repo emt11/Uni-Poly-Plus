@@ -10,7 +10,7 @@ from rdkit import Chem
 from rdkit.Chem import BRICS, rdFingerprintGenerator
 
 from .graph_data import build_periodic_multimer_mol
-from .glt_dual import build_dual_sample, dual_glt_collate
+from .glt_dual import bond_paths, build_dual_sample, dual_glt_collate
 from .canonical_periodic import resolve_normalized_identity
 
 
@@ -118,13 +118,24 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position, si
     generator = sample_generator(seed, key, position)
     groups, fingerprint = chemical_targets(identity["normalized_smiles"])
     mask, fallback = motif_mask(topology, groups, generator, ratio)
-    clean = build_dual_sample(topology, trimer, smiles)
+    # Static chemistry/connectivity/path is a pure function of
+    # (topology, smiles): build it once and share it between the clean and
+    # noisy views.  Coordinates stay view-local: clean coordinates produce the
+    # clean length/angle targets, and only the noisy clone is re-encoded.
+    static_paths = bond_paths(topology, smiles, identity=identity)
+    clean = build_dual_sample(
+        topology, trimer, smiles, identity=identity,
+        bond_path_features=static_paths,
+    )
     noisy = clean
     if clean.geometry_valid:
         changed = copy.copy(trimer)
         changed.trimer_pos = trimer.trimer_pos.float().clone()
         changed.trimer_pos += sigma * torch.randn(changed.trimer_pos.shape, generator=generator)
-        noisy = build_dual_sample(topology, changed, smiles)
+        noisy = build_dual_sample(
+            topology, changed, smiles, identity=identity,
+            bond_path_features=static_paths,
+        )
         if not noisy.geometry_valid:
             raise ValueError(f'noise invalidated required geometry: {noisy.geometry_invalid_reason}')
         for field in ('line_source', 'line_target', 'line_path', 'line_path_group', 'bond_center'):

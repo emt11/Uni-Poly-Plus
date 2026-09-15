@@ -31,6 +31,58 @@ class OrderedSampleStream:
         return int(self.permutation[within])
 
 
+class RankMicrobatchStream(Dataset):
+    """Per-rank microbatch stream for optional multi-worker prefetch.
+
+    One item is one collated microbatch and items are produced in exact global
+    position order.  Every per-sample random stream (BRICS motif mask,
+    coordinate noise) is a pure function of ``(seed, sample_key, position)``,
+    so preparing in worker processes cannot change the sample order, the
+    mask/noise stream or the accumulation order.  The cost this hides is the
+    graph/geometry construction, which dominates on CPU.
+    """
+
+    def __init__(self, source, *, seed, world, rank, microbatch, accumulation,
+                 start_step, max_steps, sigma, ratio):
+        from src.dataset.glt_dual_pretrain import (  # local: avoid import cycles
+            prepare_pretrain_sample, pretrain_collate,
+        )
+
+        self._prepare = prepare_pretrain_sample
+        self._collate = pretrain_collate
+        self.source = source
+        self.stream = OrderedSampleStream(len(source), int(seed))
+        self.seed = int(seed)
+        self.world = int(world)
+        self.rank = int(rank)
+        self.microbatch = int(microbatch)
+        self.accumulation = int(accumulation)
+        self.batch_size = self.microbatch * self.world * self.accumulation
+        self.start_step = int(start_step)
+        self.steps = max(0, int(max_steps) - self.start_step)
+        self.sigma = float(sigma)
+        self.ratio = float(ratio)
+
+    def __len__(self):
+        return self.steps * self.accumulation
+
+    def __getitem__(self, item):
+        step = self.start_step + item // self.accumulation
+        offset = item % self.accumulation
+        rows = []
+        for local in range(self.microbatch):
+            position = (step * self.batch_size
+                        + offset * self.world * self.microbatch
+                        + self.rank * self.microbatch + local)
+            index = self.stream.index_at(position)
+            key, _ = self.source.samples[index]
+            rows.append(self._prepare(
+                *self.source[index], seed=self.seed, key=key.hex(),
+                position=position, sigma=self.sigma, ratio=self.ratio,
+            ))
+        return self._collate(rows)
+
+
 def require_tmux():
     if not os.environ.get('TMUX'):
         raise RuntimeError('training must run in logged tmux session Uni-Poly')

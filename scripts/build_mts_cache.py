@@ -49,7 +49,7 @@ from src.dataset.cache_lifecycle import (  # noqa: E402
     select_record_fields,
     serialize_record,
     sha256_file,
-    snapshot_tree,
+    zero_write_snapshot,
 )
 from src.dataset.cache_spec import (  # noqa: E402
     RECORD_FIELDS,
@@ -1485,14 +1485,14 @@ def _existing_bundle(cache_root, final):
         return False
     if store.get("bundle_hash") != final.name:
         raise CacheLifecycleError("published bundle exists but is not active")
-    before = snapshot_tree(cache_root)
+    before = zero_write_snapshot(cache_root)
     dataset = PublishedCacheDataset(cache_root)
     try:
         if len(dataset):
             _ = dataset[0]
     finally:
         dataset.close()
-    if snapshot_tree(cache_root) != before:
+    if zero_write_snapshot(cache_root) != before:
         raise CacheLifecycleError("readonly duplicate execution modified cache")
     print(f"existing published bundle verified read-only: {final}")
     return True
@@ -1536,14 +1536,14 @@ def _make_report(cache_root, store, manifests, rejections, staging_existed,
         (cache_root / binding["path"] / "data.lmdb" / "data.mdb").stat().st_size
         for binding in store["artifacts"].values()
     )
-    before = snapshot_tree(cache_root)
+    before = zero_write_snapshot(cache_root)
     dataset = PublishedCacheDataset(cache_root)
     try:
         for index in range(min(8, len(dataset))):
             _ = dataset[index]
     finally:
         dataset.close()
-    zero_write = snapshot_tree(cache_root) == before
+    zero_write = zero_write_snapshot(cache_root) == before
     return {
         "scope": "cache lifecycle build report (per-source-layer terminal accounting)",
         "source_count": source_count,
