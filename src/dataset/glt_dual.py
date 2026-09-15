@@ -129,6 +129,40 @@ def two_hop_paths(row):
                 source=torch.tensor(sources, dtype=torch.long), target=torch.tensor(targets, dtype=torch.long))
 
 
+def _validate_geometry_fallback_carrier(topology, trimer):
+    """Prove an invalid-geometry row still has complete structural identity."""
+
+    names = (
+        "trimer_atomic_number", "trimer_base_ru_atom_id", "trimer_ru_offset",
+        "trimer_central_ru_mask", "trimer_edge_index", "trimer_bond_type",
+        "mips_to_trimer_central_index",
+    )
+    missing = [name for name in names if not hasattr(trimer, name)]
+    if missing:
+        raise ValueError("geometry fallback identity carrier missing: " + ",".join(missing))
+    atomic = torch.as_tensor(trimer.trimer_atomic_number).long().reshape(-1)
+    base = torch.as_tensor(trimer.trimer_base_ru_atom_id).long().reshape(-1)
+    offsets = torch.as_tensor(trimer.trimer_ru_offset).long().reshape(-1)
+    central = torch.as_tensor(trimer.trimer_central_ru_mask).bool().reshape(-1)
+    edge = torch.as_tensor(trimer.trimer_edge_index).long()
+    bond_type = torch.as_tensor(trimer.trimer_bond_type).long().reshape(-1)
+    mapping = torch.as_tensor(trimer.mips_to_trimer_central_index).long().reshape(-1)
+    topology_z = torch.as_tensor(topology.z).long().reshape(-1)
+    count = atomic.numel()
+    if (
+        count == 0 or base.numel() != count or offsets.numel() != count
+        or central.numel() != count or edge.ndim != 2 or edge.size(0) != 2
+        or bond_type.numel() != edge.size(1) or mapping.numel() != topology_z.numel()
+        or (edge.numel() and (int(edge.min()) < 0 or int(edge.max()) >= count))
+        or (mapping.numel() and (
+            int(mapping.min()) < 0 or int(mapping.max()) >= count
+            or not bool(central[mapping].all())
+            or not torch.equal(atomic[mapping], topology_z)
+        ))
+    ):
+        raise ValueError("geometry fallback structural identity is corrupt")
+
+
 def build_dual_sample(topology, trimer, smiles):
     """Build only model-required fields; never carry MD/coordinate tensors into a batch."""
     result = Data()
@@ -157,6 +191,8 @@ def build_dual_sample(topology, trimer, smiles):
     result.bond_path_features, result.bond_path_mask = bond_paths(
         topology, smiles, identity=identity
     )
+    if not bool(getattr(trimer, "trimer_geometry_valid", False)):
+        _validate_geometry_fallback_carrier(topology, trimer)
     row = build_complete_trimer_glt_sample(
         topology, trimer, smiles, identity=identity
     )
@@ -204,43 +240,38 @@ class DualGLTDataset(Dataset):
 
 
 class FrozenDualLayerSource(Dataset):
-    """Read exactly two immutable LMDB layers, with no cache-building fallback.
+    """Read one immutable active bundle through a frozen ordered cohort.
 
-    ``samples`` contains (32-byte sample key, original P-SMILES) pairs. This is
-    also the production-safe source for DualGLTDataset; arbitrary wrappers must
-    independently ensure that their source does not compute/load descriptors.
+    ``cohort`` is the value returned by :func:`load_dual_cohort`.  Original
+    P-SMILES are provenance/audit input only; keys are verified against each
+    record's explicit normalized canonical identity.
     """
-    def __init__(self, topology_root, trimer_root, samples):
-        from .lmdb_cache import LmdbLayerStore, sample_key_from_smiles
-        from .mips_trimer_contract import (
-            LEGACY_TRIMER_CONTENT_SCHEMA, LEGACY_TRIMER_LMDB_SCHEMA,
-            SUPPORTED_TRIMER_LMDB_SCHEMAS, TOPOLOGY_LMDB_SCHEMA,
-            TRIMER_CONTENT_SCHEMA, TRIMER_LMDB_SCHEMA,
-        )
-        self.topology = self.trimer = None
+    def __init__(self, cache_root, cohort):
+        from .glt_dual_cache import DualFrozenBundle
+
+        self.bundle = self.topology = self.trimer = None
+        self.cohort = cohort
+        self.entries = list(cohort["records"])
         try:
-            self.topology = LmdbLayerStore(topology_root)
-            self.trimer = LmdbLayerStore(trimer_root)
-            if (
-                self.topology.schema != TOPOLOGY_LMDB_SCHEMA
-                or self.trimer.schema not in SUPPORTED_TRIMER_LMDB_SCHEMAS
-            ):
-                raise ValueError('frozen layers do not have supported topology/Trimer semantics')
-            expected_content = {
-                TRIMER_LMDB_SCHEMA: TRIMER_CONTENT_SCHEMA,
-                LEGACY_TRIMER_LMDB_SCHEMA: LEGACY_TRIMER_CONTENT_SCHEMA,
-            }[self.trimer.schema]
-            observed_content = self.trimer.meta.get('trimer_content_schema')
-            if observed_content != expected_content:
-                raise ValueError(
-                    'Trimer LMDB schema/content schema binding is inconsistent'
-                )
-            self.samples = list(samples)
-            for key, smiles in self.samples:
-                if bytes(key) != sample_key_from_smiles(smiles):
-                    raise ValueError('sample key does not match P-SMILES')
+            self.bundle = DualFrozenBundle(
+                cache_root,
+                expected_bundle_hash=cohort["manifest"]["main_bundle_hash"],
+            )
+            self.topology = self.bundle.topology
+            self.trimer = self.bundle.trimer
+            self.samples = [
+                (bytes.fromhex(row["sample_key"]), str(row["source_smiles"]))
+                for row in self.entries
+            ]
+            # Parent-bound cohort creation proves complete coverage.  Reader
+            # startup repeats deterministic boundary checks; every later miss
+            # remains a hard error in ReadonlyArtifact.__getitem__.
+            if self.samples:
+                for index in sorted({0, len(self.samples) // 2, len(self.samples) - 1}):
+                    key = self.samples[index][0]
+                    if key not in self.topology or key not in self.trimer:
+                        raise ValueError("frozen dual cohort boundary key is missing")
         except Exception:
-            # Preserve the opening/validation error while attempting both closes.
             try:
                 self.close()
             except Exception:
@@ -260,14 +291,10 @@ class FrozenDualLayerSource(Dataset):
         return topology, trimer, smiles
 
     def close(self):
-        topology, trimer = self.topology, self.trimer
-        self.topology = self.trimer = None
-        try:
-            if topology is not None:
-                topology.close()
-        finally:
-            if trimer is not None:
-                trimer.close()
+        bundle = self.bundle
+        self.bundle = self.topology = self.trimer = None
+        if bundle is not None:
+            bundle.close()
 
 
 def dual_glt_collate(samples):

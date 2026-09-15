@@ -395,6 +395,7 @@ def test_geometry_invariance_and_no_direct_stereo_token_input():
 def test_entire_batch_without_geometry(mode):
     top, tri, _ = sample()
     tri.trimer_geometry_valid = False
+    tri.trimer_central_ru_mask = tri.trimer_ru_offset == 0
     item = build_dual_sample(top, tri, '*COC*')
     batch = dual_glt_collate([item])
     assert batch.bond_distance.numel() == batch.line_path.size(0) == 0

@@ -1040,12 +1040,12 @@ def main(argv=None):
             max_workers=4, initializer=_audit_worker_init
         )
         tri_env = lmdb.open(
-            str(tri_root), subdir=True, readonly=True, lock=True,
+            str(tri_root), subdir=True, readonly=True, lock=False,
             readahead=False, meminit=False, max_readers=512,
             map_size=read_map_size,
         )
         top_env = lmdb.open(
-            str(top_root), subdir=True, readonly=True, lock=True,
+            str(top_root), subdir=True, readonly=True, lock=False,
             readahead=False, meminit=False, max_readers=512,
             map_size=read_map_size,
         )
@@ -1184,12 +1184,12 @@ def main(argv=None):
                         except Exception:
                             pass
                         tri_env = lmdb.open(
-                            str(tri_root), subdir=True, readonly=True, lock=True,
+                            str(tri_root), subdir=True, readonly=True, lock=False,
                             readahead=False, meminit=False, max_readers=512,
                             map_size=read_map_size,
                         )
                         top_env = lmdb.open(
-                            str(top_root), subdir=True, readonly=True, lock=True,
+                            str(top_root), subdir=True, readonly=True, lock=False,
                             readahead=False, meminit=False, max_readers=512,
                             map_size=read_map_size,
                         )

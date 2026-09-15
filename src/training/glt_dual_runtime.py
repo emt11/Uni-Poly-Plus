@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.dataset.glt_dual import FrozenDualLayerSource, build_dual_sample
+from src.dataset.glt_dual_cache import load_dual_cohort
 
 
 TASKS = ('eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc')
@@ -38,15 +39,19 @@ def require_tmux():
         raise RuntimeError('training requires tmux session Uni-Poly')
 
 
-def open_source(csv_path, topology_root, trimer_root):
-    from src.dataset.lmdb_cache import sample_key_from_smiles
-    frame = pd.read_csv(csv_path)
-    smiles = frame.iloc[:, 0].astype(str).str.strip().tolist()
-    source = FrozenDualLayerSource(topology_root, trimer_root,
-                                  [(sample_key_from_smiles(s), s) for s in smiles])
+def open_source(cohort_root, cache_root, *, task=None):
+    cohort = load_dual_cohort(cohort_root, cache_root)
+    records = cohort["records"]
+    if task is not None:
+        records = [row for row in records if row.get("task") == str(task)]
+        if not records:
+            raise ValueError(f"dual cohort has no rows for task={task}")
+        cohort = {**cohort, "records": records}
+    source = FrozenDualLayerSource(cache_root, cohort)
     if not len(source):
         source.close()
         raise ValueError('empty frozen source')
+    frame = pd.DataFrame(records)
     return source, frame
 
 

@@ -8,6 +8,8 @@ from torch_geometric.data import Data
 
 from scripts.build_mts_cache import (
     _audit_freeze_publish,
+    _check_fields,
+    _downstream_geometry_fallback,
     _metadata,
     _run_trimer,
 )
@@ -22,6 +24,7 @@ from src.dataset.cache_lifecycle import (
     load_source_rows,
     sidecar_binding,
     snapshot_tree,
+    select_record_fields,
     validate_sidecar_binding,
 )
 from src.dataset.cache_spec import (
@@ -203,6 +206,30 @@ def test_sidecar_binding_rejects_any_parent_or_cohort_change():
         validate_sidecar_binding(metadata, {"artifact_hash": "c" * 64}, "b" * 64, spec)
     with pytest.raises(CacheLifecycleError):
         validate_sidecar_binding(metadata, parent, "d" * 64, spec)
+
+
+def test_downstream_geometry_fallback_keeps_complete_identity_carrier():
+    data = _downstream_geometry_fallback("*CC*", "MMFF_UNSUPPORTED")
+    assert not bool(data.trimer_geometry_valid)
+    assert data.trimer_pos.shape == (0, 3)
+    assert data.trimer_atomic_number.numel() > 0
+    assert data.trimer_base_ru_atom_id.numel() == data.trimer_atomic_number.numel()
+    assert data.trimer_ru_offset.numel() == data.trimer_atomic_number.numel()
+    assert data.trimer_central_ru_mask[data.mips_to_trimer_central_index].all()
+    assert data.trimer_failure_code == "MMFF_UNSUPPORTED"
+    spec = json.loads(json.dumps(ROUTE_BUILD_SPECS["trimer"]))
+    spec["parameters"]["coordinate_payload"] = (
+        "single-conformer-explicit-all-atom-or-full-identity-fallback"
+    )
+    spec["parameters"]["geometry_failure_policy"] = (
+        "retain_full_identity_fallback"
+    )
+    _check_fields(
+        "trimer", select_record_fields("trimer", data), b"x" * 32,
+        build_spec=spec,
+    )
+    with pytest.raises(TrimerContractError):
+        _downstream_geometry_fallback("not-a-smiles", "TIMEOUT")
 
 
 def test_multiworker_contract_error_is_not_rejection(tmp_path):

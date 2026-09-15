@@ -95,7 +95,7 @@ def fit_select_and_test(model, scaler, train_loader, val_loader, test_loader, de
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ('config', 'checkpoint', 'raw-root', 'topology-root', 'trimer-root', 'output'):
+    for name in ('config', 'checkpoint', 'raw-root', 'cohort-root', 'cache-root', 'output'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--split-root', default='data/splits/mips_outer5_inner20')
     parser.add_argument('--task', action='append', dest='tasks',
@@ -139,9 +139,13 @@ def main():
                 f'--smoke requires an existing outer5_inner20 manifest: {manifest_path}'
             )
         manifest = fixed_manifest(task, csv_path, manifest_path)
-        source, frame = open_source(csv_path, args.topology_root, args.trimer_root)
+        source, frame = open_source(args.cohort_root, args.cache_root, task=task)
         try:
-            targets = frame.iloc[:, 1].to_numpy(dtype=np.float64)
+            if len(frame) != int(manifest['sample_count']):
+                raise ValueError('downstream cohort task row count differs from fixed split')
+            if frame['original_row'].astype(int).tolist() != list(range(len(frame))):
+                raise ValueError('downstream cohort task row order differs from property CSV')
+            targets = frame['label'].to_numpy(dtype=np.float64)
             if not np.isfinite(targets).all():
                 raise ValueError('nonfinite labels')
             dataset = CleanLabeledDataset(source, targets)

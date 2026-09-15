@@ -8,6 +8,7 @@ same command resumes only its content-addressed ``.staging`` bundle.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import multiprocessing as mp
@@ -68,8 +69,16 @@ from src.dataset.trimer_mcl import (  # noqa: E402
 )
 
 
-def _metadata(layer, artifact_hash, source_manifest_hash, parents):
-    spec = ROUTE_BUILD_SPECS[layer]
+def _metadata(layer, artifact_hash, source_manifest_hash, parents,
+              build_specs=None):
+    spec = (build_specs or ROUTE_BUILD_SPECS)[layer]
+    record_fields = list(RECORD_FIELDS[layer])
+    if (
+        layer == "trimer"
+        and spec.get("parameters", {}).get("geometry_failure_policy")
+        == "retain_full_identity_fallback"
+    ):
+        record_fields.append("trimer_failure_code")
     return {
         "artifact_type": layer,
         "artifact_hash": artifact_hash,
@@ -77,7 +86,7 @@ def _metadata(layer, artifact_hash, source_manifest_hash, parents):
         "build_spec_hash": build_spec_hash(spec),
         "source_manifest_hash": source_manifest_hash,
         "parents": dict(sorted(parents.items())),
-        "record_fields": list(RECORD_FIELDS[layer]),
+        "record_fields": record_fields,
         "toolchain": {"rdkit": rdBase.rdkitVersion, "torch": torch.__version__},
     }
 
@@ -527,6 +536,41 @@ def _trimer_identity_carrier(normalized_smiles: str) -> Data:
     return carrier
 
 
+def _downstream_geometry_fallback(normalized_smiles: str, failure_code: str) -> Data:
+    """Build a complete structural carrier without attempting coordinates.
+
+    This is permitted only for a known :class:`TrimerGeometryRejection` in a
+    downstream bundle.  Contract/identity failures escape and block publish.
+    """
+
+    carrier = _trimer_identity_carrier(normalized_smiles)
+    try:
+        attach_finite_trimer_mcl(
+            carrier, normalized_smiles, max_rounds=0,
+        )
+    except TrimerGeometryRejection:
+        pass
+    if (
+        torch.as_tensor(carrier.trimer_atomic_number).numel() == 0
+        or torch.as_tensor(carrier.trimer_edge_index).ndim != 2
+        or torch.as_tensor(carrier.trimer_base_ru_atom_id).numel()
+           != torch.as_tensor(carrier.trimer_atomic_number).numel()
+        or torch.as_tensor(carrier.trimer_ru_offset).numel()
+           != torch.as_tensor(carrier.trimer_atomic_number).numel()
+        or torch.as_tensor(carrier.trimer_central_ru_mask).numel()
+           != torch.as_tensor(carrier.trimer_atomic_number).numel()
+        or torch.as_tensor(carrier.mips_to_trimer_central_index).numel()
+           != int(carrier.num_nodes)
+    ):
+        raise TrimerContractError("downstream_fallback_identity_carrier_incomplete")
+    carrier.trimer_geometry_valid = False
+    carrier.trimer_geometry_is_3d = torch.tensor(False, dtype=torch.bool)
+    carrier.trimer_2d_fallback = torch.tensor(False, dtype=torch.bool)
+    carrier.trimer_geometry_source = "geometry_failure_fallback"
+    carrier.trimer_failure_code = str(failure_code)
+    return carrier
+
+
 def _build_struct_one(payload):
     """Compute the RU and Topology records for one sample inside a worker.
 
@@ -630,7 +674,7 @@ def _build_trimer_one(payload):
         attach_finite_trimer_mcl(
             carrier,
             payload["normalized_smiles"],
-            build_spec=ROUTE_BUILD_SPECS["trimer"],
+            build_spec=payload.get("trimer_build_spec", ROUTE_BUILD_SPECS["trimer"]),
             sample_key=bytes.fromhex(payload["sample_key"]),
         )
         diagnostics = dict(getattr(carrier, "generation_diagnostics", {}))
@@ -646,6 +690,24 @@ def _build_trimer_one(payload):
             "round_reached": int(getattr(carrier, "trimer_conformer_round_id", -1)),
         }
     except TrimerGeometryRejection as exc:
+        if payload.get("retain_geometry_failures"):
+            carrier = _downstream_geometry_fallback(
+                payload["normalized_smiles"], str(exc.code)
+            )
+            return {
+                "status": "fallback", "sample_key": key,
+                "payload": serialize_record(
+                    bytes.fromhex(key), select_record_fields(
+                        "trimer", carrier, optional_fields=("trimer_failure_code",)
+                    )
+                ),
+                "failure_code": str(exc.code),
+                "elapsed_seconds": float(exc.elapsed_seconds),
+                "candidate_attempts": int(exc.candidate_attempts),
+                "round_reached": int(
+                    exc.round_reached if exc.round_reached is not None else -1
+                ),
+            }
         return {
             "status": "trimer_failed", "sample_key": key,
             "entry": _failure_entry(
@@ -715,12 +777,16 @@ def _stop_worker(state):
     process.join(timeout=2)
 
 
-def _run_trimer(staging, rows, metadata, workers, interrupt_after):
+def _run_trimer(staging, rows, metadata, workers, interrupt_after,
+                *, trimer_build_spec=None, retain_geometry_failures=False):
     writer = StagingWriter(staging / "trimer", metadata["trimer"])
     runtime_path = staging / "trimer" / "runtime.jsonl"
     runtime_path.touch(exist_ok=True)
     ledger = _FailureLedger(staging / "trimer")
     rejections = ledger.rows
+    fallback_path = staging / "trimer" / "fallbacks.jsonl"
+    fallback_path.touch(exist_ok=True)
+    fallbacks = read_rejections(fallback_path)
     runtime = {}
     if runtime_path.is_file():
         for line in runtime_path.read_text(encoding="utf-8").splitlines():
@@ -757,7 +823,11 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
                 normalized = str(ru.normalized_polymer_smiles)
                 if normalized != row["normalized_smiles"]:
                     raise TrimerContractError("source_to_RU_identity_corruption")
-                jobs.append({**row, "normalized_smiles": normalized})
+                jobs.append({
+                    **row, "normalized_smiles": normalized,
+                    "trimer_build_spec": trimer_build_spec or ROUTE_BUILD_SPECS["trimer"],
+                    "retain_geometry_failures": bool(retain_geometry_failures),
+                })
     finally:
         ru_environment.close()
     resume = bool(accepted_existing or rejections)
@@ -773,20 +843,36 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
         nonlocal processed_new, writer_seconds, last_progress
         key = bytes.fromhex(result["sample_key"])
         status = result["status"]
-        if status == "accepted":
+        if status in {"accepted", "fallback"}:
             data = deserialize_record(result.pop("payload"), key)
             inserted, payload_bytes, elapsed = writer.put(key, data)
             if not inserted:
                 raise CacheLifecycleError("duplicate accepted Trimer write")
             writer_seconds += elapsed
             runtime_row = {
-                "sample_key": key.hex(), "status": "accepted",
+                "sample_key": key.hex(), "status": status,
                 "elapsed_seconds": float(result["elapsed_seconds"]),
                 "candidate_attempts": int(result["candidate_attempts"]),
                 "round_reached": int(result["round_reached"]),
                 "record_bytes": int(payload_bytes),
                 "writer_seconds": float(elapsed),
             }
+            if status == "fallback":
+                fallback_row = {
+                    "sample_key": key.hex(), "status": "fallback",
+                    "layer": "trimer",
+                    "failure_code": str(result["failure_code"]),
+                    "candidate_attempts": int(result["candidate_attempts"]),
+                    "elapsed_seconds": float(result["elapsed_seconds"]),
+                    "round_reached": int(result["round_reached"]),
+                    "source_row": -1,
+                    "canonical_smiles": "",
+                    "exception_type": "TrimerGeometryRejection",
+                    "exception_message": str(result["failure_code"]),
+                }
+                if key not in fallbacks:
+                    append_jsonl(fallback_path, fallback_row)
+                    fallbacks[key] = fallback_row
         elif status == "trimer_failed":
             entry = result["entry"]
             ledger.append(entry, result.get("traceback_text"))
@@ -808,7 +894,8 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
         if (processed_new % 500 == 0 or time.monotonic() - last_progress >= 30.0):
             last_progress = time.monotonic()
             accepted_now = sum(
-                1 for row in runtime.values() if row["status"] == "accepted"
+                1 for row in runtime.values()
+                if row["status"] in {"accepted", "fallback"}
             )
             rejected_now = len(rejections)
             ru_failed_now = len(ru_rejections)
@@ -952,19 +1039,52 @@ def _run_trimer(staging, rows, metadata, workers, interrupt_after):
                     timed_out = state["job"]
                     _stop_worker(state)
                     states[index] = start_worker()
-                    commit_result({
-                        "status": "trimer_failed",
-                        "sample_key": timed_out["sample_key"],
-                        "entry": _failure_entry(
-                            timed_out, "trimer",
-                            failure_code="TIMEOUT",
-                            exception_type="SampleTimeout",
-                            exception_message=(
-                                "trimer exceeded the shared hard deadline"
+                    if retain_geometry_failures:
+                        try:
+                            carrier = _downstream_geometry_fallback(
+                                timed_out["normalized_smiles"], "TIMEOUT"
+                            )
+                            timeout_result = {
+                                "status": "fallback",
+                                "sample_key": timed_out["sample_key"],
+                                "payload": serialize_record(
+                                    bytes.fromhex(timed_out["sample_key"]),
+                                    select_record_fields(
+                                        "trimer", carrier,
+                                        optional_fields=("trimer_failure_code",),
+                                    ),
+                                ),
+                                "failure_code": "TIMEOUT",
+                                "elapsed_seconds": hard_timeout,
+                                "candidate_attempts": 0,
+                                "round_reached": -1,
+                            }
+                        except Exception as exc:
+                            timeout_result = {
+                                "status": "trimer_failed",
+                                "sample_key": timed_out["sample_key"],
+                                "entry": _failure_entry(
+                                    timed_out, "trimer", failure_code=UNCLASSIFIED,
+                                    exception_type=type(exc).__name__,
+                                    exception_message=str(exc),
+                                    elapsed_seconds=hard_timeout,
+                                ),
+                            }
+                        commit_result(timeout_result)
+                    else:
+                        commit_result({
+                            "status": "trimer_failed",
+                            "sample_key": timed_out["sample_key"],
+                            "entry": _failure_entry(
+                                timed_out, "trimer",
+                                failure_code="TIMEOUT",
+                                exception_type="SampleTimeout",
+                                exception_message=(
+                                    "trimer exceeded the shared hard deadline"
+                                ),
+                                elapsed_seconds=hard_timeout,
                             ),
-                            elapsed_seconds=hard_timeout,
-                        ),
-                    })
+                        })
                     assign(index)
                     progressed = True
             if not progressed:
@@ -992,9 +1112,17 @@ def _raw_artifact(root):
     return environment
 
 
-def _check_fields(layer, data, key):
+def _check_fields(layer, data, key, *, build_spec=None):
     keys = set(data.keys())
     allowed = set(RECORD_FIELDS[layer])
+    retain_fallback = bool(
+        layer == "trimer"
+        and (build_spec or {}).get("parameters", {}).get(
+            "geometry_failure_policy"
+        ) == "retain_full_identity_fallback"
+    )
+    if retain_fallback:
+        allowed.add("trimer_failure_code")
     if layer == "topology":
         # select_record_fields writes the derived node count explicitly; it
         # is a scalar projection of mips_x, not an unrecorded alias.
@@ -1025,20 +1153,43 @@ def _check_fields(layer, data, key):
         pos = torch.as_tensor(data.trimer_pos)
         z = torch.as_tensor(data.trimer_atomic_number)
         edge = torch.as_tensor(data.trimer_edge_index)
-        if pos.ndim != 2 or pos.size(1) != 3 or z.shape != (pos.size(0),):
+        geometry_valid = bool(data.trimer_geometry_valid)
+        if pos.ndim != 2 or pos.size(1) != 3:
             raise CacheAuditError("invalid Trimer atom shape")
         if not bool(torch.isfinite(pos).all()):
             raise CacheAuditError("non-finite Trimer coordinates")
         if edge.ndim != 2 or edge.size(0) != 2:
             raise CacheAuditError("invalid Trimer edge shape")
-        if not bool(data.trimer_geometry_valid) or not bool(data.trimer_geometry_is_3d):
+        if geometry_valid:
+            if z.shape != (pos.size(0),) or not bool(data.trimer_geometry_is_3d):
+                raise CacheAuditError("accepted Trimer has invalid geometry payload")
+        elif retain_fallback:
+            base = torch.as_tensor(data.trimer_base_ru_atom_id).reshape(-1)
+            offsets = torch.as_tensor(data.trimer_ru_offset).reshape(-1)
+            central = torch.as_tensor(data.trimer_central_ru_mask).reshape(-1)
+            mapping = torch.as_tensor(data.mips_to_trimer_central_index).reshape(-1)
+            if (
+                pos.shape != (0, 3) or z.numel() == 0
+                or base.numel() != z.numel() or offsets.numel() != z.numel()
+                or central.numel() != z.numel() or mapping.numel() == 0
+                or (edge.numel() and (
+                    int(edge.min()) < 0 or int(edge.max()) >= z.numel()
+                ))
+                or not str(data.trimer_failure_code)
+                or str(data.trimer_geometry_source) != "geometry_failure_fallback"
+            ):
+                raise CacheAuditError("invalid downstream geometry fallback carrier")
+        else:
             raise CacheAuditError("accepted Trimer has invalid geometry flags")
 
 
 def _audit_layer(root, layer, source_keys, expected_keys, source_manifest_hash,
                  artifact_hash, build_spec, parents, rejected_keys=()):
     metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
-    expected_metadata = _metadata(layer, artifact_hash, source_manifest_hash, parents)
+    expected_metadata = _metadata(
+        layer, artifact_hash, source_manifest_hash, parents,
+        {layer: build_spec},
+    )
     if metadata != expected_metadata:
         raise CacheAuditError(f"{layer} metadata differs from generator build_spec")
     environment = _raw_artifact(root)
@@ -1058,7 +1209,7 @@ def _audit_layer(root, layer, source_keys, expected_keys, source_manifest_hash,
                 digest.update(payload)
                 payload_bytes += len(payload)
                 data = deserialize_record(payload, key)
-                _check_fields(layer, data, key)
+                _check_fields(layer, data, key, build_spec=build_spec)
                 if index % 100000 == 0:
                     print(json.dumps({
                         "phase": "audit", "layer": layer,
@@ -1091,7 +1242,8 @@ def _audit_layer(root, layer, source_keys, expected_keys, source_manifest_hash,
 
 
 def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
-                          artifact_hashes, metadata):
+                          artifact_hashes, metadata, *, build_specs=None):
+    build_specs = build_specs or ROUTE_BUILD_SPECS
     source_keys = [bytes.fromhex(row["sample_key"]) for row in rows]
     source_set = set(source_keys)
 
@@ -1182,7 +1334,7 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
         manifest = _audit_layer(
             staging / layer, layer, cohort, expected,
             source_manifest["source_manifest_hash"], artifact_hashes[layer],
-            ROUTE_BUILD_SPECS[layer], parent_map[layer], rejected_for_layer,
+            build_specs[layer], parent_map[layer], rejected_for_layer,
         )
         # Every rejecting layer publishes its ordered accepted/rejected key
         # cohorts; topology is a pure pass-through of the RU cohort.
@@ -1221,6 +1373,14 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
             manifest["runtime_file_sha256"] = sha256_file(
                 staging / layer / "runtime.jsonl"
             )
+            fallback_path = staging / layer / "fallbacks.jsonl"
+            fallback_path.touch(exist_ok=True)
+            fallback_rows = read_rejections(fallback_path)
+            manifest["fallbacks_file_sha256"] = sha256_file(
+                fallback_path
+            )
+            manifest["fallback_count"] = len(fallback_rows)
+            manifest["fallback_distribution"] = failure_distribution(fallback_rows)
         manifests[layer] = manifest
 
     # Join audit is independent of generation: exact published Topology and
@@ -1238,15 +1398,20 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
                 trimer = deserialize_record(bytes(tri_txn.get(key)), key)
                 mapping = torch.as_tensor(trimer.mips_to_trimer_central_index).long()
                 positions = torch.as_tensor(trimer.trimer_pos)
+                atomic = torch.as_tensor(trimer.trimer_atomic_number).long()
                 central = torch.as_tensor(trimer.trimer_central_ru_mask).bool()
+                carrier_count = (
+                    positions.size(0)
+                    if bool(trimer.trimer_geometry_valid) else atomic.numel()
+                )
                 if mapping.numel() != torch.as_tensor(topology.mips_x).size(0):
                     raise CacheAuditError("O8/Trimer mapping length mismatch")
                 if mapping.numel() and (
-                    int(mapping.min()) < 0 or int(mapping.max()) >= positions.size(0)
+                    int(mapping.min()) < 0 or int(mapping.max()) >= carrier_count
                     or not bool(central[mapping].all())
                     or not torch.equal(
                         torch.as_tensor(topology.z).long(),
-                        torch.as_tensor(trimer.trimer_atomic_number).long()[mapping],
+                        atomic[mapping],
                     )
                 ):
                     raise CacheAuditError("O8/Trimer atom identity corruption")
@@ -1288,8 +1453,8 @@ def _audit_freeze_publish(cache_root, staging, final, rows, source_manifest,
             "path": str((final / layer).relative_to(cache_root)),
             "artifact_hash": artifact_hashes[layer],
             "manifest_hash": json_hash(manifest),
-            "build_spec": ROUTE_BUILD_SPECS[layer],
-            "build_spec_hash": build_spec_hash(ROUTE_BUILD_SPECS[layer]),
+            "build_spec": build_specs[layer],
+            "build_spec_hash": build_spec_hash(build_specs[layer]),
             "source_manifest_hash": source_manifest["source_manifest_hash"],
             "ordered_accepted_key_hash": manifest["ordered_accepted_key_hash"],
             "record_count": manifest["record_count"],
@@ -1342,7 +1507,9 @@ def _make_report(cache_root, store, manifests, rejections, staging_existed,
         ).splitlines() if line.strip()
     ]
     elapsed = [float(row["elapsed_seconds"]) for row in runtime]
-    accepted_runtime = [row for row in runtime if row["status"] == "accepted"]
+    accepted_runtime = [
+        row for row in runtime if row["status"] in {"accepted", "fallback"}
+    ]
     source_count = len(source_rows)
     accepted_count = manifests["trimer"]["accepted_count"]
     rejected_count = manifests["trimer"]["rejected_count"]
@@ -1477,6 +1644,11 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--interrupt-after", type=int, default=0)
     parser.add_argument("--report-json", type=Path)
+    parser.add_argument(
+        "--retain-geometry-failures", action="store_true",
+        help=("downstream-only: retain known geometry failures as complete "
+              "identity carriers with geometry_valid=false"),
+    )
     args = parser.parse_args(argv)
     if args.limit != 0 and not 100 <= args.limit <= 5000:
         parser.error("--limit must be 0 (full production source) or in [100, 5000]")
@@ -1484,13 +1656,25 @@ def main(argv=None):
     cache_root.mkdir(parents=True, exist_ok=True)
     rows, source_manifest = load_source_rows(args.source_csv, args.limit)
     source_hash = source_manifest["source_manifest_hash"]
+    build_specs = copy.deepcopy(ROUTE_BUILD_SPECS)
+    if args.retain_geometry_failures:
+        build_specs["trimer"]["parameters"]["coordinate_payload"] = (
+            "single-conformer-explicit-all-atom-or-full-identity-fallback"
+        )
+        build_specs["trimer"]["parameters"]["geometry_failure_policy"] = (
+            "retain_full_identity_fallback"
+        )
     artifact_hashes = {}
-    artifact_hashes["ru_base"] = artifact_identity("ru_base", source_hash, {})
+    artifact_hashes["ru_base"] = artifact_identity(
+        "ru_base", source_hash, {}, build_spec=build_specs["ru_base"]
+    )
     artifact_hashes["topology"] = artifact_identity(
-        "topology", source_hash, {"ru_base": artifact_hashes["ru_base"]}
+        "topology", source_hash, {"ru_base": artifact_hashes["ru_base"]},
+        build_spec=build_specs["topology"],
     )
     artifact_hashes["trimer"] = artifact_identity(
-        "trimer", source_hash, {"ru_base": artifact_hashes["ru_base"]}
+        "trimer", source_hash, {"ru_base": artifact_hashes["ru_base"]},
+        build_spec=build_specs["trimer"],
     )
     bundle_hash = bundle_identity(source_hash, artifact_hashes)
     builds_root = cache_root / "builds"
@@ -1508,7 +1692,9 @@ def main(argv=None):
         "trimer": {"ru_base": artifact_hashes["ru_base"]},
     }
     metadata = {
-        layer: _metadata(layer, artifact_hashes[layer], source_hash, parents[layer])
+        layer: _metadata(
+            layer, artifact_hashes[layer], source_hash, parents[layer], build_specs
+        )
         for layer in ("ru_base", "topology", "trimer")
     }
     build_started = time.monotonic()
@@ -1524,7 +1710,9 @@ def main(argv=None):
                 counter_writer.close()
             pre_terminal += len(read_rejections(trimer_root / "rejections.jsonl"))
         resume, processed_new, writer_seconds = _run_trimer(
-            staging, rows, metadata, args.workers, args.interrupt_after
+            staging, rows, metadata, args.workers, args.interrupt_after,
+            trimer_build_spec=build_specs["trimer"],
+            retain_geometry_failures=args.retain_geometry_failures,
         )
         phase_stats.update({
             "workers": int(args.workers),
@@ -1532,9 +1720,20 @@ def main(argv=None):
             "trimer_writer_seconds": float(writer_seconds),
             "resume_skipped_terminal": int(pre_terminal if resume else 0),
         })
+        if args.retain_geometry_failures:
+            blockers = {
+                "ru_base": read_rejections(staging / "ru_base" / "rejections.jsonl"),
+                "topology": read_rejections(staging / "topology" / "rejections.jsonl"),
+                "trimer": read_rejections(staging / "trimer" / "rejections.jsonl"),
+            }
+            if any(blockers.values()):
+                raise CacheLifecycleError(
+                    "DOWNSTREAM_CACHE_BLOCKER: structural/programming rejection "
+                    + ", ".join(f"{name}={len(value)}" for name, value in blockers.items())
+                )
         store, manifests, rejections = _audit_freeze_publish(
             cache_root, staging, final, rows, source_manifest,
-            artifact_hashes, metadata,
+            artifact_hashes, metadata, build_specs=build_specs,
         )
         report = _make_report(
             cache_root, store, manifests, rejections,

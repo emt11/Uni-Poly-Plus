@@ -21,7 +21,7 @@ from src.utils import set_global_seed
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ('config', 'samples-csv', 'topology-root', 'trimer-root', 'output'):
+    for name in ('config', 'cohort-root', 'cache-root', 'output'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--resume')
     args = parser.parse_args()
@@ -53,7 +53,7 @@ def main():
         dist.broadcast_object_list(preparation_error, src=0)
     if preparation_error[0] is not None:
         raise FileExistsError(preparation_error[0])
-    source, frame = open_source(args.samples_csv, args.topology_root, args.trimer_root)
+    source, frame = open_source(args.cohort_root, args.cache_root)
     try:
         micro, batch_size = config['microbatch'], config['global_batch']
         if batch_size % (micro * world):
@@ -66,9 +66,10 @@ def main():
                                          find_unused_parameters=True) if world > 1 else base
         start = 0
         identity = dict(config=config, world_size=world, sample_count=len(source),
-                        samples_csv=str(Path(args.samples_csv).resolve()),
-                        topology_root=str(Path(args.topology_root).resolve()),
-                        trimer_root=str(Path(args.trimer_root).resolve()))
+                        cohort_root=str(Path(args.cohort_root).resolve()),
+                        cohort_hash=source.cohort['manifest_hash'],
+                        cache_root=str(Path(args.cache_root).resolve()),
+                        main_bundle_hash=source.bundle.bundle_hash)
         # Exact ordered identities, without adding a separate cache schema.
         ordered_keys = [key.hex() for key, _ in source.samples]
         if args.resume:

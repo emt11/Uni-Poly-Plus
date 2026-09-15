@@ -111,9 +111,9 @@ def deserialize_record(payload: bytes, key: bytes) -> Data:
     return data
 
 
-def select_record_fields(layer: str, data: Data) -> Data:
+def select_record_fields(layer: str, data: Data, *, optional_fields=()) -> Data:
     output = Data()
-    for name in RECORD_FIELDS[layer]:
+    for name in (*RECORD_FIELDS[layer], *tuple(optional_fields)):
         if hasattr(data, name):
             output[name] = getattr(data, name)
     if layer == "topology":
@@ -194,10 +194,12 @@ def load_source_rows(source_csv: Path, limit: int) -> tuple[list[dict], dict]:
     return records, manifest
 
 
-def artifact_identity(layer: str, source_manifest_hash: str, parents: dict) -> str:
+def artifact_identity(layer: str, source_manifest_hash: str, parents: dict,
+                      *, build_spec=None) -> str:
+    spec = build_spec or ROUTE_BUILD_SPECS[layer]
     return json_hash({
         "artifact_type": str(layer),
-        "build_spec_hash": build_spec_hash(ROUTE_BUILD_SPECS[layer]),
+        "build_spec_hash": build_spec_hash(spec),
         "source_manifest_hash": str(source_manifest_hash),
         "parents": dict(sorted(parents.items())),
     })
