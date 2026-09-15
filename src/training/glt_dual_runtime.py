@@ -79,6 +79,8 @@ class RankMicrobatchStream(Dataset):
             rows.append(self._prepare(
                 *self.source[index], seed=self.seed, key=key.hex(),
                 position=position, sigma=self.sigma, ratio=self.ratio,
+                static=self.source.static_for(index),
+                target=self.source.target_for(index),
             ))
         return self._collate(rows)
 
@@ -91,18 +93,59 @@ def require_tmux():
         raise RuntimeError('training requires tmux session Uni-Poly')
 
 
-def open_source(cohort_root, cache_root, *, task=None):
-    cohort = load_dual_cohort(cohort_root, cache_root)
-    records = cohort["records"]
+def open_source(cohort_root, cache_root, *, task=None, dual_static_root=None,
+                pretrain_target_root=None):
+    full_cohort = load_dual_cohort(cohort_root, cache_root)
+    static_cache = target_cache = None
+    if dual_static_root is not None:
+        from src.dataset.glt_dual_static import load_static_caches
+        try:
+            static_cache, target_cache = load_static_caches(
+                dual_static_root, pretrain_target_root,
+                parent_bundle_hash=full_cohort['manifest']['main_bundle_hash'],
+                cohort_manifest_hash=full_cohort['manifest_hash'],
+            )
+        except Exception:
+            if static_cache is not None:
+                static_cache.close()
+            if target_cache is not None:
+                target_cache.close()
+            raise
+        expected_order = full_cohort['manifest'].get('ordered_sample_key_hash')
+        for cache in (static_cache, target_cache):
+            if cache is None:
+                continue
+            bound_order = cache.manifest.get('cohort_ordered_sample_key_hash')
+            if bound_order is not None and bound_order != expected_order:
+                raise ValueError('static cache cohort ordered-key binding mismatch')
+    records = full_cohort["records"]
+    cohort = full_cohort
     if task is not None:
         records = [row for row in records if row.get("task") == str(task)]
         if not records:
+            if static_cache is not None:
+                static_cache.close()
+            if target_cache is not None:
+                target_cache.close()
             raise ValueError(f"dual cohort has no rows for task={task}")
         cohort = {**cohort, "records": records}
-    source = FrozenDualLayerSource(cache_root, cohort)
+    source = FrozenDualLayerSource(cache_root, cohort, static_cache=static_cache,
+                                   target_cache=target_cache)
     if not len(source):
         source.close()
         raise ValueError('empty frozen source')
+    if static_cache is not None:
+        try:
+            # A downstream artifact may be unique-by-structure while the cohort
+            # retains repeated property rows.  Resolve every selected row by key;
+            # missing keys are a hard cache contract failure.
+            for key, _ in source.samples:
+                static_cache.index_for_key(key)
+                if target_cache is not None:
+                    target_cache.index_for_key(key)
+        except Exception:
+            source.close()
+            raise
     frame = pd.DataFrame(records)
     return source, frame
 
@@ -156,6 +199,6 @@ class CleanLabeledDataset(Dataset):
         return len(self.source)
 
     def __getitem__(self, index):
-        data = build_dual_sample(*self.source[index])
+        data = build_dual_sample(*self.source[index], static=self.source.static_for(index))
         data.y = torch.tensor([float(self.targets[index])], dtype=torch.float32)
         return data

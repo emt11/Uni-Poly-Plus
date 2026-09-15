@@ -97,6 +97,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('config', 'checkpoint', 'raw-root', 'cohort-root', 'cache-root', 'output'):
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--dual-static-root',
+                        help='downstream training-ready dual_static_v1 artifact')
     parser.add_argument('--split-root', default='data/splits/mips_outer5_inner20')
     parser.add_argument('--task', action='append', dest='tasks',
                         help='select task(s); required as a single task with --smoke')
@@ -104,6 +106,8 @@ def main():
                         help='select fold(s); required as a single fold with --smoke')
     parser.add_argument('--smoke', action='store_true',
                         help='bounded train/validation-only task/fold smoke; never reads outer-test')
+    parser.add_argument('--formal-shard', action='store_true',
+                        help='run exactly one task/fold including outer-test for a grid launcher')
     args = parser.parse_args()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
@@ -117,8 +121,11 @@ def main():
     if args.smoke:
         if len(selected_tasks) != 1 or len(selected_folds) != 1:
             raise ValueError('--smoke requires exactly one --task and one --fold')
+    elif args.formal_shard:
+        if len(selected_tasks) != 1 or len(selected_folds) != 1:
+            raise ValueError('--formal-shard requires exactly one --task and --fold')
     elif selected_tasks != list(TASKS) or selected_folds != list(range(5)):
-        raise ValueError('partial task/fold selection requires --smoke')
+        raise ValueError('partial task/fold selection requires --smoke or --formal-shard')
     run_config = dict(config)
     if args.smoke:
         run_config['epochs'] = min(int(run_config.get('epochs', 2)), 2)
@@ -127,8 +134,10 @@ def main():
     package = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     write_json(output / 'run.json', dict(config=run_config, command=sys.argv,
-        protocol='outer5_inner20_smoke' if args.smoke else 'outer5_inner20',
-        smoke=bool(args.smoke), selected_tasks=selected_tasks,
+        protocol=('outer5_inner20_smoke' if args.smoke else
+                  'outer5_inner20_formal_shard' if args.formal_shard else
+                  'outer5_inner20'),
+        smoke=bool(args.smoke), formal_shard=bool(args.formal_shard), selected_tasks=selected_tasks,
         selected_folds=selected_folds, outer_test='NOT_RUN' if args.smoke else 'RUN'))
     all_folds, task_summary = [], {}
     for task in selected_tasks:
@@ -139,7 +148,10 @@ def main():
                 f'--smoke requires an existing outer5_inner20 manifest: {manifest_path}'
             )
         manifest = fixed_manifest(task, csv_path, manifest_path)
-        source, frame = open_source(args.cohort_root, args.cache_root, task=task)
+        source, frame = open_source(
+            args.cohort_root, args.cache_root, task=task,
+            dual_static_root=args.dual_static_root,
+        )
         try:
             if len(frame) != int(manifest['sample_count']):
                 raise ValueError('downstream cohort task row count differs from fixed split')
@@ -216,6 +228,12 @@ def main():
                 results.append(result)
                 all_folds.append(result)
                 del model, encoder, optimizer, scheduler
+            if args.formal_shard:
+                task_summary[task] = dict(
+                    formal_shard=True, task=task, fold=int(selected_folds[0]),
+                    outer_test='RUN_ONCE', test_metrics=results[0] if results else None,
+                )
+                continue
             if not (visits == 1).all():
                 if args.smoke:
                     task_summary[task] = dict(
@@ -234,7 +252,11 @@ def main():
         finally:
             source.close()
     pd.DataFrame(all_folds).to_csv(output / 'all_fold_metrics.csv', index=False)
-    if args.smoke:
+    if args.formal_shard:
+        summary = dict(protocol='outer5_inner20_formal_shard', formal_shard=True,
+            tasks=task_summary, outer_test='RUN_ONCE',
+            interpretation='one isolated task/fold shard; aggregate only after all 40 shards')
+    elif args.smoke:
         summary = dict(protocol='outer5_inner20_smoke', smoke=True,
             tasks=task_summary, outer_test='NOT_RUN',
             interpretation='single selected task/fold validation-only smoke; not OOF or macro8')

@@ -134,16 +134,18 @@ def _validate_geometry_fallback_carrier(topology, trimer):
 
     names = (
         "trimer_atomic_number", "trimer_base_ru_atom_id", "trimer_ru_offset",
-        "trimer_central_ru_mask", "trimer_edge_index", "trimer_bond_type",
+        "trimer_edge_index", "trimer_bond_type",
         "mips_to_trimer_central_index",
     )
     missing = [name for name in names if not hasattr(trimer, name)]
     if missing:
-        raise ValueError("geometry fallback identity carrier missing: " + ",".join(missing))
+        raise ValueError("trimer_identity_missing: geometry fallback identity carrier missing: " + ",".join(missing))
     atomic = torch.as_tensor(trimer.trimer_atomic_number).long().reshape(-1)
     base = torch.as_tensor(trimer.trimer_base_ru_atom_id).long().reshape(-1)
     offsets = torch.as_tensor(trimer.trimer_ru_offset).long().reshape(-1)
-    central = torch.as_tensor(trimer.trimer_central_ru_mask).bool().reshape(-1)
+    central = torch.as_tensor(
+        getattr(trimer, "trimer_central_ru_mask", offsets == 0)
+    ).bool().reshape(-1)
     edge = torch.as_tensor(trimer.trimer_edge_index).long()
     bond_type = torch.as_tensor(trimer.trimer_bond_type).long().reshape(-1)
     mapping = torch.as_tensor(trimer.mips_to_trimer_central_index).long().reshape(-1)
@@ -164,7 +166,7 @@ def _validate_geometry_fallback_carrier(topology, trimer):
 
 
 def build_dual_sample(topology, trimer, smiles, *, identity=None,
-                      bond_path_features=None):
+                      bond_path_features=None, static=None):
     """Build only model-required fields; never carry MD/coordinate tensors into a batch.
 
     ``identity`` and ``bond_path_features`` are pure functions of
@@ -185,7 +187,7 @@ def build_dual_sample(topology, trimer, smiles, *, identity=None,
         )
     if not torch.equal(topology.canonical_ru_atom_index.long(), torch.arange(topology.mips_x.size(0))):
         raise ValueError('dual route requires one canonical state per atom')
-    if identity is None:
+    if identity is None and static is None:
         identity = resolve_normalized_identity(
             topology, smiles, require_fields=True
         )
@@ -196,42 +198,79 @@ def build_dual_sample(topology, trimer, smiles, *, identity=None,
     result.graph_available = bool(topology.graph_available)
     if hasattr(topology, 'lga_relation_mask'):
         result.lga_relation_mask = topology.lga_relation_mask.clone()
-    if bond_path_features is None:
+    if static is not None:
+        # Persistent static rows are the single reference for chemistry and
+        # physical line topology.  No RDKit graph or shortest-path rebuild is
+        # allowed on this branch; only coordinates are materialized below.
+        required_static = (
+            'bond_path_features', 'bond_path_mask', 'token_z_a', 'token_z_b',
+            'token_bond_type', 'token_center_mask', 'line_source',
+            'line_target', 'line_path', 'line_path_mask', 'line_path_group',
+            'line_is_self', 'geometry_valid', 'geometry_invalid_reason',
+        )
+        missing_static = [name for name in required_static if name not in static]
+        if missing_static:
+            raise ValueError('dual static row is missing fields: ' + ','.join(missing_static))
+        result.bond_path_features = torch.from_numpy(
+            np.array(static['bond_path_features'], dtype=np.float32, copy=True))
+        result.bond_path_mask = torch.from_numpy(
+            np.array(static['bond_path_mask'], dtype=bool, copy=True))
+    elif bond_path_features is None:
         result.bond_path_features, result.bond_path_mask = bond_paths(
             topology, smiles, identity=identity
         )
     else:
-        # Clone so clean and noisy views never alias one tensor.
+        # Clone so clean and noisy views never alias.
         result.bond_path_features = bond_path_features[0].clone()
         result.bond_path_mask = bond_path_features[1].clone()
     if not bool(getattr(trimer, "trimer_geometry_valid", False)):
         _validate_geometry_fallback_carrier(topology, trimer)
-    row = build_complete_trimer_glt_sample(
-        topology, trimer, smiles, identity=identity
-    )
-    if row["geometry_valid"]:
-        paths = two_hop_paths(row)
+    if static is None:
+        row = build_complete_trimer_glt_sample(
+            topology, trimer, smiles, identity=identity
+        )
+        if row["geometry_valid"]:
+            paths = two_hop_paths(row)
+        else:
+            # Invalid frozen geometry has no usable physical relations.  Structural
+            # identity/chemistry failures are not geometry fallbacks: reject them
+            # before an empty row could hide a malformed cached relation table.
+            reason = str(row["invalid_reason"])
+            geometry_reasons = {
+                "geometry_invalid", "non_3d_geometry", "2d_fallback",
+                "trimer_coordinates_invalid", "bond_distance_invalid",
+            }
+            if reason not in geometry_reasons:
+                raise ValueError(f"complete Trimer contract failure: {reason}")
+            from .periodic_line_glt_complete import empty_complete_trimer_row
+            paths = two_hop_paths(empty_complete_trimer_row(row["invalid_reason"]))
+        result.geometry_valid = bool(row['geometry_valid'])
+        result.geometry_invalid_reason = row['invalid_reason']
+        for src, dst in [('token_endpoint_z_a', 'bond_z_a'), ('token_endpoint_z_b', 'bond_z_b'),
+                         ('token_distance', 'bond_distance'), ('token_bond_type', 'bond_type'),
+                         ('token_center_internal', 'bond_center')]:
+            setattr(result, dst, torch.from_numpy(row['tokens'][src].copy()))
+        for name, value in paths.items():
+            setattr(result, 'line_' + name, value)
     else:
-        # Invalid frozen geometry has no usable physical relations.  Structural
-        # identity/chemistry failures are not geometry fallbacks: reject them
-        # before an empty row could hide a malformed cached relation table.
-        reason = str(row["invalid_reason"])
-        geometry_reasons = {
-            "geometry_invalid", "non_3d_geometry", "2d_fallback",
-            "trimer_coordinates_invalid", "bond_distance_invalid",
-        }
-        if reason not in geometry_reasons:
-            raise ValueError(f"complete Trimer contract failure: {reason}")
-        from .periodic_line_glt_complete import empty_complete_trimer_row
-        paths = two_hop_paths(empty_complete_trimer_row(row["invalid_reason"]))
-    result.geometry_valid = bool(row['geometry_valid'])
-    result.geometry_invalid_reason = row['invalid_reason']
-    for src, dst in [('token_endpoint_z_a', 'bond_z_a'), ('token_endpoint_z_b', 'bond_z_b'),
-                     ('token_distance', 'bond_distance'), ('token_bond_type', 'bond_type'),
-                     ('token_center_internal', 'bond_center')]:
-        setattr(result, dst, torch.from_numpy(row['tokens'][src].copy()))
-    for name, value in paths.items():
-        setattr(result, 'line_' + name, value)
+        from .glt_dual_static import materialize_dual_geometry
+        result.geometry_valid = bool(static['geometry_valid'])
+        result.geometry_invalid_reason = str(static['geometry_invalid_reason'])
+        geometry = materialize_dual_geometry(static, trimer.trimer_pos)
+        if bool(geometry['geometry_valid']) != result.geometry_valid:
+            raise ValueError('dual static geometry validity disagrees with materialization')
+        result.bond_z_a = torch.from_numpy(np.array(static['token_z_a'], dtype=np.int16, copy=True))
+        result.bond_z_b = torch.from_numpy(np.array(static['token_z_b'], dtype=np.int16, copy=True))
+        result.bond_distance = geometry['bond_distance']
+        result.bond_type = torch.from_numpy(np.array(static['token_bond_type'], dtype=np.int8, copy=True))
+        result.bond_center = torch.from_numpy(np.array(static['token_center_mask'], dtype=bool, copy=True))
+        result.line_source = torch.from_numpy(np.array(static['line_source'], dtype=np.int64, copy=True))
+        result.line_target = torch.from_numpy(np.array(static['line_target'], dtype=np.int64, copy=True))
+        result.line_path = torch.from_numpy(np.array(static['line_path'], dtype=np.int64, copy=True))
+        result.line_angle = geometry['line_angle']
+        result.line_mask = torch.from_numpy(np.array(static['line_path_mask'], dtype=bool, copy=True))
+        result.line_path_group = torch.from_numpy(np.array(static['line_path_group'], dtype=np.int64, copy=True))
+        result.line_is_self = torch.from_numpy(np.array(static['line_is_self'], dtype=bool, copy=True))
     if getattr(topology, 'y', None) is not None:
         result.y = topology.y.clone()
     return result
@@ -259,10 +298,12 @@ class FrozenDualLayerSource(Dataset):
     P-SMILES are provenance/audit input only; keys are verified against each
     record's explicit normalized canonical identity.
     """
-    def __init__(self, cache_root, cohort):
+    def __init__(self, cache_root, cohort, *, static_cache=None, target_cache=None):
         from .glt_dual_cache import DualFrozenBundle
 
         self.bundle = self.topology = self.trimer = None
+        self.static_cache = static_cache
+        self.target_cache = target_cache
         self.cohort = cohort
         self.entries = list(cohort["records"])
         try:
@@ -303,11 +344,32 @@ class FrozenDualLayerSource(Dataset):
         resolve_normalized_identity(topology, smiles, require_fields=True)
         return topology, trimer, smiles
 
+    def static_for(self, index):
+        if self.static_cache is None:
+            return None
+        key, _ = self.samples[int(index)]
+        return self.static_cache.get_by_key(key)
+
+    def target_for(self, index):
+        if self.target_cache is None:
+            return None
+        key, _ = self.samples[int(index)]
+        return self.target_cache.get_by_key(key)
+
     def close(self):
         bundle = self.bundle
         self.bundle = self.topology = self.trimer = None
-        if bundle is not None:
-            bundle.close()
+        static_cache = getattr(self, 'static_cache', None)
+        target_cache = getattr(self, 'target_cache', None)
+        self.static_cache = self.target_cache = None
+        try:
+            if bundle is not None:
+                bundle.close()
+        finally:
+            if static_cache is not None:
+                static_cache.close()
+            if target_cache is not None:
+                target_cache.close()
 
 
 def dual_glt_collate(samples):

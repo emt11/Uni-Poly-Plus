@@ -24,6 +24,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('config', 'cohort-root', 'cache-root', 'output'):
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--dual-static-root',
+                        help='training-ready dual_static_v1 artifact')
+    parser.add_argument('--pretrain-target-root',
+                        help='pretrain_targets_v1 artifact')
     parser.add_argument('--resume')
     parser.add_argument('--prep-workers', type=int, default=0,
                         help='DataLoader workers per rank for input prefetch '
@@ -57,7 +61,13 @@ def main():
         dist.broadcast_object_list(preparation_error, src=0)
     if preparation_error[0] is not None:
         raise FileExistsError(preparation_error[0])
-    source, frame = open_source(args.cohort_root, args.cache_root)
+    if args.pretrain_target_root and not args.dual_static_root:
+        raise ValueError('--pretrain-target-root requires --dual-static-root')
+    source, frame = open_source(
+        args.cohort_root, args.cache_root,
+        dual_static_root=args.dual_static_root,
+        pretrain_target_root=args.pretrain_target_root,
+    )
     try:
         micro, batch_size = config['microbatch'], config['global_batch']
         if batch_size % (micro * world):
@@ -73,7 +83,11 @@ def main():
                         cohort_root=str(Path(args.cohort_root).resolve()),
                         cohort_hash=source.cohort['manifest_hash'],
                         cache_root=str(Path(args.cache_root).resolve()),
-                        main_bundle_hash=source.bundle.bundle_hash)
+                        main_bundle_hash=source.bundle.bundle_hash,
+                        dual_static_manifest_hash=(source.static_cache.manifest_hash
+                                                   if source.static_cache is not None else None),
+                        pretrain_target_manifest_hash=(source.target_cache.manifest_hash
+                                                       if source.target_cache is not None else None))
         # Exact ordered identities, without adding a separate cache schema.
         ordered_keys = [key.hex() for key, _ in source.samples]
         if args.resume:
@@ -125,9 +139,12 @@ def main():
                     for local in range(micro):
                         position = step * batch_size + offset * world * micro + rank * micro + local
                         index = stream.index_at(position)
-                        rows.append(prepare_pretrain_sample(*source[index], seed=config['seed'],
+                        rows.append(prepare_pretrain_sample(
+                            *source[index], seed=config['seed'],
                             key=source.samples[index][0].hex(), position=position,
-                            sigma=config['noise_sigma'], ratio=config['atom_mask_ratio']))
+                            sigma=config['noise_sigma'], ratio=config['atom_mask_ratio'],
+                            static=source.static_for(index),
+                            target=source.target_for(index)))
                     prepared.append(pretrain_collate(rows))
             counts = torch.zeros(3, device=device)
             for data, labels in prepared:

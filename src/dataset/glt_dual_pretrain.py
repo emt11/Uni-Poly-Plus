@@ -5,6 +5,8 @@ import math
 from collections import deque
 from functools import lru_cache
 
+import numpy as np
+
 import torch
 from rdkit import Chem
 from rdkit.Chem import BRICS, rdFingerprintGenerator
@@ -109,33 +111,56 @@ def motif_mask(topology, groups, generator, ratio=0.3):
     return mask, True
 
 
-def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position, sigma=0.03, ratio=0.3):
+def _unpack_fingerprint(packed):
+    packed = np.asarray(packed, dtype=np.uint8)
+    if packed.shape != (256,):
+        raise ValueError('packed Morgan fingerprint must have shape [256]')
+    bits = np.unpackbits(packed, bitorder='little')
+    return torch.from_numpy(bits[:2048].copy()).float()
+
+
+def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
+                            sigma=0.03, ratio=0.3, static=None, target=None):
     if not bool(topology.graph_available):
         raise ValueError('three-task training requires valid canonical 2D topology')
     if not math.isfinite(sigma) or sigma < 0 or not 0 < ratio < 1:
         raise ValueError('invalid noise sigma or masking ratio')
-    identity = resolve_normalized_identity(topology, smiles, require_fields=True)
     generator = sample_generator(seed, key, position)
-    groups, fingerprint = chemical_targets(identity["normalized_smiles"])
+    if target is not None:
+        if 'brics_groups' not in target or 'fingerprint_packed' not in target:
+            raise ValueError('pretrain target row is missing required fields')
+        groups = tuple(tuple(int(atom) for atom in group)
+                       for group in target['brics_groups'])
+        fingerprint = _unpack_fingerprint(target['fingerprint_packed'])
+        identity = None
+    else:
+        identity = resolve_normalized_identity(topology, smiles, require_fields=True)
+        groups, fingerprint = chemical_targets(identity["normalized_smiles"])
     mask, fallback = motif_mask(topology, groups, generator, ratio)
     # Static chemistry/connectivity/path is a pure function of
     # (topology, smiles): build it once and share it between the clean and
     # noisy views.  Coordinates stay view-local: clean coordinates produce the
     # clean length/angle targets, and only the noisy clone is re-encoded.
-    static_paths = bond_paths(topology, smiles, identity=identity)
-    clean = build_dual_sample(
-        topology, trimer, smiles, identity=identity,
-        bond_path_features=static_paths,
-    )
+    if static is None:
+        static_paths = bond_paths(topology, smiles, identity=identity)
+        clean = build_dual_sample(
+            topology, trimer, smiles, identity=identity,
+            bond_path_features=static_paths,
+        )
+    else:
+        clean = build_dual_sample(topology, trimer, smiles, static=static)
     noisy = clean
     if clean.geometry_valid:
         changed = copy.copy(trimer)
         changed.trimer_pos = trimer.trimer_pos.float().clone()
         changed.trimer_pos += sigma * torch.randn(changed.trimer_pos.shape, generator=generator)
-        noisy = build_dual_sample(
-            topology, changed, smiles, identity=identity,
-            bond_path_features=static_paths,
-        )
+        if static is None:
+            noisy = build_dual_sample(
+                topology, changed, smiles, identity=identity,
+                bond_path_features=static_paths,
+            )
+        else:
+            noisy = build_dual_sample(topology, changed, smiles, static=static)
         if not noisy.geometry_valid:
             raise ValueError(f'noise invalidated required geometry: {noisy.geometry_invalid_reason}')
         for field in ('line_source', 'line_target', 'line_path', 'line_path_group', 'bond_center'):
