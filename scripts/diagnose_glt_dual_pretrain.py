@@ -1,32 +1,28 @@
 #!/usr/bin/env python3
 """Fixed-batch diagnostics for the frozen Concat/KFuse pretraining checkpoints.
 
-The six ``resume_*.pt`` checkpoints (Concat and KFuse at 2k/3k/5k) are each run
-on the SAME 16 real frozen records taken from the original sampling stream
-immediately after step 2000.  Batches of 8 use the same motif mask, the same
-perturbed coordinates and the same clean targets, so differences between
-checkpoints are checkpoint differences and not data differences.
+The six ``resume_*.pt`` checkpoints (Concat and KFuse at 2k/3k/5k) each run on
+the SAME 16 real frozen records, selected from the original sampling stream
+immediately after ``--base-step`` with the original world size, seed and
+microbatch.  Batches of 8 reuse one prepared CPU sample list (motif mask,
+perturbed coordinates, clean targets) across every mode, checkpoint and
+precision, so all differences are checkpoint differences rather than data
+differences.
 
-Per checkpoint and precision (fp32/bf16, eval mode, no optimizer update):
-
-* the three component losses with their valid counts;
-* length/angle target and prediction distributions, angle-head pre-tanh and
-  tanh-derivative statistics and the saturated fraction;
-* 3D representation scales (per-layer RMS, bond/center/graph RMS);
-* Gaussian basis effective widths and affine parameters;
-* for the first batch, the FP32 gradient norm of the length/angle/FP losses
-  with respect to the 3D encoder and their pairwise cosines (a loss that does
-  not depend on a parameter contributes zero, which is not a model error);
-* the "use the perturbed distance/angle directly as the prediction" error
-  reference on the same batch.
+Per checkpoint and precision (eval mode, no optimizer update) the report holds:
+component losses with valid counts, target/prediction distributions, angle-head
+pre-tanh and derivative statistics, representation scales, real Gaussian basis
+statistics (read through read-only hooks on that same forward), the
+"perturbed geometry used directly as the prediction" reference and - for the
+first batch in FP32 - the component gradient norms (unweighted and
+weight-scaled) and their pairwise cosines with respect to the full 3D encoder
+parameter list.
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import json
-import math
 from pathlib import Path
 import sys
 
@@ -36,103 +32,157 @@ import torch
 
 from src.dataset.glt_dual import build_dual_sample
 from src.dataset.glt_dual_pretrain import prepare_pretrain_sample, pretrain_collate
-from src.modules.glt_dual_pretrain import DualPretrainer, global_objective
-from src.training.glt_dual_runtime import write_json, OrderedSampleStream
+from src.modules.glt_dual_pretrain import DualPretrainer, per_graph
+from src.training.glt_dual_runtime import write_json, open_source, OrderedSampleStream
 
-CHECKPOINTS = {
-    "concat": [2000, 3000, 5000],
-    "kfuse": [2000, 3000, 5000],
-}
+MODES = ("concat", "kfuse")
+STEPS = (2000, 3000, 5000)
 RECORDS, BATCH = 16, 8
+COMPONENTS = ("chem", "length", "angle", "fingerprint")
 
 
-def load_source(cache_root, cohort_root, static_root, target_root):
-    from src.training.glt_dual_runtime import open_source
-
-    source, _ = open_source(cohort_root, cache_root,
-                            dual_static_root=static_root,
-                            pretrain_target_root=target_root)
-    return source
-
-
-def positions_after_step(step, batch_size, world, micro, rank=0, count=RECORDS):
-    base = step * batch_size
-    return [base + 0 * world * micro + rank * micro + local for local in range(count)]
+def _device(spec: str) -> torch.device:
+    device = torch.device(spec)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA diagnostics requested without CUDA")
+        torch.cuda.set_device(device)
+    return device
 
 
-def component_gradients(model, data, labels, weights):
-    """Gradient norms of each objective term wrt the 3D encoder (fp32 math)."""
+def fixed_samples(source, config, base_step, records=RECORDS):
+    """One deterministic CPU sample list from the original sampling stream."""
 
-    out = model(data, labels)
-    components = ["chem", "geometry", "fingerprint"]
-    losses = {}
-    sums, counts = out["sums"], out["counts"].clamp_min(1)
-    total = global_objective(sums, out["counts"], 1, weights)
-    # Per-component contribution: weight * world / global_count * local sum.
-    for index, name in enumerate(components):
-        losses[name] = (sums[index] * weights[index] / counts[index]).float()
-    params = [p for p in model.encoder.glt.parameters() if p.requires_grad]
-    reports = {}
-    grads = {}
-    for index, name in enumerate(components):
-        grad = torch.autograd.grad(losses[name], params, retain_graph=True, allow_unused=True)
-        flat = torch.cat([g.reshape(-1) for g in grad if g is not None]) if any(
-            g is not None for g in grad) else torch.zeros(1)
-        grads[name] = flat
-        reports[name] = {"grad_norm": float(flat.norm()),
-                         "params_with_grad": int(sum(g is not None for g in grad)),
-                         "params_total": len(params)}
+    world = 4
+    micro, batch_size = int(config["microbatch"]), int(config["global_batch"])
+    stream = OrderedSampleStream(len(source), config["seed"])
+    base = base_step * batch_size
+    entries = []
+    for local in range(records):
+        position = base + 0 * world * micro + 0 * micro + local
+        index = stream.index_at(position)
+        key = source.samples[index][0].hex()
+        static = source.static_for(index)
+        target = source.target_for(index)
+        noisy, labels = prepare_pretrain_sample(
+            *source[index], seed=config["seed"], key=key, position=position,
+            sigma=config["noise_sigma"], ratio=config["atom_mask_ratio"],
+            static=static, target=target,
+        )
+        clean = build_dual_sample(*source[index], static=static)
+        entries.append({"position": position, "index": index, "key": key,
+                        "clean": clean, "noisy": noisy, "labels": labels})
+    return entries
+
+
+def collate_chunk(chunk, device):
+    data, labels = pretrain_collate([(row["noisy"], row["labels"]) for row in chunk])
+    data = data.to(device)
+    labels = {name: (value.to(device) if torch.is_tensor(value) else value)
+              for name, value in labels.items()}
+    return data, labels
+
+
+def _angle_rows(sample):
+    """Physical one-hop center angle rows, matching the training target rule."""
+
+    path, mask, is_self = sample.line_path, sample.line_mask, sample.line_is_self
+    rows = []
+    for row in range(path.size(0)):
+        if int(mask[row].sum()) != 1 or bool(is_self[row]):
+            continue
+        a, b = int(path[row, 0]), int(path[row, 1])
+        if a < b and bool(sample.bond_center[a]) and bool(sample.bond_center[b]):
+            rows.append((row, a, b))
+    return rows
+
+
+def perturbed_reference(chunk, labels):
+    """Error of using the perturbed geometry directly, with training reductions.
+
+    Length uses the perturbed center-bond distances against the clean distance
+    targets; angles look up the perturbed cosine of exactly the (a, b) bond
+    pairs that produced the clean angle targets.  Per-graph means and the
+    valid-graph denominator follow the training loss.
+    """
+
+    graphs = labels["angle_graph"].new_tensor(len(chunk)).numel()
+    graphs = len(chunk)
+    center_sq, angle_sq, angle_graph_index = [], [], []
+    length_graphs, angle_graphs = [], []
+    without_center_angles = 0
+    for graph, row in enumerate(chunk):
+        noisy, clean, sample_labels = row["noisy"], row["clean"], row["labels"]
+        center = clean.bond_center.bool()
+        if int(center.sum()):
+            error = (noisy.bond_distance[center].float()
+                     - sample_labels["distance"].float()).square()
+            length_graphs.append((graph, error))
+        lookup = {}
+        for angle_row, a, b in _angle_rows(clean):
+            lookup[(a, b)] = float(noisy.line_angle[angle_row, 0].cos())
+        pairs = sample_labels["angle_pairs"].tolist()
+        if pairs:
+            values = []
+            for a, b in pairs:
+                key = (int(a), int(b))
+                if key not in lookup:
+                    raise ValueError("angle pair is not a valid center one-hop relation")
+                values.append(lookup[key])
+            error = (torch.tensor(values, dtype=torch.float32)
+                     - sample_labels["angle_cos"].float()).square()
+            angle_graphs.append((graph, error))
+        else:
+            without_center_angles += 1
+    def reduce(pairs_, count_graphs):
+        if not pairs_:
+            return None
+        index = torch.cat([torch.full_like(error, graph, dtype=torch.long)
+                           for graph, error in pairs_])
+        values = torch.cat([error for _, error in pairs_])
+        means, valid = per_graph(values, index, count_graphs)
+        return float(means[valid].mean()) if bool(valid.any()) else None
+
+    return {
+        "length_from_perturbed_distance": reduce(length_graphs, graphs),
+        "angle_from_perturbed_cosine": reduce(angle_graphs, graphs),
+        "graphs": graphs,
+        "samples_without_center_angles": without_center_angles,
+        "reduction": "per-graph mean over valid graphs (same as the training term)",
+    }
+
+
+def component_gradients(model, out, weights, world, counts, params):
+    """Component gradients over the FULL 3D encoder parameter list."""
+
+    tensors = out["diagnostics"]["component_tensors"]
+    # chem -> weight[0]; length AND angle -> the geometry weight[1]; fp -> weight[2].
+    component_weight = {"chem": weights[0], "length": weights[1],
+                        "angle": weights[1], "fingerprint": weights[2]}
+    gradients, norms = {}, {}
+    for index, name in enumerate(COMPONENTS):
+        grad = torch.autograd.grad(tensors[name], params,
+                                   retain_graph=True, allow_unused=True)
+        aligned = [g if g is not None else torch.zeros_like(p)
+                   for g, p in zip(grad, params)]
+        flat = torch.cat([g.reshape(-1) for g in aligned]) if aligned else torch.zeros(1)
+        gradients[name] = flat
+        scale = component_weight[name] * world / max(1, int(counts))
+        norms[name] = {
+            "unweighted_norm": float(flat.norm()),
+            "weight_scaled_norm": float(flat.norm()) * scale,
+            "params_total": len(params),
+            "params_with_grad": int(sum(g is not None for g in grad)),
+        }
     cosines = {}
-    for a in components:
-        for b in components:
-            if a >= b:
-                continue
-            x, y = grads[a], grads[b]
-            if x.numel() != y.numel():
-                cosines[f"{a}__{b}"] = None
-                continue
+    for i, a in enumerate(COMPONENTS):
+        for b in COMPONENTS[i + 1:]:
+            x, y = gradients[a], gradients[b]
             denominator = float(x.norm() * y.norm())
             cosines[f"{a}__{b}"] = (float(torch.dot(x, y) / denominator)
                                     if denominator > 0 else None)
-    return reports, cosines, float(total.detach())
-
-
-def geometry_head_gradients(model, data, labels):
-    """Split the geometry term into its length and angle parts."""
-
-    out = model(data, labels)
-    encoded = None
-    # Re-run the head math to obtain separated components without touching the
-    # training path: identical formulas to DualPretrainer.forward.
-    with torch.no_grad():
-        pass
-    return out
-
-
-def perturbed_reference(clean, noisy, labels):
-    """Error of using the perturbed geometry directly as the prediction."""
-
-    reference = {}
-    center = clean.bond_center.bool()
-    if int(center.sum()):
-        distance = noisy.bond_distance[center].float()
-        reference["length_from_perturbed_distance"] = float(
-            (distance - labels["distance"].float()).square().mean())
-    pairs = labels["angle_pairs"]
-    if pairs.numel():
-        clean_angle = clean.line_angle[:, 0]
-        # Map angle target order back to its clean and perturbed cosines.
-        cos_clean = torch.tensor([float(clean_angle[row].cos()) for row in range(
-            clean.line_path.size(0)) if int(clean.line_mask[row].sum()) == 1
-            and not bool(clean.line_is_self[row])], dtype=torch.float32)
-        cos_noisy = torch.tensor([float(noisy.line_angle[row, 0].cos()) for row in range(
-            clean.line_path.size(0)) if int(clean.line_mask[row].sum()) == 1
-            and not bool(clean.line_is_self[row])], dtype=torch.float32)
-        count = min(cos_clean.numel(), labels["angle_cos"].numel())
-        if count:
-            reference["angle_from_perturbed_cosine"] = float(
-                (cos_noisy[:count] - labels["angle_cos"][:count].float()).square().mean())
-    return reference
+    return norms, cosines, ("cosines are null where a component gradient is zero" 
+                            if any(v["unweighted_norm"] == 0 for v in norms.values()) else None)
 
 
 def main() -> int:
@@ -141,101 +191,123 @@ def main() -> int:
     parser.add_argument("--cohort-root", required=True)
     parser.add_argument("--dual-static-root", required=True)
     parser.add_argument("--pretrain-target-root", required=True)
-    parser.add_argument("--config-root", default="configs/mts")
-    parser.add_argument("--checkpoint-root", required=True,
-                        help="directory containing <mode>/resume_*.pt runs")
+    parser.add_argument("--concat-checkpoint-root", required=True)
+    parser.add_argument("--kfuse-checkpoint-root", required=True)
     parser.add_argument("--report-json", required=True)
+    parser.add_argument("--config-root", default="configs/mts")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--base-step", type=int, default=2000)
     args = parser.parse_args()
-    device = torch.device(args.device)
-    torch.cuda.set_device(device)
-    source = load_source(args.cache_root, args.cohort_root,
-                         args.dual_static_root, args.pretrain_target_root)
-    report = {"schema": "glt-dual-pretrain-fixed-batch-diagnostics-v1",
-              "records": RECORDS, "batch": BATCH, "base_step": args.base_step,
-              "checkpoints": {}}
+    device = _device(args.device)
+    config = {
+        mode: json.loads((Path(args.config_root) /
+                          f"glt_dual_three_task_{mode}.json").read_text(encoding="utf-8"))
+        for mode in MODES
+    }
+    roots = {"concat": args.concat_checkpoint_root, "kfuse": args.kfuse_checkpoint_root}
+    source, _frame = open_source(args.cohort_root, args.cache_root,
+                                 dual_static_root=args.dual_static_root,
+                                 pretrain_target_root=args.pretrain_target_root)
+    report = {
+        "schema": "glt-dual-pretrain-fixed-batch-diagnostics-v1",
+        "records": RECORDS, "batch": BATCH, "base_step": args.base_step,
+        "device": str(device), "world": 4,
+        "identity": {
+            "cohort_manifest_hash": source.cohort["manifest_hash"],
+            "cohort_root": str(Path(args.cohort_root).resolve()),
+            "cache_root": str(Path(args.cache_root).resolve()),
+            "main_bundle_hash": source.bundle.bundle_hash,
+            "dual_static_manifest_hash": (source.static_cache.manifest_hash
+                                          if source.static_cache is not None else None),
+            "pretrain_target_manifest_hash": (source.target_cache.manifest_hash
+                                              if source.target_cache is not None else None),
+        },
+        "checkpoints": {},
+    }
+    failures = []
     try:
-        for mode, steps in CHECKPOINTS.items():
-            config = json.loads((Path(args.config_root) /
-                                 f"glt_dual_three_task_{mode}.json").read_text(encoding="utf-8"))
-            world, micro, batch_size = 4, config["microbatch"], config["global_batch"]
-            stream = OrderedSampleStream(len(source), config["seed"])
-            positions = positions_after_step(args.base_step, batch_size, world, micro)
-            entry = {"positions": positions, "keys": [], "seed": config["seed"],
-                     "global_batch": batch_size, "world": world, "microbatch": micro,
-                     "steps": {}}
-            for step in steps:
-                path = Path(args.checkpoint_root) / mode / f"resume_{step:05d}.pt"
+        samples = fixed_samples(source, config["concat"], args.base_step)
+        report["sample_key_positions"] = [
+            {"position": row["position"], "key": row["key"]} for row in samples]
+        report["checkpoints"] = {mode: {"steps": {}} for mode in MODES}
+        for mode in MODES:
+            run_config = config[mode]
+            weights = list(run_config["loss_weights"])
+            for step in STEPS:
+                path = Path(roots[mode]) / f"resume_{step:05d}.pt"
                 if not path.is_file():
-                    entry["steps"][step] = {"status": "MISSING", "path": str(path)}
+                    failures.append(f"missing checkpoint: {path}")
+                    report["checkpoints"][mode]["steps"][str(step)] = {
+                        "status": "MISSING", "path": str(path)}
                     continue
                 state = torch.load(path, map_location="cpu", weights_only=False)
+                state_identity = dict(state.get("identity", {}))
+                if int(state.get("step", -1)) != step:
+                    failures.append(f"checkpoint step mismatch: {path}")
+                if state_identity.get("config", {}).get("fusion_mode") != mode:
+                    failures.append(f"checkpoint fusion mode mismatch: {path}")
+                for name, expected in (
+                    ("cohort_hash", report["identity"]["cohort_manifest_hash"]),
+                    ("main_bundle_hash", report["identity"]["main_bundle_hash"]),
+                    ("dual_static_manifest_hash", report["identity"]["dual_static_manifest_hash"]),
+                    ("pretrain_target_manifest_hash", report["identity"]["pretrain_target_manifest_hash"]),
+                ):
+                    if expected is not None and state_identity.get(name) != expected:
+                        failures.append(f"checkpoint {name} mismatch: {path}")
                 model = DualPretrainer(mode, collect_diagnostics=True).to(device)
                 model.load_state_dict(state["model"], strict=True)
                 model.eval()
-                step_entry = {"path": str(path), "checkpoint_step": int(state["step"]),
-                              "precisions": {}}
-                prepared, clean_samples, noisy_samples = [], [], []
-                for position in positions:
-                    index = stream.index_at(position)
-                    key = source.samples[index][0].hex()
-                    if len(entry["keys"]) < RECORDS:
-                        entry["keys"].append({"position": position, "key": key})
-                    noisy, labels = prepare_pretrain_sample(
-                        *source[index], seed=config["seed"], key=key, position=position,
-                        sigma=config["noise_sigma"], ratio=config["atom_mask_ratio"])
-                    prepared.append((noisy, labels))
+                entry = {"status": "OK", "path": str(path), "step": step,
+                         "architecture": model.encoder.architecture_name,
+                         "world_size_recorded": state_identity.get("world_size"),
+                         "precisions": {}, "batches": []}
                 for start in range(0, RECORDS, BATCH):
-                    chunk = prepared[start:start + BATCH]
-                    data, labels = pretrain_collate([row[0] for row in chunk]), None
-                    data, labels = pretrain_collate(chunk)
-                    data = data.to(device)
-                    labels = {k: (v.to(device) if torch.is_tensor(v) else v)
-                              for k, v in labels.items()}
+                    chunk = samples[start:start + BATCH]
+                    data, labels = collate_chunk(chunk, device)
+                    batch_id = f"batch{start // BATCH}"
+                    entry["batches"].append({
+                        "batch": batch_id,
+                        "sample_keys": [row["key"] for row in chunk],
+                        "perturbed_reference": perturbed_reference(chunk, labels),
+                    })
                     for precision in ("fp32", "bf16"):
-                        torch.manual_seed(0)
                         with torch.autocast(device.type, dtype=torch.bfloat16,
                                             enabled=precision == "bf16"):
                             out = model(data, labels)
                         diagnostics = out["diagnostics"]
-                        bucket = step_entry["precisions"].setdefault(precision, {})
-                        bucket[f"batch{start // BATCH}"] = {
-                            "components": {k: diagnostics["components"][k] for k in (
-                                "chem_sum", "length_sum", "angle_sum", "geometry_sum",
-                                "geometry_valid_count", "angle_valid_count",
-                                "graphs_without_angle", "length_plus_angle_reconstructs_geometry")},
+                        entry["precisions"].setdefault(precision, {})[batch_id] = {
+                            "components": diagnostics["components"],
                             "targets": diagnostics["targets"],
                             "predictions": diagnostics["predictions"],
                             "angle_head": diagnostics["angle_head"],
                             "representations": diagnostics["representations"],
                             "gaussian": diagnostics["gaussian"],
                         }
-                        if start == 0 and precision == "fp32":
-                            norms, cosines, total = component_gradients(
-                                model, data, labels, config["loss_weights"])
-                            bucket["batch0"]["gradient_norms_3d_encoder"] = norms
-                            bucket["batch0"]["gradient_cosines_3d_encoder"] = cosines
-                            bucket["batch0"]["total_objective"] = total
-                            clean = build_dual_sample(*source[stream.index_at(positions[0])])
-                    if start == 0:
-                        index0 = stream.index_at(positions[0])
-                        clean0 = build_dual_sample(*source[index0])
-                        clean_ref = copy.copy(source[index0][1])
-                        noisy_ref = copy.deepcopy(clean0)
-                        step_entry["perturbed_reference"] = perturbed_reference(
-                            clean0, noisy_ref, labels)
-                step_entry["status"] = "OK"
-                entry["steps"][step] = step_entry
+                        if batch_id == "batch0" and precision == "fp32":
+                            params = [p for p in model.encoder.glt.parameters()
+                                      if p.requires_grad]
+                            norms, cosines, note = component_gradients(
+                                model, out, weights, 4, int(out["counts"][1]),
+                                params)
+                            entry["precisions"][precision][batch_id][
+                                "gradient_norms_3d_encoder"] = norms
+                            entry["precisions"][precision][batch_id][
+                                "gradient_cosines_3d_encoder"] = cosines
+                            if note:
+                                entry["precisions"][precision][batch_id][
+                                    "gradient_note"] = note
+                report["checkpoints"][mode]["steps"][str(step)] = entry
                 del model
-                torch.cuda.empty_cache()
-            report["checkpoints"][mode] = entry
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
     finally:
         source.close()
+    report["failures"] = failures
+    report["status"] = "PASS" if not failures else "FAIL"
     write_json(Path(args.report_json), report)
-    print(json.dumps({"report": args.report_json,
-                      "modes": list(report["checkpoints"])}, indent=2))
-    return 0
+    print(json.dumps({"report": args.report_json, "status": report["status"],
+                      "failures": failures}, indent=2))
+    return 0 if not failures else 2
 
 
 if __name__ == "__main__":

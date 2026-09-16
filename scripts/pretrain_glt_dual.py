@@ -20,6 +20,63 @@ from src.training.glt_dual_runtime import (require_tmux, open_source, save_check
 from src.utils import set_global_seed
 
 
+def _module_grad_norms(model):
+    """Gradient norms per module group, measured before clipping."""
+
+    groups = {
+        'o8_2d_encoder': model.encoder.o8,
+        'glt_3d_encoder': model.encoder.glt,
+        'length_head': model.length_head,
+        'angle_head': model.angle_head,
+        'fp_head': model.fp_head,
+        'atom_head': model.atom_head,
+    }
+    seen, report = set(), {}
+    for name, module in groups.items():
+        params = [p for p in module.parameters() if p.requires_grad]
+        seen.update(id(p) for p in params)
+        flat = [p.grad.detach().reshape(-1) for p in params if p.grad is not None]
+        report[name] = float(torch.cat(flat).norm()) if flat else 0.0
+    fusion = [p.grad.detach().reshape(-1) for p in model.parameters()
+              if id(p) not in seen and p.grad is not None]
+    report['fusion'] = float(torch.cat(fusion).norm()) if fusion else 0.0
+    return report
+
+
+def _reference_steps(path):
+    """Rank-0 step records from an earlier run log, keyed by step."""
+
+    records = {}
+    for line in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+        line = line.strip()
+        if not line.startswith('{"step"'):
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get('rank') == 0:
+            records[int(row['step'])] = row
+    return records
+
+
+def _check_reference(reference, step, lr, target_counts, losses, rtol=1e-3):
+    """Abort when the resumed trajectory no longer matches the original run."""
+
+    expected = reference.get(step)
+    if expected is None:
+        return
+    if abs(float(expected['lr']) - lr) > 1e-12:
+        raise RuntimeError(f'resume LR differs from the original run at step {step}')
+    if [float(x) for x in expected['target_counts']] != [float(x) for x in target_counts]:
+        raise RuntimeError(f'resume target counts differ from the original run at step {step}')
+    for name, value, original in zip(('chem', 'geometry', 'fingerprint'), losses,
+                                     expected['losses']):
+        if abs(value - float(original)) > rtol * max(1e-6, abs(float(original))):
+            print(json.dumps({'reference_mismatch': name, 'step': step,
+                              'observed': value, 'original': float(original)}), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('config', 'cohort-root', 'cache-root', 'output'):
@@ -32,6 +89,15 @@ def main():
     parser.add_argument('--prep-workers', type=int, default=0,
                         help='DataLoader workers per rank for input prefetch '
                              '(0 = inline preparation, the exact original path)')
+    parser.add_argument('--diagnostics', action='store_true',
+                        help='observation only: per-step component/gradient logging; '
+                             'never writes deployment packages')
+    parser.add_argument('--stop-after-step', type=int, default=0,
+                        help='diagnostic stop position (requires --diagnostics)')
+    parser.add_argument('--diagnostic-save-steps', type=int, nargs='*', default=[],
+                        help='steps inside this run at which to save a resume state')
+    parser.add_argument('--reference-log',
+                        help='original run log for the initial-10-step cross-check')
     args = parser.parse_args()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
@@ -74,7 +140,8 @@ def main():
             raise ValueError('microbatch * accumulation * world must equal global_batch')
         accumulation = batch_size // (micro * world)
         set_global_seed(config['seed'])
-        base = DualPretrainer(config['fusion_mode']).to(device)
+        base = DualPretrainer(config['fusion_mode'],
+                              collect_diagnostics=bool(args.diagnostics)).to(device)
         optimizer = torch.optim.AdamW(base.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
         module = DistributedDataParallel(base, device_ids=[device.index] if device.type == 'cuda' else None,
                                          find_unused_parameters=True) if world > 1 else base
@@ -109,8 +176,21 @@ def main():
             raise FileExistsError('resume would overwrite later existing deployment checkpoints')
         if any(int(p.stem.rsplit('_', 1)[-1]) > start for p in output.glob('resume_*.pt')):
             raise FileExistsError('resume would overwrite later existing training checkpoints')
+        stop = config['max_optimizer_steps']
+        if args.stop_after_step:
+            if not args.diagnostics:
+                raise ValueError('--stop-after-step requires --diagnostics')
+            if not start < int(args.stop_after_step) <= config['max_optimizer_steps']:
+                raise ValueError('--stop-after-step must satisfy start < stop <= config.max_optimizer_steps')
+            stop = int(args.stop_after_step)
+        save_steps = sorted({int(value) for value in args.diagnostic_save_steps})
+        for value in save_steps:
+            if not start < value <= stop:
+                raise ValueError('--diagnostic-save-steps must lie inside this run')
         if rank == 0:
-            write_json(output / 'run.json', dict(identity=identity, command=sys.argv, accumulation=accumulation))
+            write_json(output / 'run.json', dict(identity=identity, command=sys.argv,
+                accumulation=accumulation, diagnostics=bool(args.diagnostics),
+                stop_after_step=stop, diagnostic_save_steps=save_steps))
         stream = OrderedSampleStream(len(source), config['seed'])
         # Optional CPU prefetch.  The prepared items are identical to the
         # inline path (pure function of sample and absolute position); only
@@ -122,14 +202,17 @@ def main():
             dataset = RankMicrobatchStream(
                 source, seed=config['seed'], world=world, rank=rank,
                 microbatch=micro, accumulation=accumulation,
-                start_step=start, max_steps=config['max_optimizer_steps'],
+                start_step=start, max_steps=stop,
                 sigma=config['noise_sigma'], ratio=config['atom_mask_ratio'],
             )
             prefetch = iter(torch.utils.data.DataLoader(
                 dataset, batch_size=None, num_workers=int(args.prep_workers),
                 prefetch_factor=4, persistent_workers=False, pin_memory=False,
             ))
-        for step in range(start, config['max_optimizer_steps']):
+        reference = _reference_steps(args.reference_log) if args.reference_log else {}
+        diagnostics_path = output / 'diagnostics_steps.jsonl'
+        dense_lo = min(save_steps) - 60 if save_steps else None
+        for step in range(start, stop):
             if prefetch is not None:
                 prepared = [next(prefetch) for _ in range(accumulation)]
             else:
@@ -176,7 +259,8 @@ def main():
                     loss.backward()
                 totals += result['sums'].detach()
                 target_counts += result['targets'].detach()
-            torch.nn.utils.clip_grad_norm_(base.parameters(), 1., error_if_nonfinite=True)
+            grad_total_preclip = float(torch.nn.utils.clip_grad_norm_(
+                base.parameters(), 1., error_if_nonfinite=True))
             optimizer.step()
             if world > 1:
                 dist.all_reduce(totals)
@@ -184,6 +268,44 @@ def main():
             print(json.dumps(dict(step=step + 1, rank=rank, lr=float(lr),
                 losses=(totals / counts.clamp_min(1)).tolist(), valid_graphs=counts.tolist(),
                 target_counts=target_counts.tolist(), local_fallbacks=fallbacks, local_skip_reasons=reasons)), flush=True)
+            if args.diagnostics and rank == 0 and base.last_diagnostics is not None:
+                components = base.last_diagnostics['components']
+                record = dict(step=step + 1, lr=float(lr), grad_total_preclip=grad_total_preclip,
+                              grad_norms=_module_grad_norms(base),
+                              components={k: components[k] for k in (
+                                  'chem_sum', 'length_sum', 'angle_sum', 'geometry_sum',
+                                  'geometry_valid_count', 'angle_valid_count', 'graphs_without_angle')},
+                              global_losses=(totals / counts.clamp_min(1)).tolist(),
+                              target_counts=target_counts.tolist(),
+                              rank_scoped_statistics='representation/Gaussian/angle-head values below are rank0-local')
+                dense = (step + 1) in save_steps or (dense_lo is not None and dense_lo <= step + 1 <= stop)
+                if dense or (step + 1) % 20 == 0:
+                    record['angle_head'] = base.last_diagnostics['angle_head']
+                    record['representations'] = base.last_diagnostics['representations']
+                    record['gaussian'] = base.last_diagnostics['gaussian']
+                    record['predictions'] = base.last_diagnostics['predictions']
+                with diagnostics_path.open('a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + '\n')
+                if step + 1 == start + 10 and reference:
+                    _check_reference(reference, step + 1, float(lr),
+                                     target_counts.tolist(),
+                                     (totals / counts.clamp_min(1)).tolist())
+            if args.diagnostics:
+                if (step + 1) in save_steps:
+                    states = [None] * world
+                    if world > 1:
+                        dist.all_gather_object(states, rng_state())
+                    else:
+                        states[0] = rng_state()
+                    if rank == 0:
+                        save_checkpoint(output / f'resume_{step + 1:05d}.pt', dict(identity=identity,
+                            ordered_keys=ordered_keys, step=step + 1,
+                            next_position=(step + 1) * batch_size, model=base.state_dict(),
+                            optimizer=optimizer.state_dict(), rng=states,
+                            scheduler=dict(step=step + 1, lr=float(lr))))
+                    if world > 1:
+                        dist.barrier()
+                continue
             if (step + 1) % config['save_every'] == 0 or step + 1 == config['max_optimizer_steps']:
                 states = [None] * world
                 if world > 1:
