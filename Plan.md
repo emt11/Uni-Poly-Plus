@@ -279,3 +279,62 @@ python scripts/diagnose_glt_dual_pretrain.py
 ### 审查与下一步
 
 待 Codex 审查。建议下一步（需新授权）：补 egc 5 fold 恢复 8 任务口径，或按计划优先级进入 MATCHED O8-ONLY 对照。
+
+---
+
+## 缓存优化周期 CACHE-20260916-01 / r1 执行记录（ZCode，2026-09-16）
+
+依据 `Plan_Cache.md` r1（用户指示"执行该计划"）。执行前核对：`git pull --ff-only` 为 Already up to
+date、分支 `dev`、工作树干净、无训练/构建进程；active 身份与计划基线一致（PI1M bundle
+`30f17b59…`、cohort `b03f96a1…`、dual_static_v1 `9ff122cc…`、pretrain_targets_v1 `5e7b5ec8…`、
+下游 bundle `1545eda5…`，各 235／8 chunks）。本轮唯一产物目录
+`results/cache_optimization_20260916T145328Z/`，日志 `logs/cache_optimization_20260916T145328Z/`，
+tmux window `cache_opt_a`／`a2`／`a3`／`a4`／`parity`／`bench`。
+
+### 阶段 A（有界只读化学审计复核）
+
+* 全量分解现有逐样本审计记录（`audit_reason_decomposition.json`）：11,338 FAIL 中 9,725 为非对称／
+  芳香连接对、1,571 为源中显式 `[2H]`、41 两者兼具、1 条残余；20,000 PASS 对照中 19,988 无这两类特征。
+* 逐例复核 44 个真实样本（预算 48）：10 条判为"审计期望 H 未计入显式源氢"、19 条判为"审计参照未对齐
+  已声明 `mismatch_single` 连接策略"、1 条残余判为"审计自身重建分子导致"（payload 与源逐项一致，
+  P=O 键级 2、电荷 0，重建后 `SanitizeMol` 出现 -1/SP3 氧），8 条 stereo 参照未解对照、6 条 PASS 对照。
+  **0 条未解释**；未把任何状态改写为 PASS，未估计化学错误率。
+* 4 条 `trimer_ru_internal_bond_contract` 在图层面复现（未调用 ETKDG／MMFF）：每个案例最外侧 RU 副本
+  对芳香环的感知不同（如 `codes_per_ru [4,4,1]`），检查器据此拒绝而未发布不一致副本；这 4 条不在接受集，
+  记为 manifest 的 `unclassified_failure_count: 4`。
+* 9 个下游几何 fallback 独立核实：全部 `geometry_invalid`、全部仍在下游 cohort records 中、全部属 egc；
+  3,646 + 9 = 3,655 口径自洽。
+
+### 阶段 B（最小修复、故障注入与真实样本 parity）
+
+修改文件：`src/dataset/glt_dual_static.py`、`scripts/build_glt_dual_static_cache.py`、
+`scripts/finalize_glt_dual_static_artifact.py`。修复 5 处缺口（staging 构建身份、chunk 原子写与隔离
+恢复、单边发布幂等、冻结后只读、读取端载荷校验），细节见 `results/cache_optimization_<RUN>/decision.md`
+与 `PIPELINE.md` 附录。新增 `tests/test_glt_dual_static_recovery.py`（10 项，全部通过）；
+`tests/test_glt_dual_static.py` 3 项、相关既有套件 68 项保持通过。
+
+真实样本 parity（`parity.json`）：32 个固定真实样本（PI1M 20：普通 12＋无中心角 8；下游 12：几何
+fallback 9＋普通 3）用当前构建块生成新的临时派生缓存，与已发布参考 artifact 逐数组比较，
+**0 个样本存在差异**（整数／搬运字段完全一致）；临时输出 469,563 bytes（预算 1 GiB）；
+冻结缓存零写入。
+
+### 阶段 C（公平 benchmark 与候选判定）
+
+固定 2,048 索引（`OrderedSampleStream(seed=42)`，清单与 sha256 存于 `benchmark.json`）、同一位置
+布局以保证样本级 mask／noise／targets 相同、仅 CPU、无模型／GPU；worker=0 配对各 2 次重复，
+另加 3 worker 预取各 1 次。分项（worker=0）：源 LMDB 读 17.8 ms、static 读 4.95 ms、target 读 1.04 ms、
+完整准备 11.5 ms、合计 35.4 ms。
+
+* 候选（有界 chunk 缓存容量 64）中位吞吐 29.68 samples/s vs 基线 28.45，比值 **1.043 < 1.10 ⇒ 不采纳**；
+  p95 无退化（0.983），FD 峰值由 92 升至 1890（两次重复相同，非泄漏），且候选与基线产出**逐字节相同**的
+  准备结果（`benchmark_candidate_identity.json`）。
+* 第二候选（复用静态角度索引）已是当前生产路径：`materialize_dual_geometry` 直接使用 static 的
+  `angle_pos_triplet`／`token_pos_index_*`，故 static 读仅占约 14%，无新的单因素改动依据。
+* 生产默认容量保持 2；本轮不切换配置、不删缓存、不重建、不训练。
+
+### 审查待办与未执行项
+
+未执行：阶段 D（紧凑存储）、全量重建、格式迁移、生产配置切换、缓存删除、任何训练或模型评估。
+停止条件均未触发（身份一致、无 writer 冲突、无非有限数据、中心监督与样本集合语义未变）；相对计划的
+唯一偏差是 worker=0 配对重复次数由最多 3 次降为 2 次，以遵守 30 分钟总预算。交付结论待 Codex 审查
+并按 `Plan_Cache.md` §8 分层完成标准归档；`Plan_Cache.md` 的执行记录与 `PROJECT_HISTORY.md` 归档由 Codex 维护。

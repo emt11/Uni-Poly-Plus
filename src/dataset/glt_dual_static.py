@@ -11,6 +11,7 @@ from collections import OrderedDict
 import json
 import os
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -23,6 +24,9 @@ from .periodic_line_glt_complete import (
 
 
 STATIC_FORMAT = "glt-dual-static-v1"
+# Bounded chunk-mapping cache.  The default keeps the original behaviour; a
+# larger capacity is a benchmark candidate and must be requested explicitly.
+CHUNK_CACHE_CAPACITY = 2
 TARGET_FORMAT = "glt-dual-pretrain-targets-v1"
 STATIC_FIELDS = (
     "bond_path_features", "bond_path_mask", "token_pos_index_a",
@@ -292,27 +296,152 @@ def _pack_rows(rows, target=False):
     return packed
 
 
-def write_chunk(root, start, rows, *, targets=False):
+def _quarantine(path, quarantine_root):
+    """Move an interrupted leftover aside instead of deleting it."""
+
+    quarantine_root = Path(quarantine_root)
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    target = quarantine_root / f"{Path(path).name}.attempt_{int(time.time() * 1000)}"
+    os.replace(path, target)
+    return target
+
+
+def write_chunk(root, start, rows, *, targets=False, quarantine_root=None):
+    """Write one complete chunk atomically.
+
+    The payload is written into a private temporary directory inside this
+    staging root and only then renamed to its final name, so a chunk that
+    exists together with ``.complete`` is always a finished chunk.  An
+    interrupted leftover is quarantined only when ``quarantine_root`` is given,
+    i.e. when the caller has confirmed the staging belongs to this build; a
+    completed chunk is never overwritten.
+    """
+
     root = Path(root)
-    chunk = root / "chunks" / f"chunk_{start:08d}"
-    if chunk.exists():
-        raise FileExistsError(f"refusing to overwrite static chunk: {chunk}")
-    chunk.mkdir(parents=True)
+    chunks = root / "chunks"
+    chunks.mkdir(parents=True, exist_ok=True)
+    chunk = chunks / f"chunk_{start:08d}"
+    temp = chunks / f".tmp_chunk_{start:08d}"
+    for existing in (chunk, temp):
+        if not existing.exists():
+            continue
+        if (existing / ".complete").is_file():
+            raise FileExistsError(f"refusing to overwrite completed static chunk: {existing}")
+        if quarantine_root is None:
+            raise FileExistsError(f"refusing to overwrite static chunk: {existing}")
+        _quarantine(existing, quarantine_root)
+    temp.mkdir(parents=True)
     packed = _pack_rows(rows, target=targets)
     for name, value in packed.items():
-        np.save(chunk / f"{name}.npy", value)
+        np.save(temp / f"{name}.npy", value)
     manifest = {"start": int(start), "count": len(rows), "target": bool(targets),
                 "arrays": {name: {"shape": list(value.shape), "dtype": str(value.dtype)}
                            for name, value in packed.items()}}
-    atomic_json(chunk / "manifest.json", manifest)
-    (chunk / ".complete").write_text("complete\n", encoding="utf-8")
+    atomic_json(temp / "manifest.json", manifest)
+    (temp / ".complete").write_text("complete\n", encoding="utf-8")
+    os.replace(temp, chunk)
     return manifest
 
 
+SAMPLE_OFFSET_TABLES = (
+    "bond_path_offsets", "token_offsets", "line_relation_offsets",
+    "line_path_offsets", "distance_token_offsets", "angle_pair_offsets",
+    "brics_sample_group_ptr",
+)
+
+RAGGED_PAYLOADS = (
+    ("bond_path_features", "bond_path_offsets"),
+    ("bond_path_mask", "bond_path_offsets"),
+    ("token_pos_index_a", "token_offsets"),
+    ("token_pos_index_b", "token_offsets"),
+    ("token_z_a", "token_offsets"),
+    ("token_z_b", "token_offsets"),
+    ("token_bond_type", "token_offsets"),
+    ("token_center_mask", "token_offsets"),
+    ("line_source", "line_relation_offsets"),
+    ("line_target", "line_relation_offsets"),
+    ("line_path", "line_path_offsets"),
+    ("line_path_mask", "line_path_offsets"),
+    ("line_path_group", "line_path_offsets"),
+    ("line_is_self", "line_path_offsets"),
+    ("angle_pos_triplet", "line_path_offsets"),
+    ("distance_token_index", "distance_token_offsets"),
+    ("angle_pairs", "angle_pair_offsets"),
+    ("brics_atom_index", "brics_group_atom_ptr"),
+)
+
+
+def load_chunk_payload(chunk, item, *, targets=False):
+    """Load one chunk's arrays and verify its recorded payload contract.
+
+    Only headers and the offset tables are inspected: this is deliberately not
+    a content hash, but a missing file, a truncated array, a shape/dtype change
+    or an offset table that does not partition the payload must not pass.
+    """
+
+    recorded = item.get("arrays")
+    if not isinstance(recorded, dict) or not recorded:
+        raise CacheLifecycleError(f"chunk manifest records no arrays: {chunk}")
+    arrays = {}
+    for name, expected in sorted(recorded.items()):
+        path = Path(chunk) / f"{name}.npy"
+        if not path.is_file():
+            raise CacheLifecycleError(f"chunk payload file is missing: {path}")
+        try:
+            value = np.load(path, mmap_mode="r")
+        except Exception as exc:
+            raise CacheLifecycleError(f"chunk payload cannot be read: {path}") from exc
+        if list(value.shape) != list(expected.get("shape", [])):
+            raise CacheLifecycleError(f"chunk payload shape mismatch: {path}")
+        if str(value.dtype) != str(expected.get("dtype")):
+            raise CacheLifecycleError(f"chunk payload dtype mismatch: {path}")
+        arrays[name] = value
+    count = int(item["count"])
+    ragged_names = {name for name, _ in RAGGED_PAYLOADS}
+    # Sample-level offset tables carry one more entry than rows.  Payload-level
+    # pointers (for example the BRICS group->atom table) are instead checked
+    # against the array they partition, through RAGGED_PAYLOADS below.
+    for name in SAMPLE_OFFSET_TABLES:
+        if name not in arrays:
+            continue
+        table = np.asarray(arrays[name])
+        if int(table.shape[0]) != count + 1:
+            raise CacheLifecycleError(f"chunk sample offset table shape mismatch: {name}")
+        if int(table[0]) != 0 or np.any(np.diff(table) < 0):
+            raise CacheLifecycleError(f"chunk offset table is not a monotone partition: {name}")
+    for name, value in arrays.items():
+        if name.endswith("offsets") or name.endswith("_ptr") or name in ragged_names:
+            continue
+        if value.ndim == 0 or int(value.shape[0]) != count:
+            raise CacheLifecycleError(f"chunk payload row count mismatch: {name}")
+    for name, value in arrays.items():
+        if not name.endswith("_ptr") or name in SAMPLE_OFFSET_TABLES:
+            continue
+        table = np.asarray(value)
+        if int(table[0]) != 0 or np.any(np.diff(table) < 0):
+            raise CacheLifecycleError(f"chunk pointer table is not a monotone partition: {name}")
+    for name, offset_name in RAGGED_PAYLOADS:
+        if name not in arrays or offset_name not in arrays:
+            continue
+        table = np.asarray(arrays[offset_name])
+        if int(table[-1]) != int(arrays[name].shape[0]):
+            raise CacheLifecycleError(
+                f"chunk ragged payload length does not match its offsets: {name}")
+    if targets:
+        for name in ("brics_sample_group_ptr", "fingerprint_packed"):
+            if name not in arrays:
+                raise CacheLifecycleError(f"target chunk lacks pretrain targets: {chunk}")
+    elif "geometry_valid" not in arrays or "geometry_invalid_reason" not in arrays:
+        raise CacheLifecycleError(f"static chunk lacks geometry flags: {chunk}")
+    return arrays
+
+
 class _ChunkReader:
-    def __init__(self, root, manifest):
+    def __init__(self, root, manifest, *, targets=False, cache_capacity=CHUNK_CACHE_CAPACITY):
         self.root = Path(root)
         self.manifest = manifest
+        self.targets = bool(targets)
+        self.cache_capacity = max(1, int(cache_capacity))
         self.starts = np.asarray([int(item["start"]) for item in manifest["chunks"]], dtype=np.int64)
         self._cache = OrderedDict()
 
@@ -322,12 +451,9 @@ class _ChunkReader:
             return self._cache[chunk_id]
         item = self.manifest["chunks"][chunk_id]
         chunk = self.root / item["path"]
-        arrays = {
-            path.stem: np.load(path, mmap_mode="r")
-            for path in chunk.glob("*.npy")
-        }
+        arrays = load_chunk_payload(chunk, item, targets=self.targets)
         self._cache[chunk_id] = arrays
-        while len(self._cache) > 2:
+        while len(self._cache) > self.cache_capacity:
             self._cache.popitem(last=False)
         return arrays
 
@@ -375,7 +501,7 @@ class DualStaticCache:
     """Read a frozen chunked static artifact by cohort index."""
     def __init__(self, root, *, expected_format=STATIC_FORMAT,
                  parent_bundle_hash=None, cohort_manifest_hash=None,
-                 ordered_keys_hash=None):
+                 ordered_keys_hash=None, chunk_cache_capacity=CHUNK_CACHE_CAPACITY):
         self.root = Path(root).resolve()
         manifest_path, frozen_path, keys_path = (
             self.root / "manifest.json", self.root / ".frozen", self.root / "sample_keys.npy"
@@ -411,7 +537,9 @@ class DualStaticCache:
             expected_start += count
         if expected_start != int(self.manifest["sample_count"]):
             raise CacheLifecycleError("static cache chunk count mismatch")
-        self._reader = _ChunkReader(self.root, self.manifest)
+        self._reader = _ChunkReader(self.root, self.manifest,
+                                    targets=self.manifest.get("format") == TARGET_FORMAT,
+                                    cache_capacity=chunk_cache_capacity)
 
     def __len__(self):
         return int(self.manifest["sample_count"])
@@ -446,7 +574,7 @@ def load_static_caches(static_root, target_root=None, **bindings):
 
 
 __all__ = [
-    "STATIC_FORMAT", "TARGET_FORMAT", "STATIC_FIELDS", "TARGET_FIELDS",
+    "CHUNK_CACHE_CAPACITY", "STATIC_FORMAT", "TARGET_FORMAT", "STATIC_FIELDS", "TARGET_FIELDS",
     "build_dual_static", "build_pretrain_target", "materialize_dual_geometry",
     "write_chunk", "DualStaticCache", "PretrainTargetsCache", "load_static_caches",
 ]

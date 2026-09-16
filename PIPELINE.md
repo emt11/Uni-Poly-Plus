@@ -915,3 +915,29 @@ PI1M cohort 959,588 条（source 988,775；trimer 959,588/29,181）。历史 art
 * 不变性：诊断开关不改变 loss、梯度、`state_dict`、RNG 消耗与数据顺序
 （`tests/test_glt_dual_diagnostics.py`，7 项）。B.3 回放进一步实证：从同一 `resume_02000.pt`
 恢复的 800 步与正式 5k 运行逐位一致（chem/geo/FP `max|diff| = 0`）。
+
+## 附：`dual_static_v1`／`pretrain_targets_v1` 构建与冻结契约（CACHE-20260916-01 / r1）
+
+本节记录本轮缓存优化周期实际改动的流程行为；它不是新的授权来源，也不改变 active artifact 身份。
+
+* **构建身份写入 staging**：`scripts/build_glt_dual_static_cache.py` 在写第一个 chunk 前把
+  `build_context.json`（`format`／`parent_bundle_hash`／`cohort_manifest_hash`／
+  `build_parameters`／`ordered_sample_key_hash`）写入 staging。恢复时必须逐项一致；仅有相同
+  sample keys 不再构成恢复依据，来源、参数或 cohort 不同即拒绝。
+* **chunk 原子写**：`src/dataset/glt_dual_static.py:write_chunk` 先写入 staging 内的私有临时目录，
+  再整体改名到最终 chunk 名，因此带 `.complete` 的 chunk 一定是完整 chunk。中断残留只在调用方
+  确认拥有该 staging 时被移入 `<staging>/.interrupted/` 隔离（不删除）；已完成 chunk 永不覆盖。
+* **单边发布幂等恢复**：static 与 targets 是两个独立根目录，两次 rename 不构成整体原子性。启动时
+  区分 none／static-only／target-only／both：已发布一侧必须先通过其自身构建身份校验才可复用，
+  只构建并发布缺失的一侧；两侧都已发布且身份一致时为幂等空操作（`status: IDEMPOTENT`）。
+* **单 writer 互斥**：staging 内的 `build.lock` 记录持有者 pid；并发 writer 直接报错，死进程遗留的
+  lock 会被回收，保证中断构建仍可恢复。
+* **冻结后只读**：`scripts/finalize_glt_dual_static_artifact.py` 拒绝修改已冻结 artifact（`.frozen`
+  存在）。manifest 已最终时是幂等空操作；否则报错并可用 `--diagnostic-report` 输出独立诊断报告，
+  不改写任何字节。汇总与校验必须发生在冻结之前。
+* **读取端载荷校验**：`DualStaticCache` 映射某个 chunk 时校验其 manifest 记录的数组文件存在、
+  shape／dtype 与记录一致、样本级偏移表长度为 `count+1` 且单调、载荷级指针恰好划分其载荷、
+  geometry 或 target 标记齐全。这是元数据与边界校验，**不是**载荷内容 hash；缺文件、截断或错位
+  都会被拒绝，不静默通过。
+* **chunk 映射缓存容量**：`CHUNK_CACHE_CAPACITY` 默认仍为 2（与历史行为一致）。本轮 benchmark
+  的另一容量取值只是候选，未采纳、未改变生产默认；读取路径的显式参数仅用于基准与测试。

@@ -12,6 +12,7 @@ from torch.utils.data import Dataset
 
 from src.dataset.glt_dual import FrozenDualLayerSource, build_dual_sample
 from src.dataset.glt_dual_cache import load_dual_cohort
+from src.dataset.glt_dual_static import CHUNK_CACHE_CAPACITY
 
 
 TASKS = ('eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc')
@@ -94,16 +95,18 @@ def require_tmux():
 
 
 def open_source(cohort_root, cache_root, *, task=None, dual_static_root=None,
-                pretrain_target_root=None):
+                pretrain_target_root=None,
+                chunk_cache_capacity=CHUNK_CACHE_CAPACITY):
     full_cohort = load_dual_cohort(cohort_root, cache_root)
     static_cache = target_cache = None
     if dual_static_root is not None:
-        from src.dataset.glt_dual_static import load_static_caches
+        from src.dataset.glt_dual_static import CHUNK_CACHE_CAPACITY, load_static_caches
         try:
             static_cache, target_cache = load_static_caches(
                 dual_static_root, pretrain_target_root,
                 parent_bundle_hash=full_cohort['manifest']['main_bundle_hash'],
                 cohort_manifest_hash=full_cohort['manifest_hash'],
+                chunk_cache_capacity=chunk_cache_capacity,
             )
         except Exception:
             if static_cache is not None:
