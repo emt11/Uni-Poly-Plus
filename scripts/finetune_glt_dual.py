@@ -218,7 +218,9 @@ def main():
                 if visits[test].any():
                     raise ValueError('outer test indices predicted more than once')
                 predictions[test], visits[test] = y_pred, visits[test] + 1
-                result.update(task=task, fold=fold_id, best_validation_r2=best_r2, best_epoch=best_epoch)
+                result.update(task=task, fold=fold_id, protocol='outer5_inner20',
+                              formal_shard=bool(args.formal_shard),
+                              best_validation_r2=best_r2, best_epoch=best_epoch)
                 pd.DataFrame(dict(row_index=test, target=y_true, prediction=y_pred)).to_csv(folder / 'predictions.csv', index=False)
                 save_checkpoint(folder / 'best.pt', dict(state_dict=best, fusion_mode=run_config['fusion_mode'],
                     architecture=encoder.architecture_name, task=task, fold=fold_id, protocol='outer5_inner20',
