@@ -322,14 +322,38 @@ def write_chunk(root, start, rows, *, targets=False, quarantine_root=None):
     chunks.mkdir(parents=True, exist_ok=True)
     chunk = chunks / f"chunk_{start:08d}"
     temp = chunks / f".tmp_chunk_{start:08d}"
-    for existing in (chunk, temp):
-        if not existing.exists():
-            continue
-        if (existing / ".complete").is_file():
-            raise FileExistsError(f"refusing to overwrite completed static chunk: {existing}")
+    if chunk.exists():
+        if (chunk / ".complete").is_file():
+            raise FileExistsError(f"refusing to overwrite completed static chunk: {chunk}")
         if quarantine_root is None:
-            raise FileExistsError(f"refusing to overwrite static chunk: {existing}")
-        _quarantine(existing, quarantine_root)
+            raise FileExistsError(f"refusing to overwrite static chunk: {chunk}")
+        _quarantine(chunk, quarantine_root)
+
+    # A process can be interrupted after the completion marker is durable but
+    # before the final directory rename.  A valid, current-owned temporary
+    # chunk is safe to promote; an incomplete or corrupt one is only moved to
+    # the caller's quarantine area, never silently treated as complete.
+    if temp.exists():
+        if (temp / ".complete").is_file():
+            try:
+                observed = json.loads((temp / "manifest.json").read_text(encoding="utf-8"))
+                if (int(observed.get("start", -1)) != int(start)
+                        or int(observed.get("count", -1)) != len(rows)
+                        or bool(observed.get("target")) != bool(targets)):
+                    raise CacheLifecycleError("temporary chunk identity does not match request")
+                load_chunk_payload(temp, observed, targets=targets)
+            except Exception as exc:
+                if quarantine_root is None:
+                    raise CacheLifecycleError(
+                        f"completed temporary chunk is invalid: {temp}") from exc
+                _quarantine(temp, quarantine_root)
+            else:
+                os.replace(temp, chunk)
+                return observed
+        else:
+            if quarantine_root is None:
+                raise FileExistsError(f"refusing to overwrite static chunk: {temp}")
+            _quarantine(temp, quarantine_root)
     temp.mkdir(parents=True)
     packed = _pack_rows(rows, target=targets)
     for name, value in packed.items():
@@ -382,6 +406,20 @@ def load_chunk_payload(chunk, item, *, targets=False):
     recorded = item.get("arrays")
     if not isinstance(recorded, dict) or not recorded:
         raise CacheLifecycleError(f"chunk manifest records no arrays: {chunk}")
+    if targets:
+        required = {
+            "brics_sample_group_ptr", "brics_group_atom_ptr", "brics_atom_index",
+            "fingerprint_packed",
+        }
+    else:
+        required = set(STATIC_FIELDS) | {
+            "geometry_valid", "geometry_invalid_reason", "bond_path_offsets",
+            "token_offsets", "line_relation_offsets", "line_path_offsets",
+            "distance_token_offsets", "angle_pair_offsets",
+        }
+    missing = sorted(required - set(recorded))
+    if missing:
+        raise CacheLifecycleError(f"chunk manifest lacks required arrays: {chunk}: {missing}")
     arrays = {}
     for name, expected in sorted(recorded.items()):
         path = Path(chunk) / f"{name}.npy"

@@ -941,3 +941,23 @@ PI1M cohort 959,588 条（source 988,775；trimer 959,588/29,181）。历史 art
   都会被拒绝，不静默通过。
 * **chunk 映射缓存容量**：`CHUNK_CACHE_CAPACITY` 默认仍为 2（与历史行为一致）。本轮 benchmark
   的另一容量取值只是候选，未采纳、未改变生产默认；读取路径的显式参数仅用于基准与测试。
+
+### CACHE-20260916-01 r2 返修执行记录（ZCode，待 Codex 审查）
+
+本轮仅修复缓存派生构建的恢复／冻结边界并完成有界 parity；不改变 active artifact、模型或
+训练配置。`build_glt_dual_static_cache.py` 现在在持有 staging flock 后才写入 identity／chunk，
+拒绝无上下文的非空 staging，恢复临时 `.complete` chunk 前验证其 payload，并在冻结前验证必需
+数组、target 标志、连续覆盖和 offsets。`finalize_glt_dual_static_artifact.py` 复用同一 payload
+校验；已冻结 artifact 只允许最终 manifest 的幂等读取，不能回写。
+
+`verify_glt_dual_static_parity.py` 生成新的独立 static 与 PI1M target 临时 artifact，使用固定
+20 条 PI1M（普通 12、无中心角 8）和 12 条下游（fallback 9、普通 3）逐项比较静态字段、BRICS、
+原子索引、packed／解包指纹、clean/noisy 输入、mask／label、中心几何和 skip reasons。最终报告
+`results/cache_optimization_repair_20260916T234930Z/parity.json` 为 `PASS`，临时输出
+478,748 bytes，active PI1M／下游缓存 zero-write 均为 true；原 32 条没有可证明的真实 N=0，
+未用人工样本替代。模型状态为 `NOT_RUN`。
+
+相关局部回归最终为 `55 passed, 1 warning`（完整命令和日志见 `logs/cache_opt_r2_postdoc_tests.log` 与 `Plan.md`）。benchmark 工具已
+改为 AB／BA 交替、相同预热、真正 chunk-cache miss 计数和明确的 self／worker-tree 资源范围；
+本轮没有重新执行长 benchmark，因此不产生新的吞吐结论。容量 64 仍是不采用的历史候选，默认
+容量保持 2；阶段 D、全量重建、预训练和微调均未执行。本节是执行事实记录，不等同独立验收。

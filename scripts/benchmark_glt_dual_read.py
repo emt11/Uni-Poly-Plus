@@ -8,7 +8,8 @@ Contract (cache optimization plan section 5):
 * the same per-sample mask/noise/targets for every configuration, because the
   position layout is identical and only the reader configuration changes;
 * worker=0 plus one configuration with at most three prefetch workers;
-* at most three paired repetitions per configuration, alternating order;
+* paired repetitions are executed in AB/BA order with the actual schedule
+  recorded;
 * no GPU, no model, no conformer generation, no write to the frozen caches;
 * reports samples/s, per-sample latency p50/p95, chunk-mapping events, file
   opens, process-tree RSS, FD peak, page faults and machine load.
@@ -93,18 +94,19 @@ def _instrument():
 
     import src.dataset.glt_dual_static as static_module
 
-    counts = {"chunk_map_events": 0, "np_load_calls": 0}
+    counts = {"chunk_cache_misses": 0, "array_open_calls": 0}
     original_load = static_module._ChunkReader._load
 
     def counted_load(self, chunk_id):
-        counts["chunk_map_events"] += 1
+        if chunk_id not in self._cache:
+            counts["chunk_cache_misses"] += 1
         return original_load(self, chunk_id)
 
     static_module._ChunkReader._load = counted_load
     original_np_load = np.load
 
     def counted_np_load(*args, **kwargs):
-        counts["np_load_calls"] += 1
+        counts["array_open_calls"] += 1
         return original_np_load(*args, **kwargs)
 
     np.load = counted_np_load
@@ -161,7 +163,28 @@ def _run_inline(source, indices, *, seed, microbatch, meta):
         "major_faults": faults_after["major_faults"] - faults_before["major_faults"],
         "self_rss_bytes": _rss_bytes(),
         "tree_rss_bytes": _tree_rss(os.getpid()),
+        "resource_scopes": {
+            "fd_peak": "self_process",
+            "self_rss_bytes": "self_process_at_end",
+            "tree_rss_bytes": "process_tree_at_end",
+            "minor_faults": "self_process_delta",
+            "major_faults": "self_process_delta",
+        },
     }
+
+
+def _warmup_inline(source, indices, *, seed, meta):
+    """Warm each configuration identically before recording a repetition."""
+
+    for order, index in enumerate(indices[: min(64, len(indices))]):
+        record = source[index]
+        static = source.static_for(index)
+        target = source.target_for(index)
+        key, _ = source.samples[index]
+        prepare_pretrain_sample(
+            *record, seed=seed, key=key.hex(), position=order,
+            sigma=meta["sigma"], ratio=meta["ratio"], static=static, target=target,
+        )
 
 
 def _run_prefetch(source, indices, *, seed, microbatch, workers, meta):
@@ -199,6 +222,14 @@ def _run_prefetch(source, indices, *, seed, microbatch, workers, meta):
         "self_rss_bytes": _rss_bytes(),
         "rss_peak_bytes": max(rss_peak, _rss_bytes()),
         "tree_rss_bytes": _tree_rss(os.getpid()),
+        "resource_scopes": {
+            "fd_peak": "parent_self_only",
+            "rss_peak_bytes": "process_tree_sampled_by_parent",
+            "self_rss_bytes": "parent_self_at_end",
+            "tree_rss_bytes": "process_tree_at_end",
+            "minor_faults": "parent_self_delta",
+            "major_faults": "parent_self_delta",
+        },
     }
 
 
@@ -227,7 +258,8 @@ def main():
     meta = {"sigma": args.sigma, "ratio": args.ratio}
     report = {"scope": "CPU-only paired read benchmark; no GPU, no model, no conformer generation",
               "samples": args.samples, "seed": args.seed, "microbatch": args.microbatch,
-              "reps": args.reps, "candidate_chunk_capacity": args.capacity,
+              "reps": args.reps, "paired_repetitions": args.reps,
+              "candidate_chunk_capacity": args.capacity,
               "load_average_at_start": list(os.getloadavg())}
     try:
         base_source, frame = open_source(
@@ -252,26 +284,38 @@ def main():
         ]
         report["configurations"] = {}
         for config in configurations:
-            entry = {"capacity": config["capacity"], "workers": config["workers"], "runs": []}
-            for rep in range(args.reps):
+            report["configurations"][config["name"]] = {
+                "capacity": config["capacity"], "workers": config["workers"],
+                "runs": [], "resource_counter_scope": "parent_process_inline",
+            }
+        schedule = []
+        for rep in range(args.reps):
+            order = [configurations[rep % 2], configurations[(rep + 1) % 2]]
+            for config in order:
+                schedule.append({"rep": rep, "name": config["name"]})
                 source, _ = open_source(
                     args.cohort_root, cache_root, dual_static_root=args.dual_static_root,
                     pretrain_target_root=args.pretrain_target_root,
                     chunk_cache_capacity=config["capacity"],
                 )
                 try:
-                    chunk_before, load_before = counts["chunk_map_events"], counts["np_load_calls"]
+                    _warmup_inline(source, indices, seed=args.seed, meta=meta)
+                    chunk_before = counts["chunk_cache_misses"]
+                    load_before = counts["array_open_calls"]
                     run = _run_inline(source, indices, seed=args.seed,
-                                     microbatch=args.microbatch, meta=meta)
+                                      microbatch=args.microbatch, meta=meta)
                     run["rep"] = rep
-                    run["chunk_map_events"] = counts["chunk_map_events"] - chunk_before
-                    run["np_load_calls"] = counts["np_load_calls"] - load_before
-                    entry["runs"].append(run)
+                    run["schedule_position"] = len(schedule) - 1
+                    run["chunk_cache_misses"] = counts["chunk_cache_misses"] - chunk_before
+                    run["array_open_calls"] = counts["array_open_calls"] - load_before
+                    report["configurations"][config["name"]]["runs"].append(run)
                 finally:
                     source.close()
+        report["paired_schedule"] = schedule
+        for config in configurations:
+            entry = report["configurations"][config["name"]]
             entry["median_samples_per_second"] = statistics.median(
                 run["samples_per_second"] for run in entry["runs"])
-            report["configurations"][config["name"]] = entry
 
         # One paired repetition of the existing prefetch path, baseline vs candidate.
         for config in configurations:
@@ -281,12 +325,14 @@ def main():
                 chunk_cache_capacity=config["capacity"],
             )
             try:
-                chunk_before, load_before = counts["chunk_map_events"], counts["np_load_calls"]
                 run = _run_prefetch(source, indices, seed=args.seed, microbatch=args.microbatch,
                                     workers=args.prefetch_workers, meta=meta)
                 run["rep"] = 0
-                run["chunk_map_events"] = counts["chunk_map_events"] - chunk_before
-                run["np_load_calls"] = counts["np_load_calls"] - load_before
+                # DataLoader workers have independent counters; parent-only
+                # instrumentation must not be presented as a worker total.
+                run["chunk_cache_misses"] = None
+                run["array_open_calls"] = None
+                run["resource_counter_scope"] = "not_available_for_prefetch_workers"
                 report["configurations"][config["name"]][
                     f"prefetch_workers{args.prefetch_workers}"] = run
             finally:
@@ -314,11 +360,11 @@ def main():
         "rss_min": min(rss_growth), "rss_max": max(rss_growth),
         "thresholds": {"throughput_gain": 0.10, "p95_regression": 0.05},
         "accepted": bool(ratio >= 1.10 and candidate_p95 <= baseline_p95 * 1.05),
-        "note": ("thresholds are an engineering screen over three paired repetitions, not a "
+        "note": ("thresholds are an engineering screen over the recorded paired repetitions, not a "
                  "statistical significance claim; production switching needs separate authorization"),
     }
-    Path(args.output_json).write_text(
-        json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    from src.dataset.cache_lifecycle import atomic_json
+    atomic_json(Path(args.output_json), report)
     print(json.dumps({key: report[key] for key in
                       ("samples", "reps", "decision", "frozen_cache_zero_write",
                        "load_average_at_end")}, indent=2, sort_keys=True))

@@ -282,6 +282,71 @@ python scripts/diagnose_glt_dual_pretrain.py
 
 ---
 
+## 缓存优化周期 CACHE-20260916-01 / r2 执行记录（ZCode，2026-09-16）
+
+依据 `Plan_Cache.md` §10 及用户“请你作为 ZCode 执行”的直接指令。本轮开始前在
+`dev` 执行 `git pull --ff-only origin dev`（Already up to date），核对工作树、`Uni-Poly`
+tmux 窗口与进程；未发现构建、训练、GPU smoke 或其他 parity 进程。active PI1M／下游
+bundle、cohort、`dual_static_v1`、`pretrain_targets_v1` 全部只读。
+
+### 实施变更
+
+* `scripts/build_glt_dual_static_cache.py`：将 staging 身份写入移到可靠 flock 之后；未知的
+  非空 staging（缺 `build_context.json`）拒绝；完整 chunk 恢复调用载荷校验；最终 manifest
+  在冻结前校验连续 chunk、keys、必需数组和 target 标志；修正 `started` 幂等分支，并支持
+  static 已发布、targets 缺失时的单边恢复。
+* `src/dataset/glt_dual_static.py`：允许同一已确认 staging 中“`.complete` 已写、rename
+  尚未发生”的临时 chunk 先验证后提升；损坏／未知临时目录只在显式 quarantine 根下隔离；
+  `load_chunk_payload` 还要求完整字段集合和 ragged offset／载荷边界。
+* `scripts/finalize_glt_dual_static_artifact.py`：冻结前逐 chunk 验证格式、target 标志、连续
+  覆盖及载荷；已冻结 artifact 仍只读幂等或拒绝。
+* `scripts/verify_glt_dual_static_parity.py`：新建独立 static 与 target 临时 artifact，比较
+  固定真实 keys 的 BRICS／原子索引／packed 与解包指纹、online 与 static clean/noisy 输入、
+  mask／label／中心 distance／angle／skip reasons；拒绝既有 temp 路径，记录分类状态、预算、
+  zero-write 和未执行的模型状态，避免 `shutil.rmtree`。
+* `scripts/benchmark_glt_dual_read.py`：计数改为真正 chunk-cache miss／array open，worker 计数
+  明确为不可得；worker=0 采用 AB／BA 交替与一致预热，记录实际 schedule、重复数和资源字段
+  的 self／tree 范围。生产默认容量仍为 2。
+* 测试：扩展 `tests/test_glt_dual_static_recovery.py`，新增
+  `tests/test_cache_optimization_tools.py`；未修改 active 缓存、模型、训练配置或数据划分。
+
+### 实际验证
+
+1. 初次命令 `PYTHONPATH=.` 收集阶段因测试 fixture import 路径缺失退出码 2，日志
+   `logs/cache_opt_r2_tests.log`；未据此形成代码结论。按项目约定改为 `PYTHONPATH=.:tests`。
+2. 相关恢复／reader／pretrain 回归最终命令：
+   `PYTHONPATH=.:tests pytest -q tests/test_cache_optimization_tools.py tests/test_glt_dual_static_recovery.py tests/test_glt_dual_static.py tests/test_glt_dual_cache.py tests/test_dual_glt.py tests/test_dual_glt_pretrain.py`
+   结果 `55 passed, 1 warning`，退出码 0；完整日志
+   `logs/cache_opt_r2_postdoc_tests.log`。其中覆盖实际 `build()` 两小 chunk、重复幂等、
+   static-only→targets 单边恢复、跨进程 flock、临时 complete chunk、payload 缺失／截断／
+   offset 错位、冻结前 finalize 和报告失败分类。
+   3. 首次真实 parity 在比较器修复前得到 `DATA_MISMATCH`（仅 target tuple／integer container
+   比较器误报），退出码 1，保留于
+   `results/cache_optimization_repair_20260916T234254Z/parity.json`。修复比较器后使用新目录
+   重新执行最终命令（`Uni-Poly:cache_opt_r2_parity3`）：
+   `logs/cache_optimization_repair_20260916T234930Z/parity.log`，退出码 0，报告
+   `results/cache_optimization_repair_20260916T234930Z/parity.json`。PI1M 20 条（普通 12、
+   无中心角 8）和下游 12 条（geometry fallback 9、普通 3）均无差异；独立临时输出
+   478,748 bytes（≤1 GiB），PI1M／下游 active cache zero-write 均为 true。8 条“无中心角”
+   的 angle target 为空且无 NaN；原 32 条中没有可证明真实 N=0 的记录，报告明确为
+   `real_n_zero_proven=false`，未用人工样本替代。
+   新报告中的两组 key 列表与 r1 `parity.json` 逐项相同（未扩充或替换真实记录）。
+
+### R1–R4 状态与边界
+
+| 项 | 实际状态 |
+| --- | --- |
+| R1.1–R1.6 | 已实现并由上述 55 项局部测试覆盖；未做断电耐久承诺 |
+| R2 | 固定 32 条真实 parity PASS；未新增化学审计或构象生成 |
+| R3 | benchmark 口径与工具已修正；未重新运行长 benchmark，不产生新的提速结论；化学结论保持“特征分桶＋有限逐例证据”，不改历史 JSON |
+| R4 | 本执行记录与报告待 Codex 独立审查；当前状态“待审查”，不是最终验收通过 |
+
+未执行：阶段 D 紧凑存储、全量缓存重建／格式迁移／生产切换、任何预训练／微调／GPU
+任务，以及新的长 benchmark。没有修改 `PROJECT_HISTORY.md` 或 `RESULTS.md`；后续由 Codex
+核对 diff、日志、临时 artifact 和 active zero-write 后再决定是否归档。
+
+---
+
 ## 缓存优化周期 CACHE-20260916-01 / r1 执行记录（ZCode，2026-09-16）
 
 依据 `Plan_Cache.md` r1（用户指示"执行该计划"）。执行前核对：`git pull --ff-only` 为 Already up to

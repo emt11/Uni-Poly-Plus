@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from src.dataset.cache_lifecycle import CacheLifecycleError, atomic_json, json_hash
+from src.dataset.glt_dual_static import TARGET_FORMAT, load_chunk_payload
 
 
 def _final_manifest(manifest, root):
@@ -31,6 +32,21 @@ def _final_manifest(manifest, root):
 
     manifest = json.loads(json.dumps(manifest))
     valid, reasons = 0, Counter()
+    expected_start = 0
+    targets = manifest.get("format") == TARGET_FORMAT
+    for item in sorted(manifest.get("chunks", []), key=lambda value: int(value.get("start", -1))):
+        start, count = int(item.get("start", -1)), int(item.get("count", -1))
+        if start != expected_start or count < 0:
+            raise CacheLifecycleError("artifact chunks are not contiguous")
+        if "target" in item and bool(item.get("target")) != targets:
+            raise CacheLifecycleError("artifact chunk target flag does not match format")
+        chunk = Path(root) / str(item.get("path", ""))
+        if not (chunk / ".complete").is_file():
+            raise CacheLifecycleError(f"artifact chunk is not complete: {chunk}")
+        load_chunk_payload(chunk, item, targets=targets)
+        expected_start += count
+    if expected_start != int(manifest.get("sample_count", -1)):
+        raise CacheLifecycleError("artifact chunk count does not match sample_count")
     if manifest['format'].endswith('static-v1'):
         for item in manifest['chunks']:
             chunk = Path(root) / item['path']

@@ -10,6 +10,7 @@ directory can be resumed chunk by chunk.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import multiprocessing as mp
@@ -26,7 +27,8 @@ import numpy as np
 from src.dataset.cache_lifecycle import CacheLifecycleError, atomic_json, json_hash, zero_write_snapshot
 from src.dataset.glt_dual_cache import DualFrozenBundle, load_active_dual_store, load_dual_cohort, ordered_key_hash
 from src.dataset.glt_dual_static import (STATIC_FORMAT, TARGET_FORMAT, build_dual_static,
-                                          build_pretrain_target, write_chunk)
+                                          build_pretrain_target, load_chunk_payload,
+                                          write_chunk)
 
 
 _WORKER_BUNDLE = None
@@ -136,63 +138,132 @@ def _prepare_artifact(root, fmt, keys, cohort, params):
             if published.get(name) != expected:
                 raise CacheLifecycleError(
                     f"published artifact {root} came from a different build context: {name}")
-    staging.mkdir(parents=True, exist_ok=True)
     key_array = np.frombuffer(b"".join(keys), dtype=np.uint8).reshape(-1, 32)
+    if staging.exists() and not staging.is_dir():
+        raise CacheLifecycleError(f"staging path is not a directory: {staging}")
+    context_path = staging / BUILD_CONTEXT_NAME
+    keys_path = staging / "sample_keys.npy"
+    if staging.exists():
+        entries = [path for path in staging.iterdir() if path.name != "build.lock"]
+        if not context_path.is_file() and entries:
+            raise CacheLifecycleError(
+                f"staging contains data but no build context: {staging}")
+        if context_path.is_file():
+            try:
+                recorded = json.loads(context_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise CacheLifecycleError(f"staging build context is unreadable: {staging}") from exc
+            if recorded != context:
+                differing = sorted(name for name in context if recorded.get(name) != context[name])
+                raise CacheLifecycleError(
+                    f"staging belongs to a different build context: {staging} ({','.join(differing)})")
+        if keys_path.exists():
+            try:
+                old = np.load(keys_path, mmap_mode="r")
+            except Exception as exc:
+                raise CacheLifecycleError(f"staging sample keys are unreadable: {staging}") from exc
+            if old.shape != key_array.shape or not np.array_equal(old, key_array):
+                raise CacheLifecycleError(f"staging sample keys differ: {staging}")
+    return root, staging, published
+
+
+def _atomic_numpy(path, value):
+    """Write a small identity array before exposing it in staging."""
+
+    path = Path(path)
+    temporary = path.with_name(path.name + f".tmp.{os.getpid()}.npy")
+    try:
+        np.save(temporary, value)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _initialize_staging(staging, keys, context):
+    """Create/validate staging identity while the caller holds its writer lock."""
+
+    staging = Path(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    keys_array = np.frombuffer(b"".join(keys), dtype=np.uint8).reshape(-1, 32)
     keys_path = staging / "sample_keys.npy"
     if keys_path.exists():
-        old = np.load(keys_path, mmap_mode="r")
-        if old.shape != key_array.shape or not np.array_equal(old, key_array):
+        try:
+            old = np.load(keys_path, mmap_mode="r")
+        except Exception as exc:
+            raise CacheLifecycleError(f"staging sample keys are unreadable: {staging}") from exc
+        if old.shape != keys_array.shape or not np.array_equal(old, keys_array):
             raise CacheLifecycleError(f"staging sample keys differ: {staging}")
     else:
-        np.save(keys_path, key_array)
+        _atomic_numpy(keys_path, keys_array)
     context_path = staging / BUILD_CONTEXT_NAME
-    if context_path.is_file():
-        recorded = json.loads(context_path.read_text(encoding="utf-8"))
+    if context_path.exists():
+        try:
+            recorded = json.loads(context_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise CacheLifecycleError(f"staging build context is unreadable: {staging}") from exc
         if recorded != context:
             differing = sorted(name for name in context if recorded.get(name) != context[name])
             raise CacheLifecycleError(
                 f"staging belongs to a different build context: {staging} ({','.join(differing)})")
     else:
         atomic_json(context_path, context)
-    return root, staging, published
+
+
+class _BuildLock:
+    """An advisory flock whose file descriptor remains held for the build."""
+
+    def __init__(self, path, handle):
+        self.path = Path(path)
+        self.handle = handle
+
+    def is_file(self):
+        return self.path.is_file()
 
 
 def _acquire_build_lock(staging):
     """Explicit single-writer guard for one staging root.
 
-    A concurrent writer must not adopt the same staging.  A lock left by a dead
-    process is reclaimed so that an interrupted build stays resumable.
+    A concurrent writer must not adopt the same staging.  Kernel flock release
+    makes a process-dead lock immediately reclaimable without PID probing or
+    deleting a lock file that may belong to another writer.
     """
 
     staging = Path(staging)
+    staging.mkdir(parents=True, exist_ok=True)
     lock = staging / "build.lock"
-    for attempt in (1, 2):
+    handle = lock.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        holder = ""
         try:
-            handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            holder = lock.read_text(encoding="utf-8").strip() if lock.is_file() else ""
-            alive = False
-            if holder.isdigit():
-                try:
-                    os.kill(int(holder), 0)
-                    alive = True
-                except OSError:
-                    alive = False
-            if alive or attempt == 2:
-                raise CacheLifecycleError(
-                    f"another writer holds this staging: {staging} (pid {holder or 'unknown'})")
-            lock.unlink()
-            continue
-        os.write(handle, str(os.getpid()).encode())
-        os.close(handle)
-        return lock
-    raise CacheLifecycleError(f"could not acquire the staging lock: {staging}")
+            handle.seek(0)
+            holder = handle.read().strip()
+        except OSError:
+            pass
+        handle.close()
+        raise CacheLifecycleError(
+            f"another writer holds this staging: {staging} (pid {holder or 'unknown'})") from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    os.fsync(handle.fileno())
+    return _BuildLock(lock, handle)
 
 
 def _release_build_lock(lock):
-    lock = Path(lock)
-    if lock.is_file() and lock.read_text(encoding="utf-8").strip() == str(os.getpid()):
-        lock.unlink()
+    if not isinstance(lock, _BuildLock):
+        raise TypeError("build lock must be the handle returned by _acquire_build_lock")
+    try:
+        lock.handle.seek(0)
+        lock.handle.truncate()
+        lock.handle.flush()
+        os.fsync(lock.handle.fileno())
+        fcntl.flock(lock.handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock.handle.close()
 
 
 def _publish_plan(*, static_published, targets_requested, targets_published):
@@ -218,14 +289,45 @@ def _existing_chunk(staging, start, count, target):
     chunk = Path(staging) / "chunks" / f"chunk_{start:08d}"
     marker = chunk / ".complete"
     manifest = chunk / "manifest.json"
-    if not (chunk.is_dir() and marker.is_file() and manifest.is_file()):
+    if not chunk.exists():
         return False
-    observed = json.loads(manifest.read_text(encoding="utf-8"))
-    return int(observed.get("start", -1)) == int(start) and int(observed.get("count", -1)) == int(count) and bool(observed.get("target")) == bool(target)
+    if not chunk.is_dir() or not marker.is_file() or not manifest.is_file():
+        if marker.is_file():
+            raise CacheLifecycleError(f"completed chunk lacks a readable manifest: {chunk}")
+        return False
+    try:
+        observed = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise CacheLifecycleError(f"completed chunk manifest is unreadable: {chunk}") from exc
+    if (int(observed.get("start", -1)) != int(start)
+            or int(observed.get("count", -1)) != int(count)
+            or bool(observed.get("target")) != bool(target)):
+        raise CacheLifecycleError(f"completed chunk identity mismatch: {chunk}")
+    load_chunk_payload(chunk, observed, targets=target)
+    return True
 
 
 def _artifact_manifest(root, staging, fmt, selected, cohort, params, chunk_manifests):
     keys = np.load(Path(staging) / "sample_keys.npy", mmap_mode="r")
+    expected_start = 0
+    for item in sorted(chunk_manifests, key=lambda value: int(value.get("start", -1))):
+        start, count = int(item.get("start", -1)), int(item.get("count", -1))
+        if start != expected_start or count < 0:
+            raise CacheLifecycleError("artifact chunks are not contiguous")
+        if bool(item.get("target")) != (fmt == TARGET_FORMAT):
+            raise CacheLifecycleError("artifact chunk target flag does not match format")
+        chunk = Path(staging) / str(item.get("path", ""))
+        if not (chunk / ".complete").is_file():
+            raise CacheLifecycleError(f"artifact chunk is not complete: {chunk}")
+        load_chunk_payload(chunk, item, targets=fmt == TARGET_FORMAT)
+        expected_start += count
+    if expected_start != len(selected):
+        raise CacheLifecycleError("artifact chunk count does not match selected cohort")
+    if keys.shape != (len(selected), 32):
+        raise CacheLifecycleError("artifact sample key shape does not match selected cohort")
+    if ordered_key_hash(keys) != ordered_key_hash(
+            bytes.fromhex(str(row["sample_key"])) for row in selected):
+        raise CacheLifecycleError("artifact sample key order does not match selected cohort")
     spec = {
         "format": fmt,
         "parent_bundle_hash": cohort["manifest"]["main_bundle_hash"],
@@ -244,12 +346,26 @@ def _artifact_manifest(root, staging, fmt, selected, cohort, params, chunk_manif
         "build_spec_hash": json_hash(spec),
         **_git_identity(Path(__file__).resolve().parents[1]),
     }
-    atomic_json(Path(staging) / "manifest.json", manifest)
-    atomic_json(Path(staging) / ".frozen", {"manifest_hash": json_hash(manifest)})
+    manifest_path = Path(staging) / "manifest.json"
+    frozen_path = Path(staging) / ".frozen"
+    if frozen_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise CacheLifecycleError(f"frozen staging manifest is unreadable: {staging}") from exc
+        if frozen != {"manifest_hash": json_hash(existing)}:
+            raise CacheLifecycleError(f"frozen staging does not bind its manifest: {staging}")
+        if existing != manifest:
+            raise CacheLifecycleError(f"frozen staging manifest would change: {staging}")
+        return existing
+    atomic_json(manifest_path, manifest)
+    atomic_json(frozen_path, {"manifest_hash": json_hash(manifest)})
     return manifest
 
 
 def build(args):
+    started = time.time()
     cache_root = Path(args.cache_root).resolve()
     cohort = load_dual_cohort(args.cohort_root, cache_root)
     store = load_active_dual_store(cache_root)
@@ -264,15 +380,23 @@ def build(args):
     if args.build_targets and target_root is None:
         raise ValueError("--build-targets requires --target-root")
     before = zero_write_snapshot(cache_root)
+    static_params = {
+        "chunk_size": int(args.chunk_size), "unique": bool(args.unique),
+        "limit": int(args.limit), "targets": False,
+    }
+    target_params = {
+        "chunk_size": int(args.chunk_size), "unique": bool(args.unique),
+        "limit": int(args.limit), "targets": True,
+    }
     static_root, static_staging, static_published = _prepare_artifact(
         static_root, STATIC_FORMAT, keys, cohort,
-        {"chunk_size": int(args.chunk_size), "unique": bool(args.unique), "limit": int(args.limit), "targets": bool(args.build_targets)},
+        static_params,
     )
     target_staging, target_published = None, False
     if target_root is not None:
         target_root, target_staging, target_published = _prepare_artifact(
             target_root, TARGET_FORMAT, keys, cohort,
-            {"chunk_size": int(args.chunk_size), "unique": bool(args.unique), "limit": int(args.limit), "targets": True},
+            target_params,
         )
     # A published side is never rewritten.  When both sides are already
     # published with a matching context the call is an idempotent no-op; when a
@@ -296,16 +420,23 @@ def build(args):
             "zero_write": True,
             "note": "both requested sides were already published with a matching build context; nothing was rewritten",
         }
-    quarantine_static = static_staging / ".interrupted"
-    quarantine_target = target_staging / ".interrupted" if target_staging is not None else None
-    locks = [_acquire_build_lock(static_staging)]
-    if target_staging is not None:
-        locks.append(_acquire_build_lock(target_staging))
     workers = max(1, int(args.workers))
     chunk_size = max(1, int(args.chunk_size))
-    started = time.time()
     chunks_static, chunks_target = [], []
+    quarantine_static = static_staging / ".interrupted"
+    quarantine_target = target_staging / ".interrupted" if target_staging is not None else None
+    locks = []
     try:
+        # Identity files and all chunk/finalization writes happen only after
+        # every side that will be resumed has acquired its process-held lock.
+        if resume_static:
+            locks.append(_acquire_build_lock(static_staging))
+            _initialize_staging(static_staging, keys, _build_context(
+                STATIC_FORMAT, keys, cohort, static_params))
+        if resume_target:
+            locks.append(_acquire_build_lock(target_staging))
+            _initialize_staging(target_staging, keys, _build_context(
+                TARGET_FORMAT, keys, cohort, target_params))
         context = mp.get_context("fork")
         with context.Pool(
             processes=workers,
@@ -320,10 +451,16 @@ def build(args):
                 if static_done and target_done:
                     if resume_static:
                         observed_static = json.loads((static_staging / "chunks" / f"chunk_{start:08d}" / "manifest.json").read_text())
-                        chunks_static.append({"start": start, "count": len(rows), "path": f"chunks/chunk_{start:08d}", "arrays": observed_static["arrays"]})
+                        chunks_static.append({"start": start, "count": len(rows),
+                                              "target": False,
+                                              "path": f"chunks/chunk_{start:08d}",
+                                              "arrays": observed_static["arrays"]})
                     if resume_target:
                         observed_target = json.loads((target_staging / "chunks" / f"chunk_{start:08d}" / "manifest.json").read_text())
-                        chunks_target.append({"start": start, "count": len(rows), "path": f"chunks/chunk_{start:08d}", "arrays": observed_target["arrays"]})
+                        chunks_target.append({"start": start, "count": len(rows),
+                                              "target": True,
+                                              "path": f"chunks/chunk_{start:08d}",
+                                              "arrays": observed_target["arrays"]})
                     continue
                 payloads = [
                     (index, str(row["sample_key"]), str(row["source_smiles"]),
@@ -341,7 +478,10 @@ def build(args):
                     else:
                         static_manifest = write_chunk(static_staging, start, static_rows, targets=False,
                                                       quarantine_root=quarantine_static)
-                    chunks_static.append({"start": start, "count": len(rows), "path": f"chunks/chunk_{start:08d}", "arrays": static_manifest["arrays"]})
+                    chunks_static.append({"start": start, "count": len(rows),
+                                          "target": False,
+                                          "path": f"chunks/chunk_{start:08d}",
+                                          "arrays": static_manifest["arrays"]})
                 if resume_target:
                     target_rows = [value[3] for value in built]
                     if target_done:
@@ -349,7 +489,10 @@ def build(args):
                     else:
                         target_manifest = write_chunk(target_staging, start, target_rows, targets=True,
                                                       quarantine_root=quarantine_target)
-                    chunks_target.append({"start": start, "count": len(rows), "path": f"chunks/chunk_{start:08d}", "arrays": target_manifest["arrays"]})
+                    chunks_target.append({"start": start, "count": len(rows),
+                                          "target": True,
+                                          "path": f"chunks/chunk_{start:08d}",
+                                          "arrays": target_manifest["arrays"]})
                 if (len(chunks_static) % max(1, int(args.progress_chunks))) == 0:
                     rate = (end / max(1e-6, time.time() - started))
                     print(json.dumps({"progress": end, "total": len(selected), "samples_per_second": rate}), flush=True)
@@ -357,7 +500,7 @@ def build(args):
         if resume_static:
             static_manifest = _artifact_manifest(
                 static_root, static_staging, STATIC_FORMAT, selected, cohort,
-                {"chunk_size": chunk_size, "unique": bool(args.unique), "limit": int(args.limit), "targets": bool(args.build_targets)},
+                static_params,
                 chunks_static,
             )
         else:
@@ -368,7 +511,7 @@ def build(args):
             chunks_target.sort(key=lambda item: int(item["start"]))
             target_manifest = _artifact_manifest(
                 target_root, target_staging, TARGET_FORMAT, selected, cohort,
-                {"chunk_size": chunk_size, "unique": bool(args.unique), "limit": int(args.limit), "targets": True},
+                target_params,
                 chunks_target,
             )
         elif target_root is not None:

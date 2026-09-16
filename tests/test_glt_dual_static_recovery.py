@@ -9,7 +9,10 @@ concurrent writers and finalize-on-frozen).
 """
 
 import json
+import multiprocessing as mp
 from pathlib import Path
+import shutil
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -47,6 +50,15 @@ def _row(*, geometry_valid=True, reason="", n_line=2, n_token=3, n_bond=2,
 def _target_row():
     return {"brics_groups": [np.asarray([0, 1], dtype=np.int32)],
             "fingerprint_packed": np.zeros(256, dtype=np.uint8)}
+
+
+def _hold_build_lock(staging, ready, release):
+    from scripts.build_glt_dual_static_cache import _acquire_build_lock, _release_build_lock
+
+    lock = _acquire_build_lock(staging)
+    ready.send(True)
+    release.recv()
+    _release_build_lock(lock)
 
 
 def _publish(root, chunk_counts, *, fmt="glt-dual-static-v1", targets=False,
@@ -106,6 +118,20 @@ def test_write_chunk_is_atomic_and_quarantines_only_owned_leftovers(tmp_path):
     assert (chunk / "manifest.json").read_text(encoding="utf-8") == json.dumps(manifest, sort_keys=True) \
         or json.loads((chunk / "manifest.json").read_text(encoding="utf-8")) == manifest
 
+    # A complete temporary directory left just before rename is promoted after
+    # its payload contract is revalidated, rather than being rejected as a
+    # duplicate or rebuilt blindly.
+    source = tmp_path / "complete_source"
+    write_chunk(source, 2, [_row()])
+    recover = tmp_path / "recover"
+    (recover / "chunks").mkdir(parents=True)
+    shutil.copytree(source / "chunks" / "chunk_00000002",
+                    recover / "chunks" / ".tmp_chunk_00000002")
+    recovered = write_chunk(recover, 2, [_row()])
+    assert recovered["start"] == 2
+    assert (recover / "chunks" / "chunk_00000002" / ".complete").is_file()
+    assert not (recover / "chunks" / ".tmp_chunk_00000002").exists()
+
 
 def test_loader_rejects_missing_truncated_and_misaligned_payloads(tmp_path):
     root = tmp_path / "static"
@@ -144,14 +170,32 @@ def test_loader_rejects_missing_truncated_and_misaligned_payloads(tmp_path):
         DualStaticCache(nonmonotone).get(0)
 
 
+def test_builder_resume_validates_completed_chunk_payload(tmp_path):
+    from scripts.build_glt_dual_static_cache import _existing_chunk
+
+    root = tmp_path / "resume"
+    manifest = write_chunk(root, 0, [_row(), _row()])
+    item = root / "chunks" / "chunk_00000000" / "token_pos_index_a.npy"
+    np.save(item, np.zeros(1, dtype=np.int32))
+    with pytest.raises(CacheLifecycleError):
+        _existing_chunk(root, 0, 2, False)
+    assert manifest["count"] == 2
+
+
 def test_staging_resume_requires_matching_build_context(tmp_path):
-    from scripts.build_glt_dual_static_cache import _prepare_artifact
+    from scripts.build_glt_dual_static_cache import (
+        _acquire_build_lock, _build_context, _initialize_staging, _prepare_artifact,
+        _release_build_lock,
+    )
 
     root = tmp_path / "out" / "static"
     staging = root.with_name(root.name + ".staging")
     keys = [b"k" * 32, b"j" * 32]
     params = {"chunk_size": 2, "unique": False, "limit": 0, "targets": False}
-    _prepare_artifact(root, "glt-dual-static-v1", keys, _cohort(), params)
+    _, staging, _ = _prepare_artifact(root, "glt-dual-static-v1", keys, _cohort(), params)
+    lock = _acquire_build_lock(staging)
+    _initialize_staging(staging, keys, _build_context("glt-dual-static-v1", keys, _cohort(), params))
+    _release_build_lock(lock)
     assert (staging / "build_context.json").is_file()
 
     # Same keys, different cohort or parent bundle must not resume.
@@ -168,6 +212,13 @@ def test_staging_resume_requires_matching_build_context(tmp_path):
     # Identical identity resumes.
     _, _, published = _prepare_artifact(root, "glt-dual-static-v1", keys, _cohort(), params)
     assert published is None
+
+    unknown = tmp_path / "unknown" / "static"
+    unknown_staging = unknown.with_name(unknown.name + ".staging")
+    unknown_staging.mkdir(parents=True)
+    (unknown_staging / "mystery.bin").write_bytes(b"not a cache")
+    with pytest.raises(CacheLifecycleError, match="no build context"):
+        _prepare_artifact(unknown, "glt-dual-static-v1", keys, _cohort(), params)
 
 
 def test_published_artifact_identity_is_checked_and_never_rewritten(tmp_path):
@@ -197,7 +248,7 @@ def test_published_artifact_identity_is_checked_and_never_rewritten(tmp_path):
         _published_identity(broken)
 
 
-def test_single_writer_lock_blocks_concurrency_and_reclaims_stale_lock(tmp_path):
+def test_single_writer_lock_blocks_concurrency_without_pid_reclaim_race(tmp_path):
     from scripts.build_glt_dual_static_cache import _acquire_build_lock, _release_build_lock
 
     staging = tmp_path / "staging"
@@ -207,13 +258,42 @@ def test_single_writer_lock_blocks_concurrency_and_reclaims_stale_lock(tmp_path)
     with pytest.raises(CacheLifecycleError):
         _acquire_build_lock(staging)
     _release_build_lock(lock)
-    assert not lock.is_file()
-    assert _acquire_build_lock(staging).is_file()
+    assert lock.is_file()
+    second = _acquire_build_lock(staging)
+    assert second.is_file()
+    _release_build_lock(second)
 
-    # A lock left by a dead process must not block an interrupted build forever.
+    # PID text is only provenance; stale text cannot make a live flock race
+    # unsafe, and the kernel releases a held flock when its process dies.
     (staging / "build.lock").write_text("999999", encoding="utf-8")
-    assert _acquire_build_lock(staging).is_file()
-    _release_build_lock(staging / "build.lock")
+    third = _acquire_build_lock(staging)
+    assert third.is_file()
+    _release_build_lock(third)
+
+
+def test_single_writer_lock_is_enforced_between_processes(tmp_path):
+    from scripts.build_glt_dual_static_cache import _acquire_build_lock, _release_build_lock
+
+    staging = tmp_path / "cross_process_staging"
+    ready_parent, ready_child = mp.Pipe(duplex=False)
+    release_child, release_parent = mp.Pipe(duplex=False)
+    process = mp.get_context("fork").Process(
+        target=_hold_build_lock, args=(str(staging), ready_child, release_child)
+    )
+    process.start()
+    try:
+        assert ready_parent.recv() is True
+        with pytest.raises(CacheLifecycleError):
+            _acquire_build_lock(staging)
+        release_parent.send(True)
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            release_parent.send(True)
+            process.join(timeout=5)
+    lock = _acquire_build_lock(staging)
+    _release_build_lock(lock)
 
 
 def test_finalize_refuses_to_modify_a_frozen_artifact(tmp_path):
@@ -254,6 +334,24 @@ def test_finalize_refuses_to_modify_a_frozen_artifact(tmp_path):
     assert finalized["geometry_valid_count"] == 2
     assert (unfrozen / ".frozen").is_file()
 
+    # Finalization validates payloads before creating a new frozen binding.
+    broken_unfrozen = tmp_path / "broken_unfrozen"
+    _publish(broken_unfrozen, [2])
+    (broken_unfrozen / ".frozen").unlink()
+    (broken_unfrozen / "chunks" / "chunk_00000000" / "line_path.npy").unlink()
+    with pytest.raises(CacheLifecycleError):
+        finalize(broken_unfrozen)
+    assert not (broken_unfrozen / ".frozen").exists()
+
+    # Legacy target manifests did not carry the outer target flag; finalizer
+    # still validates their payload without rewriting the historical metadata.
+    legacy_target = tmp_path / "legacy_target"
+    _publish(legacy_target, [2], fmt="glt-dual-pretrain-targets-v1", targets=True)
+    (legacy_target / ".frozen").unlink()
+    finalized_target, target_outcome = finalize(legacy_target)
+    assert target_outcome == "PUBLISHED_UNFROZEN"
+    assert finalized_target["format"] == "glt-dual-pretrain-targets-v1"
+
 
 def test_publish_state_covers_single_sided_publication(tmp_path):
     """Static and targets are separate roots: only the missing side is rebuilt."""
@@ -275,3 +373,70 @@ def test_publish_state_covers_single_sided_publication(tmp_path):
                          targets_published=True) == ("both", False, False)
     assert _publish_plan(static_published=True, targets_requested=False,
                          targets_published=False) == ("static_only", False, False)
+
+
+def test_full_build_path_is_idempotent_and_resumes_missing_target(tmp_path, monkeypatch):
+    """Exercise build() with deterministic workers, including static-only resume."""
+
+    from scripts import build_glt_dual_static_cache as builder
+    from test_complete_trimer_glt import _toy_pair
+    from src.dataset.canonical_periodic import build_canonical_periodic_topology
+
+    smiles = "*CC*"
+    topology = build_canonical_periodic_topology(smiles)
+    _, trimer = _toy_pair(smiles)
+    keys = [bytes([97 + index]) * 32 for index in range(2)]
+    key_array = np.frombuffer(b"".join(keys), dtype=np.uint8).reshape(-1, 32)
+    cohort = {
+        "records": [{"sample_key": key.hex(), "source_smiles": smiles,
+                     "normalized_smiles": smiles} for key in keys],
+        "manifest": {"main_bundle_hash": "a" * 64,
+                      "ordered_sample_key_hash": ordered_key_hash(key_array)},
+        "manifest_hash": "b" * 64,
+    }
+
+    class FakeBundle:
+        def __init__(self, *_args, **_kwargs):
+            self.topology = {key: topology for key in keys}
+            self.trimer = {key: trimer for key in keys}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(builder, "load_dual_cohort", lambda *_args, **_kwargs: cohort)
+    monkeypatch.setattr(builder, "load_active_dual_store",
+                        lambda *_args, **_kwargs: {"bundle_hash": "a" * 64})
+    monkeypatch.setattr(builder, "DualFrozenBundle", FakeBundle)
+    cache_root = tmp_path / "main"
+    cache_root.mkdir()
+    static_root = tmp_path / "static"
+    target_root = tmp_path / "targets"
+    args_static = SimpleNamespace(
+        cache_root=str(cache_root), cohort_root="unused", output_root=str(static_root),
+        target_root=None, build_targets=False, workers=1, chunk_size=1, limit=0,
+        unique=False, progress_chunks=1,
+    )
+    first = builder.build(args_static)
+    assert first["status"] == "PASS"
+    static_manifest_before = (static_root / "manifest.json").read_bytes()
+    static_frozen_before = (static_root / ".frozen").read_bytes()
+
+    # A repeated complete build is a no-op, including no new staging tree.
+    repeated = builder.build(args_static)
+    assert repeated["status"] == "IDEMPOTENT"
+    assert (static_root / "manifest.json").read_bytes() == static_manifest_before
+    assert (static_root / ".frozen").read_bytes() == static_frozen_before
+    assert not (static_root.with_name("static.staging")).exists()
+
+    # Build the missing target side while reusing the immutable static side.
+    args_both = SimpleNamespace(
+        cache_root=str(cache_root), cohort_root="unused", output_root=str(static_root),
+        target_root=str(target_root), build_targets=True, workers=1, chunk_size=1,
+        limit=0, unique=False, progress_chunks=1,
+    )
+    resumed = builder.build(args_both)
+    assert resumed["status"] == "PASS"
+    assert resumed["published_at_start"] == {"static": True, "targets": False}
+    assert (target_root / ".frozen").is_file()
+    assert (static_root / "manifest.json").read_bytes() == static_manifest_before
+    assert (static_root / ".frozen").read_bytes() == static_frozen_before
