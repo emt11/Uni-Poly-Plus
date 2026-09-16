@@ -6,7 +6,7 @@
 |-|-|
 |计划 ID|GLTV2-20260916-01|
 |修订|r2：阶段性审查后续执行；修复诊断入口，再执行 B.2／B.3，不增加原回放预算|
-|状态|需返修（诊断代码）；A 已交付，剩余诊断／有限回放仍在原授权范围内|
+|状态|执行中（A 已交付；B.2 已完成，B.3 有限回放运行中）|
 |授权来源|用户已选择“诊断并有限回放”，并说明将计划交给 ZCode／其他模型执行；随后明确报告计划正在执行|
 |规划／审查|Codex|
 |执行|ZCode／用户指定执行者；实际执行者在下方补记|
@@ -104,6 +104,13 @@
 ### ZCode 续执行记录
 
 在此追加实际修订、测试与命令、tmux window、日志／输出路径、回放开始／停止 step 和累计 updates。不要删除上面的阶段性交付；每阶段结束或阻断时更新。
+
+### 2026-09-16 B.2／B.3 续执行（Codex，执行中）
+
+* 基线核对：当前 HEAD 为 `ea2fa38a3572012303ba1b06ad8eb02248aeb510`，工作树在启动前干净；未重跑 A、未启动新的完整预训练／微调或缓存构建。`Uni-Poly:full_rebuild2` 为已有的非本计划缓存任务，当前 pane 已回到 shell，未接管或重启。
+* 局部验证：首次 `PYTHONPATH=.` 收集阶段因测试辅助模块未在路径中而导入失败；按仓库实际约定改为 `PYTHONPATH=.:tests` 后，`tests/test_dual_glt_pretrain.py tests/test_aggregate_glt_dual_finetune.py` 为 `20 passed, 1 warning`，日志为 `logs/glt_v2_dual_diagnostic_tests_20260916_retry.log`。本次导入失败未进入用例，未作为代码回归失败。
+* B.2 已完成：在 `Uni-Poly:glt_v2_diag_b2`、GPU0 运行六份真实 `resume_{2000,3000,5000}.pt`（Concat/KFuse），固定原始抽样流 step=2000 后 16 条 PI1M 记录、两批各 8 条，FP32/BF16 eval，无 optimizer update。报告 `results/glt_v2_diag_b2_20260916/fixed_batch.json`，日志 `logs/glt_v2_diag_b2_20260916/diagnose.log`，命令记录 `logs/glt_v2_diag_b2_20260916/command.txt`，exit code 0、`status=PASS`、六份均 `OK`、无非有限值。观测到 Concat step=3000 角度头 near-saturation 约 `0.7636`、exact ±1 约 `0.1576`，geometry 分项约 `2.7`；这支持执行原计划 B.3，但不单独证明训练根因。
+* B.3 已启动：`Uni-Poly:glt_v2_diag_b3`，4 GPU、从 `results/glt_dual_static_pretrain_5k_concat/resume_02000.pt` 恢复，原配置／world=4／microbatch=84／global batch=1008／BF16，`--diagnostics --stop-after-step 2800 --diagnostic-save-steps 2600 2660 2700 2800`，未生成 deploy。输出 `results/glt_v2_diag_b3_concat_replay_20260916`，日志 `logs/glt_v2_diag_b3_concat_replay_20260916/replay.log`，命令记录 `logs/glt_v2_diag_b3_concat_replay_20260916/command.txt`；截至 02:59:50 UTC 已正常运行至 step 2109，前 10 步未见 reference mismatch，累计 optimizer updates=109/最多 800。本回放未完成前不启动任何第二次回放或优化训练。
 
 ## 四、Codex 审查与下一步
 
