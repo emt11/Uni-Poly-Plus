@@ -417,3 +417,61 @@ chem/geo/FP 三项 `max|replay-ref| = 0`，`66.9968@2676` 的峰值精确重现�
 **27 passed**。诊断入口：`scripts/pretrain_glt_dual.py --diagnostics --stop-after-step`
 （诊断模式只写 resume/诊断状态、不生成 deploy）、`scripts/diagnose_glt_dual_pretrain.py`
 （六 checkpoint 固定批量前向，无 optimizer update）。
+
+## GLT-V2 固定 Concat（geometry_head_norm）5k：训练健康、deploy 与 5 任务正式微调
+
+本轮唯一改动：在进入 geometry heads 的 3D bond state 上加 `nn.LayerNorm(512, elementwise_affine=False)`
+（零新增参数），config `configs/mts/glt_dual_three_task_concat_geonorm.json`。训练身份与旧正式
+Concat 5k 一致：同 cohort `30f17b59…`、同 bundle、同 dual_static、microbatch 84、global batch 1008、
+lr 2e-4、warmup 2000、schedule total 20000、BF16、loss 权重 [1,1,0.1]、noise 0.03、mask 0.3、
+5000 optimizer steps。差异：world_size 4→3（accumulation 3→4），故每步样本组成不同，本轮对照
+不是样本级单变量证明；样本级单变量证据仍是 P2 replay。
+
+### 训练健康（`results/glt_v2_fixed_concat_5k_20260916/pretrain_health_report.json`）
+
+`FORMAL_FIXED_5K_HEALTHY = YES`（7 项阻断检查，阈值与实测参考量均写入报告）。step 5000 三项目标：
+
+| step 5000 | chem | geometry | fingerprint |
+|-|-|-|-|
+|旧 Concat（失稳）|0.1553|**0.310754**|0.0400|
+|KFuse|0.1538|0.001063|0.0376|
+|固定 Concat（geonorm）|0.1552|**0.000518**|0.0341|
+
+旧 Concat 的 geometry 自 step 3000 起再未恢复；固定路线收敛至 5.18e-4。其余稳态量：length 逐图
+稳态最大 0.01103（初始瞬态仅 step 1–16，峰值 2.617；失稳路线峰值 64.78@2676）、angle exact ±1
+饱和率恒 0.0（失稳路线末期 1.0）、tanh 导数最小 0.0031（失稳路线 0.0）、angle 头梯度 last-500
+最小 0.00206、`graph_3d_rms` 最大 1.972（末值 1.439；失稳路线最大 9.17）、clip 前梯度 last-500
+最大 0.617（失稳路线峰值 1063.1、末期仍 16–37）。残留关注（非阻断）：原始 `bond_states_rms`
+末值 2.068，高于失稳前健康带 1.07–1.22，低于失稳带 5.77–9.17。
+
+### deploy（`deploy_05000_validation.json`）
+
+`FIXED_CONCAT_DEPLOY_VALID = YES`：187 张量／39,021,942 参数、仅 O8+GLT+Concat fusion、无
+chemistry/geometry/fingerprint head、无 geometry_norm 依赖、与 `resume_05000.pt` 的 encoder 子集
+逐张量 bitwise 相同、strict load 与真实样本前向通过、冻结缓存零写入。eat/fold0 smoke（2 epochs）
+best validation R² 0.7737，`outer_test = NOT_RUN`。
+
+### 5 任务正式微调（egc 按用户指示跳过）
+
+输出 `results/glt_v2_fixed_concat_5k_20260916/finetune_grid_fixed_concat`，聚合
+`aggregation_review_7task/summary.json`（status PASS、task_count 7、fold_count 35、
+predictions_recomputed、OOF 恰好覆盖一次）。**FIXED_CONCAT_MACRO7_R2 = 0.777210**，
+pooled OOF macro7 = 0.782525。
+
+| task | fixed test R² | best fold R² | gap | 旧 Concat | KFuse | delta vs 旧 Concat |
+|-|-|-|-|-|-|-|
+|eat|0.987535|0.992401|−0.004865|0.980600|0.977742|+0.006935|
+|eea|0.902478|0.947349|−0.044872|0.916868|0.900062|−0.014391|
+|egb|0.909553|0.928526|−0.018974|0.896611|0.892708|+0.012941|
+|ei|0.780538|0.845439|−0.064901|0.767227|0.750365|+0.013312|
+|eps|0.735881|0.788369|−0.052488|0.748720|0.721013|−0.012839|
+|nc|0.815819|0.886824|−0.071005|0.815419|0.807303|+0.000400|
+|xc|0.308668|0.400945|−0.092277|0.279492|0.225616|+0.029176|
+|**macro7**|**0.777210**|||0.772134|0.753544|**+0.005077**|
+
+口径说明：通用评测只有 5 个 outer test fold，属 development folds，不是独立盲测；macro 提升幅度小
+且 2/7 任务退化，**不构成“已超过 baseline”的结论**。egc 未参与，故本轮 7 任务 macro **不可**与
+8 任务 macro8（旧 Concat `0.7877379364`、KFuse `0.7695629053`）比较；表中旧 Concat/KFuse 数值已
+按同样 7 任务重算。聚合脚本对非 8 任务刻意不输出 macro 字段，该 macro 由已验证的逐任务均值派生。
+egc 新增 fold0/1（0.8927/0.8854）与旧 Concat 同 fold（0.8979/0.9010）仅供参考，2/5 fold 不足以判定。
+XC 在三条路线中均为最低（0.279/0.226/0.309），与既有记录一致，仍需单独诊断。

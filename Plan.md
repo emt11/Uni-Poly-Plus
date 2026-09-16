@@ -232,3 +232,48 @@ python scripts/diagnose_glt_dual_pretrain.py
 若证据不足以选定根因，允许本轮结论为“未定位”；写出已排除内容和一项最小补充诊断，不自动执行。matched 2D-only、二面角／非键任务、融合门控、LR／损失权重实验均只列为后续建议，本轮不启动。
 
 交付时补齐 Plan.md 执行记录以及实际受影响的 PIPELINE.md／RESULTS.md 段落（不覆盖历史结果），列明代码版本、相关测试、诊断报告、tmux／命令／日志、累计 updates 和未完成项。由 Codex 审查后，才把该完整周期存入 PROJECT_HISTORY.md 并制定下一轮计划；当前周期暂不归档为已完成。
+
+---
+
+## 新周期（用户直接授权）：固定 Concat 5k（geonorm）→ 5 任务正式微调 → 三方对比
+
+### 计划头
+
+|项|内容|
+|-|-|
+|计划 ID|GLTV2-FIX-20260916-02|
+|修订|r1（用户 2026-09-16 直接下达 Phases 0–15）；r2 执行中修订：用户指示「可以不测试 egc」「微调执行之后使用 4 个 GPU」|
+|状态|待审查（执行已完成，等待 Codex 审查；本周期未归档）|
+|授权来源|用户消息直接授权（正式固定 5k + 正式微调 + 聚合 + 三方对比）|
+|规划／执行／审查|规划：用户直接指令；执行：ZCode；审查：待 Codex|
+|代码基线|Phase 1 记录 HEAD `70f936e`（含 P2 修复的工作树，patch sha256 `b2421c8d62d7d4a499b6d216bc6c8ea13ca082e5d5c4b13c0ce07b46dc42a50a`；该改动已由 emt11 提交为 `31c1b71`）；本轮新增脚本未提交|
+
+### 实施计划（用户指令要点）
+
+从 step 0 用 `geometry_head_norm=true` 正式固定 Concat 5k（world_size 3、microbatch 84、accumulation 4、global batch 1008、BF16、其余科学参数不变），随后健康审查 → deploy 校验 → eat/fold0 smoke → 8×5 正式微调（GPU1/2/3，最大并发 3）→ 验证式聚合 → 与旧 Concat／KFuse 三方对比。禁止项：10k/20k、KFuse 重训、O8-only、3D-only、KFuse-v2、multi-seed、其他 LayerNorm 位置、残差长度预测、robust loss、LR/loss weight/noise 改动。
+
+### 执行记录（ZCode）
+
+**Phase 0–2（冻结、pre-flight、3 卡 smoke）**：新增 config `configs/mts/glt_dual_three_task_concat_geonorm.json`（`geometry_head_norm: true`，零新增参数）；`scripts/pretrain_glt_dual.py` 读该字段；30-update smoke（accum=4、world=3、loss 有限、写 resume、不产生 deploy）；51 项测试通过。
+
+**Phase 3 正式固定 5k**：tmux `Uni-Poly:geonorm_5k`，日志 `logs/glt_dual_static_pretrain_concat_geonorm5k.log`，输出 `results/glt_dual_static_pretrain_5k_concat_geonorm`，6 个 checkpoint（1000…5000）含 deploy/resume，12:06:52 UTC 到 step 5000，正常退出。
+
+**Phase 7 健康审查**：新增 `scripts/pretrain_health_report.py`（只读）。产物 `results/glt_v2_fixed_concat_5k_20260916/pretrain_health_report.json`，**FORMAL_FIXED_5K_HEALTHY = YES**（7 项阻断检查全通过）。step 5000：chem 0.1552／geometry 0.000518／fp 0.0341（旧 Concat 0.1553／0.310754／0.0400；KFuse 0.1538／0.001063／0.0376）。稳态最长量：length 逐图 ≤0.01103、angle exact ±1 饱和率 0.0、tanh 导数最小 0.0031、angle 梯度 last-500 最小 0.00206、graph_3d_rms 最大 1.972（末值 1.439）、clip 前梯度 last-500 最大 0.617。残留关注：原始 `bond_states_rms` 末值 2.068 仍高于失稳前健康带 1.07–1.22（失稳带 5.77–9.17），已记入报告，不阻断本周期。
+
+**Phase 8 deploy 校验**：新增 `scripts/validate_glt_dual_deploy.py`。产物 `deploy_05000_validation.json`，**FIXED_CONCAT_DEPLOY_VALID = YES**：187 张量／39,021,942 参数、全 fp32 有限、仅 O8+GLT+Concat、无 head 与 geometry_norm 依赖、与 `resume_05000.pt` encoder 子集逐张量 bitwise 相同、strict load 通过、真实样本前向 [2,1] 有限、缓存零写入。
+
+**Phase 9 smoke**：tmux `Uni-Poly:fixed_eat0_smoke`，输出 `results/glt_v2_fixed_concat_5k_20260916/eat_fold0_smoke`，`outer_test = NOT_RUN`，2 epochs best validation R² 0.7737。
+
+**Phase 10 正式微调**：tmux `Uni-Poly:fixed_grid40`（3 卡）→ `Uni-Poly:fixed_grid_rest`（4 卡）；输出 `results/glt_v2_fixed_concat_5k_20260916/finetune_grid_fixed_concat`，日志同名 log-root + `.console.log`。偏离：按用户 r2 指示跳过 egc（已完成 egc_fold0/1 保留、egc_fold2 半成品保留），剩余 ei/eps/nc/xc 四任务改用物理 GPU0/1/2/3 并发；为此给 `scripts/run_glt_dual_finetune_grid.py` 增加 `--resume`（续跑已有根目录、跳过已完成单元、遇半成品报错不覆盖）。最终 37 个 shard 全部 exit 0，0 失败。
+
+**Phase 11/12 聚合**：`scripts/aggregate_glt_dual_finetune.py --task <7 任务>` → `results/glt_v2_fixed_concat_5k_20260916/aggregation_review_7task/summary.json`，status PASS、task_count 7、fold_count 35、predictions_recomputed、OOF 恰好覆盖一次、未使用 legacy 兼容。**FIXED_CONCAT_MACRO7_R2 = 0.777210**（pooled OOF macro7 = 0.782525）。聚合脚本对非 8 任务刻意不输出 macro 字段，该 macro 由已验证的逐任务均值派生并在报告中标明。
+
+**Phase 13 三方对比**：新增 `scripts/compare_glt_dual_finetune_results.py`。产物 `three_way_comparison_7task.json/.md`。7 任务 macro：固定 Concat 0.777210、旧 Concat 0.772134（+0.005077）、KFuse 0.753544（+0.023666）。逐任务相对旧 Concat：eat +0.006935、egb +0.012941、ei +0.013312、nc +0.000400、xc +0.029176 改善；eea −0.014391、eps −0.012839 退化。
+
+**口径与限制（待审查问题）**：(1) 跳过 egc 后只能给出 7 任务 macro，**不可**与 8 任务 macro8（0.7877379364／0.7695629053）混用；参考运行已按同样 7 任务重算。(2) 预训练对照中 world_size 由 4 变 3（accumulation 3→4），global batch 与其余科学参数一致但每步样本组成不同，样本级单变量证据是 P2 replay 而非本次对比。(3) 共享 development folds 非独立盲测，macro 提升幅度小且 2/5 任务退化，不宣称已超 baseline。(4) egc 新增 fold0/1（0.8927／0.8854）与旧 Concat 同 fold（0.8979／0.9010）仅供参考，2/5 fold 不足以判定。
+
+**未执行**：egc 其余 3 fold、8 任务 macro8、10k/20k、KFuse 重训、O8-only、3D-only、KFuse-v2、multi-seed、其他 LayerNorm 位置；本轮 0 次额外 replay、0 次缓存重建。
+
+### 审查与下一步
+
+待 Codex 审查。建议下一步（需新授权）：补 egc 5 fold 恢复 8 任务口径，或按计划优先级进入 MATCHED O8-ONLY 对照。

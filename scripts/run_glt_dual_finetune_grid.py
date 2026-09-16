@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -24,6 +25,9 @@ def main():
     parser.add_argument('--gpu', action='append', dest='gpus', required=True,
                         help='one CUDA device per concurrent shard; repeat up to 4')
     parser.add_argument('--log-root', required=True)
+    parser.add_argument('--resume', action='store_true',
+                        help='continue an existing grid root: skip units that already have a '
+                             'completed summary.json, and refuse to touch partial units')
     args = parser.parse_args()
     tasks = list(args.tasks) if args.tasks else list(TASKS)
     if sorted(set(tasks)) != sorted(tasks) or any(task not in TASKS for task in tasks):
@@ -33,13 +37,40 @@ def main():
         raise ValueError('grid supports one to four GPU slots')
     output = Path(args.output).resolve()
     log_root = Path(args.log_root).resolve()
-    output.mkdir(parents=True, exist_ok=False)
+    if args.resume:
+        if not output.is_dir():
+            raise ValueError('--resume requires an existing grid root')
+    else:
+        output.mkdir(parents=True, exist_ok=False)
     log_root.mkdir(parents=True, exist_ok=True)
     # Materialize fixed manifests serially before concurrent shards access them.
     for task in tasks:
         fixed_manifest(task, Path(args.raw_root) / f'smi_{task}.csv',
                        Path(args.split_root) / f'{task}.json')
     jobs = [(task, fold) for task in tasks for fold in range(5)]
+    skipped, partial = [], []
+    if args.resume:
+        pending = []
+        for task, fold in jobs:
+            unit = output / f'{task}_fold{fold}'
+            if not unit.exists():
+                pending.append((task, fold))
+                continue
+            summary_path = unit / 'summary.json'
+            complete = False
+            if summary_path.is_file():
+                try:
+                    complete = bool(json.loads(summary_path.read_text(encoding='utf-8')).get('tasks'))
+                except ValueError:
+                    complete = False
+            if complete:
+                skipped.append(f'{task}_fold{fold}')
+            else:
+                partial.append(str(unit))
+        if partial:
+            raise RuntimeError('partial grid units present; inspect before retrying: '
+                               + ', '.join(partial))
+        jobs = pending
     completed = []
     for offset in range(0, len(jobs), len(gpus)):
         batch = jobs[offset:offset + len(gpus)]
@@ -69,7 +100,8 @@ def main():
             if code != 0:
                 raise RuntimeError(f'formal shard failed: task={task} fold={fold}; log={log_path}')
             completed.append({'task': task, 'fold': fold, 'log': str(log_path)})
-    print({'status': 'PASS', 'completed': completed, 'count': len(completed)})
+    print({'status': 'PASS', 'completed': completed, 'count': len(completed),
+           'skipped_existing': skipped})
 
 
 if __name__ == '__main__':
