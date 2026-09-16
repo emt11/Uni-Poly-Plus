@@ -22,7 +22,7 @@
 
 在用户授权后，已在训练机 `dzw2` 按 `Plan_Delete.md` 的绝对路径 allowlist 完成一次精确清理。删除内容仅为不再被当前入口消费的 PI1M pilot 派生缓存、`cohort_30f17b59bc5862a1_v2`、已完成构建的 `periodic_line_glt_distill_v2.parts`，以及两个未冻结 blocked build 的大 payload；失败 build 的 manifest／metadata／rejections provenance 保留。当前 active bundle、root-level 读取链、PI1M/downstream cohort、`dual_static_v1`、`pretrain_targets_v1`、`.frozen`、固定 split、checkpoint、results、logs 与保留路线代码均未改动。清理前后文件系统可用空间差额为 `12,686,458,880` bytes（约 11.81 GiB），不是候选目录 `du` 之和。
 
-清理后的只读 import、CLI help 和 active artifact 存在性检查通过；首次聚焦回归发现测试漏传可选 `trimer_failure_code`，补上 `optional_fields` 后同一目标集合为 `54 passed, 1 warning`。两个正式 Concat/KFuse deploy 使用 active cohort 的真实普通 E/Z 与 `*O*` N=0 记录完成 strict-load、resume bitwise identity、有限 `[2,1]` forward 和 cache zero-write 检查，均为 `FIXED_CONCAT_DEPLOY_VALID=YES`。这些是清理后的只读一致性证据，不是新的训练性能结果；代码、模型、训练和缓存重建均未因清理而启动。完整命令与日志见 `logs/cleanup_20260916_01/`，详见 `Plan_Delete.md` 的阶段 2/3 执行记录。
+清理后的只读 import、CLI help 和 active artifact 存在性检查通过；首次聚焦回归发现测试漏传可选 `trimer_failure_code`，补上 `optional_fields` 后同一目标集合为 `54 passed, 1 warning`。两个正式 Concat/KFuse deploy 使用 active cohort 的真实普通 E/Z 与 `*O*` N=0 记录完成 strict-load、resume bitwise identity、有限 `[2,1]` forward 和 cache zero-write 检查，均通过；验证脚本沿用历史顶层键名 `FIXED_CONCAT_DEPLOY_VALID`，KFuse 报告内 `fusion_mode` 为 `kfuse`。这些是清理后的只读一致性证据，不是新的训练性能结果；代码、模型、训练和缓存重建均未因清理而启动。完整命令与日志见 `logs/cleanup_20260916_01/`，详见 `Plan_Delete.md` 的阶段 2/3 执行记录。
 
 ## 1. 已退役基线：MTS-GLT-v2-Base-5k
 
