@@ -104,3 +104,13 @@
 * 命令和适用性边界：验收与 modelcheck 日志没有保存完整 argv／环境；Plan_Delete 第 7 节列出执行上下文可复述的命令并明确这不是独立日志证据。`scripts/validate_glt_dual_deploy.py` 未接收 static/targets 路径且在 `torch.no_grad()` 中 forward，因此 static/targets 清理后重新消费、backward 和删除前后预测 parity 均未执行／未独立核实。历史 PI1M `run.json` 仍绑定 sample_count `959588`、cohort `b03f96...`、bundle `30f17...`、dual static `9ff122...`、targets `5e7b...`；下游历史 `run.json` 只记录 downstream dual-static 与 `outer5_inner20` 的缓存／split 路径，没有缓存 hash 字段，当前 downstream manifest 与 `.frozen` 自洽，但这些 run.json 不能单独证明历史缓存内容身份一致。
 * 聚合与溯源：复用 Concat/KFuse 8-task×40-fold summary（status PASS，macro8 `0.7877379364475444`／`0.7695629052761048`）和 80-shard summary，没有聚合重算。`cohort_30f17b59bc5862a1_v2` 原 manifest 仍是已知溯源损失，仅保留删除前 SHA256 `9eba93d60781361b005800f98d68ff8eba04a888fadf8b328915e147f1d23945` 与 `phase2_cohort_v2.json`，未生成补档。
 * 交付与结论：已更新 `Plan_Delete.md` 第 7 节、`Plan.md` 清理注记和 `PIPELINE.md` 命令可追溯性表述；`RESULTS.md`、生产代码、缓存、checkpoint 和历史结果未改动。首批清理及有限只读证据收口完成，但代码精简仍未实施；全量读取、Stereo 质量、static/targets consumer、backward、parity 和新实验不因本条记录而通过。后续若继续处理 HOLD 候选，须重新依赖审查并取得明确授权。
+
+## DOCS-20260916-06｜缓存优化计划交付
+
+* 日期：2026-09-16（UTC）。用户要求 Codex 制定缓存优化计划并写入 Plan_Cache.md；规划、文档修改与自检均为 Codex，无独立审查者。只授权文档，未授权代码、缓存、benchmark 或训练执行。
+* 基线与工作树：dev，HEAD 18572e373ae270469affa8ecb805db32f3c6489c；修改前核对 branch／origin 并 pull，返回 Already up to date。用户已有 Plan_Delete.md 删除及未跟踪 Plan_Cache.md（原内容为清理计划）；本轮按用户要求重写后者，不恢复、不提交前者的删除。
+* 最终计划 CACHE-20260916-01/r1：保留三层缓存。A 最多 48 个接受集代表案例、4 条合同错误 source／拒绝证据及 9 个下游 fallback 的有界核对，分别裁定参照差异、审计器错误、真实化学错误和缺证。B 先以两个小 chunk 的 fixture 复现 staging 身份、半成品 chunk、单边发布和冻结后 finalize 的缺口，再做最小恢复修复；最多 32 个真实样本生成独立临时派生数据（不生成坐标），输出不超过 1 GiB。C 固定 2,048 个索引、worker=0 与至多 3 workers、baseline 和至多两个独立候选、每个配对最多 3 次、总计最多 30 分钟，记录吞吐／尾延迟／FD／RSS／映射开销，不能据此宣称 GPU 或模型收益。紧凑表示 D 单列待授权，未来也仅可先做 256 条／1 GiB 单候选，不自动全量迁移。
+* 重要边界：不改变 first_valid、端基、映射、cohort、fallback、目标和随机流；不重写 active manifest／.frozen，不引入全量 hash 或通用迁移框架。两次 rename 不称为整体原子发布；优先用一致身份和幂等恢复处理单边发布。化学抽样不证明全部 FAIL 已解释，metadata hash 不证明 payload 历史未变。193 GiB 明确为清理前快照，历史 pilot benchmark 不被当成当前随机多 worker 证据。
+* 实际文件变化：Plan_Cache.md 从旧清理内容改为缓存优化细则；Plan.md 仅增加专项交接注记，保留下方未收口科学计划；本文件归档文档周期。没有修改 PIPELINE.md、RESULTS.md、模型、构建器、缓存或历史结果。
+* 验证与审查：仅对相关实现／已有报告做静态核对，检查文档引用、预算与授权一致性及 git diff --check；未运行单元测试、故障注入、真实 batch、benchmark、训练、构象生成、缓存构建或清理。文档自检不等于工程验收；实际 commit 和远端核对结果见本条对应 Git 历史及交付回复。
+* 完成与下一步：本轮仅完成计划落盘。缓存实施状态待授权；建议先 A＋B，通过审查再 C，D 暂缓。已有科学计划和清理 HOLD 不因本轮扩大或结束，执行者应在 Plan.md 补记真实进度后交 Codex 审查。
