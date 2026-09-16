@@ -96,6 +96,11 @@ def main():
                         help='diagnostic stop position (requires --diagnostics)')
     parser.add_argument('--diagnostic-save-steps', type=int, nargs='*', default=[],
                         help='steps inside this run at which to save a resume state')
+    parser.add_argument('--no-deploy', action='store_true',
+                        help='diagnostic runs: never write a deployment package')
+    parser.add_argument('--geometry-head-norm', action='store_true',
+                        help='P2 single change: non-affine LayerNorm of the 3D bond state '
+                             'feeding the geometry heads only')
     parser.add_argument('--reference-log',
                         help='original run log for the initial-10-step cross-check')
     args = parser.parse_args()
@@ -141,7 +146,8 @@ def main():
         accumulation = batch_size // (micro * world)
         set_global_seed(config['seed'])
         base = DualPretrainer(config['fusion_mode'],
-                              collect_diagnostics=bool(args.diagnostics)).to(device)
+                              collect_diagnostics=bool(args.diagnostics),
+                              geometry_head_norm=bool(args.geometry_head_norm or config.get('geometry_head_norm', False))).to(device)
         optimizer = torch.optim.AdamW(base.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
         module = DistributedDataParallel(base, device_ids=[device.index] if device.type == 'cuda' else None,
                                          find_unused_parameters=True) if world > 1 else base
@@ -190,6 +196,7 @@ def main():
         if rank == 0:
             write_json(output / 'run.json', dict(identity=identity, command=sys.argv,
                 accumulation=accumulation, diagnostics=bool(args.diagnostics),
+                geometry_head_norm=bool(args.geometry_head_norm or config.get('geometry_head_norm', False)),
                 stop_after_step=stop, diagnostic_save_steps=save_steps))
         stream = OrderedSampleStream(len(source), config['seed'])
         # Optional CPU prefetch.  The prepared items are identical to the
@@ -303,6 +310,9 @@ def main():
                             next_position=(step + 1) * batch_size, model=base.state_dict(),
                             optimizer=optimizer.state_dict(), rng=states,
                             scheduler=dict(step=step + 1, lr=float(lr))))
+                        if not args.no_deploy:
+                            save_checkpoint(output / f'deploy_{step + 1:05d}.pt',
+                                            deployment_package(base, step + 1))
                     if world > 1:
                         dist.barrier()
                 continue

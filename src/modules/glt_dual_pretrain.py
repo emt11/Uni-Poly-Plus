@@ -41,7 +41,8 @@ def _stats(values):
 
 
 class DualPretrainer(nn.Module):
-    def __init__(self, fusion_mode='concat', *, collect_diagnostics=False):
+    def __init__(self, fusion_mode='concat', *, collect_diagnostics=False,
+                 geometry_head_norm=False):
         super().__init__()
         self.encoder = build_dual_glt_model(fusion_mode)
         self.encoder.predictor = nn.Identity()
@@ -54,6 +55,14 @@ class DualPretrainer(nn.Module):
         # forward value depends on this flag.
         self.collect_diagnostics = bool(collect_diagnostics)
         self.last_diagnostics = None
+        # P2 single-change experiment: ONE geometry-specific, non-affine
+        # normalization of the 3D bond representation shared by the length and
+        # angle heads.  Non-affine => no parameters, no buffers, no optimizer
+        # state, unchanged checkpoint schema.  The raw 3D state that feeds
+        # fusion/pooling/fingerprint/chemistry is left untouched.
+        self.geometry_head_norm = bool(geometry_head_norm)
+        self.geometry_norm = (nn.LayerNorm(512, elementwise_affine=False)
+                              if self.geometry_head_norm else None)
 
     def forward(self, data, labels):
         captured, handles = {}, []
@@ -81,11 +90,15 @@ class DualPretrainer(nn.Module):
             atom_logits = self.atom_head(encoded['atom_states'], data.lga_edge_index)
             chem, chem_valid = per_graph(F.cross_entropy(atom_logits[mask].float(),
                 labels['atom_label'][mask], reduction='none'), data.canonical_graph_index[mask], graphs)
-            lengths = self.length_head(encoded['center_bond_states']).float().flatten()
+            bond_states = encoded['bond_states']
+            if self.geometry_norm is not None:
+                bond_states = self.geometry_norm(bond_states)
+            center_rows = data.bond_center.bool()
+            lengths = self.length_head(bond_states[center_rows]).float().flatten()
             length_loss, length_valid = per_graph((lengths - labels['distance'].float()).square(),
                 data.bond_batch[data.bond_center], graphs)
             a, b = labels['angle_pairs'].unbind(1)
-            left, right = encoded['bond_states'][a], encoded['bond_states'][b]
+            left, right = bond_states[a], bond_states[b]
             angles = self.angle_head(torch.cat([left + right, (left - right).abs()], -1)).float().flatten()
             angle_loss, angle_valid = per_graph((angles - labels['angle_cos'].float()).square(),
                                                 labels['angle_graph'], graphs)
@@ -153,6 +166,13 @@ class DualPretrainer(nn.Module):
                                                                       .float().mean()),
                         "note": "thresholds are descriptive statistics only, not a validity gate",
                     }),
+                    "geometry_head_norm_state": {
+                        "enabled": bool(self.geometry_head_norm),
+                        "state_rms": float(bond_states[center_rows].detach().float().pow(2).mean().sqrt())
+                        if bool(center_rows.any()) else None,
+                        "state_abs_p99": float(bond_states[center_rows].detach().float().abs().quantile(0.99))
+                        if bool(center_rows.any()) else None,
+                    },
                     "representations": {
                         "bond_states_rms": float(encoded['bond_states'].detach().float().pow(2).mean().sqrt()),
                         "center_bond_states_rms": float(encoded['center_bond_states'].detach().float().pow(2).mean().sqrt()),
