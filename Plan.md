@@ -112,6 +112,59 @@
 * B.2 已完成：在 `Uni-Poly:glt_v2_diag_b2`、GPU0 运行六份真实 `resume_{2000,3000,5000}.pt`（Concat/KFuse），固定原始抽样流 step=2000 后 16 条 PI1M 记录、两批各 8 条，FP32/BF16 eval，无 optimizer update。报告 `results/glt_v2_diag_b2_20260916/fixed_batch.json`，日志 `logs/glt_v2_diag_b2_20260916/diagnose.log`，命令记录 `logs/glt_v2_diag_b2_20260916/command.txt`，exit code 0、`status=PASS`、六份均 `OK`、无非有限值。观测到 Concat step=3000 角度头 near-saturation 约 `0.7636`、exact ±1 约 `0.1576`，geometry 分项约 `2.7`；这支持执行原计划 B.3，但不单独证明训练根因。
 * B.3 已启动：`Uni-Poly:glt_v2_diag_b3`，4 GPU、从 `results/glt_dual_static_pretrain_5k_concat/resume_02000.pt` 恢复，原配置／world=4／microbatch=84／global batch=1008／BF16，`--diagnostics --stop-after-step 2800 --diagnostic-save-steps 2600 2660 2700 2800`，未生成 deploy。输出 `results/glt_v2_diag_b3_concat_replay_20260916`，日志 `logs/glt_v2_diag_b3_concat_replay_20260916/replay.log`，命令记录 `logs/glt_v2_diag_b3_concat_replay_20260916/command.txt`；截至 02:59:50 UTC 已正常运行至 step 2109，前 10 步未见 reference mismatch，累计 optimizer updates=109/最多 800。本回放未完成前不启动任何第二次回放或优化训练。
 
+### 2026-09-16 ZCode 续执行：B.3 结果核验、失稳机制分析与 C 决策草案
+
+**预检与边界**
+
+* 交接时 HEAD 已从交接文档记录的 `ea2fa38` 前进到 `d417496`；两者之间的 `736285f`、`d417496` 只改 `Plan.md`。工作树除 3 个未跟踪文件外干净，其中 `scripts/diag_initial_trigger.py`、`scripts/diag_spike_attribution.py` 属另一执行者，本执行者未修改、未运行、未提交；`tests/test_glt_dual_diagnostics.py` 为本执行者新增。
+* 核对 §3 记录后发现 **B.3 已由另一执行者执行完毕**（与交接文档的 “B3_REPLAY = NOT_STARTED” 不符）：输出 `results/glt_v2_diag_b3_concat_replay_20260916`，日志 `logs/glt_v2_diag_b3_concat_replay_20260916/replay.log`（末行 `EXIT_CODE=0`），命令记录为同目录 `command.txt`，四个诊断 checkpoint（2600/2660/2700/2800）与 `diagnostics_steps.jsonl`（800 行，step 2001–2800）齐全。**据此未启动任何第二次回放。**
+* 累计预算：2000→2800 = **800/800 updates，已耗尽**。本轮未新增训练、优化运行、缓存重建或 fold 重跑。
+
+**B.3 核验：回放逐位复现原轨迹**
+
+* 与 `logs/dual_static_pretrain_concat5k.log` 按 step 对齐。该日志存在记录拼接，改用全文正则提取并按 step 去重（同一 step 各 rank 打印相同的全局值）：800/800 个共同 step 的 chem/geo/FP 三项 `max|replay-ref| = 0`。
+* 失稳峰值**精确重现**：`step 2676` 的全局 geometry loss `66.996841`。说明恢复身份、RNG、数据顺序与调度状态一致，且 `--diagnostics` 观测不扰动训练轨迹（满足 §4.2 的“开关不改变轨迹”要求，B.3 层面已实证）。
+
+**失稳轨迹（窗口按 step 定义；rank 去重取同 step 首次出现的全局值）**
+
+* concat：基线 `2401–2600` 中位 `0.00092`；首个 `geo>0.1` 在 `2662`；峰值 `66.9968@2676`；`2700–2800` 中位 `0.4156`；`4001–5000` 中位 `0.3139`（基线约 342×），末值 `0.3108` —— **截至 5000 未恢复**（`2700` 之后 `geo>0.1` 的步数为 2301/2301）。
+* chem / FP：chem `0.1854 → 0.1907@2676 → 0.1617`（无持久退化）；FP `0.0434 → 0.1987@2676（瞬态 4.6×）→ 0.0418`（瞬态抬升，无持久偏移）。
+* kfuse 对照：基线 `0.00107`，首个 `geo>0.1` 在 `3274`，峰值 `6.0736@3406`，末值 `0.00106` —— 完全恢复。
+
+**机制（dense 窗口 2600–2720 的 rank0 局部统计）**
+
+| 量 | 2650 | 2666 | 2668 | 2676 | 2680 → 2720 |
+|-|-|-|-|-|-|
+| angle head pre-tanh 均值 | -0.51 | +1.01 | -4.07 | +3.73 | -13.7 → -29.2 |
+| tanh 导数 均值/最小 | 0.78/0.007 | 0.42/0.30 | **0.0012/0.0006** | 0.0025 | **0.0000/0.0000** |
+| 预测 exact ±1 比例 | 0 | 0 | 0 | 0 | **1.0000** |
+| graph_3d RMS | 0.82 | 2.07 | 2.25 | 3.05 | 4.12 → 9.17 |
+| length_head 梯度范数 | 0.037 | 0.67 | 0.95 | 0.76 | 0.96–1.00 |
+| angle_head 梯度范数 | 0.039 | 0.70 | 0.0003 | 0.0001 | 0.0000 |
+
+* 尖峰以 length 为主：`2676` 分项 sum 为 `length 5441.5 / angle 176.4`（length 占 96.9%）；`2669` 92.3%；`2710` 93.5%。**length 尖峰与 angle 平台同时存在**：angle 饱和后成为约 `26.7`（基线 0.21）的常数残差。
+* 距离 Gaussian `σ_min` 全程恒为 `0.0172`（六 checkpoint 一致）→ 排除 Gaussian 宽度分支；BF16 已由 B.2 排除。
+* 判读链条：3D 表示尺度增长（0.85→9.2）→ angle head pre-tanh 失控 → tanh 完全饱和、梯度恒 0 → angle 项无法自我修正 → length 项独吞梯度并产生尖峰；尖峰步 clip 前总梯度达 `1063`（基线约 0.48），存在经由 `clip_grad_norm_(1.0)` 的反馈放大。
+* **口径限制**：`_module_grad_norms` 将 `p.grad is None` 记为 `0.0`，因此上表 angle_head 的 `0.0000` 无法区分“梯度为零”与“该步未进入反向图”。
+
+**测试**
+
+* 新增 `tests/test_glt_dual_diagnostics.py`（7 项，`PYTHONPATH=.:tests`）：诊断开关不改变 loss/sums/counts/targets、逐参数梯度、`state_dict` 与 **RNG 消耗**；`length+angle` 还原 geometry 且无角度样本计数一致；`component_tensors` 携带梯度；`_module_grad_norms` 对缺失梯度按零对齐且不丢键；Gaussian 统计取自真实 forward 并与模块参数一致；angle head 统计有限、tanh 导数落在 [0,1]。
+* `tests/test_dual_glt_pretrain.py` + `tests/test_aggregate_glt_dual_finetune.py` + 新文件 = **27 passed**。
+* 交接文档 §6 所述 2 个既有失败在当前 HEAD 上均已通过（`test_empty_geometry_and_batch_target_offsets` 1 passed；`tests/test_dual_glt_audit.py` 47 passed），该条已过期。
+
+**未完成与限制**
+
+* 诊断未记录异常 batch 的样本 key 与逐样本误差（计划 §B 该项未实现），**无法从现有证据判断尖峰是否集中在同类样本**；另一执行者的在途脚本 `scripts/diag_spike_attribution.py`（无 optimizer step）正处理该问题，本执行者未运行、结论不依赖它。
+* 未执行：第二次回放、matched 2D-only、任何优化训练、缓存重建、80 fold 重跑。
+
+**C 决策草案（三层次）**
+
+* **已确认事实**（B.3 逐 step 可复现）：失稳自 `2662` 起、峰值 `66.9968@2676`、`5000` 未恢复；尖峰以 length 项为主；angle head 在 `2668` 后 tanh 饱和、exact ±1 比例达 `1.0`、其梯度归零；3D 表示 RMS 单调增长约 11×；距离 Gaussian σ_min 恒定；FP 仅瞬态抬升。
+* **支持性证据**（相关，非因果证明）：表示尺度增长先于饱和（`2650` 0.82 → `2660` 1.01 → `2666` 2.07 → `2668` 饱和）；经裁剪的反馈放大；kfuse 同类事件可自行恢复提示与 concat 的差异在“是否进入饱和不动点”。
+* **未证实假设**：`~2655–2660` 触发尺度增长的初始事件（特定 batch、累积漂移或裁剪反馈）未定位；LayerNorm 能否阻止该链条未验证；angle 饱和是主因还是尺度增长的伴生结果未分离。
+* **首要改动建议（本轮不实施）**：仅在**几何头输入**加 LayerNorm——`src/modules/glt_dual_pretrain.py` 中 `length_head` 的输入 `encoded['center_bond_states']`（512 维，行 84）与 `angle_head` 的输入 `cat([left+right, |left-right|])`（1024 维，行 89）。原条件：两个 `nn.Sequential` 直接吃未归一化的 3D 表示，其 RMS 随训练增长约 11×。拟改条件：分别在两个 head 的 `nn.Sequential` 首部插入 `nn.LayerNorm(512)` / `nn.LayerNorm(1024)`，不动 3D backbone、O8 分支、融合与损失权重。最小验证预算：同一 `resume_02000.pt`、同四卡/同配置的 **800-update 回放（2000→2800）+ `--diagnostics`**，判据为 exact ±1 比例保持 ≈0、表示 RMS 有界、`geo` 无 >0.1 偏离、chem/FP 不退化；配套最小局部测试（head 输入归一化后前向形状/值域）。该预算需新一轮授权（本周期 800/800 已耗尽），且按 §2 E 优先级，matched 2D-only 对照排在稳定化之后。
+
 ## 四、Codex 审查与下一步
 
 ### 4.1 当前审查结论

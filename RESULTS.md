@@ -365,3 +365,55 @@ alpha 只由 validation R² 选择，不做 train+validation refit。新 no-MD �
 - 预训练日志：`logs/glt_v2_r2_o8_nomd_mipsloss_005k/{pretrain_005k.log,tmux_pretrain_retry01.log}`；
   下游承载日志：`tmux_finetune_retry01.log`；探针承载日志：`tmux_probes_retry01.log`。
 - 本轮未启动新 10k/20k、其他 seed、3D/教师路线或额外 sweep；旧缓存、旧 New-C0 和旧 C0/C1/C2 产物未覆盖。
+
+## GLT-V2 双路正式结果与几何失稳诊断（2026-09-16）
+
+本轮只读核验与固定小批量诊断；未重跑下游 fold、未追加正式预训练、未重建缓存、未覆盖历史产物。
+
+### 双路正式结果（既有运行，本轮仅校验式重聚合）
+
+静态复用缓存管线（cohort 959,588）上的 Concat/KFuse 各 5000 update，产物
+`results/glt_dual_static_pretrain_5k_{concat,kfuse}/`（resume/deploy 1000–5000，`step 5000`、
+`EXIT_CODE=0`）；8 任务 × 5 折网格 `results/glt_dual_static_finetune_formal_grid/`（80/80 `exit_code=0`）。
+校验式重聚合（`scripts/aggregate_glt_dual_finetune.py`，输出
+`<mode>/comparison_review_20260916T001828Z/`）精确复现验收值：宏观平均 test R²
+Concat `0.7877379364475444`、KFuse `0.7695629052761048`（pooled-OOF 口径分别为
+`0.7931866117573143`、`0.7758626655507175`，两者是不同估计量）。逐任务 test R² 均值（concat）：
+eat 0.9806、eea 0.9169、egb 0.8966、egc 0.8970、ei 0.7672、eps 0.7487、nc 0.8154、xc 0.2795；
+kfuse 对应为 0.9777、0.9001、0.8927、0.8817、0.7504、0.7210、0.8073、0.2256。XC 显著偏低，
+需在后续按残差/预测方差/标签分布单独检查，不用已看过的 test 反复选参数。
+
+### Concat 几何失稳：B.3 有限回放（800/800 update，逐位复现）
+
+从 `resume_02000.pt` 恢复、四卡／microbatch 84／global batch 1008／BF16，`--diagnostics
+--stop-after-step 2800`，输出 `results/glt_v2_diag_b3_concat_replay_20260916`，日志
+`logs/glt_v2_diag_b3_concat_replay_20260916/replay.log`。回放与正式运行在 800 个共同 step 上
+chem/geo/FP 三项 `max|replay-ref| = 0`，`66.9968@2676` 的峰值精确重现。
+
+窗口按 step 定义、同 step 取首次出现的全局值（各 rank 打印相同全局量）：基线 `2401–2600` 中位
+`0.00092`；首个 `geo>0.1` 在 `2662`；峰值 `66.9968@2676`；`4001–5000` 中位 `0.3139`（约 342×），
+末值 `0.3108`，**截至 5000 未恢复**。chem 由 `0.1854` 到 `0.1617`（无持久退化）；FP 在 `2676`
+瞬态升至 `0.1987`（约 4.6×）后回到 `0.0418`。KFuse 同类事件为瞬态：首个 `geo>0.1` 在 `3274`、
+峰值 `6.0736@3406`、末值 `0.00106`，完全恢复。
+
+机制证据（dense 窗口 `2600–2720` 的 rank0 局部统计）：angle head pre-tanh 均值由 `-0.51` 漂移到
+`+1.01`（2666）、`-4.07`（2668），tanh 导数由 `0.78` 塌到 `0.0012`，`2680` 起 exact ±1 比例达
+`1.0000`、导数恒 `0.0000`；同期 3D 表示 `graph_3d_rms` 由 `0.82` 单调增到 `9.17`，`length_head`
+梯度由 `0.037` 升到 `0.96–1.00`。尖峰以 length 为主（`2676` 分项 sum：length `5441.5`、angle
+`176.4`，length 占 96.9%），angle 饱和后留下约 `26.7`（基线 0.21）的常数残差。距离 Gaussian
+`σ_min` 全程恒为 `0.0172`，排除 Gaussian 宽度分支；BF16 已在固定批量诊断中排除（FP32≈BF16）。
+`_module_grad_norms` 将 `p.grad is None` 记为 `0.0`，故 angle head 梯度 `0.0000` 不区分
+“梯度为零”与“未进入反向图”，属当前口径限制。
+
+上述为观测与支持性证据：表示尺度增长先于饱和，但 `~2655–2660` 的初始触发事件、以及 LayerNorm
+能否阻断该链条均未验证。首要改动建议（本轮未实施）为仅在几何头输入加 LayerNorm
+（`length_head`/`angle_head` 的 `nn.Sequential` 首部），并以同源 800-update 回放作最小验证预算。
+
+### 局部验证
+
+`tests/test_glt_dual_diagnostics.py` 新增 7 项（开关不改变 loss/梯度/state_dict/RNG、分项还原、
+`component_tensors` 梯度、缺失梯度按零对齐、真实 Gaussian hook、angle 统计有限性）；
+与 `tests/test_dual_glt_pretrain.py`、`tests/test_aggregate_glt_dual_finetune.py` 合计
+**27 passed**。诊断入口：`scripts/pretrain_glt_dual.py --diagnostics --stop-after-step`
+（诊断模式只写 resume/诊断状态、不生成 deploy）、`scripts/diagnose_glt_dual_pretrain.py`
+（六 checkpoint 固定批量前向，无 optimizer update）。

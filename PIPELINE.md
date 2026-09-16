@@ -877,3 +877,35 @@ MMFF eligible 中 Round-0 为 50/52，retry 0/2 恢复。部分报告为
 success rate；候选 Parquet、完整 Stereo/retry/旧几何比较均未完成。当前决策为
 “3. 当前存在必须先修复的问题”，在 explicit isotope-H 的 O8/base/heavy identity
 定义确认前，不继续 pilot，不进入全量缓存重建。
+
+## 2026-09-16 更新：Trimer 层状态与预训练诊断入口
+
+### Trimer artifact 状态更正（不删除上文历史表述）
+
+上文“trimer 现存冻结 artifact（4 候选 v6 协议）与当前路线不匹配、该层保持阻断”为当时状态。
+此后已完成全量重建并在 `data/processed/mips_trimer_scage/store.json` 注册为新 active bundle：
+`bundle_hash 30f17b59bc5862a1ddae7eaee03b2767df26561d9bfecb690ec8eea3ddd09ed2`，
+trimer `artifact_hash 21a7733c96c6f1ec68b0f086e3063b7814dc5632879f27b3fc893d2b6d72935a`
+（`build_spec_hash a5c89ac88d0435e63a09c9a4ae82b1b3a63eede97cde9d1d90ef3ca015255162`），
+PI1M cohort 959,588 条（source 988,775；trimer 959,588/29,181）。历史 artifact 目录原地保留。
+
+同一阶段的 v10 身份契约修复解决了显式同位素氢导致的
+`o8_base_identity_contains_non_heavy_atom` 阻断：source/base 身份（含 `[H]/[2H]/[3H]`，
+`o8_to_trimer_atom`）与 heavy 子集（`Z>1`，`trimer_heavy_mask/indices`、`o8_heavy_mask`）
+正式解耦，content schema 升至 `mips-trimer-scage-trimer-v10`、LMDB 至 `…-lmdb-v8`。
+300 条真实记录 pilot 重跑完成（300/300、`PILOT_COMPLETE`、identity/isotope contract error = 0、
+几何成功 287/300），产物 `logs/trimer_v10_pilot_20260913/`；第一次 blocked pilot 输出保留在
+`logs/trimer_v9_pilot_20260913/` 作审计材料。
+
+### 预训练诊断入口（本轮新增，观测专用）
+
+* `scripts/pretrain_glt_dual.py`：`--diagnostics`（每步由 rank0 写 `output/diagnostics_steps.jsonl`：
+全局归约分项 mean、clip 前总梯度范数、各模块梯度范数、LR、目标数；表示/Gaussian/角度头每 20 步
+或密集窗口每步）、`--stop-after-step`（须 `start < stop <= config.max_optimizer_steps`，与
+`--diagnostics` 绑定）、`--diagnostic-save-steps`（仅限本次区间）、`--reference-log`（比对 LR、
+目标数与 loss）。诊断模式只写 resume/诊断状态、**不生成 deploy**。
+* `scripts/diagnose_glt_dual_pretrain.py`：六份真实 checkpoint（Concat/KFuse × 2k/3k/5k）的固定
+16 条记录、FP32/BF16 eval 前向与分项梯度，不执行 optimizer update。
+* 不变性：诊断开关不改变 loss、梯度、`state_dict`、RNG 消耗与数据顺序
+（`tests/test_glt_dual_diagnostics.py`，7 项）。B.3 回放进一步实证：从同一 `resume_02000.pt`
+恢复的 800 步与正式 5k 运行逐位一致（chem/geo/FP `max|diff| = 0`）。
