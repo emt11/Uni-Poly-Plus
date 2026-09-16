@@ -1,5 +1,13 @@
 # Uni-Poly 项目变更周期归档
 
+## DOCS-20260916-04｜GLT-V2 专项清理计划（仅规划）
+
+用户授权编写 Plan_Delete.md，未授权实际删除。Codex 先 pull，保留用户已有空白未跟踪文件，再只读核对本地依赖、远端 store/manifest/run.json、du 尺寸和活动进程，形成清理专项计划。
+
+实际交付：明确当前双路与 geonorm 保留范围；固定正式 PI1M/downstream bundle、cohort、static/targets 保留链；将旧根级缓存和 sidecar 列为条件候选，显示尺寸约 119 GiB、实际释放量待核；规定先解除 package／dataset／utils 共用依赖，再精简专用模块。发现 geonorm_5k 正在运行，执行期禁止删除／搬移其依赖。
+
+验证为文档静态自检及 git diff --check，无模型测试、训练、缓存生成或删除；详细清单和预算保存在 Plan_Delete.md。未覆盖当前 Plan.md，未给清理执行授予新权限。下一步是在科学任务结束后形成精确删除 allowlist、由 Codex 审查并取得实际清理授权；本记录完成的是规划文档周期，不代表清理周期完成。
+
 本文件保存每轮“规划 → 执行 → 审查”的实际记录。当前任务在 [Plan.md](Plan.md)，协作规则在 [AGENTS.md](AGENTS.md)。按周期关闭时间追加；不以归档内容授权新任务，不追溯编造旧记录。
 
 每轮保存最终实施计划和重要修订、执行摘要、验证证据、审查结论与下一步。仅链接当前 Plan.md 不足以归档；大段日志／diff 使用稳定路径或 commit 引用。未完成但被取消／替换的周期注明实际状态；历史更正以带日期的补充记录追加。
