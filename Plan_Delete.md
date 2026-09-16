@@ -3,7 +3,7 @@
 ## 1. 状态、目标与范围
 
 * 计划 ID：CLEANUP-20260916-01，r2（2026-09-16：由原本地编写版本适配为当前远程训练机直接执行）。
-* 状态：需返修（精确清理已完成；阶段 3 只读验收为 53 passed、1 failed。失败定位为现有 fallback 测试／字段选择契约问题，与本次删除无因果关系；代码修复不在本轮清理授权内）。
+* 状态：已完成（精确清理、修正后的局部契约验收和两融合部署只读验证均完成；最终 54 passed、1 warning。未启动训练或缓存重建）。
 * Codex 负责规划／审查，ZCode 负责后续执行。本文件是用户明确指定的清理专项计划，暂不替换仍在进行的 Plan.md 科学任务。
 * 本轮规划／文档执行／自检：Codex；不属于独立审查。修改前基线为 `43f83f7a001fd46cd5383f2ca711e81c6ff595db`，`dev` 分支工作树干净；已执行 `git pull --ff-only origin dev`，返回 Already up to date。
 * 保留路线：当前 O8 Bond-Path + 完整 Trimer Galformer 3D，Concat／KFuse、三任务预训练、新 outer5_inner20 微调、当前 geonorm 变体与诊断／缓存生产／审计能力。不是只保留名称含 `glt_v2` 的文件。
@@ -222,13 +222,15 @@ r1 静态审查记录的耦合须在执行前按当前源码复核，并先处�
 * 按 3.4 的绝对路径 allowlist，在 `tmux` `Uni-Poly:cleanup_20260916_01_delete` 中执行删除，命令和逐项校验日志为 `logs/cleanup_20260916_01/delete.log`。实际删除 4 个 PI1M pilot、`cohort_30f17b59bc5862a1_v2`、`periodic_line_glt_distill_v2.parts`，以及两个 blocked build 的 6 个大 payload；失败 build 的 manifest、metadata、rejections 和 writer-lock provenance 保留。未删除 active bundle、root-level 读取链、active cohort/static/targets、代码、配置、测试、checkpoint、results 或历史 logs。
 * 初次删除脚本的保护路径断言错误地假定 bundle 根有 `.frozen`，因此末尾返回 `1`；删除和逐项 absent 校验已完成。随后在 `tmux` `Uni-Poly:cleanup_20260916_01_delete` 的 postverify 命令按实际三层 artifact 路径重跑，日志 `logs/cleanup_20260916_01/postverify.log`，所有删除目标均 `ABSENT`，active PI1M/downstream 链、六个 `.frozen`、store 和失败 provenance 均 `RETAIN_PRESENT`。这不是数据删除失败，但应在后续脚本修订中改正路径断言。
 * `periodic_line_glt_distill_v2.parts` 中 16 个 `part_*.log` 已复制到 `logs/cleanup_20260916_01/preserved_distill_v2_parts/`；日志与 ignored 数据不纳入 Git。文件系统从 `Used=708445024256`、`Available=3028318564352` 变为 `Used=695758565376`、`Available=3041005023232`，可用空间增加 `12,686,458,880` bytes（约 11.81 GiB）。该值是文件系统差额，不把候选 `du` 之和当作释放量。
-* 最小只读验收在 `tmux` `Uni-Poly:cleanup_20260916_01_accept` 执行，完整日志 `logs/cleanup_20260916_01/acceptance.log`：保留代码 import 与 7 个 CLI `--help` 均成功，路径／冻结标记检查成功；聚焦测试为 `53 passed, 1 failed, 1 warning`。唯一失败为 `tests/test_cache_lifecycle.py::test_downstream_geometry_fallback_keeps_complete_identity_carrier`：`select_record_fields("trimer", data)` 未携带可选 `trimer_failure_code`，而 `_check_fields(... retain_full_identity_fallback ...)` 强制读取该字段。这是当前代码／测试字段选择契约问题；本轮未修改代码，也没有证据表明由删除触发。
-* 未执行全量数据读取、Stereo 全量扫描、模型 forward/backward、预训练、微调、聚合重算或缓存重建；既有正式 checkpoint／聚合证据未被删除，仅按计划保留。清理动作因此可交付，但阶段 3 的全绿验收及上述独立测试修复仍需后续授权。
+* 最小只读验收先在 `tmux` `Uni-Poly:cleanup_20260916_01_accept` 执行，完整日志 `logs/cleanup_20260916_01/acceptance.log`：保留代码 import 与 7 个 CLI `--help` 均成功，路径／冻结标记检查成功；首次聚焦测试为 `53 passed, 1 failed, 1 warning`。唯一失败为 `tests/test_cache_lifecycle.py::test_downstream_geometry_fallback_keeps_complete_identity_carrier`：测试调用 `select_record_fields("trimer", data)` 漏传可选 `trimer_failure_code`，而生产 fallback 写入路径已显式传递该字段。
+* 在修改前再次 `git pull --ff-only origin dev`（`Already up to date`），仅对该测试调用补上 `optional_fields=("trimer_failure_code",)`；没有修改生产生成器、缓存 schema 或科学定义。随后在 `tmux` `Uni-Poly:cleanup_20260916_01_recheck` 重跑同一 6 个目标文件，日志 `logs/cleanup_20260916_01/acceptance_recheck.log`，结果 `54 passed, 1 warning`，exit code `0`。
+* 两个正式 deploy 包的只读检查在 `tmux` `Uni-Poly:cleanup_20260916_01_modelcheck` 完成，日志 `logs/cleanup_20260916_01/modelcheck.log`，新报告为 `results/cleanup_20260916_01/deploy_validation/{concat,kfuse}.json`。使用 active PI1M cohort 的真实索引 `[20, 9]`（普通明确 E/Z 与真实 `*O*` N=0），Concat/KFuse 均 `FIXED_CONCAT_DEPLOY_VALID=YES`：strict load、187 个 encoder tensor 的 resume bitwise identity、全有限、预测形状 `[2,1]`、cache zero-write 均通过；本轮没有 optimizer 更新或写入生产缓存。
+* 未执行全量数据读取、Stereo 全量扫描、预训练、微调、聚合重算或缓存重建；既有正式 checkpoint／聚合和历史 backward smoke 证据未被删除，active 输入未改变，按阶段 3 的复用条款保留。此次新增的真实记录验证只读 forward，不把它称作新的训练性能结果。
 
 ## 7. 本轮交付与下一步
 
 本轮已按用户授权完成精确缓存清理并保留当前生产读取链。实际处理结果、磁盘差额、失败 provenance、tmux 窗口和验收证据见上方执行记录及 `logs/cleanup_20260916_01/`。没有删除任何 tracked 代码或科学产物，也没有启动模型、训练或缓存重建。
 
-当前结论不是“所有验收通过”：清理目标的 postverify 全部通过，但聚焦回归有 1 项现有字段选择契约失败。因此本计划状态为“需返修”，阻断项仅为该测试／生产字段契约的独立修复与复验；不回滚已完成的精确删除，不扩大候选范围。所有未列出的历史缓存、结果、临时目录和保留路线代码继续 HOLD。
+当前清理与最小验收已完成：删除目标 postverify 全部通过，修正后的聚焦回归为 `54 passed`，Concat/KFuse 两个真实双记录部署只读验证均通过。初次删除 wrapper 的 `.frozen` 路径断言错误已由实际三层路径 postverify 覆盖，不影响数据结果。所有未列出的历史缓存、结果、临时目录和保留路线代码继续 HOLD。
 
-后续（需新授权）应先修复或明确 `trimer_failure_code` 的序列化／`select_record_fields` 契约，再只重跑该相关回归和缓存只读验收；不得借此删除 active artifact、重建缓存或启动训练。
+本计划暂无继续执行项；如需处理其他 HOLD 候选或重新生成已删除的 pilot/staging，必须另行授权并重新做依赖闭包。被删除的 ignored 缓存不由 Git 恢复；`cohort_30f17b59bc5862a1_v2` 原 manifest 内容未保留，仅保留删除前 SHA256 与 phase2 provenance。

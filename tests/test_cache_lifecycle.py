@@ -225,7 +225,9 @@ def test_downstream_geometry_fallback_keeps_complete_identity_carrier():
         "retain_full_identity_fallback"
     )
     _check_fields(
-        "trimer", select_record_fields("trimer", data), b"x" * 32,
+        "trimer", select_record_fields(
+            "trimer", data, optional_fields=("trimer_failure_code",)
+        ), b"x" * 32,
         build_spec=spec,
     )
     with pytest.raises(TrimerContractError):
