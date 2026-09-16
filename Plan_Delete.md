@@ -3,7 +3,7 @@
 ## 1. 状态、目标与范围
 
 * 计划 ID：CLEANUP-20260916-01，r2（2026-09-16：由原本地编写版本适配为当前远程训练机直接执行）。
-* 状态：待授权（实际清理）；本轮环境适配文档已完成。用户仅授权修订本文件，没有授权删除文件、缓存或产物。
+* 状态：需返修（精确清理已完成；阶段 3 只读验收为 53 passed、1 failed。失败定位为现有 fallback 测试／字段选择契约问题，与本次删除无因果关系；代码修复不在本轮清理授权内）。
 * Codex 负责规划／审查，ZCode 负责后续执行。本文件是用户明确指定的清理专项计划，暂不替换仍在进行的 Plan.md 科学任务。
 * 本轮规划／文档执行／自检：Codex；不属于独立审查。修改前基线为 `43f83f7a001fd46cd5383f2ca711e81c6ff595db`，`dev` 分支工作树干净；已执行 `git pull --ff-only origin dev`，返回 Already up to date。
 * 保留路线：当前 O8 Bond-Path + 完整 Trimer Galformer 3D，Concat／KFuse、三任务预训练、新 outer5_inner20 微调、当前 geonorm 变体与诊断／缓存生产／审计能力。不是只保留名称含 `glt_v2` 的文件。
@@ -124,6 +124,35 @@ ZCode 在删除前把精确 allowlist 表追加到本文件：`dzw2` 上的绝�
 
 当前大缓存不全量反序列化，不重新 hash 全部 LMDB，不全量 Stereo 扫描；必要时只对保留真实 fixture 做 readonly 读取验证。未完成上述检查前本表仍是候选，不发布“一键 rm”命令。
 
+### 3.4 本次执行的精确 allowlist（2026-09-16 13:31 UTC 复核）
+
+复核主机为 `dzw2`，项目根为 `/root/workspace/Uni-Poly-Plus-master`，预检时 HEAD 为
+`5a8fe0fa2d24696a36ae7bcb311710fa12cbf9bb`，当时工作树干净且已执行
+`git pull --ff-only origin dev`（Already up to date）。预检日志为
+`logs/cleanup_20260916_01/preflight_audit.log`；其中没有候选路径的打开 fd、硬链接或软链接。
+正式 grid 与训练子进程均已退出；仅有旧监视 shell，不读写下列候选路径。
+
+**DELETE_CANDIDATE（本次实际处理）**
+
+1. `/root/workspace/Uni-Poly-Plus-master/data/processed/glt_dual_v2/pi1m/dual_static_v1_pilot1k`（约 41 MiB）：仅被已保存的 `results/glt_dual_static/pilot1k_build.json` provenance 引用，无代码、配置或现行 run 入口引用。
+2. `/root/workspace/Uni-Poly-Plus-master/data/processed/glt_dual_v2/pi1m/dual_static_v1_pilot10k`（约 499 MiB）：仅被已保存的 `results/glt_dual_static/pilot10k_build.json` provenance 引用。
+3. `/root/workspace/Uni-Poly-Plus-master/data/processed/glt_dual_v2/pi1m/pretrain_targets_v1_pilot1k`（约 516 KiB）：仅被 pilot provenance 引用。
+4. `/root/workspace/Uni-Poly-Plus-master/data/processed/glt_dual_v2/pi1m/pretrain_targets_v1_pilot10k`（约 4.9 MiB）：仅被 pilot provenance 引用。
+5. `/root/workspace/Uni-Poly-Plus-master/data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1_v2`（约 247 MiB）：与正式 cohort 同计数但无当前代码、配置或保留 run.json 消费者；删除前 manifest 的 SHA256（`9eba93d60781361b005800f98d68ff8eba04a888fadf8b328915e147f1d23945`）及 `results/glt_dual_readiness_20260915/phase2_cohort_v2.json` provenance 仍保留，原 manifest 随 cohort 目录删除。
+6. `/root/workspace/Uni-Poly-Plus-master/data/processed/mips_trimer_scage/periodic_line_glt_distill_v2.parts`（约 4.1 GiB）：最终 `periodic_line_glt_distill_v2` 已存在，当前源码与配置无 `.parts` 读取入口，预检无 writer/fd；删除前复制其中 `part_*.log` 到清理日志目录。
+7. 两个失败 build 仅删除大 payload，保留失败 provenance：
+   * `/root/workspace/Uni-Poly-Plus-master/data/processed/mips_trimer_scage/builds/0e7c97850147a972c5774d401731a33a05c0e1262a1e841150f87ed8a9134be7.blocked-old-failure-policy/ru_base/data.lmdb`
+   * `/root/workspace/Uni-Poly-Plus-master/data/processed/mips_trimer_scage/builds/0e7c97850147a972c5774d401731a33a05c0e1262a1e841150f87ed8a9134be7.blocked-old-failure-policy/topology/data.lmdb`
+   * `/root/workspace/Uni-Poly-Plus-master/data/processed/mips_trimer_scage/builds/0e7c97850147a972c5774d401731a33a05c0e1262a1e841150f87ed8a9134be7.blocked-old-failure-policy/source/records.jsonl`
+   * `/root/workspace/Uni-Poly-Plus-master/data/processed/mips_trimer_scage/builds/ece3a6d6cf6f73f76260afea10ef44f62f38c7b065bdfd672b26dcea9104fb11.contract-blocked-ru-build-boundary/ru_base/data.lmdb`
+   * `/root/workspace/Uni-Poly-Plus-master/data/processed/mips_trimer_scage/builds/ece3a6d6cf6f73f76260afea10ef44f62f38c7b065bdfd672b26dcea9104fb11.contract-blocked-ru-build-boundary/topology/data.lmdb`
+   * `/root/workspace/Uni-Poly-Plus-master/data/processed/mips_trimer_scage/builds/ece3a6d6cf6f73f76260afea10ef44f62f38c7b065bdfd672b26dcea9104fb11.contract-blocked-ru-build-boundary/source/records.jsonl`
+   这些目录没有 `.done`/`.frozen`；各自的 `source/manifest.json`、`ru_base/metadata.json`、`topology/metadata.json`、`rejections.jsonl`（存在时）不删除。
+
+**KEEP（本次不处理）**：active `store.json` 及其 bundle、root-level `topology`/`trimer`/`ru_base`（W-CAMR 与旧读取链仍引用）、当前 PI1M/downstream cohort、`dual_static_v1`、`pretrain_targets_v1`、`periodic_line_glt_v1`、`periodic_line_glt_image_v1`、`periodic_line_glt_distill_v1/v2`、MD200、所有当前/保留路线代码、配置、测试、checkpoint、results 与 logs。
+
+**HOLD（不因名称删除）**：`src/modules/mts_glt_distill.py`、`src/modules/periodic_line_glt_v3.py`、`src/modules/atomic_point_encoder.py`、`src/training/w_camr_v2_support/` 及其入口；`PIPELINE.md` 和 import/测试审查证明它们仍属于保留路线。所有未列出的历史缓存、结果和临时目录也保持 HOLD。
+
 ## 4. 代码精简：先解除依赖，再删除退役实现
 
 ### 保留入口及能力
@@ -187,10 +216,19 @@ r1 静态审查记录的耦合须在执行前按当前源码复核，并先处�
 * 报告当前机逐项删／留／HOLD、删除前后文件系统可用空间差额、剩余依赖、运行命令及验证结果。若有并发写入、共享存储变化或已 unlink 但未关闭的 fd，说明差额不能精确归因于本轮删除，不把候选尺寸直接当成释放量。更新 PIPELINE.md 当前入口与退役说明，不擦除 RESULTS.md 历史结论；完成后归档本轮完整清理周期。
 * 按 AGENTS.md 显式提交本轮代码与文档，fetch 后检查待推送提交，推送当前同名分支并核对 GitHub origin 包含该 commit；不上传缓存、checkpoint 或大型日志。分别报告“当前训练机文件系统清理结果”和“Git 代码／文档同步结果”，不声称清理了用户个人电脑或任何其他机器。
 
+### 阶段 2/3 实际执行记录（2026-09-16，Codex）
+
+* 用户于本轮明确授权直接执行；执行前已在 `dzw2`、`/root/workspace/Uni-Poly-Plus-master` 核对 `dev`、origin 和活动任务，并执行 `git pull --ff-only origin dev`（`Already up to date`）。预检时 HEAD 为 `5a8fe0fa2d24696a36ae7bcb311710fa12cbf9bb`；仅旧监视 shell 存活，未发现预训练、微调、缓存 builder 或候选路径的 writer/fd/mmap。预检完整日志：`logs/cleanup_20260916_01/preflight_audit.log`。
+* 按 3.4 的绝对路径 allowlist，在 `tmux` `Uni-Poly:cleanup_20260916_01_delete` 中执行删除，命令和逐项校验日志为 `logs/cleanup_20260916_01/delete.log`。实际删除 4 个 PI1M pilot、`cohort_30f17b59bc5862a1_v2`、`periodic_line_glt_distill_v2.parts`，以及两个 blocked build 的 6 个大 payload；失败 build 的 manifest、metadata、rejections 和 writer-lock provenance 保留。未删除 active bundle、root-level 读取链、active cohort/static/targets、代码、配置、测试、checkpoint、results 或历史 logs。
+* 初次删除脚本的保护路径断言错误地假定 bundle 根有 `.frozen`，因此末尾返回 `1`；删除和逐项 absent 校验已完成。随后在 `tmux` `Uni-Poly:cleanup_20260916_01_delete` 的 postverify 命令按实际三层 artifact 路径重跑，日志 `logs/cleanup_20260916_01/postverify.log`，所有删除目标均 `ABSENT`，active PI1M/downstream 链、六个 `.frozen`、store 和失败 provenance 均 `RETAIN_PRESENT`。这不是数据删除失败，但应在后续脚本修订中改正路径断言。
+* `periodic_line_glt_distill_v2.parts` 中 16 个 `part_*.log` 已复制到 `logs/cleanup_20260916_01/preserved_distill_v2_parts/`；日志与 ignored 数据不纳入 Git。文件系统从 `Used=708445024256`、`Available=3028318564352` 变为 `Used=695758565376`、`Available=3041005023232`，可用空间增加 `12,686,458,880` bytes（约 11.81 GiB）。该值是文件系统差额，不把候选 `du` 之和当作释放量。
+* 最小只读验收在 `tmux` `Uni-Poly:cleanup_20260916_01_accept` 执行，完整日志 `logs/cleanup_20260916_01/acceptance.log`：保留代码 import 与 7 个 CLI `--help` 均成功，路径／冻结标记检查成功；聚焦测试为 `53 passed, 1 failed, 1 warning`。唯一失败为 `tests/test_cache_lifecycle.py::test_downstream_geometry_fallback_keeps_complete_identity_carrier`：`select_record_fields("trimer", data)` 未携带可选 `trimer_failure_code`，而 `_check_fields(... retain_full_identity_fallback ...)` 强制读取该字段。这是当前代码／测试字段选择契约问题；本轮未修改代码，也没有证据表明由删除触发。
+* 未执行全量数据读取、Stereo 全量扫描、模型 forward/backward、预训练、微调、聚合重算或缓存重建；既有正式 checkpoint／聚合证据未被删除，仅按计划保留。清理动作因此可交付，但阶段 3 的全绿验收及上述独立测试修复仍需后续授权。
+
 ## 7. 本轮交付与下一步
 
-本轮仅将 r1 清理计划适配为当前训练机 `dzw2` 的 r2，补齐单机路径、活动任务快照、直接执行与日志规范、Git origin 边界和验收口径。不执行删除、模型／训练验证或构象生成；未启动清理窗口，未完成逐候选占用审计。仅做文档 diff／格式与关键路径静态检查，不宣称清理验收通过。
+本轮已按用户授权完成精确缓存清理并保留当前生产读取链。实际处理结果、磁盘差额、失败 provenance、tmux 窗口和验收证据见上方执行记录及 `logs/cleanup_20260916_01/`。没有删除任何 tracked 代码或科学产物，也没有启动模型、训练或缓存重建。
 
-最优先的潜在空间收益仍来自旧根级 topology/trimer/ru_base 与旧 sidecar；r1 记录的约 75 GiB bundle 和 45 GiB static 必须保留。约 119 GiB 是原候选盘点估计，不是本轮已释放或承诺可释放容量。
+当前结论不是“所有验收通过”：清理目标的 postverify 全部通过，但聚焦回归有 1 项现有字段选择契约失败。因此本计划状态为“需返修”，阻断项仅为该测试／生产字段契约的独立修复与复验；不回滚已完成的精确删除，不扩大候选范围。所有未列出的历史缓存、结果、临时目录和保留路线代码继续 HOLD。
 
-下一步由 ZCode 在相关科学任务结束后，根据本计划准备精确删除 allowlist 与剩余引用证据，交 Codex 审查。未核实缓存和历史资产保持 HOLD；不为追求“只剩 GLT-V2”而删除可复现性和当前共享依赖。
+后续（需新授权）应先修复或明确 `trimer_failure_code` 的序列化／`select_record_fields` 契约，再只重跑该相关回归和缓存只读验收；不得借此删除 active artifact、重建缓存或启动训练。

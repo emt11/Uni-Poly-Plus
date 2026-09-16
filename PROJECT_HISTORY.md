@@ -74,3 +74,15 @@
 * 只读证据：`hostname`、`pwd -P`、Git 状态／分支／remote、`tmux list-windows -t Uni-Poly`、`ps -eo pid,ppid,etime,args`、store 元数据、`findmnt -T`／`df -h`。09:11 UTC 的 `geonorm_5k` 训练与 worker 仍存活，实际命令读取受保护的 PI1M 数据链，日志为 `logs/glt_dual_static_pretrain_concat_geonorm5k.log`；未核实训练完成或所有候选 fd/mmap，不把进程存活称为训练健康证明。
 * 验证预算与结果：文档 diff／`git diff --check`、旧平台假设与关键路径静态检查；没有模型测试、GPU 任务、全量 LMDB 扫描、缓存生成／搬移／删除，没有创建清理窗口。文档自检不等于清理执行或科学验收。
 * 交付与下一步：本轮完成的是适配文档周期，实际提交及 push 结果见本条对应 Git 历史和最终回复。清理周期仍待授权；后续由 ZCode 在相关任务自然结束并交接后补齐精确 allowlist，Codex 审查后才可进入获准的清理阶段。未核实项 HOLD，不追加实验或终止现有任务。
+
+## CLEANUP-20260916-01/r2｜当前训练机精确缓存清理执行
+
+* 日期：2026-09-16（UTC）；主机 `dzw2`；项目根 `/root/workspace/Uni-Poly-Plus-master`；分支 `dev`；规划、执行和本轮审查均由 Codex 完成。用户明确授权执行 `Plan_Delete.md`，并说明现有任务已结束。
+* 基线与同步：执行前核对 `git status`、branch、origin、tmux、进程和文件系统，并运行 `git pull --ff-only origin dev`，结果 `Already up to date`。删除前 HEAD 为 `5a8fe0fa2d24696a36ae7bcb311710fa12cbf9bb`；没有回滚或覆盖用户改动。
+* 实施范围：依照 `Plan_Delete.md` 3.4 精确 allowlist 删除 4 个 PI1M pilot（dual_static／pretrain_targets）、`cohort_30f17b59bc5862a1_v2`、`periodic_line_glt_distill_v2.parts`，以及两个未冻结 blocked build 的 6 个大 payload。保留失败 manifest／metadata／rejections／writer-lock provenance、16 个分片日志副本、active bundle 与 root-level 读取链、active cohort/static/targets、代码／配置／测试／checkpoint／results／logs。没有删除 tracked 代码或科学产物。
+* 日志与窗口：预检 `Uni-Poly:cleanup_20260916_01`／`logs/cleanup_20260916_01/preflight_audit.log`；删除 `Uni-Poly:cleanup_20260916_01_delete`／`delete.log`；修正后的 postverify／`postverify.log`；验收 `Uni-Poly:cleanup_20260916_01_accept`／`acceptance.log`。所有窗口均独立于训练 pane；未启动 GPU、worker、模型、训练或缓存构建。
+* 结果：删除目标 postverify 全部 `ABSENT`，active 六个 `.frozen`、store、PI1M/downstream cohort/static/targets 和失败 provenance 全部存在。文件系统 `Available` 从 `3028318564352` 增至 `3041005023232` bytes，增加 `12,686,458,880` bytes（约 11.81 GiB）；该数值按文件系统差额记录，不冒称为候选目录大小总和。
+* 验收：保留代码 import、7 个 CLI `--help` 和 active 路径检查成功；聚焦测试 `53 passed, 1 failed, 1 warning`。唯一失败 `tests/test_cache_lifecycle.py::test_downstream_geometry_fallback_keeps_complete_identity_carrier` 源于 `select_record_fields("trimer", ...)` 未携带可选 `trimer_failure_code`、而 fallback `_check_fields` 强制访问它；代码与测试未因本轮清理而改动，现有问题未降级为清理成功。
+* 过程偏差：删除脚本首次错误地把 bundle 根当作 `.frozen` 路径并返回 1；实际删除与逐项校验已完成，随后按三层 artifact 的真实 `.frozen` 路径复核通过。该脚本断言属于后续可修复的工具问题，不影响本次已核准路径的删除结果。
+* 审查结论：清理动作本身完成，未发现 active cache identity、读取链或 writer 冲突损坏；计划状态为“需返修”而非全绿完成，阻断项是独立 fallback 字段契约测试失败。未执行全量读取、Stereo 全量审计、模型前后向、预训练、微调、聚合重算或缓存重建。
+* 下一步（需新授权）：先修复／明确 `trimer_failure_code` 序列化字段契约，并只重跑相关回归与 active artifact 只读验收；不扩大删除 allowlist，不恢复已删除 pilot／staging，不启动训练。

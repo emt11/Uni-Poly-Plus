@@ -18,6 +18,12 @@
 - `src/modules/periodic_line_glt_v3.py`、`scripts/build_mts_glt_v3_sidecars.py`、`data/processed/mips_trimer_scage/periodic_line_glt_image_v1`：`mts_glt_distill.py`、`scripts/build_mts_glt_distill_repair_sidecars.py` 与 `tests/test_mts_glt_distill.py` 的依赖，文件名带 v3 但服务保留路线。
 - `data/processed/mips_trimer_scage/periodic_line_glt_v1`：`tests/test_mts_glt_distill.py` 的对齐 fixture。
 
+## 2026-09-16：精确缓存清理状态
+
+在用户授权后，已在训练机 `dzw2` 按 `Plan_Delete.md` 的绝对路径 allowlist 完成一次精确清理。删除内容仅为不再被当前入口消费的 PI1M pilot 派生缓存、`cohort_30f17b59bc5862a1_v2`、已完成构建的 `periodic_line_glt_distill_v2.parts`，以及两个未冻结 blocked build 的大 payload；失败 build 的 manifest／metadata／rejections provenance 保留。当前 active bundle、root-level 读取链、PI1M/downstream cohort、`dual_static_v1`、`pretrain_targets_v1`、`.frozen`、固定 split、checkpoint、results、logs 与保留路线代码均未改动。清理前后文件系统可用空间差额为 `12,686,458,880` bytes（约 11.81 GiB），不是候选目录 `du` 之和。
+
+清理后的只读 import、CLI help 和 active artifact 存在性检查通过；聚焦回归为 `53 passed, 1 failed, 1 warning`。唯一失败是现有 `trimer_failure_code` 可选字段未由 `select_record_fields("trimer", ...)` 传入 fallback 的字段选择契约，不是本次缓存删除造成的读取链缺失。该问题尚未修复，不能将本轮状态写成全绿回归；代码、模型、训练和缓存重建均未因清理而启动。完整命令与日志见 `logs/cleanup_20260916_01/`，详见 `Plan_Delete.md` 的阶段 2/3 执行记录。
+
 ## 1. 已退役基线：MTS-GLT-v2-Base-5k
 
 ```text
