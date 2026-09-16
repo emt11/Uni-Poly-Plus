@@ -95,3 +95,12 @@
 * 最终计划：同一 ID 升 r3，ZCode 后续只读追溯现有日志／命令并补齐验收对应表，Codex 复核后收口；找不到材料就保留缺失，不靠新测试补造历史。已删除 cohort_v2 原 manifest 仅留 hash／摘要，记录溯源损失，不自动重建。其余代码和缓存继续 HOLD，若用户仍需精简，另行授权用途分类和精确依赖审查，实际删除不自动启动。
 * 实际修改：Plan_Delete.md 修订计划头、历史快照／阶段边界并新增第 7 节交接任务、预算、停止条件和完成标准；Plan.md 仅更新清理注记；本文件追加同周期更正，不重复归档首批删除，不改写原执行结论。未修改代码、缓存、PIPELINE.md 或 RESULTS.md。
 * 验证与状态：仅文档 diff、引用及 `git diff --check` 自检；没有运行模型、测试、训练或清理，没有执行新依赖调查。本轮完成的是下一步计划落盘，证据补记仍待执行，不能把计划交付写成整个精简项目完成。
+
+### 2026-09-16 更正｜CLEANUP-20260916-01/r3 证据补记完成
+
+* 授权与角色：用户要求继续当前 `Plan_Delete.md`；本次由 Codex 在 `dzw2:/root/workspace/Uni-Poly-Plus-master` 只读追溯第 7 节 A 并修订交接文档，不新增删除、代码、模型测试、训练或缓存重建。没有独立执行者复核，故不将本次自检称为独立审查。
+* 基线与活动任务：修改前工作树干净，分支 `dev`，HEAD `248371d`，`git pull --ff-only origin dev` 为 `Already up to date`。tmux `Uni-Poly` 没有运行中的 pretrain／finetune／builder／pytest；仅旧监视 shell 的轮询仍在，本次未接管或终止。
+* 证据补记：读取 `logs/cleanup_20260916_01/{postverify,acceptance_recheck,modelcheck}.log`、两份 deploy JSON、active `.frozen`／manifest、PI1M/downstream pretrain／finetune `run.json` 和 aggregation summary。删除目标仍为 `ABSENT`，active 读取链仍在。清理后的局部回归已有 `54 passed, 1 warning`、exit 0；两份 deploy 报告已有 strict load、187 encoder tensors、resume bitwise identity、有限 `[2,1]` forward 和 cache zero-write。没有重跑这些检查。
+* 命令和适用性边界：验收与 modelcheck 日志没有保存完整 argv／环境；Plan_Delete 第 7 节列出执行上下文可复述的命令并明确这不是独立日志证据。`scripts/validate_glt_dual_deploy.py` 未接收 static/targets 路径且在 `torch.no_grad()` 中 forward，因此 static/targets 清理后重新消费、backward 和删除前后预测 parity 均未执行／未独立核实。历史 PI1M `run.json` 仍绑定 sample_count `959588`、cohort `b03f96...`、bundle `30f17...`、dual static `9ff122...`、targets `5e7b...`；下游 run 仍绑定 downstream dual-static 与 `outer5_inner20`，只能作为未受删除目标影响的历史身份证据。
+* 聚合与溯源：复用 Concat/KFuse 8-task×40-fold summary（status PASS，macro8 `0.7877379364475444`／`0.7695629052761048`）和 80-shard summary，没有聚合重算。`cohort_30f17b59bc5862a1_v2` 原 manifest 仍是已知溯源损失，仅保留删除前 SHA256 `9eba93d60781361b005800f98d68ff8eba04a888fadf8b328915e147f1d23945` 与 `phase2_cohort_v2.json`，未生成补档。
+* 交付与结论：已更新 `Plan_Delete.md` 第 7 节、`Plan.md` 清理注记和 `PIPELINE.md` 命令可追溯性表述；`RESULTS.md`、生产代码、缓存、checkpoint 和历史结果未改动。首批清理及有限只读证据收口完成，但代码精简仍未实施；全量读取、Stereo 质量、static/targets consumer、backward、parity 和新实验不因本条记录而通过。后续若继续处理 HOLD 候选，须重新依赖审查并取得明确授权。

@@ -3,13 +3,13 @@
 ## 1. 状态、目标与范围
 
 * 计划 ID：CLEANUP-20260916-01，r3（2026-09-16：审查后明确首批清理完成范围，补入证据收口与下一步）。
-* 状态：需返修（仅限第 7 节的证据补记）；首批 12 个精确目标的缓存清理已完成并通过有限范围复核，原代码精简阶段未实施，其余候选继续 HOLD。不得将本状态理解为缓存损坏或整个项目精简已完成。
-* 授权：用户本轮要求将下一步写入本文件，仅授权文档修订；不授权新增删除、代码修改、模型测试、训练或缓存重建。首批删除的历史授权与执行记录保留在第 6 节。
-* Codex 负责规划／审查，本次文档修订由 Codex 执行并自检；后续证据补记交 ZCode，完成后交回 Codex 复核，不将同一主体的自检称为独立审查。本文件仍是用户指定专项计划，不替换 Plan.md 的科学任务。
-* r3 文档基线：`4c3416e3499a91acdff7853dea6801ab851024e9`；`dev` 分支工作树干净，修改前 `git pull --ff-only origin dev` 返回 Already up to date。r2 环境适配基线 `43f83f7` 与首批实际删除基线 `5a8fe0f` 均为历史阶段，不混作本轮基线。
+* 状态：已完成（首批 12 个精确目标的缓存清理及第 7 节证据补记已完成；原代码精简阶段未实施，其余候选继续 HOLD）。不得将本状态理解为缓存损坏、全量内容审计通过或整个项目精简已完成。
+* 授权：用户要求继续当前计划；本次仅执行第 7 节 A 的只读证据补记及必要文档修订，不新增删除、代码修改、模型测试、训练或缓存重建。首批删除的历史授权与执行记录保留在第 6 节。
+* Codex 负责本次只读补记、规划与审查记录并自检；本次没有独立执行者复核，因此不将同一主体的自检称为独立审查。本文件仍是用户指定专项计划，不替换 Plan.md 的科学任务。
+* r3 文档基线（证据补记前）：`4c3416e3499a91acdff7853dea6801ab851024e9`；本次补记前 `dev` 分支工作树干净，HEAD 为 `248371d`，修改前 `git pull --ff-only origin dev` 返回 Already up to date。r2 环境适配基线 `43f83f7` 与首批实际删除基线 `5a8fe0f` 均为历史阶段，不混作本轮基线。
 * 保留路线：当前 O8 Bond-Path + 完整 Trimer Galformer 3D，Concat／KFuse、三任务预训练、新 outer5_inner20 微调、当前 geonorm 变体与诊断／缓存生产／审计能力。不是只保留名称含 `glt_v2` 的文件。
 * 目标：移除退役路线的入口、专用实现、专用测试和冗余派生缓存；保留当前运行、恢复、再生成、审计和结果解释所需的依赖。
-* r1 候选盘点、r2 环境适配及首批删除分别保留其历史范围；未逐项复核的旧引用与容量不得升级为当前删除依据。r3 只修订文档，不重新执行已完成的清理或验证。
+* r1 候选盘点、r2 环境适配及首批删除分别保留其历史范围；未逐项复核的旧引用与容量不得升级为当前删除依据。r3 已完成只读证据收口；没有重新执行清理、测试、模型、训练或缓存重建。
 
 ## 2. 当前重要事实与执行前提
 
@@ -232,31 +232,31 @@ r1 静态审查记录的耦合须在执行前按当前源码复核，并先处�
 * 两个正式 deploy 包的只读检查在 `tmux` `Uni-Poly:cleanup_20260916_01_modelcheck` 完成，日志 `logs/cleanup_20260916_01/modelcheck.log`，新报告为 `results/cleanup_20260916_01/deploy_validation/{concat,kfuse}.json`。使用 active PI1M cohort 的真实索引 `[20, 9]`（普通明确 E/Z 与真实 `*O*` N=0），Concat/KFuse 均通过检查；脚本顶层键沿用历史名称 `FIXED_CONCAT_DEPLOY_VALID=YES`（KFuse 报告的 `fusion_mode` 明确为 `kfuse`），strict load、187 个 encoder tensor 的 resume bitwise identity、全有限、预测形状 `[2,1]`、cache zero-write 均通过；本轮没有 optimizer 更新或写入生产缓存。
 * 未执行全量数据读取、Stereo 全量扫描、预训练、微调、聚合重算或缓存重建；既有正式 checkpoint／聚合和历史 backward smoke 证据未被删除，active 输入未改变，按阶段 3 的复用条款保留。此次新增的真实记录验证只读 forward，不把它称作新的训练性能结果。
 
-## 7. r3 审查结论与下一步
+## 7. r3 审查结论与证据收口
 
-### 7.1 审查结论：首批清理有限范围通过，证据记录需收口
+### 7.1 审查结论：首批清理有限范围通过，证据补记已完成
 
 此前只读复核确认 12 个精确目标均不存在，active bundle／六个层级 `.frozen` 仍在，PI1M static／targets manifest hash 与原记录一致，16 个分片日志副本保留。既有日志记录 `54 passed, 1 warning`，Concat/KFuse 两份部署报告记录 strict load、187 个 encoder tensor 与 resume 逐位一致及真实双记录有限 forward。11.81 GiB 是首批日志中的文件系统差额，不是 r3 新释放空间。
 
 这支持“首批清理未发现破坏当前读取链”，不证明整个项目精简完成，也不证明所有缓存 payload 或科学质量均通过全量审计。首次删除 wrapper 的 `.frozen` 路径断言错误保留在记录中；postverify 已覆盖真实路径，不为纠正日志重新执行删除。
 
-|验收项|已存在证据／当前边界|下一步记录要求|
+|验收项|已存在证据／当前边界|本次执行／复用证据／未执行或未核实|
 |-|-|-|
-|删除目标与保留路径|`logs/cleanup_20260916_01/postverify.log`，且此前只读复核目标状态一致|保留，不重复删除；存在性不等于全量内容一致性|
-|局部回归|`logs/cleanup_20260916_01/acceptance_recheck.log`：54 passed，exit 0|补准确命令、环境变量及六个测试文件的完整名称；不能仅凭通过数量猜测|
-|部署加载与真实 forward|`results/cleanup_20260916_01/deploy_validation/concat.json`、`kfuse.json`；普通 E/Z 与真实 `*O*` N=0，输出 `[2,1]` 有限|明确是既有 forward 验证，不是新增 backward、训练或性能结果|
-|static／targets 消费路径|上述部署脚本未传静态缓存，不能据此声称此路径已重新验证|列出可复用报告及对应 bundle／cohort／static／targets 身份；无适用证据则标未核实|
-|backward 与删除前后预测 parity|本次部署脚本使用 `torch.no_grad()`；resume tensor 一致不等于预测 parity|分别列出旧报告、代码／checkpoint 身份和复用理由；找不到则标未执行／未核实，不自动补跑|
-|聚合结果|本轮未重算，生产代码与正式结果未删除|注明复用报告及适用范围，不追加 folds 或训练|
+|删除目标与保留路径|`logs/cleanup_20260916_01/postverify.log`，且此前只读复核目标状态一致|本次只读确认删除目标仍为 `ABSENT`、active 六层 `.frozen`／store／cohort／static／targets 仍为 `RETAIN_PRESENT`；不重复删除。该证据是存在性检查，不是全量内容一致性证明。|
+|局部回归|`logs/cleanup_20260916_01/acceptance_recheck.log`：54 passed，exit 0|日志没有保存完整 argv／环境。执行记录可复述的命令为 `PYTHONPATH=.:tests pytest -q tests/test_glt_dual_cache.py tests/test_glt_dual_static.py tests/test_glt_dual_diagnostics.py tests/test_frozen_cache_store.py tests/test_cache_lifecycle.py tests/test_aggregate_glt_dual_finetune.py`，cwd 为项目根、tmux 为 `Uni-Poly:cleanup_20260916_01_recheck`；六文件列表和 `PYTHONPATH` 属于执行上下文补记，不能当作日志中已持久化的独立命令证据。结果为 54 passed、1 DeprecationWarning、exit 0；本次不重跑。|
+|部署加载与真实 forward|`results/cleanup_20260916_01/deploy_validation/concat.json`、`kfuse.json`；普通明确 E/Z 与真实 `*O*` N=0，输出 `[2,1]` 有限|`modelcheck.log` 未保存完整 argv；执行记录可复述为分别调用 `scripts/validate_glt_dual_deploy.py`，输入对应 `deploy_05000.pt`／`resume_05000.pt`、`--expected-step 5000`、`--fusion-mode concat|kfuse`、`--cohort-root data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1`、`--cache-root data/processed/mips_trimer_scage`、`--index 20 --index 9 --device cpu` 及对应 `--report-json`，cwd 为项目根、tmux 为 `Uni-Poly:cleanup_20260916_01_modelcheck`。报告确认 strict load、187 tensors、resume bitwise identity、finite、`[2,1]` forward、cache zero-write；脚本源码在 `scripts/validate_glt_dual_deploy.py:130-145` 明确用 `build_dual_sample` 且 `torch.no_grad()`，因此这是既有只读 forward，不是新增 backward、训练或性能结果。|
+|static／targets 消费路径|部署脚本没有 `--dual-static-root`／`--pretrain-target-root`，不能据此声称清理后重新消费该路径|复用既有 PI1M `run.json`：`results/glt_dual_static_pretrain_5k_{concat,kfuse}/run.json` 绑定 sample_count `959588`、cohort `b03f96a14c2...`、main bundle `30f17b59bc...`、dual static `9ff122cc16...`、targets `5e7b5ec8...`；`results/glt_dual_static_smoke4_{concat,kfuse}/run.json` 亦绑定同一身份。下游 `results/glt_dual_static_finetune_formal_grid/{concat,kfuse}/eat_fold0/run.json` 与 `results/glt_dual_static_finetune_smoke_auto_retry/{concat,kfuse}/run.json` 绑定 downstream dual-static 与 split。当前 active `.frozen` 与这些身份一致；清理后没有再次运行 static/targets consumer，故只能复用未受清理目标影响的历史身份，不能称为本次重新验证。|
+|backward 与删除前后预测 parity|本次部署脚本使用 `torch.no_grad()`；resume tensor 一致不等于预测 parity|本次未执行 backward，也没有同一输入的删除前／删除后预测差分报告。`resume_identity.bitwise_identical=true` 仅证明 deploy 与 resume encoder tensor 一致；不外推为输出 parity。历史 backward／静态路径证据未被删除，但未在本清理周期复核，当前项标为未执行／未独立核实。|
+|聚合结果|本轮未重算，生产代码与正式结果未删除|复用 `results/glt_dual_static_finetune_formal_grid/{concat,kfuse}/comparison_review_20260916T001828Z/summary.json`（各 `status=PASS`、8 tasks、40 folds，macro8 分别 `0.7877379364475444`／`0.7695629052761048`）及 `results/glt_dual_static_finetune_formal_grid/summary.json`（80 shards、0 failures）。另有旧 fixed Concat 7-task 报告 `results/glt_v2_fixed_concat_5k_20260916/aggregation_review_7task/summary.json`，其 scope 仍为 7 tasks；没有因本次清理新增 folds 或训练。|
 
-### 7.2 下一步 A：补齐现有证据与文档收口（待执行）
+### 7.2 下一步 A：补齐现有证据与文档收口（已完成）
 
-交接角色：ZCode 补记，Codex 复核。本轮授权的是将本节写入计划；没有在本轮执行以下证据追溯，也没有新增运行授权。
+本次由 Codex 在 `dzw2` 只读完成；没有独立执行者复核，也没有新增运行授权。
 
-1. 从现有日志、保留的 tmux 命令历史或执行记录补回实际测试／部署命令、工作目录、环境、测试文件列表及退出码。只读取已有材料；找不到原命令就明确记录缺失，不伪造可执行命令冒充历史命令，也不为补日志重跑测试。
-2. 按 7.1 表逐项填写“本次执行／复用证据／未执行或未核实”；复用时说明产物身份与代码适用性。static 路径、backward 和 parity 不得由有限 forward 代替。若已有证据足够，停止追加验证。
-3. 将 `cohort_30f17b59bc5862a1_v2` 原 manifest 未备份记录为已知溯源损失：目前仅保留删除前 SHA256 和 `phase2_cohort_v2.json`，不能还原原文；不影响正式 cohort，但不能称完整来源信息已保存，不为补档生成缓存。
-4. 将补记交回 Codex。复核后同步 Plan.md 的清理交接状态，向 PROJECT_HISTORY.md 同一周期追加更正，不另立重复清理周期、不擦除首次失败；PIPELINE.md 仅在存在错误表述时修正文义，RESULTS.md 不新增结果。r3 本次已经同步基本范围与历史快照，剩余工作是证据补记。
+1. 读取 `acceptance_recheck.log`、`modelcheck.log`、`postverify.log`、active manifests／`.frozen`、相关 pretrain／finetune `run.json` 与聚合 summary；日志未保存的完整 argv／env 保留为缺失，不以新运行补造。
+2. 已按 7.1 表逐项记录本次存在性证据、可复用身份和未执行项。static/targets、backward、parity 没有由有限 forward 代替。
+3. 已记录 `cohort_30f17b59bc5862a1_v2` 原 manifest 的已知溯源损失：仅保留删除前 SHA256 `9eba93d60781361b005800f98d68ff8eba04a888fadf8b328915e147f1d23945` 与 `results/glt_dual_readiness_20260915/phase2_cohort_v2.json`；原文不可还原，不影响正式 cohort 身份，也未生成缓存补档。
+4. 已同步 `Plan.md`、`PROJECT_HISTORY.md`，并修正 `PIPELINE.md` 对清理命令可追溯性的表述；`RESULTS.md` 未新增结果。
 
 预算：只读代码／元数据／现有日志与必要文档修订；**零新增删除、零模型测试、零 GPU／worker、零训练、零构象生成／缓存重建**。不扫描全量 LMDB、不修改生产 schema、不新增通用清理框架。预计超过一分钟的只读检查仍遵守 tmux 与日志规则。
 
@@ -272,6 +272,25 @@ r1 静态审查记录的耦合须在执行前按当前源码复核，并先处�
 
 缓存构建恢复机制、静态存储优化和化学审计问题另立范围，不混入本轮清理。未获新增授权前，首批之外的缓存、代码、结果与临时目录继续 HOLD。
 
-### 7.4 r3 本次文档交付
+### 7.4 r3 证据补记执行记录与边界（2026-09-16，Codex，只读）
 
-Codex 按用户要求将上述下一步写入本文件，修正计划头的完成范围与历史快照表述，同步 Plan.md 的清理交接注记，并在 PROJECT_HISTORY.md 追加更正。仅检查文档 diff、引用与 `git diff --check`；未执行 A/B 的新调查、模型测试或任何删除。文档修改与自检不作为独立科学审查。
+* 基线核对：`dzw2`、`/root/workspace/Uni-Poly-Plus-master`、`dev`，HEAD `248371d`，工作树干净；修改前 `git pull --ff-only origin dev` 返回 `Already up to date`。tmux `Uni-Poly` 没有运行中的 pretrain／finetune／builder／pytest；仅有一个旧监视 shell 的轮询命令，未发现其目标进程，本次未接管或终止。
+* 只读来源：上述清理日志、现有部署报告、PI1M/downstream active manifest 与 `.frozen`、pretrain／finetune `run.json` 及 aggregation summary；另静态查看 `scripts/validate_glt_dual_deploy.py` 的 static 参数缺失与 `no_grad` 调用。没有全量 LMDB 读取、Stereo 扫描、缓存重建或代码调查。
+* 命令追溯边界：`acceptance_recheck.log` 与 `modelcheck.log` 只保存结果和退出码，没有完整 argv／环境；7.1 所列命令是本次执行上下文可复述的调用，已明确标注为非独立日志证据，不将缺失包装成“日志完整”。
+* 可复述的实际调用（不是日志原文，因原日志未保存 argv／环境）：
+
+  ```text
+  PYTHONPATH=.:tests pytest -q tests/test_glt_dual_cache.py tests/test_glt_dual_static.py tests/test_glt_dual_diagnostics.py tests/test_frozen_cache_store.py tests/test_cache_lifecycle.py tests/test_aggregate_glt_dual_finetune.py
+
+  python scripts/validate_glt_dual_deploy.py --checkpoint results/glt_dual_static_pretrain_5k_concat/deploy_05000.pt --resume results/glt_dual_static_pretrain_5k_concat/resume_05000.pt --expected-step 5000 --fusion-mode concat --cohort-root data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1 --cache-root data/processed/mips_trimer_scage --index 20 --index 9 --device cpu --report-json results/cleanup_20260916_01/deploy_validation/concat.json
+
+  python scripts/validate_glt_dual_deploy.py --checkpoint results/glt_dual_static_pretrain_5k_kfuse/deploy_05000.pt --resume results/glt_dual_static_pretrain_5k_kfuse/resume_05000.pt --expected-step 5000 --fusion-mode kfuse --cohort-root data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1 --cache-root data/processed/mips_trimer_scage --index 20 --index 9 --device cpu --report-json results/cleanup_20260916_01/deploy_validation/kfuse.json
+  ```
+
+  第一条在 `Uni-Poly:cleanup_20260916_01_recheck`、后两条在 `Uni-Poly:cleanup_20260916_01_modelcheck`，cwd 均为项目根；上述调用由执行记录复述，不能替代缺失的持久化命令日志。
+* 身份复用边界：active PI1M cohort `.frozen`=`b03f96a14c2beb1d987743886cfeb2b738d94b27897f9107400d573f048d476b`、dual static=`9ff122cc16df5c869582ee2fa07b6f42fa44f2a228f554d25412eb2ae6d6006d`、targets=`5e7b5ec8e5f96bf695494436cd471c9d44a85d99571db88adf34c7d5f5777482`；downstream cohort=`0cf28f5ee54886c4bc17a3f2d15fb824d4a82dbe801aae2095920a0cfaed4b30`、dual static=`0ae172f88574c3beec0406ade84c96755681e32158b49bd385ffe862a29d3df7`。这些与保留 `run.json` 一致；deploy 只读检查本身未消费 static/targets。
+* 结论：首批删除目标仍不存在，active 读取链及历史聚合产物未被清理破坏；54 项局部回归和两份 deploy 结果属于已有证据。backward、删除前后预测 parity、清理后 static/targets 重新消费、聚合重算、全量读取和科学质量审计均未执行／未独立核实。该结论不等于整个项目精简完成。
+
+### 7.5 r3 文档交付与后续边界
+
+本次已完成第 7 节 A 的只读证据补记、`Plan.md` 清理交接同步及同一周期 `PROJECT_HISTORY.md` 更正，并修正 `PIPELINE.md` 中对完整命令日志的错误暗示；未修改生产代码、缓存、checkpoint 或历史结果。第 7.3 节的代码精简和其余候选仍为待授权／HOLD；若用户继续处理，必须另行做当前依赖闭包和精确 allowlist，不由本计划自动删除。
