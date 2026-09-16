@@ -64,3 +64,13 @@
 * 执行：先核对工作树干净、dev 分支及 origin 地址，执行 `git pull --ff-only origin dev`，结果为 Already up to date；随后修改 AGENTS.md 第 8 节，规定先拉取、重读文件再修改，以及本地改动保护和同步失败处理。
 * 验证与审查：检查文档 diff 和 `git diff --check`；本轮仅文档自检，未执行模型、训练或测试，不影响当前科学计划。
 * 交付与下一步：本条与规则一起提交推送，实际哈希及同步结果见 Git 历史和最终回复。后续执行统一遵循“pull → 修改与验证 → commit → push → 核对远端”。
+
+## DOCS-20260916-05｜清理计划适配当前远程训练机
+
+* 日期：2026-09-16（UTC）。规划／文档执行／自检均为 Codex；无独立审查。用户明确要求优化当前机上的 `Plan_Delete.md`，未授权实际清理。
+* 基线：`43f83f7a001fd46cd5383f2ca711e81c6ff595db`，`dev` 分支；开始时工作树干净，origin 为 `emt11/Uni-Poly-Plus`。修改前执行 `git pull --ff-only origin dev`，返回 Already up to date，随后重读文件。
+* 最终实施计划与修订：`CLEANUP-20260916-01/r1 → r2`，只做环境适配。唯一清理执行环境为当前 Linux 主机 `dzw2`、项目根 `/root/workspace/Uni-Poly-Plus-master`；去掉 Windows 和两端分别清理假设，明确 GitHub origin 不备份 ignored 数据。保留当前生产 bundle／cohort／static／targets 与科学证据链，原约 119 GiB 候选容量及未重新审计的引用标为 r1 记录，不当成实时验收结果。
+* 实际变化：`Plan_Delete.md` 增加主机／解释器／文件系统核验、活动任务快照、只读复核命令、当前机独立 tmux window／日志约定、逐路径授权与单机验收口径；`Plan.md` 仅增加本次文档交接注记，不替换科学计划或改变实验预算；本文件追加本周期记录。未修改模型、配置、PIPELINE.md 或 RESULTS.md。
+* 只读证据：`hostname`、`pwd -P`、Git 状态／分支／remote、`tmux list-windows -t Uni-Poly`、`ps -eo pid,ppid,etime,args`、store 元数据、`findmnt -T`／`df -h`。09:11 UTC 的 `geonorm_5k` 训练与 worker 仍存活，实际命令读取受保护的 PI1M 数据链，日志为 `logs/glt_dual_static_pretrain_concat_geonorm5k.log`；未核实训练完成或所有候选 fd/mmap，不把进程存活称为训练健康证明。
+* 验证预算与结果：文档 diff／`git diff --check`、旧平台假设与关键路径静态检查；没有模型测试、GPU 任务、全量 LMDB 扫描、缓存生成／搬移／删除，没有创建清理窗口。文档自检不等于清理执行或科学验收。
+* 交付与下一步：本轮完成的是适配文档周期，实际提交及 push 结果见本条对应 Git 历史和最终回复。清理周期仍待授权；后续由 ZCode 在相关任务自然结束并交接后补齐精确 allowlist，Codex 审查后才可进入获准的清理阶段。未核实项 HOLD，不追加实验或终止现有任务。

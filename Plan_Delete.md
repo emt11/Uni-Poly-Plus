@@ -1,19 +1,36 @@
-# GLT-V2 项目精简与缓存清理计划
+# GLT-V2 项目精简与缓存清理计划（当前远程训练机）
 
 ## 1. 状态、目标与范围
 
-* 计划 ID：CLEANUP-20260916-01，r1。
-* 状态：规划完成，删除执行待用户授权。当前仅授权审查并编写本文件，没有删除任何文件、缓存或产物。
+* 计划 ID：CLEANUP-20260916-01，r2（2026-09-16：由原本地编写版本适配为当前远程训练机直接执行）。
+* 状态：待授权（实际清理）；本轮环境适配文档已完成。用户仅授权修订本文件，没有授权删除文件、缓存或产物。
 * Codex 负责规划／审查，ZCode 负责后续执行。本文件是用户明确指定的清理专项计划，暂不替换仍在进行的 Plan.md 科学任务。
+* 本轮规划／文档执行／自检：Codex；不属于独立审查。修改前基线为 `43f83f7a001fd46cd5383f2ca711e81c6ff595db`，`dev` 分支工作树干净；已执行 `git pull --ff-only origin dev`，返回 Already up to date。
 * 保留路线：当前 O8 Bond-Path + 完整 Trimer Galformer 3D，Concat／KFuse、三任务预训练、新 outer5_inner20 微调、当前 geonorm 变体与诊断／缓存生产／审计能力。不是只保留名称含 `glt_v2` 的文件。
 * 目标：移除退役路线的入口、专用实现、专用测试和冗余派生缓存；保留当前运行、恢复、再生成、审计和结果解释所需的依赖。
-* 本次基于本地与远端代码、store/manifest/run.json、目录尺寸和进程的只读核对。不运行模型或测试，不读取全部 LMDB payload，不将候选目录宣称为已经批准删除。
+* r2 仅直接核对当前主机、工作目录、Git、tmux／进程、store 元数据和文件系统位置；下文 r1 的依赖清单、记录数、派生缓存 hash 和目录尺寸作为待执行前复核的盘点记录保留。本轮未重新测量全量目录尺寸或验证全部引用，不将这些记录升级为已通过删除验收。
 
 ## 2. 当前重要事实与执行前提
 
-远端根目录为 `/root/workspace/Uni-Poly-Plus-master`；本地为 `D:\CODE\Paper\Uni-Poly-Plus`，本地没有远端的 data/results 完整资产。两端必须分别盘点，Git push 不会同步或备份被 ignore 的缓存。
+### 2.1 唯一执行环境：当前会话所在的 Linux 训练机
 
-本次发现 `tmux Uni-Poly:geonorm_5k` 中存在三卡预训练及读取 worker，使用：
+**当前计算机已经是远程训练机，不需要再登录另一台机器执行本计划。** 本文“当前机／本机”均指下面的主机；用户个人电脑上的旧 checkout 不在本轮清理范围。
+
+|项目|本轮直接核验值|
+|-|-|
+|主机名|`dzw2`|
+|唯一项目根目录|`/root/workspace/Uni-Poly-Plus-master`（`pwd -P`）|
+|Shell／路径语义|Bash／Linux，路径区分大小写|
+|Python／torchrun|`/opt/conda/bin/python`／`/opt/conda/bin/torchrun`；不新建或升级环境|
+|Git 工作分支／origin|`dev`／`https://github.com/emt11/Uni-Poly-Plus.git`|
+|项目所在文件系统|`/root/workspace`，ext4；当前 `findmnt` 显示 `/dev/nvme1n1p1[/docker_home/dzw2]`|
+|任务承载|现有 `tmux` session `Uni-Poly`；清理获准后另建独立 window，不能复用训练 pane|
+
+Git 的 `origin` 是代码仓库，不是第二台待清理训练机。`pull/commit/push` 在上述项目目录执行，只同步受版本控制的变更，不能同步、备份或证明已删除被 ignore 的 data/results/logs。本计划不包含 SSH 嵌套执行、个人电脑路径、跨机复制或两端清理验收。若重新连接后主机或项目根变化，停止套用此清单并重新核对。
+
+### 2.2 活动任务快照与保护边界
+
+2026-09-16 09:11 UTC 直接检查时，`Uni-Poly:geonorm_5k`（window 27）中仍存在三卡预训练及读取 worker：torchrun PID `1588833`，rank PID `1588950/1588951/1588952`，命令设置 `CUDA_VISIBLE_DEVICES=1,2,3`。PID／window 编号仅是本次快照，不得作为之后自动操作的固定目标。实际命令使用：
 
 ```text
 configs/mts/glt_dual_three_task_concat_geonorm.json
@@ -22,9 +39,32 @@ data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1
 data/processed/glt_dual_v2/pi1m/dual_static_v1
 data/processed/glt_dual_v2/pi1m/pretrain_targets_v1
 results/glt_dual_static_pretrain_5k_concat_geonorm
+logs/glt_dual_static_pretrain_concat_geonorm5k.log
 ```
 
 **当前不可执行代码删除、缓存搬移或删除。** 等相关任务及后续自动任务自然结束，取得执行者交接后再动手；不终止训练来制造清理窗口。执行前重新核对进程、tmux、cwd、打开文件与 mmap；只看 GPU 空闲或 lmdb lock 文件存在与否都不够。
+
+本轮核实的是训练进程仍存活，不是训练完成、loss 正常或清理目标无人占用。本轮没有穷尽所有进程的 fd/mmap；发现现有等待训练结束的进程，后续是否自动启动其他任务须由执行者确认。不得用旧 Plan.md 中的本地／远端快照推断当前机器状态，也不在本次文档修订中改写其科学任务进度。
+
+### 2.3 执行前只读复核入口
+
+下列命令直接在当前训练机运行，仅用于定位，不执行清理，也不代表已完成引用／占用审计：
+
+```bash
+cd /root/workspace/Uni-Poly-Plus-master
+hostname
+pwd -P
+date -u
+git status --short --branch
+git remote -v
+tmux list-windows -t Uni-Poly
+tmux list-panes -a -F '#{session_name}:#{window_name}.#{pane_index} pid=#{pane_pid} cwd=#{pane_current_path} cmd=#{pane_current_command}'
+ps -eo pid,ppid,etime,args
+findmnt -T /root/workspace/Uni-Poly-Plus-master
+df -h /root/workspace/Uni-Poly-Plus-master
+```
+
+进入获准的清理阶段后，对精确候选路径另查 symlink／inode／fd／mmap 与恢复依赖，权限不足或证据不全则 HOLD。目录容量审计若预计超过一分钟，也必须在 `Uni-Poly` 的独立 window 中运行并留日志；不在训练期间反复全盘扫描，不新增高频轮询。
 
 ## 3. 缓存详细审查与保留集合
 
@@ -32,7 +72,7 @@ results/glt_dual_static_pretrain_5k_concat_geonorm
 
 读取链为 `store.json → active bundle → ru_base/topology/trimer + source → cohort → static/targets → checkpoint identity`。保留整条链；派生 static 不是原始 Trimer 的替代品，训练仍从原坐标生成噪声几何。
 
-|路径（相对远端项目根）|核对结果|处理|
+|路径（相对当前机项目根）|盘点依据（除 active bundle 外，本轮未逐项重验）|处理|
 |-|-|-|
 |data/processed/mips_trimer_scage/store.json|生产 PI1M store|保留|
 |data/processed/mips_trimer_scage/builds/30f17b59bc5862a1ddae7eaee03b2767df26561d9bfecb690ec8eea3ddd09ed2|约 75 GiB，当前正式 bundle|完整保留 source、三层数据、metadata、manifest、key arrays、拒绝／运行记录及 .frozen|
@@ -50,9 +90,9 @@ results/glt_dual_static_pretrain_5k_concat_geonorm
 
 ### 3.2 高收益候选：需完成引用审计后才能删除
 
-`data/processed/mips_trimer_scage` 总计约 193 GiB，是新旧混合根目录，禁止整体删除。下表前缀均为该目录：
+按 r1 盘点，`data/processed/mips_trimer_scage` 总计约 193 GiB，是新旧混合根目录，禁止整体删除。下表前缀均为该目录；尺寸不是 r2 实时测量值：
 
-|候选相对路径|当前占用约|初步判断与删除条件|
+|候选相对路径|r1 记录占用约|初步判断与删除条件|
 |-|-|-|
 |topology|66 GiB|旧根级布局；与 active builds/.../topology 不同，确认无当前读取、硬链接共享或保留恢复依赖后清理|
 |trimer|20 GiB|旧根级几何；必须确认不是当前审计 fixture 的唯一坐标来源|
@@ -78,7 +118,7 @@ results/glt_dual_static_pretrain_5k_concat_geonorm
 
 ### 3.3 实际删除清单必须具备的证据
 
-ZCode 在删除前把精确 allowlist 表追加到本文件：绝对路径、所属主机、realpath、大小、store/bundle 身份、被哪些入口／run.json／审计使用、是否有打开 fd/mmap、备份或报告保留位置、拟处理动作。分类仅用 KEEP／DELETE_CANDIDATE／HOLD，缺证据即 HOLD，不默认删除。
+ZCode 在删除前把精确 allowlist 表追加到本文件：`dzw2` 上的绝对路径、核验时间、realpath、大小、store/bundle 身份、被哪些入口／run.json／审计使用、是否有打开 fd/mmap、备份或报告保留位置、拟处理动作。分类仅用 KEEP／DELETE_CANDIDATE／HOLD，缺证据即 HOLD，不默认删除。主机、真实路径或消费者变化后，旧核验失效；批准必须对应具体清单，不能只批准一个目录前缀。
 
 引用审计从当前模型、生产缓存入口、所有保留 run.json、Plan.md、PIPELINE.md／RESULTS.md 的证据链出发，递归跟随 source／parents／manifest 绑定。文本搜索只能提供线索；同时检查软链接、硬链接、checkpoint 中记录的身份和数据类序列化依赖。优先复用已有 identity 读取器，不调用具有自动构建／修复行为的 Dataset。
 
@@ -101,7 +141,7 @@ ZCode 在删除前把精确 allowlist 表追加到本文件：绝对路径、所
 
 逐个候选检查 Python import（包含 package `__init__`）、动态 import、CLI/config 路由、字符串类名、tests 与序列化对象依赖；输出具体文件 allowlist，不以模糊通配符执行删除。
 
-已确认的耦合必须先处理：
+r1 静态审查记录的耦合须在执行前按当前源码复核，并先处理：
 
 1. `src/dataset/__init__.py` 当前 eager import 旧 sidecar／蒸馏；`src/modules/__init__.py` 当前 eager import 蒸馏、旧 encoder 和 point-cloud。先删除退役导出及引用，再删除模块。
 2. `scripts/build_mts_cache.py` 使用 `dataset.py` 的生产函数，而 `dataset.py` 又导入旧 line/distill 模块；不能整个删除 dataset.py。最小拆分或解除旧路线导入，保留现有序列化可读性，不随清理改变字段／科学定义。
@@ -122,7 +162,9 @@ ZCode 在删除前把精确 allowlist 表追加到本文件：绝对路径、所
 
 ### 阶段 0：冻结范围和删除清单
 
-用户授权实际清理后，先 pull 并核对当前代码／Plan.md／活动进程。在无运行者使用相关文件的窗口中完成依赖闭包和逐路径 allowlist，Codex 审查具体清单后才进入破坏性删除；不把本次计划编写当作删除授权。若科学路线已经变化，更新本计划，不能沿用过期 keep 集合。
+用户授权实际清理后，先在当前机项目目录检查工作树、分支及 origin，按 AGENTS.md 执行对应分支的 `git pull --ff-only`（当前分支为 `dev`），成功后重读代码／Plan.md／本文件并核对活动进程。不得为同步清空用户改动或覆盖当前执行者记录。清理准备好接管时，由 Codex 将获准阶段写入 Plan.md，明确其与原科学任务的交接，不让两个执行者同时修改同一文件。
+
+在无运行者使用相关文件的窗口中完成依赖闭包和逐路径 allowlist，Codex 审查具体清单后才进入破坏性删除；不把本次计划编写当作删除授权。若科学路线已经变化，更新本计划，不能沿用过期 keep 集合。
 
 ### 阶段 1：精简 tracked 代码
 
@@ -130,7 +172,9 @@ ZCode 在删除前把精确 allowlist 表追加到本文件：绝对路径、所
 
 ### 阶段 2：删除核准的旧缓存
 
-在 tmux 独立窗口记录执行清单及结果，按精确路径逐项删除，禁止对 `data/processed` 或混合根目录做递归通配删除。每项删除前重新验证 realpath 留在批准根内、不等于保护目录及其祖先、不跨符号链接／挂载点、不被进程占用、身份未变化。Windows 使用原生 PowerShell `-LiteralPath`，先核实最终绝对路径，禁止跨 shell 拼接删除命令。发现新引用则该项 HOLD，不擅自修改消费者以让删除通过。
+在当前机 `tmux` session `Uni-Poly` 新建唯一命名窗口（例如 `cleanup_20260916_01`，若已存在先核查，不覆盖或重复启动）。执行工作目录固定为 `/root/workspace/Uni-Poly-Plus-master`，日志使用独立的 `logs/cleanup_20260916_01_<UTC时间>.log`；这些是获准后的拟用名称，本轮未创建或启动。日志须记录主机、基线 commit、实际命令、清单、逐项退出码及删除前后磁盘计量，不仅记录“命令已提交”。
+
+仅用当前 Bash／Linux 工具按精确路径逐项处理，禁止对 `data/processed` 或混合根目录做递归通配删除。每项删除前重新验证 realpath 留在批准根内、不等于项目根或保护目录及其祖先、不跨符号链接／挂载点、不被进程占用、身份未变化。发现新引用则该项 HOLD，不擅自修改消费者以让删除通过。不得根据 `/dev/nvme1n1p1[/docker_home/dzw2]` 推导容器外删除路径；只能操作本计划核准的项目内路径。
 
 旧 LMDB、旧分片可以在这些条件全部满足后直接释放，不强制复制百 GiB 数据到同盘。被保留的失败报告／manifest 不放在即将整删的目录里，先存入稳定审计产物目录并记录来源。
 
@@ -140,11 +184,13 @@ ZCode 在删除前把精确 allowlist 表追加到本文件：绝对路径、所
 * 当前 store、bundle、cohort、static/targets 的身份、记录数与文件存在性保持不变；不改变 `.frozen`、source key 顺序和 split。
 * 用既有最多两条真实 fixture（普通与 N=0，如不存在如实说明），两融合 eval 前后向及部署加载验证；与删除前同 checkpoint／同输入输出比较。测试固定 RNG，预算不扩大到 optimizer 更新或正式训练。
 * 聚合复算仍得到原 macro8；若只改无关文件且没有影响汇总依赖，可复用已通过证据，不机械跑全仓或 80 folds。
-* 报告逐项删／留／HOLD、真实释放磁盘量、剩余依赖、运行命令及验证结果。更新 PIPELINE.md 当前入口与退役说明，不擦除 RESULTS.md 历史结论；完成后归档本轮完整清理周期。
-* Git 提交／推送代码与文档，核对远端；缓存删除是远端文件系统动作，与 Git push 分别报告。本地／远端若仅一端清理不得称两端均完成。
+* 报告当前机逐项删／留／HOLD、删除前后文件系统可用空间差额、剩余依赖、运行命令及验证结果。若有并发写入、共享存储变化或已 unlink 但未关闭的 fd，说明差额不能精确归因于本轮删除，不把候选尺寸直接当成释放量。更新 PIPELINE.md 当前入口与退役说明，不擦除 RESULTS.md 历史结论；完成后归档本轮完整清理周期。
+* 按 AGENTS.md 显式提交本轮代码与文档，fetch 后检查待推送提交，推送当前同名分支并核对 GitHub origin 包含该 commit；不上传缓存、checkpoint 或大型日志。分别报告“当前训练机文件系统清理结果”和“Git 代码／文档同步结果”，不声称清理了用户个人电脑或任何其他机器。
 
 ## 7. 本轮交付与下一步
 
-本轮仅生成清理计划、盘点当前路径与引用，不执行删除、模型或训练验证。最优先的潜在空间收益来自旧根级 topology/trimer/ru_base 与旧 sidecar，当前 75 GiB bundle 和 45 GiB static 必须保留。
+本轮仅将 r1 清理计划适配为当前训练机 `dzw2` 的 r2，补齐单机路径、活动任务快照、直接执行与日志规范、Git origin 边界和验收口径。不执行删除、模型／训练验证或构象生成；未启动清理窗口，未完成逐候选占用审计。仅做文档 diff／格式与关键路径静态检查，不宣称清理验收通过。
+
+最优先的潜在空间收益仍来自旧根级 topology/trimer/ru_base 与旧 sidecar；r1 记录的约 75 GiB bundle 和 45 GiB static 必须保留。约 119 GiB 是原候选盘点估计，不是本轮已释放或承诺可释放容量。
 
 下一步由 ZCode 在相关科学任务结束后，根据本计划准备精确删除 allowlist 与剩余引用证据，交 Codex 审查。未核实缓存和历史资产保持 HOLD；不为追求“只剩 GLT-V2”而删除可复现性和当前共享依赖。
