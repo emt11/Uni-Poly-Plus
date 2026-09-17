@@ -109,6 +109,38 @@ def _autocast(device, amp_dtype):
             if device.type == "cuda" and amp_dtype == "bf16" else nullcontext())
 
 
+def _deterministic_average_gradients(model, rank, world):
+    """Average gradients in a fixed rank order for the bounded exact-resume smoke.
+
+    NCCL bucket all-reduce is numerically reproducible for most runs but may
+    choose a different reduction tree after a fresh launch.  This opt-in path
+    is used only by the 4-update smoke; formal training keeps normal DDP.
+    """
+    parameters = [parameter for parameter in model.parameters()
+                  if parameter.requires_grad]
+    flat = torch.cat([
+        (parameter.grad if parameter.grad is not None else torch.zeros_like(parameter)).reshape(-1)
+        for parameter in parameters
+    ])
+    gathered = [torch.empty_like(flat) for _ in range(int(world))] if int(rank) == 0 else None
+    dist.gather(flat, gather_list=gathered, dst=0)
+    if int(rank) == 0:
+        average = torch.zeros_like(flat)
+        for value in gathered:
+            average = average + value
+        average = average / int(world)
+    else:
+        average = torch.empty_like(flat)
+    dist.broadcast(average, src=0)
+    offset = 0
+    for parameter in parameters:
+        size = parameter.numel()
+        if parameter.grad is None:
+            parameter.grad = torch.empty_like(parameter)
+        parameter.grad.copy_(average[offset:offset + size].view_as(parameter))
+        offset += size
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("config", "cohort-root", "cache-root", "output"):
@@ -167,9 +199,10 @@ def main():
             base.parameters(), lr=float(config["lr"]),
             weight_decay=float(config["weight_decay"]),
         )
+        deterministic_reduction = bool(config.get("deterministic_gradient_reduction", False))
         module = (DistributedDataParallel(
             base, device_ids=[device.index], find_unused_parameters=False
-        ) if world > 1 else base)
+        ) if world > 1 and not deterministic_reduction else base)
         ordered_keys = [key.hex() for key, _ in source.samples]
         identity = {
             "schema": config["schema"], "config": config, "world_size": world,
@@ -245,7 +278,9 @@ def main():
                 # Attach central batch to the labels only to keep Data's index
                 # offset logic explicit and avoid relying on PyG custom batching.
                 labels["central_batch"] = data.central_batch
-                sync = module.no_sync() if world > 1 and offset + 1 < accumulation else nullcontext()
+                sync = (module.no_sync()
+                        if world > 1 and not deterministic_reduction and offset + 1 < accumulation
+                        else nullcontext())
                 with sync:
                     moved = data.to(device, non_blocking=True)
                     moved_labels = {key: value.to(device) if torch.is_tensor(value) else value
@@ -274,6 +309,8 @@ def main():
                 total_hist += result["neighbor_hist"].detach().to(total_hist.dtype)
                 scalar_values.append(result["central_scalar_states"].detach().float().pow(2).mean().sqrt())
                 vector_values.append(result["central_vector_states"].detach().float().pow(2).mean().sqrt())
+            if world > 1 and deterministic_reduction:
+                _deterministic_average_gradients(base, rank, world)
             grad_norm = float(torch.nn.utils.clip_grad_norm_(base.parameters(), 1.0, error_if_nonfinite=True))
             optimizer.step()
             if world > 1:

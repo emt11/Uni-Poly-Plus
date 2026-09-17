@@ -20,5 +20,6 @@
   "rbf_dim": 32,
   "noise_loss_weight": 1.0,
   "neighbor_hit_max_stop_fraction": 0.1,
+  "deterministic_gradient_reduction": true,
   "downstream_step": 4
 }
