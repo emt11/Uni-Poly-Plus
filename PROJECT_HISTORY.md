@@ -124,3 +124,12 @@
 * 修改文件：Plan_Cache.md、Plan.md、PROJECT_HISTORY.md；没有修改生产代码、PIPELINE.md、RESULTS.md 或旧报告／缓存。保留容量 64 不采用、默认 2 和全部科学／数据边界；已有授权不因交接撤销，计划不授权扩大预算。
 * 验证：文档 diff、相关引用与逻辑检查、git diff --check；未运行单元测试、故障注入、数据构建、benchmark、模型或训练。提交／推送及远端核对结果见本条对应 Git 历史和交付回复。
 * 周期边界：本条仅归档本次文档交付，不将未完成的 CACHE 实施周期归档为验收通过。r2 返修尚未执行，后续执行者按 Plan.md 记录真实进度，再交 Codex 审查。
+
+## CACHE-20260916-01｜r1→r2→r3 缓存优化周期最终归档（2026-09-17）
+
+* 授权与角色：本周期由用户授权缓存专项返修；Codex 负责规划与最终独立审查，ZCode 负责 r3 实现与局部验证。归档依据为 `Plan_Cache.md` 的 r1、r2、r3 记录及本次关闭核对。
+* 修订链：r1 建立缓存合同、恢复、parity 与读取审查范围；r2 根据 Codex 审查结果收窄为六项恢复／冻结修复、固定 32-key parity 与工具口径返修；r3 完成 published payload contract、summary／冻结边界、固定 key provenance、parity fail-closed gate、benchmark 状态语义及对应 focused tests 的最小收口。
+* 最终实现：r3 代码与测试的最终提交为 `632caa1`（`cache-opt: close r3 contract gaps`）。本周期最终文档状态为 **Codex review PASS / CLOSED**；该 PASS 仅覆盖计划约定的缓存合同、恢复与审计工具收口。
+* 证据：既有 r3 focused tests 日志记录 `36 passed, 1 warning`（`logs/cache_opt_r3_tests2.log`），r2 固定 32-key parity 报告为 PASS（`results/cache_optimization_repair_20260916T234930Z/parity.json`），active frozen cache zero-write 与临时预算门控已在报告／实现中保留。上述证据在本次归档中只读复核，未重新运行测试或实验。
+* 重要边界：本周期**没有全量缓存重建、格式迁移或生产迁移**，没有切换或写入 active cache，没有修改模型、配置、checkpoint 或历史结果数字；未执行的 parity 重跑、长 benchmark、payload 全字节历史完整性、断电耐久、模型／训练验证仍为未验证，不因 CLOSED 状态而改变。
+* 交付与后续：`Plan_Cache.md` 与 `Plan.md` 已将缓存专项标记为 CLOSED，专项不再占据下一执行入口。若需生产切换、全量重建或新的优化，应另行制定计划并取得授权；本归档不产生这些操作的授权。

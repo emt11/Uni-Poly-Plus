@@ -6,9 +6,9 @@
 | --- | --- |
 | 计划 ID／修订 | CACHE-20260916-01 / r3：r2 审查后的最小合同收口 |
 | 日期／环境 | 2026-09-17；当前远程 Linux 训练机，项目根 /root/workspace/Uni-Poly-Plus-master |
-| 状态 | 待审查；r3 返修已由 ZCode 执行，尚未由 Codex 独立验收 |
+| 状态 | Codex 独立验收通过 / CLOSED |
 | 当前授权 | 用户直接要求按本计划由 ZCode 执行。范围限于 R3.1–R3.8 的局部代码、focused tests、固定 32 条 parity 证据与文档／报告；不授权生产切换、全量重建、训练或 GPU smoke |
-| 角色 | Codex 规划与后续审查；ZCode 执行。本节执行结果是执行记录，不代表独立验收通过 |
+| 角色 | Codex 规划与独立审查；ZCode 执行。r3 已由 Codex 独立复核并通过 |
 | 基准 commit | r3 执行基线 31e137c481e4f9216860d2f092e70dbfb295de14，dev；r2 基线保留作为历史记录 |
 | 修改前状态 | dev 工作树干净，pull 返回 Already up to date；r1 文档创建时的用户改动已记入 PROJECT_HISTORY.md，不沿用为当前状态 |
 | 交接入口 | [Plan.md](Plan.md)；本文件是缓存专项实施细则，不替换正在进行或未收口的科学计划 |
@@ -333,9 +333,9 @@ r1 报告中“停止条件均未触发／A–C 完成”的自检不能覆盖�
 - A／C 的过强结论已纠正；仍未解和未采集项保留，容量 64 不采用，角度优化／阶段 D 未启动。
 - 不生成构象、不全量重建、不删除缓存、不运行任何正式实验；未知身份／writer 冲突／NaN／超预算按第 8 节停止。
 
-本轮文档交付不等于独立验收通过。r2 周期当前状态为“待审查”；不将 ZCode 自检或本轮局部测试写成最终验收结论。
+上述“文档交付不等于独立验收通过”是 r2 阶段的历史限制；r3 已完成独立复核并关闭本缓存优化周期。ZCode 自检与既有局部测试仍按其实际范围记录，不外推为全量缓存或生产验收。
 
-## 11. r3 执行记录（ZCode，2026-09-17，待 Codex 审查）
+## 11. r3 执行记录（ZCode，2026-09-17，Codex 独立验收通过 / CLOSED）
 
 ### 执行前与范围
 
@@ -378,7 +378,7 @@ r1 报告中“停止条件均未触发／A–C 完成”的自检不能覆盖�
 
 `Plan.md` 当前注记已更正为：B.3 replay COMPLETE、geometry collapse 已复现并诊断、geonorm P2
 validation／fixed geonorm 5k／deploy validation COMPLETE、正式 downstream 为 7 tasks／35 folds，
-egc full 5-fold NOT COMPLETE；cache r2 为 `NEEDS_REPAIR`，r3 为 `WAITING_FOR_REVIEW`。`RESULTS.md`
+egc full 5-fold NOT COMPLETE；cache r2 为 `NEEDS_REPAIR`，r3 已为 `CLOSED`（Codex 独立验收通过）。`RESULTS.md`
 仅修正文案为 7 任务，并更正 world-size 变化的样本／RNG 说明，不改实验数字；`PIPELINE.md` 追加
 本轮 cache contract 记录。
 
@@ -399,5 +399,19 @@ fail-closed、锁／offset／reader contract。另完成 `py_compile`、`git dif
 
 未重跑已有 r2 真实 32-key parity（按 r3 明确要求保留原报告）、未跑 2048 benchmark、未做全量 cache
 重建／格式迁移／生产切换、未启动任何 GPU／pretrain／finetune、未修改 `PROJECT_HISTORY.md` 或
-`RESULTS.md` 历史数字。active frozen cache 未写入。r3 执行结果交由 Codex 独立审查；在审查前不宣称
-缓存专项最终验收或生产可用。
+`RESULTS.md` 历史数字。active frozen cache 未写入。r3 执行结果已由 Codex 按提交、差异、既有日志和报告
+完成独立审查；本关闭结论仅覆盖本计划约定的缓存合同、恢复与审计工具收口，不宣称全量缓存内容、生产迁移、
+吞吐、模型或训练已验收。
+
+## 12. Codex 独立验收与关闭（2026-09-17）
+
+* 验收范围：复核 r1→r2→r3 的计划、实际 diff、最终实现提交 `632caa1`、r3 focused-test 日志
+  `logs/cache_opt_r3_tests2.log`（既有结果 `36 passed, 1 warning`）、r2 真实 parity 报告
+  `results/cache_optimization_repair_20260916T234930Z/parity.json`（既有 PASS）以及 active
+  frozen-cache zero-write 证据。未在本次关闭操作中重跑测试或实验。
+* 结论：r3 的 published payload contract、恢复／幂等边界、固定 key provenance、parity fail-closed
+  gate 和 benchmark 状态口径均与返修合同一致，**Codex 独立验收通过 / CLOSED**。
+* 边界：本周期没有全量重建、格式迁移或生产迁移；没有改动 active cache、配置、模型、checkpoint 或
+  历史结果数字。未执行的 32-key parity 重跑、2048 benchmark、payload 全字节历史完整性、断电耐久、
+  模型／训练验证仍保持未验证，不因关闭而变成 PASS。
+* 后续：缓存专项不再占据 `Plan.md` 的下一执行入口；若需生产切换或新的缓存工作，须另行制定并授权。

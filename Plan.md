@@ -1,10 +1,10 @@
 # GLT-V2：结果闭环、几何失稳诊断与优化决策
 
-> 2026-09-17 当前状态核对（CACHE-20260916-01/r3 执行前）：GLT-V2 B.3 replay 已完成；几何
+> 2026-09-17 当前状态核对（CACHE-20260916-01/r3 收口后）：GLT-V2 B.3 replay 已完成；几何
 > collapse 已复现并完成机制诊断；geonorm P2 validation、fixed geonorm 5k 与 deploy validation
 > 已完成。正式 downstream 当前可用口径为 7 个 task／35 folds；egc 完整 5-fold 尚未完成。缓存
-> r2 经 Codex 审查为 `NEEDS_REPAIR`，r3 本轮执行后状态为 `WAITING_FOR_REVIEW`。以下历史段落保留
-> 原始执行语义，后续状态以本注记和对应周期执行记录为准。
+> r2 经 Codex 审查为 `NEEDS_REPAIR`，r3 已经 Codex 独立验收通过并关闭（`CLOSED`）。缓存专项不再
+> 占据下一执行入口。以下历史段落保留原始执行语义，后续状态以本注记和对应周期执行记录为准。
 
 > 2026-09-16 缓存专项交接更新（Codex，`CACHE-20260916-01/r2`）：状态“需返修”。ZCode 已交付 `7f476b4`，Codex 静态审查未通过；当前下一步见 [Plan_Cache.md 第 10 节](Plan_Cache.md#10-r2-下一步仅返修可靠性与证据缺口)。按“六项构建恢复／冻结修复 → 原 32 条目标及 clean/noisy parity → 化学和 benchmark 口径修正 → 复审”推进，不重新运行完整 A–C。容量 64 继续不采用，不启动长 benchmark、角度优化、阶段 D、全量重建或训练。原已获授权范围不重复申请，本轮用户只要求计划落盘，Codex 未接管执行。r1 原交接与执行材料保留在 Git／历史记录及下方；其他科学周期状态不由本次更新裁定。
 
@@ -16,7 +16,7 @@
 |-|-|
 |计划 ID|GLTV2-20260916-01|
 |修订|r2：阶段性审查后续执行；修复诊断入口，再执行 B.2／B.3，不增加原回放预算|
-|状态|待审查（A、B.2、B.3 已完成；缓存 CACHE-20260916-01/r3 执行完成待审查）|
+|状态|待审查（A、B.2、B.3 已完成；缓存专项 CACHE-20260916-01/r3 已 CLOSED，不占据下一执行入口）|
 |授权来源|用户已选择“诊断并有限回放”，并说明将计划交给 ZCode／其他模型执行；随后明确报告计划正在执行|
 |规划／审查|Codex|
 |执行|ZCode／用户指定执行者；实际执行者在下方补记|
@@ -353,7 +353,7 @@ bundle、cohort、`dual_static_v1`、`pretrain_targets_v1` 全部只读。
 
 ---
 
-## 缓存优化周期 CACHE-20260916-01 / r3 执行记录（ZCode，2026-09-17，待审查）
+## 缓存优化周期 CACHE-20260916-01 / r3 执行记录（ZCode，2026-09-17，Codex 独立验收通过 / CLOSED）
 
 依据用户提供的 r3 返修计划。执行前已读取 `AGENTS.md`、`Plan.md`、`Plan_Cache.md`、
 `PIPELINE.md`、`RESULTS.md`，在 `dev` 执行 `git pull --ff-only origin dev`（Already up to date），
@@ -390,8 +390,8 @@ shape 与 count 相同而未触发预期拒绝，退出码 1；该测试 fixture
 ### 范围边界
 
 未重建 PI1M／下游 active cache，未重新生成 conformer，未运行 2048 benchmark、Stage D、GPU、
-预训练或微调，未删除／迁移／切换产物；`PROJECT_HISTORY.md` 未修改，`RESULTS.md` 仅改文案而未改
-历史实验数字。r3 当前状态为 `WAITING_FOR_REVIEW`，需 Codex 独立审查后才能关闭。
+预训练或微调，未删除／迁移／切换产物；执行阶段未修改 `PROJECT_HISTORY.md`，`RESULTS.md` 仅改文案而未改
+历史实验数字。r3 随后经 Codex 独立审查通过，当前状态为 `CLOSED`；本关闭不改变上述未执行项的状态。
 
 ---
 
