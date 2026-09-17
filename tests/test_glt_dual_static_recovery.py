@@ -247,6 +247,27 @@ def test_published_artifact_identity_is_checked_and_never_rewritten(tmp_path):
     with pytest.raises(CacheLifecycleError):
         _published_identity(broken)
 
+    # A matching manifest/frozen pair is still not reusable when a published
+    # payload is truncated.  The builder must validate the side before
+    # idempotent or single-sided reuse.
+    broken_payload = tmp_path / "broken_payload"
+    _publish(broken_payload, [2])
+    np.save(
+        broken_payload / "chunks" / "chunk_00000000" / "token_pos_index_a.npy",
+        np.zeros(1, dtype=np.int32),
+    )
+    with pytest.raises(CacheLifecycleError):
+        _published_identity(broken_payload)
+
+    broken_target = tmp_path / "broken_target"
+    _publish(broken_target, [2], fmt="glt-dual-pretrain-targets-v1", targets=True)
+    np.save(
+        broken_target / "chunks" / "chunk_00000000" / "fingerprint_packed.npy",
+        np.zeros((1, 256), dtype=np.uint8),
+    )
+    with pytest.raises(CacheLifecycleError):
+        _published_identity(broken_target)
+
 
 def test_single_writer_lock_blocks_concurrency_without_pid_reclaim_race(tmp_path):
     from scripts.build_glt_dual_static_cache import _acquire_build_lock, _release_build_lock
@@ -385,6 +406,8 @@ def test_full_build_path_is_idempotent_and_resumes_missing_target(tmp_path, monk
     smiles = "*CC*"
     topology = build_canonical_periodic_topology(smiles)
     _, trimer = _toy_pair(smiles)
+    invalid_trimer = trimer.clone()
+    invalid_trimer.trimer_geometry_valid = False
     keys = [bytes([97 + index]) * 32 for index in range(2)]
     key_array = np.frombuffer(b"".join(keys), dtype=np.uint8).reshape(-1, 32)
     cohort = {
@@ -398,7 +421,7 @@ def test_full_build_path_is_idempotent_and_resumes_missing_target(tmp_path, monk
     class FakeBundle:
         def __init__(self, *_args, **_kwargs):
             self.topology = {key: topology for key in keys}
-            self.trimer = {key: trimer for key in keys}
+            self.trimer = {keys[0]: trimer, keys[1]: invalid_trimer}
 
         def close(self):
             pass
@@ -418,8 +441,20 @@ def test_full_build_path_is_idempotent_and_resumes_missing_target(tmp_path, monk
     )
     first = builder.build(args_static)
     assert first["status"] == "PASS"
+    static_manifest = json.loads((static_root / "manifest.json").read_text(encoding="utf-8"))
+    assert static_manifest["geometry_valid_count"] == 1
+    assert static_manifest["geometry_invalid_reason_counts"] == {
+        "": 1, "geometry_invalid": 1
+    }
     static_manifest_before = (static_root / "manifest.json").read_bytes()
     static_frozen_before = (static_root / ".frozen").read_bytes()
+
+    from scripts.finalize_glt_dual_static_artifact import finalize
+    finalized, outcome = finalize(static_root)
+    assert outcome == "IDEMPOTENT_ALREADY_FINAL"
+    assert finalized == static_manifest
+    assert (static_root / "manifest.json").read_bytes() == static_manifest_before
+    assert (static_root / ".frozen").read_bytes() == static_frozen_before
 
     # A repeated complete build is a no-op, including no new staging tree.
     repeated = builder.build(args_static)
@@ -440,3 +475,28 @@ def test_full_build_path_is_idempotent_and_resumes_missing_target(tmp_path, monk
     assert (target_root / ".frozen").is_file()
     assert (static_root / "manifest.json").read_bytes() == static_manifest_before
     assert (static_root / ".frozen").read_bytes() == static_frozen_before
+    target_manifest = json.loads((target_root / "manifest.json").read_text(encoding="utf-8"))
+    assert "geometry_valid_count" not in target_manifest
+    target_manifest_before = (target_root / "manifest.json").read_bytes()
+    target_frozen_before = (target_root / ".frozen").read_bytes()
+    _, target_outcome = finalize(target_root)
+    assert target_outcome == "IDEMPOTENT_ALREADY_FINAL"
+    assert (target_root / "manifest.json").read_bytes() == target_manifest_before
+    assert (target_root / ".frozen").read_bytes() == target_frozen_before
+
+    # Published-side reuse validates payloads before the idempotent branch;
+    # either side being damaged is a hard refusal, not a target-only/static-only
+    # continuation.
+    target_payload_path = target_root / "chunks" / "chunk_00000000" / "fingerprint_packed.npy"
+    target_payload = np.load(target_payload_path).copy()
+    np.save(target_payload_path, np.zeros((2, 256), dtype=np.uint8))
+    with pytest.raises(CacheLifecycleError):
+        builder.build(args_both)
+    np.save(target_payload_path, target_payload)
+
+    static_payload_path = static_root / "chunks" / "chunk_00000000" / "token_pos_index_a.npy"
+    static_payload = np.load(static_payload_path).copy()
+    np.save(static_payload_path, np.zeros(1, dtype=np.int32))
+    with pytest.raises(CacheLifecycleError):
+        builder.build(args_both)
+    np.save(static_payload_path, static_payload)

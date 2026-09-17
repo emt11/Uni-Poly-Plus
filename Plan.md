@@ -1,5 +1,11 @@
 # GLT-V2：结果闭环、几何失稳诊断与优化决策
 
+> 2026-09-17 当前状态核对（CACHE-20260916-01/r3 执行前）：GLT-V2 B.3 replay 已完成；几何
+> collapse 已复现并完成机制诊断；geonorm P2 validation、fixed geonorm 5k 与 deploy validation
+> 已完成。正式 downstream 当前可用口径为 7 个 task／35 folds；egc 完整 5-fold 尚未完成。缓存
+> r2 经 Codex 审查为 `NEEDS_REPAIR`，r3 本轮执行后状态为 `WAITING_FOR_REVIEW`。以下历史段落保留
+> 原始执行语义，后续状态以本注记和对应周期执行记录为准。
+
 > 2026-09-16 缓存专项交接更新（Codex，`CACHE-20260916-01/r2`）：状态“需返修”。ZCode 已交付 `7f476b4`，Codex 静态审查未通过；当前下一步见 [Plan_Cache.md 第 10 节](Plan_Cache.md#10-r2-下一步仅返修可靠性与证据缺口)。按“六项构建恢复／冻结修复 → 原 32 条目标及 clean/noisy parity → 化学和 benchmark 口径修正 → 复审”推进，不重新运行完整 A–C。容量 64 继续不采用，不启动长 benchmark、角度优化、阶段 D、全量重建或训练。原已获授权范围不重复申请，本轮用户只要求计划落盘，Codex 未接管执行。r1 原交接与执行材料保留在 Git／历史记录及下方；其他科学周期状态不由本次更新裁定。
 
 > 2026-09-16 清理交接更新（Codex，`CLEANUP-20260916-01/r3`）：首批 12 个精确目标的缓存清理及第 7 节 A 的只读证据补记已完成；代码精简未实施，其余候选 HOLD。现有验收日志未保存完整 argv／env；deploy 检查未传 static/targets 且使用 `no_grad`，因此 backward、删除前后预测 parity 和清理后 static/targets 重新消费均未核实。54 passed 与两份有限 forward 报告均为既有证据，不是本轮新增模型结果。原 09:11 UTC 环境适配及“删除待授权”注记保存在 `PROJECT_HISTORY.md`；本次只同步清理交接，不改变下方科学计划的授权、预算或科学完成状态。
@@ -10,7 +16,7 @@
 |-|-|
 |计划 ID|GLTV2-20260916-01|
 |修订|r2：阶段性审查后续执行；修复诊断入口，再执行 B.2／B.3，不增加原回放预算|
-|状态|执行中（A 已交付；B.2 已完成，B.3 有限回放运行中）|
+|状态|待审查（A、B.2、B.3 已完成；缓存 CACHE-20260916-01/r3 执行完成待审查）|
 |授权来源|用户已选择“诊断并有限回放”，并说明将计划交给 ZCode／其他模型执行；随后明确报告计划正在执行|
 |规划／审查|Codex|
 |执行|ZCode／用户指定执行者；实际执行者在下方补记|
@@ -237,7 +243,7 @@ python scripts/diagnose_glt_dual_pretrain.py
 
 ---
 
-## 新周期（用户直接授权）：固定 Concat 5k（geonorm）→ 5 任务正式微调 → 三方对比
+## 新周期（用户直接授权）：固定 Concat 5k（geonorm）→ 7 任务正式微调 → 三方对比
 
 ### 计划头
 
@@ -252,7 +258,7 @@ python scripts/diagnose_glt_dual_pretrain.py
 
 ### 实施计划（用户指令要点）
 
-从 step 0 用 `geometry_head_norm=true` 正式固定 Concat 5k（world_size 3、microbatch 84、accumulation 4、global batch 1008、BF16、其余科学参数不变），随后健康审查 → deploy 校验 → eat/fold0 smoke → 8×5 正式微调（GPU1/2/3，最大并发 3）→ 验证式聚合 → 与旧 Concat／KFuse 三方对比。禁止项：10k/20k、KFuse 重训、O8-only、3D-only、KFuse-v2、multi-seed、其他 LayerNorm 位置、残差长度预测、robust loss、LR/loss weight/noise 改动。
+从 step 0 用 `geometry_head_norm=true` 正式固定 Concat 5k（world_size 3、microbatch 84、accumulation 4、global batch 1008、BF16、其余科学参数不变），随后健康审查 → deploy 校验 → eat/fold0 smoke → 8×5 正式微调（原计划；实际按 r2 指示跳过 egc，为 7×5，GPU1/2/3，最大并发 3）→ 验证式聚合 → 与旧 Concat／KFuse 三方对比。禁止项：10k/20k、KFuse 重训、O8-only、3D-only、KFuse-v2、multi-seed、其他 LayerNorm 位置、残差长度预测、robust loss、LR/loss weight/noise 改动。
 
 ### 执行记录（ZCode）
 
@@ -272,7 +278,7 @@ python scripts/diagnose_glt_dual_pretrain.py
 
 **Phase 13 三方对比**：新增 `scripts/compare_glt_dual_finetune_results.py`。产物 `three_way_comparison_7task.json/.md`。7 任务 macro：固定 Concat 0.777210、旧 Concat 0.772134（+0.005077）、KFuse 0.753544（+0.023666）。逐任务相对旧 Concat：eat +0.006935、egb +0.012941、ei +0.013312、nc +0.000400、xc +0.029176 改善；eea −0.014391、eps −0.012839 退化。
 
-**口径与限制（待审查问题）**：(1) 跳过 egc 后只能给出 7 任务 macro，**不可**与 8 任务 macro8（0.7877379364／0.7695629053）混用；参考运行已按同样 7 任务重算。(2) 预训练对照中 world_size 由 4 变 3（accumulation 3→4），global batch 与其余科学参数一致但每步样本组成不同，样本级单变量证据是 P2 replay 而非本次对比。(3) 共享 development folds 非独立盲测，macro 提升幅度小且 2/5 任务退化，不宣称已超 baseline。(4) egc 新增 fold0/1（0.8927／0.8854）与旧 Concat 同 fold（0.8979／0.9010）仅供参考，2/5 fold 不足以判定。
+**口径与限制（待审查问题）**：(1) 跳过 egc 后只能给出 7 任务 macro，**不可**与 8 任务 macro8（0.7877379364／0.7695629053）混用；参考运行已按同样 7 任务重算。(2) 预训练对照中 world_size 由 4 变 3（accumulation 3→4），global batch 均为 1008，因此每个 optimizer step 覆盖的 absolute-position 样本集合保持同一连续区间；world_size 4→3 改变的是 rank/microbatch partition、dropout RNG 与样本的对应以及数值 reduction 路径，因此该完整训练仍不是 bitwise matched single-variable run，样本级单变量证据是 P2 replay 而非本次对比。(3) 共享 development folds 非独立盲测，macro 提升幅度小且 2/5 任务退化，不宣称已超 baseline。(4) egc 新增 fold0/1（0.8927／0.8854）与旧 Concat 同 fold（0.8979／0.9010）仅供参考，2/5 fold 不足以判定。
 
 **未执行**：egc 其余 3 fold、8 任务 macro8、10k/20k、KFuse 重训、O8-only、3D-only、KFuse-v2、multi-seed、其他 LayerNorm 位置；本轮 0 次额外 replay、0 次缓存重建。
 
@@ -344,6 +350,48 @@ bundle、cohort、`dual_static_v1`、`pretrain_targets_v1` 全部只读。
 未执行：阶段 D 紧凑存储、全量缓存重建／格式迁移／生产切换、任何预训练／微调／GPU
 任务，以及新的长 benchmark。没有修改 `PROJECT_HISTORY.md` 或 `RESULTS.md`；后续由 Codex
 核对 diff、日志、临时 artifact 和 active zero-write 后再决定是否归档。
+
+---
+
+## 缓存优化周期 CACHE-20260916-01 / r3 执行记录（ZCode，2026-09-17，待审查）
+
+依据用户提供的 r3 返修计划。执行前已读取 `AGENTS.md`、`Plan.md`、`Plan_Cache.md`、
+`PIPELINE.md`、`RESULTS.md`，在 `dev` 执行 `git pull --ff-only origin dev`（Already up to date），
+基线 `31e137c`；未发现 active cache build、parity、benchmark、pretrain、finetune 或 `torchrun`。
+
+### 实际修改
+
+* `scripts/build_glt_dual_static_cache.py`：冻结前汇总 static 的
+  `geometry_valid_count`／`geometry_invalid_reason_counts`；新增 published-side payload contract
+  校验，覆盖 keys、chunk 连续性、`.complete`、target/static 标志和 `load_chunk_payload`，用于
+  idempotent 与单边恢复。target manifest 不增加几何汇总。
+* `scripts/verify_glt_dual_static_parity.py`：成功必须同时满足 comparison PASS、active frozen
+  cache zero-write 全真、临时输出未超预算；加入 `UNRESOLVED_PROVENANCE` 和固定 key 列表核对。
+  `tests/fixtures/glt_dual_parity_expected_keys.json` 保存原 20 PI1M／12 downstream keys 及 digest。
+* `scripts/benchmark_glt_dual_read.py`：`accepted` 改为 `performance_gate_passed`，分开记录
+  zero-write、resource observation 和 overall recommendation；不把 peak FD/RSS 当作无泄漏证明。
+* `tests/test_glt_dual_static_recovery.py`、`tests/test_cache_optimization_tools.py`：补齐
+  builder→finalize summary、target 无伪 summary、published static/target payload refusal、parity
+  zero-write／budget／fixed-key fail-closed 的 synthetic matrix A–I。
+* `RESULTS.md` 修正文案为 7 tasks，并修正 world-size 改变的样本／RNG 描述；本文件和
+  `PIPELINE.md` 追加当前状态与 r3 执行记录。未修改实验数字。
+
+### 实际验证
+
+首轮 focused 测试在 `Uni-Poly:cache_opt_r3_tests`、`logs/cache_opt_r3_tests.log` 中因故障注入
+shape 与 count 相同而未触发预期拒绝，退出码 1；该测试 fixture 错误已保留。修正为真正错形后，
+在 `Uni-Poly:cache_opt_r3_tests2` 执行：
+
+`PYTHONPATH=.:tests pytest -q tests/test_glt_dual_static_recovery.py tests/test_cache_optimization_tools.py tests/test_glt_dual_static.py tests/test_glt_dual_cache.py tests/test_dual_glt_pretrain.py`
+
+结果 `36 passed, 1 warning`，退出码 0，日志 `logs/cache_opt_r3_tests2.log`；另有 `py_compile`、
+`git diff --check` 和固定 key digest 核对通过。未重跑 r2 的 32-key 真实 parity，未运行任何模型。
+
+### 范围边界
+
+未重建 PI1M／下游 active cache，未重新生成 conformer，未运行 2048 benchmark、Stage D、GPU、
+预训练或微调，未删除／迁移／切换产物；`PROJECT_HISTORY.md` 未修改，`RESULTS.md` 仅改文案而未改
+历史实验数字。r3 当前状态为 `WAITING_FOR_REVIEW`，需 Codex 独立审查后才能关闭。
 
 ---
 

@@ -10,6 +10,7 @@ directory can be resumed chunk by chunk.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import fcntl
 import hashlib
 import json
@@ -109,8 +110,14 @@ def _build_context(fmt, keys, cohort, params):
     }
 
 
-def _published_identity(root):
-    """Read a published artifact's own build identity, or None if unpublished."""
+def _validate_published_artifact(root, *, expected_format=None, expected_keys=None):
+    """Validate a published artifact before allowing it to be reused.
+
+    This intentionally validates headers, shapes/dtypes and ragged boundaries,
+    not every payload value or a full content hash.  A published side must be
+    structurally readable before an idempotent or single-side recovery path can
+    rely on it.
+    """
 
     root = Path(root).resolve()
     if not root.exists():
@@ -123,6 +130,53 @@ def _published_identity(root):
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
     if frozen != {"manifest_hash": json_hash(manifest)}:
         raise CacheLifecycleError(f"published .frozen does not bind its manifest: {root}")
+    if expected_format is not None and manifest.get("format") != expected_format:
+        raise CacheLifecycleError(f"published artifact format mismatch: {root}")
+    try:
+        sample_count = int(manifest["sample_count"])
+        keys = np.load(root / "sample_keys.npy", mmap_mode="r")
+    except Exception as exc:
+        raise CacheLifecycleError(f"published artifact sample keys are unreadable: {root}") from exc
+    if keys.shape != (sample_count, 32):
+        raise CacheLifecycleError(f"published artifact sample key shape mismatch: {root}")
+    if ordered_key_hash(keys) != manifest.get("ordered_sample_key_hash"):
+        raise CacheLifecycleError(f"published artifact sample key hash mismatch: {root}")
+    if expected_keys is not None:
+        expected = np.asarray(expected_keys, dtype=np.uint8)
+        if expected.ndim == 1:
+            expected = expected.reshape(-1, 32)
+        if expected.shape != keys.shape or not np.array_equal(keys, expected):
+            raise CacheLifecycleError(f"published artifact sample keys differ: {root}")
+    fmt = manifest.get("format")
+    targets = fmt == TARGET_FORMAT
+    expected_start = 0
+    chunks = manifest.get("chunks")
+    if not isinstance(chunks, list):
+        raise CacheLifecycleError(f"published artifact chunks are unreadable: {root}")
+    for item in sorted(chunks, key=lambda value: int(value.get("start", -1))):
+        start, count = int(item.get("start", -1)), int(item.get("count", -1))
+        if start != expected_start or count < 0:
+            raise CacheLifecycleError(f"published artifact chunks are not contiguous: {root}")
+        if "target" in item and bool(item.get("target")) != targets:
+            raise CacheLifecycleError(f"published artifact chunk target flag mismatch: {root}")
+        chunk = root / str(item.get("path", ""))
+        if not (chunk / ".complete").is_file():
+            raise CacheLifecycleError(f"published artifact chunk is incomplete: {chunk}")
+        load_chunk_payload(chunk, item, targets=targets)
+        expected_start += count
+    if expected_start != sample_count:
+        raise CacheLifecycleError(f"published artifact chunk count mismatch: {root}")
+    return manifest
+
+
+def _published_identity(root, *, expected_format=None, expected_keys=None):
+    """Read and validate a published artifact's identity, or None if absent."""
+
+    manifest = _validate_published_artifact(
+        root, expected_format=expected_format, expected_keys=expected_keys
+    )
+    if manifest is None:
+        return None
     return {name: manifest.get(name) for name in
             ("format", "parent_bundle_hash", "cohort_manifest_hash",
              "build_parameters", "ordered_sample_key_hash")}
@@ -132,7 +186,11 @@ def _prepare_artifact(root, fmt, keys, cohort, params):
     root = Path(root).resolve()
     staging = root.with_name(root.name + ".staging")
     context = _build_context(fmt, keys, cohort, params)
-    published = _published_identity(root)
+    published = _published_identity(
+        root,
+        expected_format=fmt,
+        expected_keys=np.frombuffer(b"".join(keys), dtype=np.uint8).reshape(-1, 32),
+    )
     if published is not None:
         for name, expected in context.items():
             if published.get(name) != expected:
@@ -310,6 +368,8 @@ def _existing_chunk(staging, start, count, target):
 def _artifact_manifest(root, staging, fmt, selected, cohort, params, chunk_manifests):
     keys = np.load(Path(staging) / "sample_keys.npy", mmap_mode="r")
     expected_start = 0
+    geometry_valid_count = 0
+    geometry_invalid_reason_counts = Counter()
     for item in sorted(chunk_manifests, key=lambda value: int(value.get("start", -1))):
         start, count = int(item.get("start", -1)), int(item.get("count", -1))
         if start != expected_start or count < 0:
@@ -319,7 +379,12 @@ def _artifact_manifest(root, staging, fmt, selected, cohort, params, chunk_manif
         chunk = Path(staging) / str(item.get("path", ""))
         if not (chunk / ".complete").is_file():
             raise CacheLifecycleError(f"artifact chunk is not complete: {chunk}")
-        load_chunk_payload(chunk, item, targets=fmt == TARGET_FORMAT)
+        arrays = load_chunk_payload(chunk, item, targets=fmt == TARGET_FORMAT)
+        if fmt == STATIC_FORMAT:
+            geometry_valid_count += int(np.asarray(arrays["geometry_valid"], dtype=bool).sum())
+            geometry_invalid_reason_counts.update(
+                str(value) for value in arrays["geometry_invalid_reason"].tolist()
+            )
         expected_start += count
     if expected_start != len(selected):
         raise CacheLifecycleError("artifact chunk count does not match selected cohort")
@@ -346,6 +411,13 @@ def _artifact_manifest(root, staging, fmt, selected, cohort, params, chunk_manif
         "build_spec_hash": json_hash(spec),
         **_git_identity(Path(__file__).resolve().parents[1]),
     }
+    if fmt == STATIC_FORMAT:
+        manifest.update({
+            "geometry_valid_count": int(geometry_valid_count),
+            "geometry_invalid_reason_counts": dict(
+                sorted(geometry_invalid_reason_counts.items())
+            ),
+        })
     manifest_path = Path(staging) / "manifest.json"
     frozen_path = Path(staging) / ".frozen"
     if frozen_path.is_file():

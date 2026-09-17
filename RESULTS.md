@@ -418,14 +418,16 @@ chem/geo/FP 三项 `max|replay-ref| = 0`，`66.9968@2676` 的峰值精确重现�
 （诊断模式只写 resume/诊断状态、不生成 deploy）、`scripts/diagnose_glt_dual_pretrain.py`
 （六 checkpoint 固定批量前向，无 optimizer update）。
 
-## GLT-V2 固定 Concat（geometry_head_norm）5k：训练健康、deploy 与 5 任务正式微调
+## GLT-V2 固定 Concat（geometry_head_norm）5k：训练健康、deploy 与 7 任务正式微调
 
 本轮唯一改动：在进入 geometry heads 的 3D bond state 上加 `nn.LayerNorm(512, elementwise_affine=False)`
 （零新增参数），config `configs/mts/glt_dual_three_task_concat_geonorm.json`。训练身份与旧正式
 Concat 5k 一致：同 cohort `30f17b59…`、同 bundle、同 dual_static、microbatch 84、global batch 1008、
 lr 2e-4、warmup 2000、schedule total 20000、BF16、loss 权重 [1,1,0.1]、noise 0.03、mask 0.3、
-5000 optimizer steps。差异：world_size 4→3（accumulation 3→4），故每步样本组成不同，本轮对照
-不是样本级单变量证明；样本级单变量证据仍是 P2 replay。
+5000 optimizer steps。差异：world_size 4→3（accumulation 3→4），global batch 均为 1008，因此每个
+optimizer step 覆盖的 absolute-position 样本集合保持同一连续区间；world_size 4→3 改变的是
+rank/microbatch partition、dropout RNG 与样本的对应以及数值 reduction 路径，因此该完整训练仍不是
+bitwise matched single-variable run。本轮对照不是样本级单变量证明；样本级单变量证据仍是 P2 replay。
 
 ### 训练健康（`results/glt_v2_fixed_concat_5k_20260916/pretrain_health_report.json`）
 
@@ -451,7 +453,7 @@ chemistry/geometry/fingerprint head、无 geometry_norm 依赖、与 `resume_050
 逐张量 bitwise 相同、strict load 与真实样本前向通过、冻结缓存零写入。eat/fold0 smoke（2 epochs）
 best validation R² 0.7737，`outer_test = NOT_RUN`。
 
-### 5 任务正式微调（egc 按用户指示跳过）
+### 7 任务正式微调（egc 按用户指示跳过）
 
 输出 `results/glt_v2_fixed_concat_5k_20260916/finetune_grid_fixed_concat`，聚合
 `aggregation_review_7task/summary.json`（status PASS、task_count 7、fold_count 35、

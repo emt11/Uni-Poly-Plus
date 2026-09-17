@@ -173,6 +173,12 @@ def _run_inline(source, indices, *, seed, microbatch, meta):
     }
 
 
+def _performance_gate_passed(throughput_ratio, p95_ratio):
+    """Apply only the declared throughput/p95 engineering screen."""
+
+    return bool(float(throughput_ratio) >= 1.10 and float(p95_ratio) <= 1.05)
+
+
 def _warmup_inline(source, indices, *, seed, meta):
     """Warm each configuration identically before recording a repetition."""
 
@@ -350,6 +356,10 @@ def main():
         run["latency_ms"]["total"]["p95"] for run in candidate["runs"])
     fd_growth = [run["fd_peak"] for run in candidate["runs"] + baseline["runs"]]
     rss_growth = [run["self_rss_bytes"] for run in candidate["runs"] + baseline["runs"]]
+    performance_gate_passed = _performance_gate_passed(
+        ratio, candidate_p95 / baseline_p95
+    )
+    zero_write_ok = report["frozen_cache_zero_write"] is True
     report["decision"] = {
         "throughput_ratio": ratio,
         "median_samples_per_second": {
@@ -359,9 +369,20 @@ def main():
         "fd_peak_max": max(fd_growth), "fd_peak_min": min(fd_growth),
         "rss_min": min(rss_growth), "rss_max": max(rss_growth),
         "thresholds": {"throughput_gain": 0.10, "p95_regression": 0.05},
-        "accepted": bool(ratio >= 1.10 and candidate_p95 <= baseline_p95 * 1.05),
+        "performance_gate_passed": performance_gate_passed,
+        "frozen_cache_zero_write": report["frozen_cache_zero_write"],
+        "resource_observations": {
+            "fd_peak": "recorded_peak_only_no_slope_proof",
+            "rss": "recorded_peak_or_end_only_no_slope_proof",
+            "counter_scope": "see_each_run_resource_scopes",
+        },
+        "overall_recommendation": (
+            "CANDIDATE_ONLY" if performance_gate_passed and zero_write_ok
+            else "NOT_ADOPTED"
+        ),
         "note": ("thresholds are an engineering screen over the recorded paired repetitions, not a "
-                 "statistical significance claim; production switching needs separate authorization"),
+                 "statistical significance claim; peak FD/RSS does not prove absence of a leak; "
+                 "production switching needs separate authorization"),
     }
     from src.dataset.cache_lifecycle import atomic_json
     atomic_json(Path(args.output_json), report)

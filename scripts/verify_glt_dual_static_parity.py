@@ -36,6 +36,10 @@ CLASS_QUOTAS = (("ordinary", 12), ("no_center_angles", 8))
 DOWNSTREAM_QUOTAS = (("geometry_fallback", 9), ("ordinary", 3))
 COMPARE_ATOL = 1e-6
 COMPARE_RTOL = 1e-6
+DEFAULT_EXPECTED_KEY_JSON = (
+    Path(__file__).resolve().parents[1] / "tests" / "fixtures" /
+    "glt_dual_parity_expected_keys.json"
+)
 
 
 class MissingFixture(CacheLifecycleError):
@@ -44,6 +48,10 @@ class MissingFixture(CacheLifecycleError):
 
 class BudgetExceeded(CacheLifecycleError):
     """The bounded temporary output exceeded its explicit budget."""
+
+
+class ExpectedKeyMismatch(CacheLifecycleError):
+    """The fixed historical parity key list cannot be reproduced exactly."""
 
 
 class ParityMismatch(CacheLifecycleError):
@@ -61,23 +69,68 @@ def _classify_reference(cache, index):
     return "ordinary"
 
 
-def _select(reference, quotas, limit, *, scan_limit):
-    chosen, counts = [], {name: 0 for name, _ in quotas}
-    scanned = 0
+def _key_list_digest(keys):
+    return hashlib.sha256("\n".join(keys).encode("ascii")).hexdigest()
+
+
+def _load_expected_keys(path):
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise ExpectedKeyMismatch(f"fixed parity key fixture is missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ExpectedKeyMismatch(f"fixed parity key fixture is unreadable: {path}") from exc
+    expected = {}
+    for route in ("pi1m", "downstream"):
+        entry = payload.get(route)
+        if not isinstance(entry, dict) or not isinstance(entry.get("keys"), list):
+            raise ExpectedKeyMismatch(f"fixed parity key fixture lacks {route} keys: {path}")
+        keys = [str(value) for value in entry["keys"]]
+        if not keys or len(keys) != len(set(keys)):
+            raise ExpectedKeyMismatch(f"fixed parity {route} key list is empty or duplicated")
+        if any(len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
+               for value in keys):
+            raise ExpectedKeyMismatch(f"fixed parity {route} key list contains invalid sample key")
+        digest = entry.get("sha256")
+        if digest != _key_list_digest(keys):
+            raise ExpectedKeyMismatch(f"fixed parity {route} key digest does not match fixture")
+        expected[route] = keys
+    return expected
+
+
+def _select_fixed(reference, expected_keys, quotas, limit):
+    """Resolve exactly the historical keys; never replace them by quota scan."""
+
+    if int(limit) != len(expected_keys):
+        raise ExpectedKeyMismatch(
+            f"requested limit {limit} differs from fixed {len(expected_keys)} keys"
+        )
     quota_map = dict(quotas)
-    for index in range(min(len(reference), int(scan_limit))):
-        scanned = index + 1
-        name = _classify_reference(reference, index)
-        if counts.get(name, 0) < quota_map.get(name, 0):
-            counts[name] = counts.get(name, 0) + 1
-            chosen.append((name, index))
-        if len(chosen) >= int(limit):
-            break
-    counts["_scanned_rows"] = scanned
+    counts = {name: 0 for name, _ in quotas}
+    chosen = []
+    for key_hex in expected_keys:
+        try:
+            index = reference.index_for_key(bytes.fromhex(key_hex))
+        except (ValueError, CacheLifecycleError) as exc:
+            raise ExpectedKeyMismatch(
+                f"fixed parity key is absent from reference artifact: {key_hex}"
+            ) from exc
+        class_name = _classify_reference(reference, index)
+        if class_name not in quota_map:
+            raise ExpectedKeyMismatch(
+                f"fixed parity key has unexpected class {class_name}: {key_hex}"
+            )
+        counts[class_name] += 1
+        if counts[class_name] > quota_map[class_name]:
+            raise ExpectedKeyMismatch(
+                f"fixed parity {class_name} quota exceeded by key: {key_hex}"
+            )
+        chosen.append((class_name, index))
     missing = {name: quota - counts.get(name, 0)
-               for name, quota in quotas if counts.get(name, 0) < quota}
+               for name, quota in quotas if counts.get(name, 0) != quota}
     if missing:
-        raise MissingFixture(f"reference artifact lacks requested categories: {missing}")
+        raise ExpectedKeyMismatch(f"fixed parity class counts differ from contract: {missing}")
     return chosen, counts
 
 
@@ -303,8 +356,8 @@ def _check_static_and_runtime(reference, candidate, topology, trimer, row, key_h
 
 
 def _route(reference_root, reference_targets, cohort_root, cache_root, *, quotas, limit,
-           targets, chunk_size, workers, temp_root, size_budget, seed=20260915,
-           sigma=0.03, ratio=0.3, scan_limit=60000):
+           targets, chunk_size, workers, temp_root, size_budget, expected_keys,
+           seed=20260915, sigma=0.03, ratio=0.3):
     store = load_active_dual_store(cache_root)
     cohort = load_dual_cohort(cohort_root, cache_root)
     records = {str(row["sample_key"]): row for row in cohort["records"]}
@@ -325,7 +378,7 @@ def _route(reference_root, reference_targets, cohort_root, cache_root, *, quotas
                 parent_bundle_hash=cohort["manifest"]["main_bundle_hash"],
                 cohort_manifest_hash=cohort["manifest_hash"],
             )
-        chosen, counts = _select(reference, quotas, limit, scan_limit=scan_limit)
+        chosen, counts = _select_fixed(reference, expected_keys, quotas, limit)
         rows = []
         for _, index in chosen:
             key_hex = bytes(reference.sample_keys[index]).hex()
@@ -402,6 +455,32 @@ def _new_temp_root(value):
     return Path(tempfile.mkdtemp(prefix="glt_dual_static_parity_"))
 
 
+def _zero_write_ok(value):
+    if value is True:
+        return True
+    return isinstance(value, dict) and bool(value) and all(item is True for item in value.values())
+
+
+def _apply_success_gates(report):
+    """Turn a nominal comparison PASS into failure when safety gates fail."""
+
+    if report.get("status") != "PASS":
+        return
+    if not _zero_write_ok(report.get("frozen_cache_zero_write")):
+        report.update({
+            "status": "ACTIVE_CACHE_MODIFIED",
+            "error_type": "ActiveCacheModified",
+            "error": "active frozen cache changed during parity",
+        })
+        return
+    if report.get("within_size_budget") is not True:
+        report.update({
+            "status": "BUDGET_EXCEEDED",
+            "error_type": "BudgetExceeded",
+            "error": "temporary parity output is missing or exceeds its budget",
+        })
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pi1m-cache-root", required=True)
@@ -413,6 +492,7 @@ def main():
     parser.add_argument("--downstream-reference-static", required=True)
     parser.add_argument("--report-json", required=True)
     parser.add_argument("--temp-root")
+    parser.add_argument("--expected-key-json", default=str(DEFAULT_EXPECTED_KEY_JSON))
     parser.add_argument("--limit-pi1m", type=int, default=20)
     parser.add_argument("--limit-downstream", type=int, default=12)
     parser.add_argument("--workers", type=int, default=1)
@@ -431,10 +511,15 @@ def main():
         "size_budget_bytes": int(args.size_budget_bytes),
         "model_status": "NOT_RUN", "conformer_generation": "NOT_RUN",
         "seed": int(args.seed), "sigma": float(args.sigma), "mask_ratio": float(args.ratio),
+        "expected_key_json": str(Path(args.expected_key_json).resolve()),
     }
     before = {}
     temp_root = None
     try:
+        expected_keys = _load_expected_keys(args.expected_key_json)
+        report["expected_key_digests"] = {
+            route: _key_list_digest(keys) for route, keys in expected_keys.items()
+        }
         temp_root = _new_temp_root(args.temp_root)
         report["temporary_root"] = str(temp_root)
         before = {
@@ -445,19 +530,25 @@ def main():
             args.pi1m_reference_static, args.pi1m_reference_targets, args.pi1m_cohort_root,
             args.pi1m_cache_root, quotas=CLASS_QUOTAS, limit=args.limit_pi1m, targets=True,
             chunk_size=4096, workers=args.workers, temp_root=temp_root,
+            expected_keys=expected_keys["pi1m"],
             size_budget=args.size_budget_bytes, seed=args.seed, sigma=args.sigma,
             ratio=args.ratio,
         )
         report["pi1m"] = pi1m
+        if pi1m.get("keys") != expected_keys["pi1m"]:
+            raise ExpectedKeyMismatch("selected PI1M parity keys differ from fixed fixture")
         downstream = _route(
             args.downstream_reference_static, None, args.downstream_cohort_root,
             args.downstream_cache_root, quotas=DOWNSTREAM_QUOTAS,
             limit=args.limit_downstream, targets=False, chunk_size=512,
             workers=args.workers, temp_root=temp_root,
+            expected_keys=expected_keys["downstream"],
             size_budget=args.size_budget_bytes, seed=args.seed, sigma=args.sigma,
             ratio=args.ratio,
         )
         report["downstream"] = downstream
+        if downstream.get("keys") != expected_keys["downstream"]:
+            raise ExpectedKeyMismatch("selected downstream parity keys differ from fixed fixture")
         report["key_list_sha256"] = {
             "pi1m": hashlib.sha256(
                 "\n".join(pi1m["keys"]).encode("ascii")
@@ -471,6 +562,8 @@ def main():
         report.update({"status": "MISSING_FIXTURE", "error_type": type(exc).__name__, "error": str(exc)})
     except BudgetExceeded as exc:
         report.update({"status": "BUDGET_EXCEEDED", "error_type": type(exc).__name__, "error": str(exc)})
+    except ExpectedKeyMismatch as exc:
+        report.update({"status": "UNRESOLVED_PROVENANCE", "error_type": type(exc).__name__, "error": str(exc)})
     except ParityMismatch as exc:
         report.update({"status": "DATA_MISMATCH", "error_type": type(exc).__name__, "error": str(exc),
                        "parity_details": exc.details})
@@ -497,6 +590,7 @@ def main():
                 report["within_size_budget"] = report["temporary_bytes"] <= int(args.size_budget_bytes)
             except Exception as exc:
                 report["temporary_bytes_error"] = f"{type(exc).__name__}: {exc}"
+        _apply_success_gates(report)
         atomic_json(report_path, report)
     print(json.dumps({
         key: report.get(key) for key in (

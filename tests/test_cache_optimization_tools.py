@@ -2,8 +2,45 @@ import numpy as np
 import pytest
 import sys
 import json
+import hashlib
 
 from src.dataset.cache_lifecycle import CacheLifecycleError
+
+
+def _write_key_fixture(tmp_path):
+    entries = {"pi1m": ["a" * 64], "downstream": ["b" * 64]}
+    payload = {"format": "test", "source": "synthetic"}
+    for route, keys in entries.items():
+        payload[route] = {
+            "keys": keys,
+            "sha256": hashlib.sha256("\n".join(keys).encode("ascii")).hexdigest(),
+        }
+    path = tmp_path / "expected_keys.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path, entries
+
+
+def _patch_fake_route(monkeypatch, parity, expected, result_keys=None):
+    def fake_route(*_args, **kwargs):
+        route = "pi1m" if kwargs["targets"] else "downstream"
+        return {"keys": (result_keys or expected)[route]}
+
+    monkeypatch.setattr(parity, "_route", fake_route)
+
+
+def _base_parity_argv(parity, tmp_path, key_fixture, budget=1024):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    return [
+        "verify_glt_dual_static_parity.py",
+        "--pi1m-cache-root", str(cache), "--pi1m-cohort-root", str(cache),
+        "--pi1m-reference-static", str(cache), "--pi1m-reference-targets", str(cache),
+        "--downstream-cache-root", str(cache), "--downstream-cohort-root", str(cache),
+        "--downstream-reference-static", str(cache), "--temp-root", str(tmp_path / "temporary"),
+        "--report-json", str(tmp_path / "report.json"),
+        "--expected-key-json", str(key_fixture), "--limit-pi1m", "1",
+        "--limit-downstream", "1", "--size-budget-bytes", str(budget),
+    ]
 
 
 def test_parity_comparison_accepts_integer_container_representations():
@@ -71,6 +108,17 @@ def test_benchmark_counter_counts_only_chunk_cache_misses(monkeypatch):
     monkeypatch.setattr(np, "load", original_np_load)
 
 
+def test_benchmark_exposes_performance_gate_without_claiming_acceptance():
+    from scripts import benchmark_glt_dual_read as benchmark
+
+    assert benchmark._performance_gate_passed(1.10, 1.05)
+    assert not benchmark._performance_gate_passed(1.09, 1.00)
+    source = open(benchmark.__file__, encoding="utf-8").read()
+    assert '"performance_gate_passed"' in source
+    assert '"overall_recommendation"' in source
+    assert '"accepted"' not in source
+
+
 def test_parity_main_writes_classified_failure_report(monkeypatch, tmp_path):
     from scripts import verify_glt_dual_static_parity as parity
 
@@ -96,3 +144,48 @@ def test_parity_main_writes_classified_failure_report(monkeypatch, tmp_path):
     assert payload["status"] == "MISSING_FIXTURE"
     assert payload["error_type"] == "MissingFixture"
     assert payload["model_status"] == "NOT_RUN"
+
+
+def test_parity_main_fails_closed_when_active_cache_changes(monkeypatch, tmp_path):
+    from scripts import verify_glt_dual_static_parity as parity
+
+    key_fixture, expected = _write_key_fixture(tmp_path)
+    _patch_fake_route(monkeypatch, parity, expected)
+    states = iter([
+        {"snapshot": 1}, {"snapshot": 1},
+        {"snapshot": 2}, {"snapshot": 1},
+    ])
+    monkeypatch.setattr(parity, "zero_write_snapshot", lambda _path: next(states))
+    monkeypatch.setattr(sys, "argv", _base_parity_argv(parity, tmp_path, key_fixture))
+    assert parity.main() == 1
+    payload = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "ACTIVE_CACHE_MODIFIED"
+    assert payload["error_type"] == "ActiveCacheModified"
+
+
+def test_parity_main_fails_closed_when_temporary_budget_is_exceeded(monkeypatch, tmp_path):
+    from scripts import verify_glt_dual_static_parity as parity
+
+    key_fixture, expected = _write_key_fixture(tmp_path)
+    _patch_fake_route(monkeypatch, parity, expected)
+    monkeypatch.setattr(parity, "zero_write_snapshot", lambda _path: {"snapshot": 1})
+    monkeypatch.setattr(parity, "_temporary_bytes", lambda _path: 5)
+    monkeypatch.setattr(sys, "argv", _base_parity_argv(parity, tmp_path, key_fixture, budget=4))
+    assert parity.main() == 1
+    payload = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "BUDGET_EXCEEDED"
+    assert payload["error_type"] == "BudgetExceeded"
+
+
+def test_parity_main_rejects_changed_fixed_key_list(monkeypatch, tmp_path):
+    from scripts import verify_glt_dual_static_parity as parity
+
+    key_fixture, expected = _write_key_fixture(tmp_path)
+    wrong = {"pi1m": ["c" * 64], "downstream": expected["downstream"]}
+    _patch_fake_route(monkeypatch, parity, expected, result_keys=wrong)
+    monkeypatch.setattr(parity, "zero_write_snapshot", lambda _path: {"snapshot": 1})
+    monkeypatch.setattr(sys, "argv", _base_parity_argv(parity, tmp_path, key_fixture))
+    assert parity.main() == 1
+    payload = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "UNRESOLVED_PROVENANCE"
+    assert payload["error_type"] == "ExpectedKeyMismatch"

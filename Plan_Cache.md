@@ -4,17 +4,17 @@
 
 | 项目 | 记录 |
 | --- | --- |
-| 计划 ID／修订 | CACHE-20260916-01 / r2：审查后最小返修 |
-| 日期／环境 | 2026-09-16；当前远程 Linux 训练机，项目根 /root/workspace/Uni-Poly-Plus-master |
-| 状态 | 待审查；r2 返修已由 ZCode 执行，尚未由 Codex 独立验收 |
-| 当前授权 | 用户直接要求按本计划由 ZCode 执行。范围仍限于 R1–R4 的局部代码、相关测试、32 条固定 parity 与文档／报告；不授权生产切换、全量重建、训练或 GPU smoke |
+| 计划 ID／修订 | CACHE-20260916-01 / r3：r2 审查后的最小合同收口 |
+| 日期／环境 | 2026-09-17；当前远程 Linux 训练机，项目根 /root/workspace/Uni-Poly-Plus-master |
+| 状态 | 待审查；r3 返修已由 ZCode 执行，尚未由 Codex 独立验收 |
+| 当前授权 | 用户直接要求按本计划由 ZCode 执行。范围限于 R3.1–R3.8 的局部代码、focused tests、固定 32 条 parity 证据与文档／报告；不授权生产切换、全量重建、训练或 GPU smoke |
 | 角色 | Codex 规划与后续审查；ZCode 执行。本节执行结果是执行记录，不代表独立验收通过 |
-| 基准 commit | r2 审查／返修基线 7f476b481ceff4fa4a0561845230b329f6fa872b，dev；r1 规划基线 18572e3 保留作为历史记录 |
+| 基准 commit | r3 执行基线 31e137c481e4f9216860d2f092e70dbfb295de14，dev；r2 基线保留作为历史记录 |
 | 修改前状态 | dev 工作树干净，pull 返回 Already up to date；r1 文档创建时的用户改动已记入 PROJECT_HISTORY.md，不沿用为当前状态 |
 | 交接入口 | [Plan.md](Plan.md)；本文件是缓存专项实施细则，不替换正在进行或未收口的科学计划 |
 | 总结论 | 保留基础缓存＋静态派生缓存＋预训练目标缓存；先解决少量具体证据与工程缺口，不直接全量重建 |
 
-r2 执行以第 9 节的审查状态和第 10 节的返修合同为准。第 1–8 节保留 r1 的目标、基线与原始验收要求，不表示它们已全部完成，也不构成重新运行 A–D 的指令；其中构建缺口表为 r1 修改前的静态发现，当前缺口以第 10 节为准。旧清理周期见 [PROJECT_HISTORY.md](PROJECT_HISTORY.md)，其余 HOLD 不解除。
+r2 执行以第 9 节的审查状态和第 10 节的返修合同为准。第 1–8 节保留 r1 的目标、基线与原始验收要求，不表示它们已全部完成，也不构成重新运行 A–D 的指令；其中构建缺口表为 r1 修改前的静态发现，当前缺口以第 10 节为准。r3 执行以第 11 节的实际记录为准；r2 历史记录与报告不覆盖。旧清理周期见 [PROJECT_HISTORY.md](PROJECT_HISTORY.md)，其余 HOLD 不解除。
 
 ## 1. 目标与不可改变的边界
 
@@ -334,3 +334,70 @@ r1 报告中“停止条件均未触发／A–C 完成”的自检不能覆盖�
 - 不生成构象、不全量重建、不删除缓存、不运行任何正式实验；未知身份／writer 冲突／NaN／超预算按第 8 节停止。
 
 本轮文档交付不等于独立验收通过。r2 周期当前状态为“待审查”；不将 ZCode 自检或本轮局部测试写成最终验收结论。
+
+## 11. r3 执行记录（ZCode，2026-09-17，待 Codex 审查）
+
+### 执行前与范围
+
+执行前读取 `AGENTS.md`、`Plan.md`、本文件、`PIPELINE.md`、`RESULTS.md`；在 `dev` 执行
+`git pull --ff-only origin dev`（`Already up to date`），基线为 `31e137c`，工作树干净。
+核对 `Uni-Poly` 现有窗口和进程，未发现 cache build、parity、benchmark、pretrain、finetune
+或 `torchrun` 活动任务。active bundle／cohort／dual_static／pretrain_targets 仅作只读依赖。
+本轮严格未重建 active cache、未生成 conformer、未运行 GPU、训练或长 benchmark。
+
+### R3.1–R3.3 实施
+
+* `scripts/build_glt_dual_static_cache.py` 在冻结前从已经通过 `load_chunk_payload` 的 static chunks
+  汇总 `geometry_valid_count` 与 `geometry_invalid_reason_counts`；target manifest 不添加几何汇总。
+  `finalize()` 对新 builder 产物保持 `IDEMPOTENT_ALREADY_FINAL`，不放宽 frozen rewrite。
+* 新增 `_validate_published_artifact()`；published side 在 idempotent、static-only／target-only
+  recovery 前验证 manifest／`.frozen`、sample-key shape/hash、连续 chunks、`.complete`、target
+  标志（兼容旧缺失字段）及完整 payload contract。故意错形的 static／target payload 均在 synthetic
+  build reuse 路径被拒绝。
+* `tests/test_glt_dual_static_recovery.py` 的实际 `builder.build()` fixture 现含 1 个 valid 与 1 个
+  `geometry_invalid` row；检查两类 summary、frozen bytes、static/target finalize 幂等和发布侧
+  payload refusal。
+
+### R3.4–R3.6 实施
+
+* `scripts/verify_glt_dual_static_parity.py` 增加 fail-closed success gate：比较 PASS 只有在
+  `frozen_cache_zero_write` 全部为 `true` 且临时输出 `within_size_budget=true` 时才保留 PASS；否则
+  返回非零并写 `ACTIVE_CACHE_MODIFIED` 或 `BUDGET_EXCEEDED`。固定 key provenance 缺失／不一致记为
+  `UNRESOLVED_PROVENANCE`。
+* 新增 `tests/fixtures/glt_dual_parity_expected_keys.json`，保存 r1/r2 已核实的原 20 个 PI1M、12 个
+  downstream keys 及 newline SHA-256（分别为
+  `5854f94abc331295f304f7e3e010ab45c2032d1422b2818d086cd6eda161a064`、
+  `60dcdde476897bf9097b50012d5d7c77e1d80bce42b01dd1705c85ffe469485c`）。verifier 按固定列表解析并
+  再核对返回列表，不再 quota+scan 静默换样本。
+* `scripts/benchmark_glt_dual_read.py` 将 `accepted` 改为 `performance_gate_passed`，另记
+  zero-write、resource observation 与 `overall_recommendation`；FD/RSS 仅作 peak/end 观察，不声明
+  无泄漏。默认 chunk capacity 仍为 2，未采用 capacity 64。
+* R3.7 的 target-only 避免重复 static build 未实施，保持计划中的 `DO_NOT_FIX`。
+
+### R3.8 文档状态
+
+`Plan.md` 当前注记已更正为：B.3 replay COMPLETE、geometry collapse 已复现并诊断、geonorm P2
+validation／fixed geonorm 5k／deploy validation COMPLETE、正式 downstream 为 7 tasks／35 folds，
+egc full 5-fold NOT COMPLETE；cache r2 为 `NEEDS_REPAIR`，r3 为 `WAITING_FOR_REVIEW`。`RESULTS.md`
+仅修正文案为 7 任务，并更正 world-size 变化的样本／RNG 说明，不改实验数字；`PIPELINE.md` 追加
+本轮 cache contract 记录。
+
+### 实际 focused tests
+
+首轮执行窗口 `Uni-Poly:cache_opt_r3_tests`、日志 `logs/cache_opt_r3_tests.log` 因 target 故障注入
+使用与 chunk count 相同的 `(1,256)` shape，得到 1 个失败；该失败属于测试 fixture，已保留。修正为
+真正错形 `(2,256)` 后，在 `Uni-Poly:cache_opt_r3_tests2` 重跑同一相关命令：
+
+`PYTHONPATH=.:tests pytest -q tests/test_glt_dual_static_recovery.py tests/test_cache_optimization_tools.py tests/test_glt_dual_static.py tests/test_glt_dual_cache.py tests/test_dual_glt_pretrain.py`
+
+结果 `36 passed, 1 warning`，退出码 0；完整日志为 `logs/cache_opt_r3_tests2.log`。覆盖 builder→finalize
+summary、target 无伪几何汇总、重复幂等、两侧 payload refusal、parity zero-write／budget／固定 key
+fail-closed、锁／offset／reader contract。另完成 `py_compile`、`git diff --check` 和固定 key digest
+核对。
+
+### 未执行与交接
+
+未重跑已有 r2 真实 32-key parity（按 r3 明确要求保留原报告）、未跑 2048 benchmark、未做全量 cache
+重建／格式迁移／生产切换、未启动任何 GPU／pretrain／finetune、未修改 `PROJECT_HISTORY.md` 或
+`RESULTS.md` 历史数字。active frozen cache 未写入。r3 执行结果交由 Codex 独立审查；在审查前不宣称
+缓存专项最终验收或生产可用。

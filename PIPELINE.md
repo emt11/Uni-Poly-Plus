@@ -961,3 +961,21 @@ PI1M cohort 959,588 条（source 988,775；trimer 959,588/29,181）。历史 art
 改为 AB／BA 交替、相同预热、真正 chunk-cache miss 计数和明确的 self／worker-tree 资源范围；
 本轮没有重新执行长 benchmark，因此不产生新的吞吐结论。容量 64 仍是不采用的历史候选，默认
 容量保持 2；阶段 D、全量重建、预训练和微调均未执行。本节是执行事实记录，不等同独立验收。
+
+### CACHE-20260916-01 r3 合同收口执行记录（ZCode，2026-09-17，待 Codex 审查）
+
+本轮未改变 active bundle、cohort、`dual_static_v1` 或 `pretrain_targets_v1`，未重建缓存、未生成
+构象、未运行 GPU／训练／长 benchmark。builder 在冻结前汇总 static chunk 的
+`geometry_valid_count` 和 `geometry_invalid_reason_counts`；target manifest 不写入伪几何汇总。
+published-side 复用前统一验证 sample-key shape/hash、连续 chunk、`.complete`、target/static 标志及
+`load_chunk_payload`，因此损坏的已发布 payload 不会进入幂等或单边恢复。
+
+parity verifier 现在要求 comparison PASS、active frozen cache zero-write 全部为 true、临时输出未超预算
+三项同时满足才返回 PASS；固定 32 个真实 parity key 由
+`tests/fixtures/glt_dual_parity_expected_keys.json` 显式绑定，不再按 quota+scan 静默换样本。benchmark
+工具仅将吞吐／p95 条件命名为 `performance_gate_passed`，FD/RSS 只记录观察值，默认 chunk capacity 仍为 2，
+不自动采用 capacity 64。
+
+`Uni-Poly:cache_opt_r3_tests2` 中 focused 命令结果为 `36 passed, 1 warning`、退出码 0；首轮 fixture
+错误及日志保留在 `logs/cache_opt_r3_tests.log`，修正后日志为 `logs/cache_opt_r3_tests2.log`。本轮未重跑
+r2 真实 parity、未运行模型；当前状态为等待 Codex 独立审查。
