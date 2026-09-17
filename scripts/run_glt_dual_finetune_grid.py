@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -14,6 +15,27 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.finetune_glt_dual import TASKS, fixed_manifest
+
+
+def _validate_gpu_slots(gpus):
+    gpus = [str(gpu) for gpu in gpus]
+    if not 1 <= len(gpus) <= 4:
+        raise ValueError('grid supports one to four GPU slots')
+    if len(set(gpus)) != len(gpus):
+        raise ValueError('grid requires distinct GPU slots; duplicate --gpu values are not allowed')
+    return gpus
+
+
+def _build_shard_command(args, task, fold, unit):
+    return [
+        sys.executable, 'scripts/finetune_glt_dual.py',
+        '--config', args.config, '--checkpoint', args.checkpoint,
+        '--raw-root', args.raw_root, '--cohort-root', args.cohort_root,
+        '--cache-root', args.cache_root, '--dual-static-root', args.dual_static_root,
+        '--clean-cache-gib', format(args.clean_cache_gib, 'g'),
+        '--output', str(unit), '--split-root', args.split_root,
+        '--task', task, '--fold', str(fold), '--formal-shard',
+    ]
 
 
 def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
@@ -99,6 +121,8 @@ def main():
     parser.add_argument('--gpu', action='append', dest='gpus', required=True,
                         help='one CUDA device per concurrent shard; repeat up to 4')
     parser.add_argument('--log-root', required=True)
+    parser.add_argument('--clean-cache-gib', type=float, default=0.0,
+                        help='forwarded process-local clean cache capacity in GiB (default: 0)')
     parser.add_argument('--resume', action='store_true',
                         help='continue an existing grid root: skip units that already have a '
                              'completed summary.json, and refuse to touch partial units')
@@ -106,9 +130,9 @@ def main():
     tasks = list(args.tasks) if args.tasks else list(TASKS)
     if sorted(set(tasks)) != sorted(tasks) or any(task not in TASKS for task in tasks):
         raise ValueError('unknown or duplicate task selection')
-    gpus = [str(gpu) for gpu in args.gpus]
-    if not 1 <= len(gpus) <= 4:
-        raise ValueError('grid supports one to four GPU slots')
+    if not math.isfinite(args.clean_cache_gib) or args.clean_cache_gib < 0:
+        raise ValueError('--clean-cache-gib must be finite and non-negative')
+    gpus = _validate_gpu_slots(args.gpus)
     output = Path(args.output).resolve()
     log_root = Path(args.log_root).resolve()
     if args.resume:
@@ -148,14 +172,7 @@ def main():
     def launch(task, fold, gpu):
         unit = output / f'{task}_fold{fold}'
         log_path = log_root / f'{task}_fold{fold}.log'
-        command = [
-            sys.executable, 'scripts/finetune_glt_dual.py',
-            '--config', args.config, '--checkpoint', args.checkpoint,
-            '--raw-root', args.raw_root, '--cohort-root', args.cohort_root,
-            '--cache-root', args.cache_root, '--dual-static-root', args.dual_static_root,
-            '--output', str(unit), '--split-root', args.split_root,
-            '--task', task, '--fold', str(fold), '--formal-shard',
-        ]
+        command = _build_shard_command(args, task, fold, unit)
         handle = log_path.open('w', encoding='utf-8')
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
         handle.write('COMMAND=' + ' '.join(command) + '\nCUDA_VISIBLE_DEVICES=' + gpu + '\n')

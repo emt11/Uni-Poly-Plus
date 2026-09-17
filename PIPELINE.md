@@ -588,6 +588,11 @@ sum/count 归约；日志包含任务均值、有效样本数、目标数量、�
 避免 worker base-seed 初始化消耗公共模型 RNG。
 BF16 仅用于模型，几何和 loss 使用 FP32。AdamW 默认 betas=(0.9,0.999)，weight decay=0。
 
+资源配置需区分历史正式协议与本轮提速 smoke：历史 fixed-geonorm formal 使用
+`world_size=3, microbatch=84, accumulation=4, global_batch=1008`；
+`SPEED-20260917-01` 的 bounded smoke 使用 `world_size=4, microbatch=84,
+accumulation=3, global_batch=1008`。二者保持 global batch 不变，未来正式实验由对应计划单独指定。
+
 5000 updates，LR=2e-4，warmup=2000，cosine horizon=20000，end LR=1e-9，每 1000
 步保存完整恢复包和部署包。注意旧 no-MD runner 源码实际使用线性衰减；本入口按新计划
 使用 cosine，因此不是旧 runner 学习率轨迹的逐步复刻，不宣称匹配旧训练。
@@ -601,9 +606,10 @@ BF16 仅用于模型，几何和 loss 使用 FP32。AdamW 默认 betas=(0.9,0.99
 
 ```bash
 MODE=concat
+WORLD_SIZE=${WORLD_SIZE:?set WORLD_SIZE=3 for historical fixed-geonorm formal or 4 for SPEED bounded smoke}
 mkdir -p logs/glt_dual_three_task
 set -o pipefail
-torchrun --standalone --nproc_per_node=4 scripts/pretrain_glt_dual.py \
+torchrun --standalone --nproc_per_node="${WORLD_SIZE}" scripts/pretrain_glt_dual.py \
   --config configs/mts/glt_dual_three_task_${MODE}.json \
   --samples-csv PI1M_CSV --topology-root TOPOLOGY_LAYER --trimer-root TRIMER_LAYER \
   --output results/glt_dual_three_task/${MODE}/pretrain \
@@ -633,7 +639,8 @@ Data LRU（默认 0，关闭；不写磁盘、不缓存 GPU tensor）。
 有界 grid 入口 `scripts/run_glt_dual_finetune_grid.py` 使用每个唯一 GPU 一个 shard 的 pending/running
 队列；某个 shard 成功释放槽位后立即派发下一个，失败或启动异常停止新派发并收口已持有进程。该调度优化
 只改变启动时序，不改变 task/fold、seed、模型、optimizer 或输出隔离；须以独立授权的真实 grid 运行验证，
-不能用合成调度测试宣称正式总工期收益。
+不能用合成调度测试宣称正式总工期收益。grid 的 `--clean-cache-gib` 默认是 `0`，只有显式指定时才原样
+转发到每个 shard 的 finetune 命令；shard 日志保留实际 COMMAND。
 
 ```bash
 python scripts/finetune_glt_dual.py \

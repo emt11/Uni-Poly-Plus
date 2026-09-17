@@ -2,10 +2,10 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 计划 ID / 修订 | SPEED-20260917-01 / r3：有界执行记录收口；补记恢复 RNG 与 grid 异常路径更正 |
+| 计划 ID / 修订 | SPEED-20260917-01 / r4：关闭 Codex 独立审查指出的执行合同缺口 |
 | 日期 | 2026-09-17（UTC） |
-| 状态 | 待审查；代码实现、局部测试、32+32 parity 与 4-GPU 有界 smoke 已执行，恢复 RNG 更正后的 GPU 集成尚未复跑 |
-| 授权来源 | 用户明确要求执行本计划，并补充允许使用 4 张 GPU；仍受本计划的样本、步数、时间和“不启动正式实验”边界约束 |
+| 状态 | 待审查；r4 新增测试与 4-GPU resume 已执行，未启动正式训练或微调 |
+| 授权来源 | 用户明确要求执行 r4，并补充允许最多 4 张 GPU；不启动正式 5k/20k、完整微调或新科学实验 |
 | 角色 | Codex 规划与后续审查；ZCode 按获授权范围实施；本轮文档由 Codex 修改、自检，无独立审查者 |
 | 基线 | dev，执行前 HEAD `b185941`；工作树干净，`git pull --ff-only origin dev` 为 Already up to date |
 | 交接边界 | 本文件为新提速计划；不恢复已删除的 Plan_Cache.md，不重开已 CLOSED 的缓存返修周期 |
@@ -167,3 +167,19 @@ A-B-B-A每次独立进程、相同初始化/恢复点、相同绝对样本位置
 - **调度失败路径**：18 项局部测试包含 free-slot 先派发、子进程失败后停止新派发，以及 `launch()` 异常时 drain 已持有子进程；未启动正式 fold。
 - **未执行**：正式 5000/20000-step 预训练、Concat/KFuse 完整训练、完整 8×5 微调、正式 grid、5k+15-step 长 benchmark、第二预训练候选、缓存重建/迁移、post-fix GPU resume rerun。当前不把 smoke 或静态 sidecar parity 写成模型性能提升或正式实验完成。
 - **提交与同步**：本轮 9 个项目文件已显式暂存并提交为 `8cbe78e`（`perf: bound GLT dual runtime speed paths`），已推送 `origin/dev`；推送后 `dev...origin/dev`，工作树干净。该 commit 仍处于待 Codex 独立审查状态。
+
+### 7.3 r4 执行启动记录（2026-09-17 UTC）
+
+- 执行前已读取最新 `AGENTS.md`、`Plan.md`，核对 `dev`、`origin/dev` 和工作树；`git pull --ff-only origin dev` 返回 `Already up to date`，基线为 `ff4e899`。
+- 当前未发现匹配的预训练、微调、grid 或 pytest 活动进程；不重用或覆盖 r3 的既有日志和产物。
+- 本轮只新增/修改 r4 合同相关代码、测试和计划记录；既有 32+32 parity、256 profile、A-B-B-A smoke、baseline smoke 与完整局部测试均不重跑。
+
+### 7.4 r4 执行结果（2026-09-17 UTC）
+
+- **worker-resume unit**：新增测试先保存 RNG、创建 `num_workers=2` 的 DataLoader、调用 `iter(loader)`，再 restore 并比较 parent Torch RNG；通过。
+- **GPU resume**：`Uni-Poly:speed_r4_gpu_resume` 使用当前 static/target candidate、4 ranks、`--prep-workers 3`，连续 4 步 + 恢复前 2 步 + 恢复后 2 步，共 8 logical optimizer updates；三段退出码均为 0。报告 `results/speed_20260917/r4_gpu_resume_report.json` 为 `PASS`：model、optimizer、scheduler、ordered keys、next position、step、Python/NumPy/CPU Torch RNG、4 rank CUDA RNG、losses 与 target counts 均 exact（loss 使用既有 `1e-7` 容差）。完整日志 `logs/speed_r4_gpu_resume.log`。
+- **GPU identity 与 grid forwarding**：`_validate_gpu_slots` 拒绝重复 GPU；CLI 测试使用 `--gpu 1 --gpu 1` 在 output 创建和 shard launch 前失败；command construction 检查 `--clean-cache-gib 0` 与 `4` 分别原样转发为 `0` 与 `4`。grid 默认仍为 `0`，实际 shard COMMAND 会记录转发值。
+- **clean cache 边界**：重复 sample key 的两行只 build 一次但保留独立标签与 override；单样本容量触发 eviction 后重新 build，结果与 uncached Data 相同，未删样本、未串 graph。
+- **本轮测试**：`Uni-Poly:speed_r4_scoped_tests` 执行授权范围内的新增测试选择：`PYTHONPATH=.:tests pytest -q tests/test_glt_dual_speed.py -k "worker_iterator or grid_rejects_gpu or grid_cli_rejects or grid_forwards_clean_cache or duplicate_key_keeps or bounded_eviction"`，`5 passed, 5 deselected, 1 warning`，退出码 0，日志 `logs/speed_r4_scoped_tests.log`；py_compile 与一次完整文件自检也曾执行，修正 synthetic fixture 后为 `10 passed`（`logs/speed_r4_local_tests_retry.log`），不作为旧动态时序证据。
+- **PIPELINE 更正**：模板改为显式 `WORLD_SIZE`；正文区分历史 fixed-geonorm formal（3 ranks × 84 × 4 = 1008）与 SPEED bounded smoke（4 ranks × 84 × 3 = 1008），没有将 4-GPU smoke 写成历史正式默认。
+- **验收状态**：`POSTFIX_WORKER_RESUME_GPU_EXACT=PASS`、`GRID_DUPLICATE_GPU_REJECTED=PASS`、`GRID_CLEAN_CACHE_FORWARDING=PASS`、`CACHE_DUPLICATE_KEY_LABEL_TEST=PASS`、`CACHE_EVICTION_TEST=PASS`；`FORMAL_TRAINING_RUN=NO`、`FORMAL_FINETUNE_RUN=NO`、`ACTIVE_CACHE_MODIFIED=NO`。r4 仍为“待审查”，不写 Codex 独立验收通过或 CLOSED。

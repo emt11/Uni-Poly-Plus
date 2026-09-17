@@ -3,13 +3,17 @@
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Data
 
-from scripts.run_glt_dual_finetune_grid import _run_dynamic_jobs
+from scripts.run_glt_dual_finetune_grid import (
+    _build_shard_command, _run_dynamic_jobs, _validate_gpu_slots,
+)
 from src.training import glt_dual_runtime as runtime
 
 
@@ -20,10 +24,127 @@ class _FakeSource:
         return len(self.samples)
 
     def __getitem__(self, index):
+        return self.samples[index][0], object(), self.samples[index][1]
+
+    def static_for(self, index):
+        return None
+
+
+class _DuplicateSource:
+    samples = [(b'same-key' * 4, '*C*'), (b'same-key' * 4, '*C*')]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
         return object(), object(), self.samples[index][1]
 
     def static_for(self, index):
         return None
+
+
+class _IndexDataset(Dataset):
+    def __len__(self):
+        return 8
+
+    def __getitem__(self, index):
+        return index
+
+
+def _grid_args(clean_cache_gib):
+    return SimpleNamespace(
+        config='config.json', checkpoint='checkpoint.pt', raw_root='raw',
+        cohort_root='cohort', cache_root='cache', dual_static_root='static',
+        clean_cache_gib=clean_cache_gib, split_root='split',
+    )
+
+
+def test_worker_iterator_then_restore_preserves_parent_torch_rng():
+    torch.manual_seed(9271)
+    saved = runtime.rng_state()
+    reference = torch.rand(16)
+    runtime.restore_rng(saved)
+    loader = DataLoader(_IndexDataset(), batch_size=1, num_workers=2)
+    iterator = iter(loader)
+    next(iterator)
+    runtime.restore_rng(saved)
+    observed = torch.rand(16)
+    assert torch.equal(observed, reference)
+    del iterator, loader
+
+
+def test_grid_rejects_duplicate_gpu_slots_before_launch():
+    with pytest.raises(ValueError, match='distinct GPU slots'):
+        _validate_gpu_slots(['1', '1'])
+    assert _validate_gpu_slots(['1', '2']) == ['1', '2']
+
+
+def test_grid_cli_rejects_duplicate_gpu_before_launch(tmp_path):
+    output = tmp_path / 'grid'
+    command = [
+        sys.executable, 'scripts/run_glt_dual_finetune_grid.py',
+        '--config', 'config.json', '--checkpoint', 'checkpoint.pt',
+        '--raw-root', str(tmp_path), '--cohort-root', str(tmp_path),
+        '--cache-root', str(tmp_path), '--dual-static-root', str(tmp_path),
+        '--output', str(output), '--log-root', str(tmp_path / 'logs'),
+        '--gpu', '1', '--gpu', '1',
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert result.returncode != 0
+    assert 'distinct GPU slots' in result.stderr
+    assert not output.exists()
+
+
+def test_grid_forwards_clean_cache_capacity():
+    for capacity, expected in ((0, '0'), (4, '4')):
+        command = _build_shard_command(
+            _grid_args(capacity), 'xc', 0, Path('out/xc_fold0'))
+        marker = command.index('--clean-cache-gib')
+        assert command[marker + 1] == expected
+
+
+def test_clean_dataset_duplicate_key_keeps_row_labels(monkeypatch):
+    calls = []
+
+    def fake_build(*record, static=None):
+        calls.append(record[2])
+        return Data(x=torch.tensor([3.0]))
+
+    monkeypatch.setattr(runtime, 'build_dual_sample', fake_build)
+    dataset = runtime.CleanLabeledDataset(
+        _DuplicateSource(), np.asarray([1.0, 2.0]), cache_capacity_bytes=1024,
+    )
+    row0, row1 = dataset[0], dataset[1]
+    assert len(calls) == 1
+    assert row0.y.tolist() == [1.0] and row1.y.tolist() == [2.0]
+    dataset.set_target_override([11.0, 22.0])
+    assert dataset[0].y.tolist() == [11.0]
+    assert dataset[1].y.tolist() == [22.0]
+    assert dataset.cache_stats()['hits'] == 3
+
+
+def test_clean_dataset_bounded_eviction_rebuilds_correct_data(monkeypatch):
+    calls = []
+
+    def fake_build(*record, static=None):
+        calls.append(record[2])
+        return Data(x=torch.tensor([float(record[0][0])]))
+
+    monkeypatch.setattr(runtime, 'build_dual_sample', fake_build)
+    source = _FakeSource()
+    cached = runtime.CleanLabeledDataset(
+        source, np.asarray([1.0, 2.0]), cache_capacity_bytes=4,
+    )
+    first = cached[0]
+    cached[1]
+    rebuilt = cached[0]
+    uncached = runtime.CleanLabeledDataset(source, np.asarray([1.0, 2.0]))[0]
+    assert first.x.tolist() == [97.0]
+    assert rebuilt.x.tolist() == [97.0]
+    assert rebuilt.x.tolist() == uncached.x.tolist()
+    stats = cached.cache_stats()
+    assert stats['evictions'] == 2 and stats['entries'] == 1
+    assert len(calls) == 4
 
 
 def test_clean_dataset_cache_clones_and_keeps_target_override(monkeypatch):
