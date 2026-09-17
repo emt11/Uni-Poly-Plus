@@ -143,3 +143,13 @@
 * 文档操作：修改前 dev 工作树干净、HEAD 为 `84f9132`，pull 为 Already up to date；同步 `Plan_Cache.md` 完成状态与关闭说明、`Plan.md` 当前交接和本条归档；文档 diff／`git diff --check` 自检，提交与远端同步结果见对应 Git 历史和交付回复。没有改代码、缓存、PIPELINE.md、RESULTS.md 或历史指标。
 * 最终结论：**已完成／CLOSED**，仅覆盖本缓存专项约定的审计解释、构建恢复、冻结／互斥、验证工具与证据口径收口。不等于全量化学认证、payload 全字节历史完整性、断电耐久、生产迁移、吞吐或模型收益验收。
 * 下一步：**暂无后续缓存执行任务**。不补跑真实 parity、长 benchmark、训练，不启动全量重建、迁移、紧凑存储或清理；以后新增缓存工作另行规划并获得授权。其他科学计划不因本条自动完成。
+
+## DOCS-20260917-01｜训练提速实施计划交付
+
+* 授权与角色：用户要求制定当前预训练与微调提速计划；Codex完成静态核查、文档编写与自检，无独立审查者。本轮不执行代码修改、模型或benchmark。
+* 基线：dev，`64d10bcd379a99e82dc5ad827d521ef08d39a342`；工作树干净，pull为Already up to date。该提交已删除旧Plan.md/Plan_Cache.md，本次新建Plan.md作为SPEED-20260917-01/r1入口，不恢复已关闭的缓存专项。
+* 最终计划：保留当前GLT双通道Concat科学定义和训练工作量；先对实际static/targets路径做有界计时，再实现微调无标签clean输入的有限进程内复用和grid空闲槽位及时补位；预训练根据profile至多选择两个准备/预取/诊断开销候选。保留mask/noise、物理关系与中心目标、DDP全局分母、split、train-only scaler及validation选择，不新增全量缓存或改精度/batch。
+* 证据与限制：核对当前源码、geonorm预训练run.json及fixed Concat代表微调run.json；预训练实际已有3workers/rank、BF16、no_sync和详细diagnostics；微调确有逐次clean重建，grid存在批次barrier。机器资源为瞬时快照，不把静态瓶颈假设写成已测提速。
+* 拟议预算：输入parity每类最多32条，边界用fixture；预训练正确性12updates及一次必要2-step定位，性能最多160updates+40组合确认；xc/fold0微调最多8epochs且outer-test=NOT_RUN；墙钟总计2小时/产物10GiB先到即停。预算待授权，不是本轮已执行内容；GPU/worker任务仅在Uni-Poly独立窗口，低频监控。
+* 实际文件：新增Plan.md，追加本条归档；不修改代码、缓存、PIPELINE.md、RESULTS.md或历史产物。文档引用/逻辑及git diff --check自检，无测试、训练、重建、清理。提交/推送结果见本条对应Git历史及交付回复。
+* 结论与下一步：完成的是文档计划周期；SPEED实施仍待授权，未归档为完成。下一步按A→B→C→按证据D实施、记录后交Codex审查；不自动开启正式预训练或全任务微调。
