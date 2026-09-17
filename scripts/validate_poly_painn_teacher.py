@@ -63,7 +63,7 @@ def main():
         ) if key in hyper
     }).to(device).eval()
     load_teacher_deployment(model, package, expected_step=int(package.get("step", -1)))
-    source = open_source(args.cohort_root, args.cache_root)
+    source, _ = open_source(args.cohort_root, args.cache_root)
     try:
         if not 0 <= int(args.index) < len(source):
             raise IndexError("validation index outside frozen cohort")

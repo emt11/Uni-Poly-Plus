@@ -142,7 +142,7 @@ def main():
         raise RuntimeError(error[0])
 
     from src.training.glt_dual_runtime import open_source
-    source = open_source(args.cohort_root, args.cache_root)
+    source, _ = open_source(args.cohort_root, args.cache_root)
     try:
         micro = int(config["microbatch"])
         global_batch = int(config["global_batch"])
