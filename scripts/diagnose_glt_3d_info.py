@@ -577,13 +577,17 @@ def _summarize(records):
     effective_torsion = deltas["P2"]["macro7_validation_r2_delta"] >= 0.005 and deltas["P2"]["positive_task_count"] >= 4
     effective_nonbonded = deltas["P3"]["macro7_validation_r2_delta"] >= 0.005 and deltas["P3"]["positive_task_count"] >= 4
     current3d = deltas["P1"]["macro7_validation_r2_delta"] >= 0.005 and deltas["P1"]["positive_task_count"] >= 4
+    close_torsion_nonbonded = (
+        effective_torsion and effective_nonbonded
+        and abs(macro["P3"] - macro["P2"]) < 0.002
+    )
     if current3d:
         route = "STOP_GEOMETRY_REDESIGN_PRIORITIZE_FUSION_OR_DISTILLATION"
-    elif effective_torsion:
+    elif close_torsion_nonbonded:
         route = "GLT-Torsion-v2"
     elif effective_nonbonded and macro["P3"] >= macro["P2"] + 0.002:
         route = "Spatial/nonbonded GLT"
-    elif effective_torsion and effective_nonbonded and abs(macro["P3"] - macro["P2"]) < 0.002:
+    elif effective_torsion:
         route = "GLT-Torsion-v2"
     else:
         route = "STOP_BOND_TOKEN_ROUTE_SWITCH_TO_EQUIVARIANT_3D_TEACHER"
@@ -595,7 +599,7 @@ def _summarize(records):
             "current3d_gate_pass": bool(current3d),
             "torsion_gate_pass": bool(effective_torsion),
             "nonbonded_gate_pass": bool(effective_nonbonded and macro["P3"] >= macro["P2"] + 0.002),
-            "torsion_nonbonded_close": bool(effective_torsion and effective_nonbonded and abs(macro["P3"] - macro["P2"]) < 0.002),
+            "torsion_nonbonded_close": bool(close_torsion_nonbonded),
             "selected_route": route,
             "thresholds": {
                 "macro7_delta": 0.005, "positive_task_count": 4,
