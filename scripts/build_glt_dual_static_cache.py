@@ -279,35 +279,37 @@ class _BuildLock:
         return self.path.is_file()
 
 
-def _acquire_build_lock(staging):
-    """Explicit single-writer guard for one staging root.
+def _build_lock_path(artifact_root):
+    """Return the stable lock path for an artifact root.
 
-    A concurrent writer must not adopt the same staging.  Kernel flock release
-    makes a process-dead lock immediately reclaimable without PID probing or
-    deleting a lock file that may belong to another writer.
+    The lock is deliberately a sibling of the published/staging roots.  It is
+    never moved by the staging-to-published rename and is never deleted for
+    stale-lock recovery; the kernel releases the flock when its owner exits.
     """
 
-    staging = Path(staging)
-    staging.mkdir(parents=True, exist_ok=True)
-    lock = staging / "build.lock"
-    handle = lock.open("a+", encoding="utf-8")
+    root = Path(artifact_root).resolve()
+    return root.with_name(root.name + ".build.lock")
+
+
+def _acquire_build_lock(artifact_root):
+    """Explicit single-writer guard for one artifact root.
+
+    A concurrent writer must not adopt a different staging inode after a
+    publish.  The stable sibling path keeps the flock identity independent of
+    staging renames.  The lock file is only a persistent flock anchor; its
+    contents are not used for liveness or recovery.
+    """
+
+    root = Path(artifact_root).resolve()
+    lock = _build_lock_path(root)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock.open("a+")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
-        holder = ""
-        try:
-            handle.seek(0)
-            holder = handle.read().strip()
-        except OSError:
-            pass
         handle.close()
         raise CacheLifecycleError(
-            f"another writer holds this staging: {staging} (pid {holder or 'unknown'})") from exc
-    handle.seek(0)
-    handle.truncate()
-    handle.write(str(os.getpid()))
-    handle.flush()
-    os.fsync(handle.fileno())
+            f"another writer holds this artifact: {root} (lock {lock})") from exc
     return _BuildLock(lock, handle)
 
 
@@ -315,13 +317,29 @@ def _release_build_lock(lock):
     if not isinstance(lock, _BuildLock):
         raise TypeError("build lock must be the handle returned by _acquire_build_lock")
     try:
-        lock.handle.seek(0)
-        lock.handle.truncate()
-        lock.handle.flush()
-        os.fsync(lock.handle.fileno())
         fcntl.flock(lock.handle.fileno(), fcntl.LOCK_UN)
     finally:
         lock.handle.close()
+
+
+def _acquire_side_locks(static_root, target_root):
+    """Acquire static then targets locks, releasing partial acquisition on error."""
+
+    roots = [("static", Path(static_root).resolve())]
+    if target_root is not None:
+        roots.append(("targets", Path(target_root).resolve()))
+    if len(roots) == 2 and roots[0][1] == roots[1][1]:
+        raise CacheLifecycleError("static and targets artifact roots must differ")
+    locks = []
+    try:
+        # Keep this order explicit for every caller: static first, targets second.
+        for _name, root in roots:
+            locks.append(_acquire_build_lock(root))
+    except BaseException:
+        for lock in reversed(locks):
+            _release_build_lock(lock)
+        raise
+    return locks
 
 
 def _publish_plan(*, static_published, targets_requested, targets_published):
@@ -451,7 +469,6 @@ def build(args):
         raise ValueError("--target-root requires --build-targets")
     if args.build_targets and target_root is None:
         raise ValueError("--build-targets requires --target-root")
-    before = zero_write_snapshot(cache_root)
     static_params = {
         "chunk_size": int(args.chunk_size), "unique": bool(args.unique),
         "limit": int(args.limit), "targets": False,
@@ -460,6 +477,8 @@ def build(args):
         "chunk_size": int(args.chunk_size), "unique": bool(args.unique),
         "limit": int(args.limit), "targets": True,
     }
+    # This first read is advisory only.  A concurrent writer may publish after
+    # it; no state returned here is allowed to drive a write.
     static_root, static_staging, static_published = _prepare_artifact(
         static_root, STATIC_FORMAT, keys, cohort,
         static_params,
@@ -473,42 +492,54 @@ def build(args):
     # A published side is never rewritten.  When both sides are already
     # published with a matching context the call is an idempotent no-op; when a
     # single side is published only the missing side is resumed and published.
-    publish_state, resume_static, resume_target = _publish_plan(
+    _publish_plan(
         static_published=bool(static_published),
         targets_requested=target_staging is not None,
         targets_published=bool(target_published),
     )
-    if not resume_static and not resume_target:
-        return {
-            "status": "IDEMPOTENT", "publish_state": publish_state,
-            "sample_count": len(selected),
-            "static_root": str(static_root),
-            "target_root": str(target_root) if target_root is not None else None,
-            "static_manifest_hash": json_hash(json.loads((static_root / "manifest.json").read_text(encoding="utf-8"))),
-            "target_manifest_hash": (json_hash(json.loads((target_root / "manifest.json").read_text(encoding="utf-8")))
-                                     if target_root is not None else None),
-            "elapsed_seconds": time.time() - started,
-            "main_bundle_hash": store["bundle_hash"],
-            "zero_write": True,
-            "note": "both requested sides were already published with a matching build context; nothing was rewritten",
-        }
-    workers = max(1, int(args.workers))
-    chunk_size = max(1, int(args.chunk_size))
-    chunks_static, chunks_target = [], []
-    quarantine_static = static_staging / ".interrupted"
-    quarantine_target = target_staging / ".interrupted" if target_staging is not None else None
-    locks = []
+    # The lock path is stable across the staging rename.  Acquire static first
+    # and targets second, then discard the advisory state and read everything
+    # again while both locks are held.
+    locks = _acquire_side_locks(static_root, target_root)
+    before = zero_write_snapshot(cache_root)
     try:
+        static_root, static_staging, static_published = _prepare_artifact(
+            static_root, STATIC_FORMAT, keys, cohort, static_params)
+        target_staging, target_published = None, False
+        if target_root is not None:
+            target_root, target_staging, target_published = _prepare_artifact(
+                target_root, TARGET_FORMAT, keys, cohort, target_params)
+        # Only this post-lock state may choose idempotent, recovery, or writes.
+        publish_state, resume_static, resume_target = _publish_plan(
+            static_published=bool(static_published),
+            targets_requested=target_staging is not None,
+            targets_published=bool(target_published),
+        )
+        if not resume_static and not resume_target:
+            return {
+                "status": "IDEMPOTENT", "publish_state": publish_state,
+                "sample_count": len(selected),
+                "static_root": str(static_root),
+                "target_root": str(target_root) if target_root is not None else None,
+                "static_manifest_hash": json_hash(json.loads((static_root / "manifest.json").read_text(encoding="utf-8"))),
+                "target_manifest_hash": (json_hash(json.loads((target_root / "manifest.json").read_text(encoding="utf-8")))
+                                         if target_root is not None else None),
+                "elapsed_seconds": time.time() - started,
+                "main_bundle_hash": store["bundle_hash"],
+                "zero_write": True,
+                "note": "both requested sides were already published with a matching build context; nothing was rewritten",
+            }
+        workers = max(1, int(args.workers))
+        chunk_size = max(1, int(args.chunk_size))
+        chunks_static, chunks_target = [], []
+        quarantine_static = static_staging / ".interrupted"
+        quarantine_target = target_staging / ".interrupted" if target_staging is not None else None
         # Identity files and all chunk/finalization writes happen only after
-        # every side that will be resumed has acquired its process-held lock.
+        # the post-lock state has been checked.
         if resume_static:
-            locks.append(_acquire_build_lock(static_staging))
-            _initialize_staging(static_staging, keys, _build_context(
-                STATIC_FORMAT, keys, cohort, static_params))
+            _initialize_staging(static_staging, keys, _build_context(STATIC_FORMAT, keys, cohort, static_params))
         if resume_target:
-            locks.append(_acquire_build_lock(target_staging))
-            _initialize_staging(target_staging, keys, _build_context(
-                TARGET_FORMAT, keys, cohort, target_params))
+            _initialize_staging(target_staging, keys, _build_context(TARGET_FORMAT, keys, cohort, target_params))
         context = mp.get_context("fork")
         with context.Pool(
             processes=workers,
@@ -599,7 +630,7 @@ def build(args):
         # readers until the final .frozen manifest is atomically published.
         raise
     finally:
-        for lock in locks:
+        for lock in reversed(locks):
             _release_build_lock(lock)
     result = {
         "status": "PASS", "sample_count": len(selected),

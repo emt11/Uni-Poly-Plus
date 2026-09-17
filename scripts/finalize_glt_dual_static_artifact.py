@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -67,8 +68,35 @@ def _final_manifest(manifest, root):
     return manifest
 
 
+def _validated_diagnostic_path(root, diagnostic_report):
+    """Validate and canonicalize a diagnostic path before any report write."""
+
+    if diagnostic_report is None:
+        return None
+    root = Path(root).resolve()
+    requested = Path(diagnostic_report).expanduser()
+    try:
+        # Check both the lexical path (a link rooted below the artifact) and
+        # its resolved destination (an external alias pointing into it).
+        lexical = Path(os.path.abspath(os.fspath(requested)))
+        resolved = requested.resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise CacheLifecycleError(
+            f"invalid diagnostic report path: {diagnostic_report}") from exc
+    for candidate in (lexical, resolved):
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        raise CacheLifecycleError(
+            "diagnostic report must be outside the protected artifact root: "
+            f"{diagnostic_report} (resolved {resolved})")
+    return resolved
+
+
 def finalize(root, *, diagnostic_report=None):
     root = Path(root).resolve()
+    diagnostic_path = _validated_diagnostic_path(root, diagnostic_report)
     manifest_path = root / 'manifest.json'
     frozen_path = root / '.frozen'
     if not manifest_path.is_file():
@@ -91,8 +119,8 @@ def finalize(root, *, diagnostic_report=None):
     differing = sorted(
         name for name in set(manifest) | set(candidate)
         if manifest.get(name) != candidate.get(name))
-    if diagnostic_report:
-        atomic_json(Path(diagnostic_report), {
+    if diagnostic_path is not None:
+        atomic_json(diagnostic_path, {
             'status': 'REFUSED_FROZEN_ARTIFACT',
             'root': str(root),
             'manifest_hash': current_hash,

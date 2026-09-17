@@ -52,13 +52,33 @@ def _target_row():
             "fingerprint_packed": np.zeros(256, dtype=np.uint8)}
 
 
-def _hold_build_lock(staging, ready, release):
+def _hold_build_lock(artifact_root, ready, release):
     from scripts.build_glt_dual_static_cache import _acquire_build_lock, _release_build_lock
 
-    lock = _acquire_build_lock(staging)
+    lock = _acquire_build_lock(artifact_root)
     ready.send(True)
     release.recv()
     _release_build_lock(lock)
+
+
+def _run_builder_process(args_payload, result_pipe, ready=None, proceed=None):
+    """Run the real builder in a child, optionally pausing before lock acquire."""
+
+    from scripts import build_glt_dual_static_cache as builder
+
+    if ready is not None:
+        original_acquire = builder._acquire_build_lock
+
+        def pause_before_lock(root):
+            ready.send("preflight_complete")
+            proceed.recv()
+            return original_acquire(root)
+
+        builder._acquire_build_lock = pause_before_lock
+    try:
+        result_pipe.send(("ok", builder.build(SimpleNamespace(**args_payload))))
+    except BaseException as exc:  # pragma: no cover - surfaced by the parent assertion
+        result_pipe.send(("error", type(exc).__name__, str(exc)))
 
 
 def _publish(root, chunk_counts, *, fmt="glt-dual-static-v1", targets=False,
@@ -193,7 +213,7 @@ def test_staging_resume_requires_matching_build_context(tmp_path):
     keys = [b"k" * 32, b"j" * 32]
     params = {"chunk_size": 2, "unique": False, "limit": 0, "targets": False}
     _, staging, _ = _prepare_artifact(root, "glt-dual-static-v1", keys, _cohort(), params)
-    lock = _acquire_build_lock(staging)
+    lock = _acquire_build_lock(root)
     _initialize_staging(staging, keys, _build_context("glt-dual-static-v1", keys, _cohort(), params))
     _release_build_lock(lock)
     assert (staging / "build_context.json").is_file()
@@ -276,6 +296,7 @@ def test_single_writer_lock_blocks_concurrency_without_pid_reclaim_race(tmp_path
     staging.mkdir()
     lock = _acquire_build_lock(staging)
     assert lock.is_file()
+    assert lock.path == staging.with_name(staging.name + ".build.lock")
     with pytest.raises(CacheLifecycleError):
         _acquire_build_lock(staging)
     _release_build_lock(lock)
@@ -284,9 +305,8 @@ def test_single_writer_lock_blocks_concurrency_without_pid_reclaim_race(tmp_path
     assert second.is_file()
     _release_build_lock(second)
 
-    # PID text is only provenance; stale text cannot make a live flock race
-    # unsafe, and the kernel releases a held flock when its process dies.
-    (staging / "build.lock").write_text("999999", encoding="utf-8")
+    # The stable anchor is never deleted or recreated to recover a lock.
+    assert lock.path.is_file()
     third = _acquire_build_lock(staging)
     assert third.is_file()
     _release_build_lock(third)
@@ -317,6 +337,123 @@ def test_single_writer_lock_is_enforced_between_processes(tmp_path):
     _release_build_lock(lock)
 
 
+def test_static_then_targets_lock_order_releases_partial_acquisition(tmp_path, monkeypatch):
+    from scripts import build_glt_dual_static_cache as builder
+
+    static_root = tmp_path / "static"
+    target_root = tmp_path / "targets"
+    original = builder._acquire_build_lock
+    calls = []
+
+    def fail_targets(root):
+        root = Path(root).resolve()
+        calls.append(root)
+        if root == target_root.resolve():
+            raise CacheLifecycleError("synthetic target lock failure")
+        return original(root)
+
+    monkeypatch.setattr(builder, "_acquire_build_lock", fail_targets)
+    with pytest.raises(CacheLifecycleError, match="synthetic target lock failure"):
+        builder._acquire_side_locks(static_root, target_root)
+    assert calls == [static_root.resolve(), target_root.resolve()]
+
+    # The first lock was released after the second acquisition failed.
+    lock = original(static_root)
+    builder._release_build_lock(lock)
+
+
+def test_build_rechecks_after_stable_lock_when_publish_wins_race(tmp_path, monkeypatch):
+    """A preflight loser must return idempotent after another process publishes."""
+
+    from scripts import build_glt_dual_static_cache as builder
+    from test_complete_trimer_glt import _toy_pair
+    from src.dataset.canonical_periodic import build_canonical_periodic_topology
+
+    smiles = "*CC*"
+    topology = build_canonical_periodic_topology(smiles)
+    _, trimer = _toy_pair(smiles)
+    key = b"r" * 32
+    cohort = {
+        "records": [{"sample_key": key.hex(), "source_smiles": smiles,
+                     "normalized_smiles": smiles}],
+        "manifest": {"main_bundle_hash": "a" * 64,
+                      "ordered_sample_key_hash": ordered_key_hash(np.frombuffer(key, dtype=np.uint8).reshape(1, 32))},
+        "manifest_hash": "b" * 64,
+    }
+
+    class FakeBundle:
+        def __init__(self, *_args, **_kwargs):
+            self.topology = {key: topology}
+            self.trimer = {key: trimer}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(builder, "load_dual_cohort", lambda *_args, **_kwargs: cohort)
+    monkeypatch.setattr(builder, "load_active_dual_store",
+                        lambda *_args, **_kwargs: {"bundle_hash": "a" * 64})
+    monkeypatch.setattr(builder, "DualFrozenBundle", FakeBundle)
+
+    cache_root = tmp_path / "main"
+    cache_root.mkdir()
+    static_root = tmp_path / "race_static"
+    args_payload = {
+        "cache_root": str(cache_root), "cohort_root": "unused",
+        "output_root": str(static_root), "target_root": None,
+        "build_targets": False, "workers": 1, "chunk_size": 1,
+        "limit": 0, "unique": False, "progress_chunks": 1,
+    }
+    context = mp.get_context("fork")
+    ready_parent, ready_child = context.Pipe(duplex=False)
+    proceed_child, proceed_parent = context.Pipe(duplex=False)
+    second_result_parent, second_result_child = context.Pipe(duplex=False)
+    first_result_parent, first_result_child = context.Pipe(duplex=False)
+    second = context.Process(
+        target=_run_builder_process,
+        args=(args_payload, second_result_child, ready_child, proceed_child),
+    )
+    first = context.Process(
+        target=_run_builder_process,
+        args=(args_payload, first_result_child),
+    )
+    second.start()
+    try:
+        assert ready_parent.recv() == "preflight_complete"
+        # The second process has completed its unlocked read.  The first now
+        # publishes, deterministically, before the second acquires the stable
+        # lock and performs its mandatory post-lock recheck.
+        first.start()
+        first.join(timeout=15)
+        assert first.exitcode == 0
+        first_message = first_result_parent.recv()
+        assert first_message[0] == "ok", first_message
+        assert first_message[1]["status"] == "PASS"
+        manifest_before = (static_root / "manifest.json").read_bytes()
+        frozen_before = (static_root / ".frozen").read_bytes()
+        proceed_parent.send(True)
+        second.join(timeout=15)
+        assert second.exitcode == 0
+        second_message = second_result_parent.recv()
+        assert second_message[0] == "ok", second_message
+        assert second_message[1]["status"] == "IDEMPOTENT"
+        assert (static_root / "manifest.json").read_bytes() == manifest_before
+        assert (static_root / ".frozen").read_bytes() == frozen_before
+        assert not static_root.with_name(static_root.name + ".staging").exists()
+        assert builder._build_lock_path(static_root).is_file()
+    finally:
+        if second.is_alive():
+            proceed_parent.send(True)
+            second.join(timeout=15)
+        if first.is_alive():
+            first.join(timeout=15)
+        if second.is_alive():
+            second.terminate()
+            second.join(timeout=5)
+        if first.is_alive():
+            first.terminate()
+            first.join(timeout=5)
+
+
 def test_finalize_refuses_to_modify_a_frozen_artifact(tmp_path):
     from scripts.finalize_glt_dual_static_artifact import finalize
 
@@ -339,6 +476,25 @@ def test_finalize_refuses_to_modify_a_frozen_artifact(tmp_path):
     stale.pop("geometry_invalid_reason_counts")
     (root / "manifest.json").write_text(json.dumps(stale), encoding="utf-8")
     (root / ".frozen").write_text(json.dumps({"manifest_hash": json_hash(stale)}), encoding="utf-8")
+    protected_before = {
+        name: (root / name).read_bytes() for name in ("manifest.json", ".frozen")
+    }
+    manifest_alias = tmp_path / "manifest_alias.json"
+    manifest_alias.symlink_to(root / "manifest.json")
+    root_alias = tmp_path / "artifact_alias"
+    root_alias.symlink_to(root, target_is_directory=True)
+    for invalid_report in (
+        root / "manifest.json",
+        root / ".frozen",
+        root / "other-diagnostic.json",
+        manifest_alias,
+        root_alias / "diagnostic.json",
+    ):
+        with pytest.raises(CacheLifecycleError, match="protected artifact root"):
+            finalize(root, diagnostic_report=invalid_report)
+        assert {name: (root / name).read_bytes() for name in protected_before} == protected_before
+    assert not (root / "other-diagnostic.json").exists()
+
     report = tmp_path / "refusal.json"
     with pytest.raises(CacheLifecycleError):
         finalize(root, diagnostic_report=report)
@@ -346,6 +502,14 @@ def test_finalize_refuses_to_modify_a_frozen_artifact(tmp_path):
     payload = json.loads(report.read_text(encoding="utf-8"))
     assert payload["status"] == "REFUSED_FROZEN_ARTIFACT"
     assert "geometry_valid_count" in payload["differing_fields"]
+
+    external_dir = tmp_path / "external-diagnostics"
+    external_dir.mkdir()
+    external_report = external_dir / "refusal.json"
+    with pytest.raises(CacheLifecycleError):
+        finalize(root, diagnostic_report=external_report)
+    assert json.loads(external_report.read_text(encoding="utf-8"))["status"] == "REFUSED_FROZEN_ARTIFACT"
+    assert {name: (root / name).read_bytes() for name in protected_before} == protected_before
 
     unfrozen = tmp_path / "unfrozen"
     _publish(unfrozen, [2])

@@ -1,10 +1,10 @@
 # GLT-V2：结果闭环、几何失稳诊断与优化决策
 
-> 2026-09-17 当前状态核对（CACHE-20260916-01/r3 收口后）：GLT-V2 B.3 replay 已完成；几何
+> 2026-09-17 当前状态核对（CACHE-20260916-01/r4 返修后）：GLT-V2 B.3 replay 已完成；几何
 > collapse 已复现并完成机制诊断；geonorm P2 validation、fixed geonorm 5k 与 deploy validation
 > 已完成。正式 downstream 当前可用口径为 7 个 task／35 folds；egc 完整 5-fold 尚未完成。缓存
-> r2 经 Codex 审查为 `NEEDS_REPAIR`，r3 已经 Codex 独立验收通过并关闭（`CLOSED`）。缓存专项不再
-> 占据下一执行入口。以下历史段落保留原始执行语义，后续状态以本注记和对应周期执行记录为准。
+> r2 经 Codex 审查为 `NEEDS_REPAIR`，r3 曾标记为 `CLOSED`；最新审查发现发布期 writer 互斥和诊断输出路径仍有两项
+> 缺陷，CACHE-20260916-01 的 r4 返修已完成，当前为 `返修完成，待 Codex 审查`。r3 的执行与关闭记录保留，当前状态以 r4 记录为准。
 
 > 2026-09-16 缓存专项交接更新（Codex，`CACHE-20260916-01/r2`）：状态“需返修”。ZCode 已交付 `7f476b4`，Codex 静态审查未通过；当前下一步见 [Plan_Cache.md 第 10 节](Plan_Cache.md#10-r2-下一步仅返修可靠性与证据缺口)。按“六项构建恢复／冻结修复 → 原 32 条目标及 clean/noisy parity → 化学和 benchmark 口径修正 → 复审”推进，不重新运行完整 A–C。容量 64 继续不采用，不启动长 benchmark、角度优化、阶段 D、全量重建或训练。原已获授权范围不重复申请，本轮用户只要求计划落盘，Codex 未接管执行。r1 原交接与执行材料保留在 Git／历史记录及下方；其他科学周期状态不由本次更新裁定。
 
@@ -16,7 +16,7 @@
 |-|-|
 |计划 ID|GLTV2-20260916-01|
 |修订|r2：阶段性审查后续执行；修复诊断入口，再执行 B.2／B.3，不增加原回放预算|
-|状态|待审查（A、B.2、B.3 已完成；缓存专项 CACHE-20260916-01/r3 已 CLOSED，不占据下一执行入口）|
+|状态|待审查（A、B.2、B.3 已完成；缓存专项 CACHE-20260916-01/r4 返修完成，待 Codex 审查）|
 |授权来源|用户已选择“诊断并有限回放”，并说明将计划交给 ZCode／其他模型执行；随后明确报告计划正在执行|
 |规划／审查|Codex|
 |执行|ZCode／用户指定执行者；实际执行者在下方补记|
@@ -392,6 +392,43 @@ shape 与 count 相同而未触发预期拒绝，退出码 1；该测试 fixture
 未重建 PI1M／下游 active cache，未重新生成 conformer，未运行 2048 benchmark、Stage D、GPU、
 预训练或微调，未删除／迁移／切换产物；执行阶段未修改 `PROJECT_HISTORY.md`，`RESULTS.md` 仅改文案而未改
 历史实验数字。r3 随后经 Codex 独立审查通过，当前状态为 `CLOSED`；本关闭不改变上述未执行项的状态。
+
+---
+
+## 缓存优化周期 CACHE-20260916-01 / r4 最小更正执行记录（2026-09-17，返修完成，待 Codex 审查）
+
+本轮只处理最新审查指出的两个工程缺陷，保留 r1–r3 的历史记录，不重做此前缓存优化。执行前读取最新
+`AGENTS.md`、`Plan.md`、`Plan_Cache.md`，检查 `dev`／origin 和工作树，并执行
+`git pull --ff-only origin dev`（`Already up to date`）。未发现 cache build、parity、benchmark、pretrain、
+finetune 或 `torchrun` 活动任务；r4 基线为 `669fdf3`。
+
+### 实际修改
+
+* `scripts/build_glt_dual_static_cache.py`：writer flock 改用不随 staging rename 移动的稳定
+  `<artifact>.build.lock`；static 后 targets 固定顺序获取锁，部分获取失败和异常路径释放本轮已持有锁。
+  未锁前只做 advisory preflight，持锁后重新检查 published／staging 身份和发布状态，幂等、恢复和写入只使用
+  post-lock 状态；不删除锁文件，不覆盖已发布产物。
+* `scripts/finalize_glt_dual_static_artifact.py`：诊断报告写入前同时检查 lexical 与 symlink-resolved 路径，
+  拒绝 artifact 根目录内的 manifest、`.frozen`、其他文件及解析后落入该根目录的别名；外部报告路径保持可用。
+* `tests/test_glt_dual_static_recovery.py`：新增确定性双进程 preflight→publish 竞争、static→targets 部分锁释放，
+  以及五类诊断路径保护回归。首次 fixture 的 bytes 转换错误已修正，保留首次失败日志。
+
+### 实际验证
+
+仅在 `tmux` session `Uni-Poly` 独立窗口执行相关测试：
+
+`Uni-Poly:cache_opt_r4_tests_final`（此前修正后的同一测试也保留在 `cache_opt_r4_tests_retry`）：
+`PYTHONPATH=.:tests pytest -q tests/test_glt_dual_static_recovery.py`
+
+退出码 0，结果 `12 passed, 1 warning`，最终日志 `logs/cache_opt_r4_tests_final.log`。首次窗口
+`Uni-Poly:cache_opt_r4_tests` 因测试 fixture 错误退出码 1，日志 `logs/cache_opt_r4_tests.log`；该失败不涉及生产代码，
+修正后仅重跑同一相关测试。
+
+### 范围与状态
+
+未重跑 32-key parity、r3 focused 全集、2048 benchmark；未重建／迁移 active cache、生成构象、清理产物、启动 GPU、
+预训练或微调；未修改 `RESULTS.md`、`PROJECT_HISTORY.md` 或历史实验数字。当前状态为 **返修完成，待 Codex 审查**，
+不宣称 Codex 独立验收通过或 CLOSED。
 
 ---
 

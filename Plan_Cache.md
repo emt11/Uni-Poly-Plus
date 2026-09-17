@@ -4,17 +4,17 @@
 
 | 项目 | 记录 |
 | --- | --- |
-| 计划 ID／修订 | CACHE-20260916-01 / r3：r2 审查后的最小合同收口 |
+| 计划 ID／修订 | CACHE-20260916-01 / r4：r3 关闭记录的最小更正 |
 | 日期／环境 | 2026-09-17；当前远程 Linux 训练机，项目根 /root/workspace/Uni-Poly-Plus-master |
-| 状态 | Codex 独立验收通过 / CLOSED |
-| 当前授权 | 用户直接要求按本计划由 ZCode 执行。范围限于 R3.1–R3.8 的局部代码、focused tests、固定 32 条 parity 证据与文档／报告；不授权生产切换、全量重建、训练或 GPU smoke |
-| 角色 | Codex 规划与独立审查；ZCode 执行。r3 已由 Codex 独立复核并通过 |
-| 基准 commit | r3 执行基线 31e137c481e4f9216860d2f092e70dbfb295de14，dev；r2 基线保留作为历史记录 |
+| 状态 | 返修完成，待 Codex 审查 |
+| 当前授权 | 用户直接要求按本计划执行 r4 最小返修。范围限于稳定 writer 互斥、finalize 诊断路径保护、对应确定性合成回归测试、Plan／PIPELINE 交接；不授权生产切换、全量重建、训练或 GPU smoke |
+| 角色 | Codex 规划与后续独立审查；本轮由当前执行者实施。r3 的 CLOSED 记录保留为历史，r4 尚未验收 |
+| 基准 commit | r4 执行基线 `669fdf3`，dev；r3 的 `632caa1` 与关闭文档作为历史记录 |
 | 修改前状态 | dev 工作树干净，pull 返回 Already up to date；r1 文档创建时的用户改动已记入 PROJECT_HISTORY.md，不沿用为当前状态 |
 | 交接入口 | [Plan.md](Plan.md)；本文件是缓存专项实施细则，不替换正在进行或未收口的科学计划 |
 | 总结论 | 保留基础缓存＋静态派生缓存＋预训练目标缓存；先解决少量具体证据与工程缺口，不直接全量重建 |
 
-r2 执行以第 9 节的审查状态和第 10 节的返修合同为准。第 1–8 节保留 r1 的目标、基线与原始验收要求，不表示它们已全部完成，也不构成重新运行 A–D 的指令；其中构建缺口表为 r1 修改前的静态发现，当前缺口以第 10 节为准。r3 执行以第 11 节的实际记录为准；r2 历史记录与报告不覆盖。旧清理周期见 [PROJECT_HISTORY.md](PROJECT_HISTORY.md)，其余 HOLD 不解除。
+r2 执行以第 9 节的审查状态和第 10 节的返修合同为准。第 1–8 节保留 r1 的目标、基线与原始验收要求，不表示它们已全部完成，也不构成重新运行 A–D 的指令；其中构建缺口表为 r1 修改前的静态发现，当前缺口以第 10 节为准。r3 执行与关闭以第 11–12 节的历史记录为准；r4 更正以第 13 节为准，不能把 r3 的 CLOSED 直接沿用于本轮。旧清理周期见 [PROJECT_HISTORY.md](PROJECT_HISTORY.md)，其余 HOLD 不解除。
 
 ## 1. 目标与不可改变的边界
 
@@ -415,3 +415,49 @@ fail-closed、锁／offset／reader contract。另完成 `py_compile`、`git dif
   历史结果数字。未执行的 32-key parity 重跑、2048 benchmark、payload 全字节历史完整性、断电耐久、
   模型／训练验证仍保持未验证，不因关闭而变成 PASS。
 * 后续：缓存专项不再占据 `Plan.md` 的下一执行入口；若需生产切换或新的缓存工作，须另行制定并授权。
+
+## 13. r4 最小返修（2026-09-17，返修完成，待 Codex 审查）
+
+r4 仅更正 Codex 最新审查指出的两项工程缺陷，保留 r1–r3 的执行、报告和关闭记录，不重做已完成的缓存优化：
+
+1. `scripts/build_glt_dual_static_cache.py`：将 writer flock 移到不随 staging rename 的稳定 artifact-side 路径；static 后 targets
+   按固定顺序获取锁，部分获取失败／异常时释放本次已持有的锁。保留一个只读 preflight，但持锁后必须重新读取 published／staging
+   身份和发布状态，所有初始化、恢复、幂等判断与写入只使用持锁后的状态；不删除锁文件，不改写已发布产物。
+2. `scripts/finalize_glt_dual_static_artifact.py`：在任何 diagnostic report 写入前解析 lexical 与 symlink-resolved 路径；凡落在
+   受保护 artifact 根目录内（manifest、`.frozen` 或其他文件）均直接拒绝，外部报告路径仍可用，拒绝时受保护文件不得变化。
+3. 测试仅增加确定性 synthetic fixture：两个真实进程同步覆盖“第二执行者已完成 preflight、第一执行者随后发布”的竞争窗口，
+   以及 manifest／`.frozen`／目录内文件／符号链接别名／合法外部诊断路径。禁止真实 parity、benchmark、缓存重建、迁移、构象、
+   GPU、预训练、微调和清理。
+
+### 实际修改
+
+* `scripts/build_glt_dual_static_cache.py`：writer flock 改为 artifact root 旁的稳定
+  `<artifact>.build.lock`，不随 `.staging` rename 移动；static 后 targets 固定顺序获取锁，部分获取失败时释放已持有锁。
+  保留只读 preflight，但持锁后重新调用 `_prepare_artifact()` 和 `_publish_plan()`；初始化、恢复、幂等返回和写入只使用
+  这一轮 post-lock 状态。锁文件不删除，已发布目录仍只读。
+* `scripts/finalize_glt_dual_static_artifact.py`：新增诊断路径的 lexical／resolved 双重检查；artifact 根目录及其
+  manifest、`.frozen`、其他文件和通过符号链接解析到根目录的别名均在写报告前拒绝，合法外部路径仍写入独立报告。
+* `tests/test_glt_dual_static_recovery.py`：更新稳定锁断言，新增 static→targets 部分加锁释放、两个真实进程的确定性
+  preflight/publish 竞争回归，以及 manifest／`.frozen`／目录内文件／符号链接／外部报告路径保护回归。
+
+### 实际验证
+
+执行环境为 `dzw2:/root/workspace/Uni-Poly-Plus-master`，分支 `dev`；修改前执行
+`git pull --ff-only origin dev`，结果 `Already up to date`。无活动 cache build、parity、benchmark、pretrain、
+finetune 或 `torchrun` 进程。
+
+* 首次 fixture 运行窗口 `Uni-Poly:cache_opt_r4_tests`，日志 `logs/cache_opt_r4_tests.log`，退出码 1；失败仅为
+  新增测试将 `bytes` 直接交给 `np.asarray` 的 fixture 错误，其他 11 项已通过，未涉及生产逻辑。
+* 修正 fixture 后在 `Uni-Poly:cache_opt_r4_tests_retry` 执行一次，随后在锁释放逻辑最小收口后于
+  `Uni-Poly:cache_opt_r4_tests_final` 对同一测试做最终重跑：
+  `PYTHONPATH=.:tests pytest -q tests/test_glt_dual_static_recovery.py`
+  最终结果 `12 passed, 1 warning`，退出码 0；日志 `logs/cache_opt_r4_tests_final.log`（中间修正结果保留于
+  `logs/cache_opt_r4_tests_retry.log`）。该用例实际覆盖两个进程、稳定 flock、post-lock recheck、部分锁释放和诊断
+  路径拒绝／合法外部写入。
+* 未重跑 r2 的 32-key parity、r3 focused 全集、2048 benchmark 或任何模型／训练；未生成构象、重建／迁移 active cache、
+  GPU smoke 或清理历史产物。未修改 `RESULTS.md`、`PROJECT_HISTORY.md` 或历史实验数字。
+
+### 当前交接
+
+r4 **返修完成，待 Codex 审查**；不宣称独立验收通过或 CLOSED。残留风险限于尚未重跑的历史 parity／benchmark、payload
+全字节历史完整性、断电耐久和模型／训练验证；本轮未改变这些边界。

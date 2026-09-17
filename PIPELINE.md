@@ -930,11 +930,14 @@ PI1M cohort 959,588 条（source 988,775；trimer 959,588/29,181）。历史 art
 * **单边发布幂等恢复**：static 与 targets 是两个独立根目录，两次 rename 不构成整体原子性。启动时
   区分 none／static-only／target-only／both：已发布一侧必须先通过其自身构建身份校验才可复用，
   只构建并发布缺失的一侧；两侧都已发布且身份一致时为幂等空操作（`status: IDEMPOTENT`）。
-* **单 writer 互斥**：staging 内的 `build.lock` 记录持有者 pid；并发 writer 直接报错，死进程遗留的
-  lock 会被回收，保证中断构建仍可恢复。
+* **单 writer 互斥**：每个 artifact 使用不随 staging rename 移动的稳定 sibling
+  `<artifact>.build.lock`，以 Linux `flock` 保持单 writer；static 后 targets 固定顺序加锁，部分加锁失败和
+  异常路径释放本轮已持有的锁，绝不删除锁文件回收活锁。builder 的 preflight 仅作提示，持锁后会重新检查
+  published／staging 身份和发布状态，避免发布窗口后进入重复写入。
 * **冻结后只读**：`scripts/finalize_glt_dual_static_artifact.py` 拒绝修改已冻结 artifact（`.frozen`
   存在）。manifest 已最终时是幂等空操作；否则报错并可用 `--diagnostic-report` 输出独立诊断报告，
-  不改写任何字节。汇总与校验必须发生在冻结之前。
+  不改写任何字节；诊断路径必须在 artifact 根目录外，解析后落入根目录的 manifest、`.frozen`、其他文件或
+  符号链接别名均在写入前拒绝。汇总与校验必须发生在冻结之前。
 * **读取端载荷校验**：`DualStaticCache` 映射某个 chunk 时校验其 manifest 记录的数组文件存在、
   shape／dtype 与记录一致、样本级偏移表长度为 `count+1` 且单调、载荷级指针恰好划分其载荷、
   geometry 或 target 标记齐全。这是元数据与边界校验，**不是**载荷内容 hash；缺文件、截断或错位
@@ -979,3 +982,15 @@ parity verifier 现在要求 comparison PASS、active frozen cache zero-write �
 `Uni-Poly:cache_opt_r3_tests2` 中 focused 命令结果为 `36 passed, 1 warning`、退出码 0；首轮 fixture
 错误及日志保留在 `logs/cache_opt_r3_tests.log`，修正后日志为 `logs/cache_opt_r3_tests2.log`。本轮未重跑
 r2 真实 parity、未运行模型；当前状态为等待 Codex 独立审查。
+
+### CACHE-20260916-01 r4 最小更正执行记录（2026-09-17，返修完成，待 Codex 审查）
+
+r4 仅修复发布期 writer 互斥和 finalize 诊断路径保护。builder 使用稳定 artifact-side flock，static→targets
+按固定顺序加锁，并在持锁后重新读取发布／staging 状态；finalizer 在任何报告写入前拒绝 artifact 根目录内路径及
+解析后落入该目录的符号链接别名。active cache、模型和训练配置未改变。
+
+`Uni-Poly:cache_opt_r4_tests_final` 中最终执行
+`PYTHONPATH=.:tests pytest -q tests/test_glt_dual_static_recovery.py`，结果 `12 passed, 1 warning`、退出码 0，
+日志为 `logs/cache_opt_r4_tests_final.log`；此前修正后的同一测试日志保留在
+`logs/cache_opt_r4_tests_retry.log`。首次 fixture 错误保留在 `logs/cache_opt_r4_tests.log`，退出码 1；修正后
+仅重跑同一相关测试。未重跑 r2/r3 parity、长 benchmark 或任何模型／训练，当前状态为返修完成、待 Codex 审查。
