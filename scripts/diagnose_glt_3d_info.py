@@ -472,10 +472,14 @@ def _probe_results(features, frame, manifests):
     }
     labels = frame["label"].to_numpy(dtype=np.float64)
     keys = frame["sample_key"].astype(str).to_numpy()
-    matrices = {
+    unique_matrices = {
         name: _probe_matrix(name, features["h2"], features["h3"],
                             features["torsion"], features["nonbonded"])
         for name in PROBES
+    }
+    matrices = {
+        name: matrix[features["row_feature_index"]]
+        for name, matrix in unique_matrices.items()
     }
     for matrix in matrices.values():
         if not np.isfinite(matrix).all():
