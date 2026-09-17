@@ -153,3 +153,13 @@
 * 拟议预算：输入parity每类最多32条，边界用fixture；预训练正确性12updates及一次必要2-step定位，性能最多160updates+40组合确认；xc/fold0微调最多8epochs且outer-test=NOT_RUN；墙钟总计2小时/产物10GiB先到即停。预算待授权，不是本轮已执行内容；GPU/worker任务仅在Uni-Poly独立窗口，低频监控。
 * 实际文件：新增Plan.md，追加本条归档；不修改代码、缓存、PIPELINE.md、RESULTS.md或历史产物。文档引用/逻辑及git diff --check自检，无测试、训练、重建、清理。提交/推送结果见本条对应Git历史及交付回复。
 * 结论与下一步：完成的是文档计划周期；SPEED实施仍待授权，未归档为完成。下一步按A→B→C→按证据D实施、记录后交Codex审查；不自动开启正式预训练或全任务微调。
+
+## SPEED-20260917-01｜r1→r4 提速周期最终归档（2026-09-17）
+
+* 授权与角色：用户授权在不改变 GLT-V2 科学定义的前提下执行有界提速返修，并明确不得自动启动正式 5k、20k 或完整微调。Codex 负责规划与最终审查，执行者完成 r1→r4 的代码、测试和 bounded smoke；本次归档由 Codex 只读核对后完成，不新增实验。
+* 修订链：r1 建立计时、clean 输入复用、动态 grid 和候选准备路径的范围；r2/r3 实现有限进程内 clean cache、static/target 读取、中心 one-hop angle 向量化、可选 timing/worker 参数及 free-slot grid；r4 补齐 `prep_workers>0` 的恢复 RNG 顺序、重复 GPU 拒绝、`--clean-cache-gib` 显式转发、重复 key 不同标签和 bounded eviction 边界。
+* 最终实现与记录：代码及测试最终实现提交为 `eda9f5c`（`fix: close speed plan execution contracts`）；r4 执行记录补记提交为 `f19ef02`（`docs: record speed plan r4 results`）。相关先前实现提交 `8cbe78e`、执行记录 `ff4e899` 保留在 Git 历史中。未修改 active cache、模型科学定义、配置、数据划分或历史结果数字。
+* 验证证据（本次未重跑）：`logs/speed_r4_scoped_tests.log` 记录授权选择测试 `5 passed, 5 deselected, 1 warning`、退出码 0；`results/speed_20260917/r4_gpu_resume_report.json` 与 `logs/speed_r4_gpu_resume.log` 记录 4-GPU、`prep-workers=3`、总 8 logical updates 的连续／恢复比较为 PASS，模型、optimizer、scheduler、ordered keys、next position、各类 RNG、loss 与 target count 均符合既有 exact／容差口径。既有 parity、256 profile 与 `xc/fold0` A-B-B-A smoke 证据仍按原记录适用。
+* 结论边界：**Codex review PASS / CLOSED** 仅覆盖 r4 约定的执行合同和有界提速证据。微调提速有 bounded evidence；预训练正式 throughput 未测。没有正式 5k/20k 预训练、Concat/KFuse 完整训练、正式 grid、8×5 微调、独立模型性能比较或全量缓存重建，因此不能把本周期写成正式性能提升或完整科学实验完成。
+* 未执行与限制：没有重跑 PI1M/downstream parity、CPU 长 benchmark 或 baseline；没有启动 speed r5、正式预训练、完整微调、outer-test、构象生成、缓存迁移或新科学路线。合成测试与 bounded GPU smoke 不外推到全量训练吞吐；历史 5000-sample profile 未完成，不作为正式 throughput 证据。
+* 归档操作：本轮仅修改 `Plan.md` 与本文件，未改 `.py`、config、cache、results 数字，未运行测试、benchmark、模型或训练。`Plan.md` 已切换为 `GLT-SCI-20260917-01 / r1`，状态为“待授权”；后续科学周期须由用户明确给出数据、模型包、task/fold、epoch/step 和比较预算后再执行。本归档不产生正式实验授权。
