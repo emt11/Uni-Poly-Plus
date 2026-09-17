@@ -139,27 +139,39 @@ def _extract_features(source, teacher, o8, device, batch_size):
     for start in range(0, len(unique_indices), int(batch_size)):
         indices = unique_indices[start:start + int(batch_size)]
         teacher_records, o8_records = [], []
+        valid_teacher_slots = []
         for index in indices:
             topology, trimer, smiles = source[index]
             key = source.samples[index][0].hex()
-            noisy, target = build_teacher_sample(
-                topology, trimer, seed=42, key=key, position=0, sigma=0.03,
-            )
-            noisy.pos = target["clean_pos"]
-            teacher_records.append((noisy, target))
+            valid = bool(getattr(trimer, "trimer_geometry_valid", False)) \
+                and bool(getattr(trimer, "trimer_geometry_is_3d", False)) \
+                and not bool(getattr(trimer, "trimer_2d_fallback", False))
+            if valid:
+                noisy, target = build_teacher_sample(
+                    topology, trimer, seed=42, key=key, position=0, sigma=0.0,
+                )
+                noisy.pos = target["clean_pos"]
+                valid_teacher_slots.append(len(o8_records))
+                teacher_records.append((noisy, target))
             o8_records.append(build_dual_sample(
                 topology, trimer, smiles, static=source.static_for(index),
             ))
             keys.append(key)
-            validity.append(bool(trimer.trimer_geometry_valid))
-        teacher_data, _ = teacher_collate(teacher_records)
+            validity.append(valid)
         o8_data = dual_glt_collate(o8_records)
         with torch.no_grad():
-            teacher_out = teacher(teacher_data.to(device))
             o8_encoded = o8.encode(o8_data.to(device))
             h2 = o8.norm2(o8_encoded["graph_2d"])
+            teacher_graph = np.zeros((len(indices), 256), dtype=np.float32)
+            if teacher_records:
+                teacher_data, _ = teacher_collate(teacher_records)
+                teacher_out = teacher(teacher_data.to(device))
+                values = teacher_out["graph_scalar"].float().cpu().numpy()
+                if values.shape != (len(teacher_records), 256):
+                    raise ValueError("unexpected teacher graph feature dimensions")
+                teacher_graph[np.asarray(valid_teacher_slots, dtype=np.int64)] = values
         h2_chunks.append(h2.float().cpu().numpy())
-        teacher_chunks.append(teacher_out["graph_scalar"].float().cpu().numpy())
+        teacher_chunks.append(teacher_graph)
         print(json.dumps({"phase": "embedding", "done": min(start + len(indices), len(unique_indices)),
                           "total": len(unique_indices)}, ensure_ascii=False), flush=True)
     h2 = np.concatenate(h2_chunks, axis=0)

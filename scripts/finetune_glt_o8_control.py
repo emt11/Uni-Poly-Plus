@@ -26,7 +26,10 @@ from src.training.glt_dual_runtime import require_tmux, save_checkpoint, write_j
 from src.utils import evaluate, scale_targets, set_global_seed, test_model, train_epoch, _cosine_scheduler
 
 
-TASKS = ("eat", "eea", "egb", "ei", "eps", "nc", "xc")
+DEFAULT_TASKS_7 = ("eat", "eea", "egb", "ei", "eps", "nc", "xc")
+ALLOWED_TASKS_8 = ("eat", "eea", "egb", "egc", "ei", "eps", "nc", "xc")
+# Backward-compatible import used by the historical 7-task aggregator.
+TASKS = DEFAULT_TASKS_7
 
 
 def fixed_manifest(task, csv_path, path):
@@ -96,7 +99,7 @@ def main():
     parser.add_argument("--split-root", default="data/splits/mips_outer5_inner20")
     parser.add_argument("--task", action="append", dest="tasks")
     parser.add_argument("--fold", action="append", type=int, dest="folds")
-    parser.add_argument("--arm", choices=("A", "B"), required=True)
+    parser.add_argument("--arm", choices=("A", "B", "DND"), required=True)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--formal-shard", action="store_true")
     parser.add_argument("--clean-cache-gib", type=float, default=0.0)
@@ -105,9 +108,9 @@ def main():
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
     if args.clean_cache_gib < 0 or not np.isfinite(args.clean_cache_gib):
         raise ValueError("--clean-cache-gib must be finite and non-negative")
-    tasks = list(args.tasks) if args.tasks else list(TASKS)
+    tasks = list(args.tasks) if args.tasks else list(DEFAULT_TASKS_7)
     folds = [int(value) for value in args.folds] if args.folds else list(range(5))
-    if sorted(set(tasks)) != sorted(tasks) or any(task not in TASKS for task in tasks):
+    if sorted(set(tasks)) != sorted(tasks) or any(task not in ALLOWED_TASKS_8 for task in tasks):
         raise ValueError("unknown or duplicate task selection")
     if any(fold < 0 or fold >= 5 for fold in folds):
         raise ValueError("fold must lie in 0..4")

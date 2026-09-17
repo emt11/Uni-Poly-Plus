@@ -13,13 +13,13 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.finetune_glt_o8_control import TASKS, fixed_manifest
+from scripts.finetune_glt_o8_control import ALLOWED_TASKS_8, DEFAULT_TASKS_7, fixed_manifest
 
 
 def validate_gpus(gpus):
     values = [str(value) for value in gpus]
-    if len(values) != 3:
-        raise ValueError("O8 control grid requires exactly three GPU slots")
+    if not 1 <= len(values) <= 4:
+        raise ValueError("O8 control grid requires one to four GPU slots")
     if len(set(values)) != len(values):
         raise ValueError("O8 control grid requires distinct GPU slots")
     return values
@@ -48,8 +48,8 @@ def run_grid(args):
     else:
         output.mkdir(parents=True, exist_ok=False)
     logs.mkdir(parents=True, exist_ok=True)
-    tasks = list(args.tasks) if args.tasks else list(TASKS)
-    if sorted(set(tasks)) != sorted(tasks) or any(task not in TASKS for task in tasks):
+    tasks = list(args.tasks) if args.tasks else list(DEFAULT_TASKS_7)
+    if sorted(set(tasks)) != sorted(tasks) or any(task not in ALLOWED_TASKS_8 for task in tasks):
         raise ValueError("unknown or duplicate task")
     if args.clean_cache_gib < 0:
         raise ValueError("--clean-cache-gib must be non-negative")
