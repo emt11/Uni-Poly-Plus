@@ -98,12 +98,24 @@ def _logged_steps(log_path):
     path = Path(log_path)
     if not path.is_file():
         return steps
+    decoder = json.JSONDecoder()
     for line in path.open(encoding="utf-8", errors="replace"):
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if row.get("rank") == 0 and "step" in row:
+        # torchrun can interleave rank stdout without inserting a newline.
+        # Decode every complete JSON object on the line instead of treating
+        # the line as one object; warnings and non-JSON fragments are skipped.
+        offset = 0
+        while offset < len(line):
+            start = line.find("{", offset)
+            if start < 0:
+                break
+            try:
+                row, end = decoder.raw_decode(line, start)
+            except json.JSONDecodeError:
+                offset = start + 1
+                continue
+            offset = end
+            if not isinstance(row, dict) or row.get("rank") != 0 or "step" not in row:
+                continue
             try:
                 steps.append(int(row["step"]))
             except (TypeError, ValueError):
@@ -276,9 +288,16 @@ class Controller:
 
     def wait_teacher(self):
         name = "WAIT_TEACHER"
-        if not self.stage_start(name, command=["wait", str(self.teacher_root)],
-                                inputs={"teacher_root": str(self.teacher_root),
-                                        "teacher_log": str(self.teacher_log)}):
+        command = ["wait", str(self.teacher_root)]
+        inputs = {"teacher_root": str(self.teacher_root),
+                  "teacher_log": str(self.teacher_log)}
+        existing = self.state["stages"].get(name)
+        if existing and existing.get("status") == "RUNNING":
+            # A controller interrupted while polling may safely resume this
+            # idempotent wait stage, but only for the same teacher inputs.
+            if existing.get("command") != command or existing.get("input_artifacts") != inputs:
+                raise RuntimeError("WAIT_TEACHER resume identity mismatch")
+        elif not self.stage_start(name, command=command, inputs=inputs):
             return True
         while not _teacher_complete(self.teacher_root, self.teacher_log):
             self.state["stages"][name]["last_observation"] = {
