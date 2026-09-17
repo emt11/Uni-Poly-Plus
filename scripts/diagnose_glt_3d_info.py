@@ -348,13 +348,15 @@ def _feature_sidecar(source, model, device, batch_size: int):
         row_feature_index[row] = key_to_unique[key]
     keys = list(key_to_unique)
     h2_rows, h3_rows, torsion_rows, nonbonded_rows = [], [], [], []
-    geometry_valid_rows, torsion_valid_rows, torsion_candidate_rows = [], [], []
+    geometry_valid_rows, graph3d_valid_rows = [], []
+    torsion_valid_rows, torsion_candidate_rows = [], []
     pair_rows = []
     model.eval()
     for start in range(0, len(unique_indices), batch_size):
         chunk_indices = unique_indices[start:start + batch_size]
         data_rows, torsion_chunk, nonbonded_chunk = [], [], []
-        geometry_chunk, torsion_valid_chunk, torsion_candidate_chunk, pair_chunk = [], [], [], []
+        geometry_chunk = []
+        torsion_valid_chunk, torsion_candidate_chunk, pair_chunk = [], [], []
         for index in chunk_indices:
             topology, trimer, smiles = source[index]
             static = source.static_for(index)
@@ -377,13 +379,21 @@ def _feature_sidecar(source, model, device, batch_size: int):
         h2_np, h3_np = h2.detach().float().cpu().numpy(), h3.detach().float().cpu().numpy()
         if not np.isfinite(h2_np).all() or not np.isfinite(h3_np).all():
             raise FloatingPointError("nonfinite frozen Fixed Concat embedding")
-        if valid.detach().cpu().tolist() != geometry_chunk:
-            raise ValueError("model/static geometry validity mismatch")
+        # A legal static row can contain no center-internal bond token.  The
+        # frozen Galformer implementation then has no 3D readout and marks
+        # graph_3d invalid even though the underlying Trimer coordinates are
+        # valid.  Preserve both flags; h3 follows the model flag, while the
+        # descriptor diagnostics retain the static geometry flag.
+        valid_list = valid.detach().cpu().tolist()
+        if any(model_valid and not static_valid
+               for model_valid, static_valid in zip(valid_list, geometry_chunk)):
+            raise ValueError("model graph_3d validity exceeds static geometry validity")
         h2_rows.append(h2_np)
         h3_rows.append(h3_np)
         torsion_rows.extend(torsion_chunk)
         nonbonded_rows.extend(nonbonded_chunk)
         geometry_valid_rows.extend(geometry_chunk)
+        graph3d_valid_rows.extend(valid_list)
         torsion_valid_rows.extend(torsion_valid_chunk)
         torsion_candidate_rows.extend(torsion_candidate_chunk)
         pair_rows.extend(pair_chunk)
@@ -403,6 +413,7 @@ def _feature_sidecar(source, model, device, batch_size: int):
         "torsion": torsion.astype(np.float32),
         "nonbonded": nonbonded.astype(np.float32),
         "geometry_valid": np.asarray(geometry_valid_rows, dtype=bool),
+        "graph3d_valid": np.asarray(graph3d_valid_rows, dtype=bool),
         "torsion_valid_count": np.asarray(torsion_valid_rows, dtype=np.int32),
         "torsion_candidate_count": np.asarray(torsion_candidate_rows, dtype=np.int32),
         "pair_counts": np.asarray(
@@ -483,6 +494,8 @@ def _probe_results(features, frame, manifests):
             train_groups = keys[train]
             train_geometry = features["geometry_valid"][features["row_feature_index"][train]]
             validation_geometry = features["geometry_valid"][features["row_feature_index"][validation]]
+            train_graph3d = features["graph3d_valid"][features["row_feature_index"][train]]
+            validation_graph3d = features["graph3d_valid"][features["row_feature_index"][validation]]
             train_torsion_valid = features["torsion_valid_count"][features["row_feature_index"][train]]
             train_torsion_candidates = features["torsion_candidate_count"][features["row_feature_index"][train]]
             validation_torsion_valid = features["torsion_valid_count"][features["row_feature_index"][validation]]
@@ -509,6 +522,8 @@ def _probe_results(features, frame, manifests):
                     "validation_unique_structure_count": int(np.unique(keys[validation]).size),
                     "train_geometry_valid_fraction": float(np.mean(train_geometry)),
                     "validation_geometry_valid_fraction": float(np.mean(validation_geometry)),
+                    "train_graph3d_valid_fraction": float(np.mean(train_graph3d)),
+                    "validation_graph3d_valid_fraction": float(np.mean(validation_graph3d)),
                     "train_torsion_valid_fraction": float(
                         train_torsion_valid.sum() / train_torsion_candidates.sum()
                         if train_torsion_candidates.sum() else 0.0),
@@ -600,10 +615,12 @@ def main():
     args = parser.parse_args()
     output = Path(args.output).resolve()
     if output.exists():
-        raise FileExistsError(f"diagnostic output already exists: {output}")
+        if any(output.iterdir()):
+            raise FileExistsError(f"diagnostic output already exists and is non-empty: {output}")
+    else:
+        output.mkdir(parents=True)
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
-    output.mkdir(parents=True)
     try:
         device = torch.device(args.device)
         if device.type == "cuda" and not torch.cuda.is_available():
@@ -646,7 +663,9 @@ def main():
             "checkpoint": str(Path(args.checkpoint)),
             "checkpoint_sha256": _sha256_file(Path(args.checkpoint)),
             "h2": "norm2(graph_2d), 512-D",
-            "h3": "norm3(graph_3d), 512-D; zeroed when geometry_valid=false",
+            "h3": "norm3(graph_3d), 512-D; zeroed when the frozen encoder reports graph3d_valid=false",
+            "geometry_valid": "static Trimer geometry flag",
+            "graph3d_valid": "effective Fixed Concat Galformer graph_3d readout flag",
             "encoder_frozen": True,
             "outer_test_accessed": False,
         }
@@ -715,6 +734,8 @@ def main():
             "diagnostic_statistics": {
                 "geometry_valid_count": int(features["geometry_valid"].sum()),
                 "geometry_invalid_count": int((~features["geometry_valid"]).sum()),
+                "graph3d_valid_count": int(features["graph3d_valid"].sum()),
+                "graph3d_invalid_count": int((~features["graph3d_valid"]).sum()),
                 "torsion_candidate_count": int(features["torsion_candidate_count"].sum()),
                 "torsion_valid_count": int(features["torsion_valid_count"].sum()),
                 "torsion_valid_fraction": float(
