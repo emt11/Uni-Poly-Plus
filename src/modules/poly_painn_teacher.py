@@ -108,7 +108,12 @@ class _PaiNNLayer(nn.Module):
             [scalar, scalar_message, scalar_norm, message_norm], dim=-1
         )
         scalar = scalar + self.scalar_update(context)
-        vector = vector + vector_message * self.vector_gate(context)[:, :, None]
+        # Recompute the invariant gate after the scalar residual so the final
+        # layer's scalar parameters participate in the denoising objective too.
+        gate_context = torch.cat(
+            [scalar, scalar_message, vector.norm(dim=-1), message_norm], dim=-1
+        )
+        vector = vector + vector_message * self.vector_gate(gate_context)[:, :, None]
         return scalar, vector, edge_index
 
 
