@@ -407,11 +407,12 @@ finetune 或 `torchrun` 活动任务；r4 基线为 `669fdf3`。
 * `scripts/build_glt_dual_static_cache.py`：writer flock 改用不随 staging rename 移动的稳定
   `<artifact>.build.lock`；static 后 targets 固定顺序获取锁，部分获取失败和异常路径释放本轮已持有锁。
   未锁前只做 advisory preflight，持锁后重新检查 published／staging 身份和发布状态，幂等、恢复和写入只使用
-  post-lock 状态；不删除锁文件，不覆盖已发布产物。
+  post-lock 状态；并将 `zero_write_snapshot()` 放入已持有双锁的 `try/finally`，使 snapshot 异常也释放两侧锁；
+  不删除锁文件，不覆盖已发布产物。
 * `scripts/finalize_glt_dual_static_artifact.py`：诊断报告写入前同时检查 lexical 与 symlink-resolved 路径，
   拒绝 artifact 根目录内的 manifest、`.frozen`、其他文件及解析后落入该根目录的别名；外部报告路径保持可用。
-* `tests/test_glt_dual_static_recovery.py`：新增确定性双进程 preflight→publish 竞争、static→targets 部分锁释放，
-  以及五类诊断路径保护回归。首次 fixture 的 bytes 转换错误已修正，保留首次失败日志。
+* `tests/test_glt_dual_static_recovery.py`：新增确定性双进程 preflight→publish 竞争、static→targets 部分锁释放、
+  snapshot 异常后双锁可重新获取，以及五类诊断路径保护回归。首次 fixture 的 bytes 转换错误已修正，保留首次失败日志。
 
 ### 实际验证
 
@@ -423,6 +424,11 @@ finetune 或 `torchrun` 活动任务；r4 基线为 `669fdf3`。
 退出码 0，结果 `12 passed, 1 warning`，最终日志 `logs/cache_opt_r4_tests_final.log`。首次窗口
 `Uni-Poly:cache_opt_r4_tests` 因测试 fixture 错误退出码 1，日志 `logs/cache_opt_r4_tests.log`；该失败不涉及生产代码，
 修正后仅重跑同一相关测试。
+
+针对 snapshot 异常释放窗口，在 `Uni-Poly:cache_opt_r4_snapshot_final2` 独立窗口再次执行同一命令，结果
+`13 passed, 1 warning`、退出码 0，日志 `logs/cache_opt_r4_snapshot_final2.log`；新增用例在 `zero_write_snapshot()`
+抛出后于同一进程重新获取 static／targets 两把锁。另执行 `python -m py_compile scripts/build_glt_dual_static_cache.py
+scripts/finalize_glt_dual_static_artifact.py` 与 `git diff --check`，均退出码 0。
 
 ### 范围与状态
 

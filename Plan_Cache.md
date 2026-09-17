@@ -434,11 +434,12 @@ r4 仅更正 Codex 最新审查指出的两项工程缺陷，保留 r1–r3 的�
 * `scripts/build_glt_dual_static_cache.py`：writer flock 改为 artifact root 旁的稳定
   `<artifact>.build.lock`，不随 `.staging` rename 移动；static 后 targets 固定顺序获取锁，部分获取失败时释放已持有锁。
   保留只读 preflight，但持锁后重新调用 `_prepare_artifact()` 和 `_publish_plan()`；初始化、恢复、幂等返回和写入只使用
-  这一轮 post-lock 状态。锁文件不删除，已发布目录仍只读。
+  这一轮 post-lock 状态。并将 `zero_write_snapshot()` 纳入已持有双锁的 `try/finally`，使 snapshot 的 I/O／权限异常也会
+  释放两侧锁。锁文件不删除，已发布目录仍只读。
 * `scripts/finalize_glt_dual_static_artifact.py`：新增诊断路径的 lexical／resolved 双重检查；artifact 根目录及其
   manifest、`.frozen`、其他文件和通过符号链接解析到根目录的别名均在写报告前拒绝，合法外部路径仍写入独立报告。
-* `tests/test_glt_dual_static_recovery.py`：更新稳定锁断言，新增 static→targets 部分加锁释放、两个真实进程的确定性
-  preflight/publish 竞争回归，以及 manifest／`.frozen`／目录内文件／符号链接／外部报告路径保护回归。
+* `tests/test_glt_dual_static_recovery.py`：更新稳定锁断言，新增 static→targets 部分加锁释放、snapshot 异常后两侧锁可重新获取、
+  两个真实进程的确定性 preflight/publish 竞争回归，以及 manifest／`.frozen`／目录内文件／符号链接／外部报告路径保护回归。
 
 ### 实际验证
 
@@ -454,6 +455,12 @@ finetune 或 `torchrun` 进程。
   最终结果 `12 passed, 1 warning`，退出码 0；日志 `logs/cache_opt_r4_tests_final.log`（中间修正结果保留于
   `logs/cache_opt_r4_tests_retry.log`）。该用例实际覆盖两个进程、稳定 flock、post-lock recheck、部分锁释放和诊断
   路径拒绝／合法外部写入。
+* 针对后续发现的 snapshot 异常释放窗口，在 `Uni-Poly:cache_opt_r4_snapshot_final2` 独立窗口再次执行同一局部命令：
+  结果 `13 passed, 1 warning`，退出码 0；完整日志 `logs/cache_opt_r4_snapshot_final2.log`。新增
+  `test_snapshot_failure_releases_both_side_locks` 让生产 `build()` 在双锁取得后由 `zero_write_snapshot()` 抛出
+  `OSError`，随后在同一进程重新获取 static 与 targets 两把锁，验证异常路径已显式释放。
+* 对本轮代码执行 `python -m py_compile scripts/build_glt_dual_static_cache.py scripts/finalize_glt_dual_static_artifact.py`
+  及 `git diff --check`，均退出码 0。
 * 未重跑 r2 的 32-key parity、r3 focused 全集、2048 benchmark 或任何模型／训练；未生成构象、重建／迁移 active cache、
   GPU smoke 或清理历史产物。未修改 `RESULTS.md`、`PROJECT_HISTORY.md` 或历史实验数字。
 

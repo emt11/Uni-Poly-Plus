@@ -501,8 +501,8 @@ def build(args):
     # and targets second, then discard the advisory state and read everything
     # again while both locks are held.
     locks = _acquire_side_locks(static_root, target_root)
-    before = zero_write_snapshot(cache_root)
     try:
+        before = zero_write_snapshot(cache_root)
         static_root, static_staging, static_published = _prepare_artifact(
             static_root, STATIC_FORMAT, keys, cohort, static_params)
         target_staging, target_published = None, False

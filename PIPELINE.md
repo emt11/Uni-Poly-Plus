@@ -986,11 +986,14 @@ r2 真实 parity、未运行模型；当前状态为等待 Codex 独立审查。
 ### CACHE-20260916-01 r4 最小更正执行记录（2026-09-17，返修完成，待 Codex 审查）
 
 r4 仅修复发布期 writer 互斥和 finalize 诊断路径保护。builder 使用稳定 artifact-side flock，static→targets
-按固定顺序加锁，并在持锁后重新读取发布／staging 状态；finalizer 在任何报告写入前拒绝 artifact 根目录内路径及
-解析后落入该目录的符号链接别名。active cache、模型和训练配置未改变。
+按固定顺序加锁，并在持锁后重新读取发布／staging 状态；`zero_write_snapshot()` 位于双锁持有期间的
+`try/finally` 内，snapshot 异常也会释放两侧锁；finalizer 在任何报告写入前拒绝 artifact 根目录内路径及解析后落入该目录的
+符号链接别名。active cache、模型和训练配置未改变。
 
 `Uni-Poly:cache_opt_r4_tests_final` 中最终执行
 `PYTHONPATH=.:tests pytest -q tests/test_glt_dual_static_recovery.py`，结果 `12 passed, 1 warning`、退出码 0，
 日志为 `logs/cache_opt_r4_tests_final.log`；此前修正后的同一测试日志保留在
 `logs/cache_opt_r4_tests_retry.log`。首次 fixture 错误保留在 `logs/cache_opt_r4_tests.log`，退出码 1；修正后
-仅重跑同一相关测试。未重跑 r2/r3 parity、长 benchmark 或任何模型／训练，当前状态为返修完成、待 Codex 审查。
+仅重跑同一相关测试。针对 snapshot 异常窗口，在 `Uni-Poly:cache_opt_r4_snapshot_final2` 再执行同一局部命令，结果
+`13 passed, 1 warning`、退出码 0，日志为 `logs/cache_opt_r4_snapshot_final2.log`；另有 `py_compile` 与 `git diff --check`
+均退出码 0。未重跑 r2/r3 parity、长 benchmark 或任何模型／训练，当前状态为返修完成、待 Codex 审查。

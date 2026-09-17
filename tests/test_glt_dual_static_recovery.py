@@ -362,6 +362,46 @@ def test_static_then_targets_lock_order_releases_partial_acquisition(tmp_path, m
     builder._release_build_lock(lock)
 
 
+def test_snapshot_failure_releases_both_side_locks(tmp_path, monkeypatch):
+    from scripts import build_glt_dual_static_cache as builder
+
+    key = b"s" * 32
+    key_array = np.frombuffer(key, dtype=np.uint8).reshape(1, 32)
+    cohort = {
+        "records": [{"sample_key": key.hex(), "source_smiles": "*CC*",
+                     "normalized_smiles": "*CC*"}],
+        "manifest": {"main_bundle_hash": "a" * 64,
+                      "ordered_sample_key_hash": ordered_key_hash(key_array)},
+        "manifest_hash": "b" * 64,
+    }
+    monkeypatch.setattr(builder, "load_dual_cohort", lambda *_args, **_kwargs: cohort)
+    monkeypatch.setattr(builder, "load_active_dual_store",
+                        lambda *_args, **_kwargs: {"bundle_hash": "a" * 64})
+
+    def fail_snapshot(_root):
+        raise OSError("synthetic snapshot failure")
+
+    monkeypatch.setattr(builder, "zero_write_snapshot", fail_snapshot)
+    cache_root = tmp_path / "main"
+    cache_root.mkdir()
+    static_root = tmp_path / "static"
+    target_root = tmp_path / "targets"
+    args = SimpleNamespace(
+        cache_root=str(cache_root), cohort_root="unused", output_root=str(static_root),
+        target_root=str(target_root), build_targets=True, workers=1, chunk_size=1,
+        limit=0, unique=False, progress_chunks=1,
+    )
+    with pytest.raises(OSError, match="synthetic snapshot failure"):
+        builder.build(args)
+
+    # The snapshot failed immediately after both stable locks were acquired;
+    # both must nevertheless be available again, without process teardown.
+    static_lock = builder._acquire_build_lock(static_root)
+    target_lock = builder._acquire_build_lock(target_root)
+    builder._release_build_lock(target_lock)
+    builder._release_build_lock(static_lock)
+
+
 def test_build_rechecks_after_stable_lock_when_publish_wins_race(tmp_path, monkeypatch):
     """A preflight loser must return idempotent after another process publishes."""
 
