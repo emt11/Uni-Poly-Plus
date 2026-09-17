@@ -282,9 +282,7 @@ class Controller:
                 self.stage_finish(name, status="FAIL", exit_code=1, error=error)
             elif error:
                 row["error"] = str(error)
-                self.flush()
-        else:
-            self.flush()
+        self.flush()
 
     def wait_teacher(self):
         name = "WAIT_TEACHER"

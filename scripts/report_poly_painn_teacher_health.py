@@ -30,14 +30,24 @@ def _finite_tensors(value):
 
 def _records(log_path):
     records = []
+    decoder = json.JSONDecoder()
     with Path(log_path).open(encoding="utf-8") as stream:
         for line in stream:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if row.get("rank") == 0 and "step" in row:
-                records.append(row)
+            # torchrun may concatenate rank stdout records on one physical
+            # line; decode each complete object rather than dropping the line.
+            offset = 0
+            while offset < len(line):
+                start = line.find("{", offset)
+                if start < 0:
+                    break
+                try:
+                    row, end = decoder.raw_decode(line, start)
+                except json.JSONDecodeError:
+                    offset = start + 1
+                    continue
+                offset = end
+                if isinstance(row, dict) and row.get("rank") == 0 and "step" in row:
+                    records.append(row)
     records.sort(key=lambda row: int(row["step"]))
     return records
 
