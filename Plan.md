@@ -2,12 +2,12 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 计划 ID / 修订 | SPEED-20260917-01 / r1 |
+| 计划 ID / 修订 | SPEED-20260917-01 / r3：有界执行记录收口；补记恢复 RNG 与 grid 异常路径更正 |
 | 日期 | 2026-09-17（UTC） |
-| 状态 | 计划已交付；实现与下述短测待授权，尚未执行 |
-| 授权来源 | 用户要求“制定计划实现：优化当前预训练和微调的速度”；本轮落实实施计划，不启动代码修改或训练 |
+| 状态 | 待审查；代码实现、局部测试、32+32 parity 与 4-GPU 有界 smoke 已执行，恢复 RNG 更正后的 GPU 集成尚未复跑 |
+| 授权来源 | 用户明确要求执行本计划，并补充允许使用 4 张 GPU；仍受本计划的样本、步数、时间和“不启动正式实验”边界约束 |
 | 角色 | Codex 规划与后续审查；ZCode 按获授权范围实施；本轮文档由 Codex 修改、自检，无独立审查者 |
-| 基线 | dev，`64d10bcd379a99e82dc5ad827d521ef08d39a342`；修改前工作树干净，pull 为 Already up to date |
+| 基线 | dev，执行前 HEAD `b185941`；工作树干净，`git pull --ff-only origin dev` 为 Already up to date |
 | 交接边界 | 本文件为新提速计划；不恢复已删除的 Plan_Cache.md，不重开已 CLOSED 的缓存返修周期 |
 
 ## 1. 目标与不变项
@@ -116,11 +116,11 @@
 | --- | --- |
 | 局部单元/子进程测试 | 仅新增或受影响测试；调度合成最多6个短任务，不启动模型 |
 | 真实输入parity | 最多32个固定预训练key、32个固定下游行；覆盖不足用fixture，不生成构象 |
-| GPU正确性短测 | 最终预训练候选包baseline连续4步、candidate连续4步、candidate2+恢复2步；最多12个逻辑update，3ranks；必要2-step故障定位最多一次 |
+| GPU正确性短测 | 最终预训练候选包baseline连续4步、candidate连续4步、candidate2+恢复2步；最多12个逻辑update，最多4 ranks；必要2-step故障定位最多一次 |
 | 预训练测速 | baseline与至多2个单因素候选；每个比较A-B-B-A，每次5步warmup+15步计时；最多160个optimizer updates；不缩放原LR horizon，不让候选接续baseline权重训练 |
 | 微调测速 | 固定xc、fold0；baseline与clean-cache候选A-B-B-A，各最多2epochs，既有smoke模式，只用train/validation；最多8个训练epochs |
 | 可选组合确认 | 仅单因素已有效：预训练baseline/组合各1次20updates；不新增候选，微调pinning若要新增实测则留下一轮 |
-| 总资源边界 | 上述上限和总墙钟2小时先到者停止；GPU最多3张并只跑一个测速组，数据CPU测量最多15分钟；临时产物最多10GiB，不删除旧产物凑预算 |
+| 总资源边界 | 上述上限和总墙钟2小时先到者停止；GPU最多4张并只跑一个测速组，数据CPU测量最多15分钟；临时产物最多10GiB，不删除旧产物凑预算 |
 
 A-B-B-A每次独立进程、相同初始化/恢复点、相同绝对样本位置。报告冷启动和稳定窗口；不声称OS缓存被清空。baseline与candidate启用相同计时和日志设置，若测试诊断降频则单列为受控改变。
 
@@ -143,7 +143,26 @@ A-B-B-A每次独立进程、相同初始化/恢复点、相同绝对样本位置
 
 ## 7. 当前执行记录与下一步
 
-- 本轮完成：检查Git/当前源码、两类历史run.json、配置、机器资源与相关进程；创建本计划。预训练/微调没有在本轮运行，没有实测新提速比例。
-- 当前未实施：A–D代码、单元测试、真实parity、resume、benchmark、生产默认切换；本文件中的接口/预算是实施要求，不冒充现有全部功能。
+- 本轮完成：检查 Git/当前源码、两类历史 run.json、配置、机器资源与相关进程；确认 4 张 RTX 4090 可作为本轮有界 GPU 测速资源；此前未实施 A–D。
+- 当前阶段：A→B→C→D 已执行；结果与未核实项写入下方执行记录，不能把计划目标冒充为结果。
 - 文档自检：相关路径、授权/预算/科学不变项及 `git diff --check`；实际提交和推送信息见本次交付及Git历史。
-- 下一步：用户确认实施范围后，由ZCode先A→B→C，再按A证据进入D；每完成一项即验证，必要验证完成即停止追加。正式重跑和新科学实验不属于本计划预算。
+- 下一步：等待 Codex 独立审查；4 GPU 仅用于本计划允许的短测，不启动正式重训或完整微调。
+
+### 7.1 本轮执行启动记录（2026-09-17 UTC）
+
+- 执行前核对：`git status --short --branch` 为 `dev...origin/dev` 且工作树干净；`git pull --ff-only origin dev` 返回 `Already up to date`。
+- 当前无匹配的预训练、微调、cache builder、`torchrun` 或 pytest 活动进程；历史 `Uni-Poly` windows 保留，不复用其输出或覆盖产物。
+- 资源核对：4 张 RTX 4090、112 logical CPUs、约 179 GiB available RAM；GPU 短测最多使用 4 张，仍遵守本计划的短测与总墙钟边界。
+- 当前状态：启动记录完成；尚未宣称任何候选通过、正式提速或模型性能改善。
+
+### 7.2 有界执行结果（2026-09-17 UTC）
+
+- **代码修改**：`CleanLabeledDataset` 增加默认关闭、按 tensor payload 计量的进程内 LRU（smoke 使用 4 GiB）；`pretrain_glt_dual.py` 增加可选 `--timing`，并支持 `--prep-workers` 恢复时在 DataLoader iterator 建立后恢复 RNG；`profile_glt_dual_runtime.py` 支持 static/target sidecar；中心 one-hop angle 行筛选改为保持顺序与物理关系多重性的向量化 gather；finetune grid 改为 free-slot 动态派发，并对 shard 退出与 `launch()` 异常统一收口；新增 `tests/test_glt_dual_speed.py`。
+- **局部验证**：`Uni-Poly:speed_r3_final_tests` 执行 py_compile 与
+  `PYTHONPATH=.:tests pytest -q tests/test_glt_dual_speed.py tests/test_glt_dual_static.py tests/test_dual_glt_pretrain.py`，`18 passed, 1 warning`，退出码 0，日志 `logs/speed_r3_final_tests.log`。此前同一集合为 `18 passed`（`logs/speed_r2_grid_cleanup_tests.log`）；一次误用不存在测试文件名的命令退出码 4，未作为通过证据。
+- **真实输入 parity**：PI1M 固定 32 条真实记录的 old runtime 与 static/target runtime 准备结果通过（数据字段、mask/noise、距离/角度、fingerprint、skip reasons；整数 exact，浮点 `1e-6`），报告 `results/speed_20260917/parity_32.json`，日志 `logs/speed_r2_parity32_retry.log`，退出码 0。下游 `xc` 固定 32 行 clean 输入通过同样比较，报告 `results/speed_20260917/downstream_parity_32.json`，日志 `logs/speed_r2_downstream_parity32.log`，退出码 0。第一次同进程双 LMDB 打开尝试被 LMDB 正确拒绝（`logs/speed_r2_parity32.log`，退出码 1），重排为先关闭旧 source 后复跑。
+- **CPU profile**：256 条固定间隔 PI1M 记录 old/static 均为 read-only zero-write PASS。旧路径 clean `median=53.288 ms`、prepare `median=91.173 ms`；static/target 路径分别为 `0.792 ms`、`1.738 ms`，报告 `results/speed_20260917/profile_{baseline,static}_256.json`，日志 `logs/speed_r1_cpu_profile256.log`，退出码 0。5000 条 profile 在 15 分钟 CPU 预算到达时停止，未产生报告，不能外推完整吞吐。
+- **微调 A-B-B-A smoke**：`Uni-Poly:speed_r1_finetune_xc` 在 `xc/fold0`、2 epoch、train/validation-only 下四次均退出码 0，`outer-test=NOT_RUN`；baseline 两次 epoch 总时长约 `59.84/59.75 s`，cache 两次约 `10.52/10.76 s`，两次验证 R² 轨迹均为 `0.0590856084 → 0.1038316778`。日志 `logs/speed_r1_finetune_xc.log`，产物 `results/speed_20260917/finetune_xc/`。这只是 smoke/timing，不是性能或下游结论。
+- **4-GPU预训练 bounded smoke**：`Uni-Poly:speed_r1_pretrain_4gpu` 使用 `torchrun --nproc_per_node=4`，baseline 4 步、static/target candidate 4 步、candidate 2 步保存后恢复 2 步，均退出码 0；四 rank `valid_graphs=1008`，loss、target counts、梯度范数均有限，candidate 与 baseline 四步 loss/target 完全一致，candidate 连续与恢复的 model/optimizer/scheduler/step/ordered keys 完全一致。产物 `results/speed_20260917/pretrain/{baseline4,candidate4,candidate_resume}/`，日志 `logs/speed_r1_pretrain_4gpu.log`。初始恢复比较发现带 3 workers 时 checkpoint Torch RNG 不一致；已将恢复点移到 DataLoader iterator 建立之后并通过局部测试，但受 12-update 预算限制**未复跑修正后的 GPU 恢复集成**，因此 RNG exact 仍标为未核实。
+- **调度失败路径**：18 项局部测试包含 free-slot 先派发、子进程失败后停止新派发，以及 `launch()` 异常时 drain 已持有子进程；未启动正式 fold。
+- **未执行**：正式 5000/20000-step 预训练、Concat/KFuse 完整训练、完整 8×5 微调、正式 grid、5k+15-step 长 benchmark、第二预训练候选、缓存重建/迁移、post-fix GPU resume rerun。当前不把 smoke 或静态 sidecar parity 写成模型性能提升或正式实验完成。

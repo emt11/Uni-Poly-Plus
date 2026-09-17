@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
@@ -103,6 +104,8 @@ def main():
                              'feeding the geometry heads only')
     parser.add_argument('--reference-log',
                         help='original run log for the initial-10-step cross-check')
+    parser.add_argument('--timing', action='store_true',
+                        help='optional bounded phase timing; adds synchronization only for the timing run')
     args = parser.parse_args()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
@@ -163,6 +166,7 @@ def main():
                                                        if source.target_cache is not None else None))
         # Exact ordered identities, without adding a separate cache schema.
         ordered_keys = [key.hex() for key, _ in source.samples]
+        resume_rng = None
         if args.resume:
             state = torch.load(args.resume, map_location='cpu', weights_only=False)
             if state['identity'] != identity or state['ordered_keys'] != ordered_keys:
@@ -172,7 +176,10 @@ def main():
             start = state['step']
             if state['next_position'] != start * batch_size or state['scheduler']['step'] != start:
                 raise ValueError('resume scheduler/data position mismatch')
-            restore_rng(state['rng'][rank])
+            # Restore after constructing the optional DataLoader iterator below.
+            # Worker-base-seed creation consumes the process Torch RNG; doing it
+            # before restore keeps that setup draw outside the resumed stream.
+            resume_rng = state['rng'][rank]
         else:
             # Identical initialization; independent dropout streams after DDP sync.
             set_global_seed(config['seed'] + rank)
@@ -216,10 +223,16 @@ def main():
                 dataset, batch_size=None, num_workers=int(args.prep_workers),
                 prefetch_factor=4, persistent_workers=False, pin_memory=False,
             ))
+        if resume_rng is not None:
+            restore_rng(resume_rng)
         reference = _reference_steps(args.reference_log) if args.reference_log else {}
         diagnostics_path = output / 'diagnostics_steps.jsonl'
+        timing_path = output / 'timing_steps.jsonl'
         dense_lo = min(save_steps) - 60 if save_steps else None
         for step in range(start, stop):
+            timing = {}
+            step_started = time.perf_counter()
+            prep_started = time.perf_counter()
             if prefetch is not None:
                 prepared = [next(prefetch) for _ in range(accumulation)]
             else:
@@ -236,6 +249,7 @@ def main():
                             static=source.static_for(index),
                             target=source.target_for(index)))
                     prepared.append(pretrain_collate(rows))
+            timing['preparation_seconds'] = time.perf_counter() - prep_started
             counts = torch.zeros(3, device=device)
             for data, labels in prepared:
                 masked = torch.bincount(data.canonical_graph_index[labels['atom_mask']], minlength=data.graph_available.numel())
@@ -251,6 +265,7 @@ def main():
             totals = torch.zeros(3, device=device)
             target_counts = torch.zeros(4, device=device)
             fallbacks, reasons = 0, {}
+            h2d_seconds = forward_backward_seconds = optimizer_seconds = 0.0
             for offset, (data, labels) in enumerate(prepared):
                 fallbacks += labels['fallback_count']
                 for reason in labels['skip_reasons']:
@@ -258,23 +273,53 @@ def main():
                         reasons[reason] = reasons.get(reason, 0) + 1
                 sync = module.no_sync() if world > 1 and offset + 1 < accumulation else nullcontext()
                 with sync:
+                    if args.timing and device.type == 'cuda':
+                        torch.cuda.synchronize(device)
+                    h2d_started = time.perf_counter()
+                    moved_data = data.to(device, non_blocking=True)
+                    moved_labels = move_labels(labels, device)
+                    if args.timing and device.type == 'cuda':
+                        torch.cuda.synchronize(device)
+                    h2d_seconds += time.perf_counter() - h2d_started
+                    if args.timing and device.type == 'cuda':
+                        torch.cuda.synchronize(device)
+                    forward_backward_started = time.perf_counter()
                     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config['amp_dtype'] == 'bf16'):
-                        result = module(data.to(device), move_labels(labels, device))
+                        result = module(moved_data, moved_labels)
                         loss = global_objective(result['sums'], counts, world, config['loss_weights'])
                     if not torch.isfinite(loss):
                         raise FloatingPointError('nonfinite pretraining loss')
                     loss.backward()
+                    if args.timing and device.type == 'cuda':
+                        torch.cuda.synchronize(device)
+                    forward_backward_seconds += time.perf_counter() - forward_backward_started
                 totals += result['sums'].detach()
                 target_counts += result['targets'].detach()
+            if args.timing and device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            optimizer_started = time.perf_counter()
             grad_total_preclip = float(torch.nn.utils.clip_grad_norm_(
                 base.parameters(), 1., error_if_nonfinite=True))
             optimizer.step()
+            if args.timing and device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            optimizer_seconds = time.perf_counter() - optimizer_started
             if world > 1:
                 dist.all_reduce(totals)
                 dist.all_reduce(target_counts)
-            print(json.dumps(dict(step=step + 1, rank=rank, lr=float(lr),
+            record = dict(step=step + 1, rank=rank, lr=float(lr),
                 losses=(totals / counts.clamp_min(1)).tolist(), valid_graphs=counts.tolist(),
-                target_counts=target_counts.tolist(), local_fallbacks=fallbacks, local_skip_reasons=reasons)), flush=True)
+                target_counts=target_counts.tolist(), local_fallbacks=fallbacks, local_skip_reasons=reasons)
+            if args.timing:
+                timing.update(h2d_seconds=h2d_seconds,
+                              forward_backward_seconds=forward_backward_seconds,
+                              optimizer_seconds=optimizer_seconds,
+                              step_seconds=time.perf_counter() - step_started)
+                record['timing'] = timing
+            print(json.dumps(record), flush=True)
+            if args.timing and rank == 0:
+                with timing_path.open('a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + '\n')
             if args.diagnostics and rank == 0 and base.last_diagnostics is not None:
                 components = base.last_diagnostics['components']
                 record = dict(step=step + 1, lr=float(lr), grad_total_preclip=grad_total_preclip,
@@ -313,8 +358,8 @@ def main():
                         if not args.no_deploy:
                             save_checkpoint(output / f'deploy_{step + 1:05d}.pt',
                                             deployment_package(base, step + 1))
-                    if world > 1:
-                        dist.barrier()
+                if world > 1:
+                    dist.barrier()
                 continue
             if (step + 1) % config['save_every'] == 0 or step + 1 == config['max_optimizer_steps']:
                 states = [None] * world

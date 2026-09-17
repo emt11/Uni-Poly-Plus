@@ -3,6 +3,7 @@ import json
 import os
 import random
 import subprocess
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -189,19 +190,90 @@ def move_labels(labels, device):
     return {key: value.to(device) if torch.is_tensor(value) else value for key, value in labels.items()}
 
 
+def _tensor_payload_bytes(value):
+    """Count tensor payload bytes without charging Python/container overhead."""
+
+    if torch.is_tensor(value):
+        return int(value.numel() * value.element_size())
+    if isinstance(value, dict):
+        return sum(_tensor_payload_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_tensor_payload_bytes(item) for item in value)
+    return 0
+
+
 class CleanLabeledDataset(Dataset):
-    def __init__(self, source, targets):
+    """Clean downstream samples with an optional bounded process-local cache.
+
+    The cache contains only the label-free CPU ``Data`` object.  Every access
+    returns a clone before attaching the current target, so scaler/label
+    overrides and DataLoader collation cannot mutate a cached sample.
+    """
+
+    def __init__(self, source, targets, *, cache_capacity_bytes=0):
         self.source = source
         self.raw_targets = np.asarray(targets, dtype=np.float64)
         self.targets = self.raw_targets.copy()
+        self.cache_capacity_bytes = max(0, int(cache_capacity_bytes))
+        self._cache = OrderedDict()
+        self._cache_bytes = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
+        self._cache_skipped_bytes = 0
+        if self.raw_targets.reshape(-1).size != len(source):
+            raise ValueError('downstream target count differs from frozen source')
 
     def set_target_override(self, targets):
-        self.targets = np.asarray(targets).reshape(-1)
+        values = np.asarray(targets).reshape(-1)
+        if values.size != len(self.source):
+            raise ValueError('target override count differs from frozen source')
+        self.targets = values
 
     def __len__(self):
         return len(self.source)
 
     def __getitem__(self, index):
-        data = build_dual_sample(*self.source[index], static=self.source.static_for(index))
+        index = int(index)
+        key = self.source.samples[index][0]
+        if self.cache_capacity_bytes:
+            entry = self._cache.pop(key, None)
+            if entry is not None:
+                cached, payload_bytes = entry
+                self._cache[key] = entry
+                self._cache_hits += 1
+                data = cached.clone()
+            else:
+                self._cache_misses += 1
+                built = build_dual_sample(*self.source[index], static=self.source.static_for(index))
+                payload_bytes = _tensor_payload_bytes(built.to_dict())
+                if payload_bytes > self.cache_capacity_bytes:
+                    self._cache_skipped_bytes += payload_bytes
+                    data = built.clone()
+                else:
+                    while (self._cache and
+                           self._cache_bytes + payload_bytes > self.cache_capacity_bytes):
+                        _, evicted = self._cache.popitem(last=False)
+                        self._cache_bytes -= evicted[1]
+                        self._cache_evictions += 1
+                    cached = built.clone()
+                    self._cache[key] = (cached, payload_bytes)
+                    self._cache_bytes += payload_bytes
+                    data = cached.clone()
+        else:
+            built = build_dual_sample(*self.source[index], static=self.source.static_for(index))
+            data = built.clone()
         data.y = torch.tensor([float(self.targets[index])], dtype=torch.float32)
         return data
+
+    def cache_stats(self):
+        return {
+            'enabled': bool(self.cache_capacity_bytes),
+            'capacity_bytes': int(self.cache_capacity_bytes),
+            'payload_bytes': int(self._cache_bytes),
+            'entries': len(self._cache),
+            'hits': int(self._cache_hits),
+            'misses': int(self._cache_misses),
+            'evictions': int(self._cache_evictions),
+            'skipped_bytes': int(self._cache_skipped_bytes),
+        }

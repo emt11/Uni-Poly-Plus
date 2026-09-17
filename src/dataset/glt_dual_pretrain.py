@@ -166,15 +166,18 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
         for field in ('line_source', 'line_target', 'line_path', 'line_path_group', 'bond_center'):
             if not torch.equal(getattr(clean, field), getattr(noisy, field)):
                 raise ValueError('coordinate perturbation changed physical topology')
-    # Use one path row for each genuine undirected one-hop center angle.
-    pairs, cosines = [], []
-    for row in range(clean.line_path.size(0)):
-        if int(clean.line_mask[row].sum()) != 1 or bool(clean.line_is_self[row]):
-            continue
-        a, b = clean.line_path[row, :2].tolist()
-        if a < b and clean.bond_center[a] and clean.bond_center[b]:
-            pairs.append([a, b])
-            cosines.append(clean.line_angle[row, 0].cos())
+    # Use one path row for each genuine undirected one-hop center angle.  Keep
+    # the original row order and directed relation multiplicity, but gather the
+    # validity mask in one tensor operation instead of scanning Python rows.
+    path = clean.line_path
+    row_valid = (clean.line_mask.sum(dim=1) == 1) & (~clean.line_is_self)
+    safe_a = path[:, 0].clamp_min(0)
+    safe_b = path[:, 1].clamp_min(0)
+    row_valid &= path[:, 0] < path[:, 1]
+    row_valid &= clean.bond_center[safe_a] & clean.bond_center[safe_b]
+    selected = torch.where(row_valid)[0]
+    pairs = path[selected, :2].long()
+    cosines = clean.line_angle[selected, 0].cos()
     reasons = []
     if not mask.any():
         reasons.append('chem:single_atom')
@@ -182,12 +185,12 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
         reasons.append('geo:' + clean.geometry_invalid_reason)
     elif not clean.bond_center.any():
         reasons.append('geo:no_center_bonds')
-    elif not pairs:
+    elif not pairs.numel():
         reasons.append('angle:no_center_angles')
     targets = dict(atom_mask=mask, atom_label=topology.mips_x[:, :101].argmax(-1),
         distance=clean.bond_distance[clean.bond_center].clone(),
-        angle_pairs=torch.tensor(pairs, dtype=torch.long).reshape(-1, 2),
-        angle_cos=torch.stack(cosines) if cosines else torch.empty(0),
+        angle_pairs=pairs.reshape(-1, 2),
+        angle_cos=cosines if cosines.numel() else torch.empty(0),
         fingerprint=fingerprint.clone(), fallback=fallback, skip_reasons=reasons)
     return noisy, targets
 

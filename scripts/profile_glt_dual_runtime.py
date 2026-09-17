@@ -36,6 +36,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-root", required=True)
     parser.add_argument("--cohort-root", required=True)
+    parser.add_argument("--dual-static-root",
+                        help="optional training-ready dual_static_v1 artifact")
+    parser.add_argument("--pretrain-target-root",
+                        help="optional pretrain_targets_v1 artifact")
     parser.add_argument("--samples", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=20260915)
     parser.add_argument("--report-json", required=True)
@@ -46,7 +50,11 @@ def main():
     cache_root = Path(args.cache_root).resolve()
     before = zero_write_snapshot(cache_root)
     opened = time.perf_counter()
-    source, _ = open_source(args.cohort_root, cache_root)
+    source, _ = open_source(
+        args.cohort_root, cache_root,
+        dual_static_root=args.dual_static_root,
+        pretrain_target_root=args.pretrain_target_root,
+    )
     open_seconds = time.perf_counter() - opened
     try:
         count = min(args.samples, len(source))
@@ -58,25 +66,32 @@ def main():
             records.append(source[index])
             read_times.append(time.perf_counter() - started)
 
-        # Warm only the bounded in-process BRICS/fingerprint memoization.  This
-        # is not a persistent sidecar and is part of the existing runtime.
-        for topology, _, smiles in records:
-            normalized = str(topology.normalized_canonical_smiles)
-            chemical_targets(normalized)
+        # Warm only the bounded in-process BRICS/fingerprint memoization when
+        # the target sidecar is absent.  Sidecar-backed preparation must not
+        # rebuild those targets merely because this is a profile.
+        if args.pretrain_target_root is None:
+            for topology, _, smiles in records:
+                normalized = str(topology.normalized_canonical_smiles)
+                chemical_targets(normalized)
 
         clean_times, prepare_times = [], []
         geometry_valid = 0
         for local, record in enumerate(records):
+            index = indices[local]
+            static = source.static_for(index) if args.dual_static_root else None
+            target = source.target_for(index) if args.pretrain_target_root else None
             started = time.perf_counter()
-            clean = build_dual_sample(*record)
+            clean = build_dual_sample(*record, static=static)
             clean_times.append(time.perf_counter() - started)
             geometry_valid += int(clean.geometry_valid)
             started = time.perf_counter()
             prepare_pretrain_sample(
                 *record,
                 seed=args.seed,
-                key=source.samples[indices[local]][0].hex(),
+                key=source.samples[index][0].hex(),
                 position=local,
+                static=static,
+                target=target,
             )
             prepare_times.append(time.perf_counter() - started)
     finally:
@@ -95,6 +110,10 @@ def main():
         "scope": "read-only current runtime profile; no model forward",
         "cache_root": str(cache_root),
         "cohort_root": str(Path(args.cohort_root).resolve()),
+        "dual_static_root": (str(Path(args.dual_static_root).resolve())
+                             if args.dual_static_root else None),
+        "pretrain_target_root": (str(Path(args.pretrain_target_root).resolve())
+                                 if args.pretrain_target_root else None),
         "cohort_count": len(source),
         "profile_count": count,
         "cohort_load_seconds": open_seconds,

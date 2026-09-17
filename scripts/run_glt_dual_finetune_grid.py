@@ -16,6 +16,80 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.finetune_glt_dual import TASKS, fixed_manifest
 
 
+def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
+    """Run isolated shards with a free-slot queue instead of batch barriers.
+
+    ``launch(task, fold, gpu)`` returns ``(process, handle, log_path)``.  A
+    completed process immediately frees its own GPU slot; a failed shard stops
+    new dispatch, while already-running shards are allowed to finish and are
+    still closed/recorded before the error is raised.
+    """
+
+    pending = list(jobs)
+    free = list(gpus)
+    active = {}
+    completed, failures = [], []
+
+    def drain_active():
+        """Wait for already-owned children and close their log handles."""
+        for gpu, (task, fold, process, handle, log_path) in list(active.items()):
+            code = process.wait()
+            handle.write(f'EXIT_CODE={code}\n')
+            handle.close()
+            completed.append({'task': task, 'fold': fold, 'log': str(log_path),
+                              'exit_code': code})
+            del active[gpu]
+
+    def start_available():
+        while pending and free and not failures:
+            task, fold = pending.pop(0)
+            gpu = free.pop(0)
+            try:
+                process, handle, log_path = launch(task, fold, gpu)
+            except BaseException:
+                free.insert(0, gpu)
+                drain_active()
+                raise
+            active[gpu] = (task, fold, process, handle, log_path)
+
+    start_available()
+    while active:
+        finished = []
+        for gpu, (task, fold, process, handle, log_path) in list(active.items()):
+            code = process.poll()
+            if code is None:
+                continue
+            handle.write(f'EXIT_CODE={code}\n')
+            handle.close()
+            del active[gpu]
+            free.append(gpu)
+            finished.append(gpu)
+            if code != 0:
+                failures.append({'task': task, 'fold': fold, 'exit_code': code,
+                                 'log': str(log_path)})
+            else:
+                completed.append({'task': task, 'fold': fold, 'log': str(log_path)})
+        if failures:
+            # Do not dispatch pending work after a failure.  Existing child
+            # processes remain owned and are waited/closed, so no orphaned
+            # shard is left behind.
+            if active:
+                time.sleep(float(poll_interval))
+            continue
+        if finished:
+            free.sort(key=str)
+            start_available()
+        else:
+            time.sleep(float(poll_interval))
+
+    if failures:
+        raise RuntimeError('formal shard failed; no new shards dispatched: '
+                           + json.dumps({'failures': failures,
+                                         'completed': completed,
+                                         'pending': pending}, sort_keys=True))
+    return completed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('config', 'checkpoint', 'raw-root', 'cohort-root', 'cache-root', 'dual-static-root', 'output'):
@@ -71,35 +145,26 @@ def main():
             raise RuntimeError('partial grid units present; inspect before retrying: '
                                + ', '.join(partial))
         jobs = pending
-    completed = []
-    for offset in range(0, len(jobs), len(gpus)):
-        batch = jobs[offset:offset + len(gpus)]
-        running = []
-        for (task, fold), gpu in zip(batch, gpus):
-            unit = output / f'{task}_fold{fold}'
-            log_path = log_root / f'{task}_fold{fold}.log'
-            command = [
-                sys.executable, 'scripts/finetune_glt_dual.py',
-                '--config', args.config, '--checkpoint', args.checkpoint,
-                '--raw-root', args.raw_root, '--cohort-root', args.cohort_root,
-                '--cache-root', args.cache_root, '--dual-static-root', args.dual_static_root,
-                '--output', str(unit), '--split-root', args.split_root,
-                '--task', task, '--fold', str(fold), '--formal-shard',
-            ]
-            handle = log_path.open('w', encoding='utf-8')
-            env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
-            handle.write('COMMAND=' + ' '.join(command) + '\nCUDA_VISIBLE_DEVICES=' + gpu + '\n')
-            handle.flush()
-            process = subprocess.Popen(command, cwd=Path(__file__).resolve().parents[1],
-                                       env=env, stdout=handle, stderr=subprocess.STDOUT)
-            running.append((task, fold, process, handle, log_path))
-        for task, fold, process, handle, log_path in running:
-            code = process.wait()
-            handle.write(f'EXIT_CODE={code}\n')
-            handle.close()
-            if code != 0:
-                raise RuntimeError(f'formal shard failed: task={task} fold={fold}; log={log_path}')
-            completed.append({'task': task, 'fold': fold, 'log': str(log_path)})
+    def launch(task, fold, gpu):
+        unit = output / f'{task}_fold{fold}'
+        log_path = log_root / f'{task}_fold{fold}.log'
+        command = [
+            sys.executable, 'scripts/finetune_glt_dual.py',
+            '--config', args.config, '--checkpoint', args.checkpoint,
+            '--raw-root', args.raw_root, '--cohort-root', args.cohort_root,
+            '--cache-root', args.cache_root, '--dual-static-root', args.dual_static_root,
+            '--output', str(unit), '--split-root', args.split_root,
+            '--task', task, '--fold', str(fold), '--formal-shard',
+        ]
+        handle = log_path.open('w', encoding='utf-8')
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
+        handle.write('COMMAND=' + ' '.join(command) + '\nCUDA_VISIBLE_DEVICES=' + gpu + '\n')
+        handle.flush()
+        process = subprocess.Popen(command, cwd=Path(__file__).resolve().parents[1],
+                                   env=env, stdout=handle, stderr=subprocess.STDOUT)
+        return process, handle, log_path
+
+    completed = _run_dynamic_jobs(jobs, gpus, launch)
     print({'status': 'PASS', 'completed': completed, 'count': len(completed),
            'skipped_existing': skipped})
 

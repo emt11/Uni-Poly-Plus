@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
@@ -65,14 +66,29 @@ def optimizer_for(model, config):
 
 def fit_select_and_test(model, scaler, train_loader, val_loader, test_loader, device,
                         optimizer, scheduler, config, *, task, fold_id,
-                        validation_only=False):
+                        validation_only=False, timing=False, timing_sink=None):
     encoder, criterion = model.encoder, nn.MSELoss()
     best, best_r2, best_epoch, stalled = None, -float('inf'), -1, 0
     for epoch in range(config['epochs']):
-        train_epoch(model, train_loader, criterion, optimizer, scheduler, device,
-                    epoch=epoch + 1, amp_dtype='fp32', max_grad_norm=1., fail_nonfinite=True)
+        epoch_started = time.perf_counter()
+        if timing:
+            train_result = train_epoch(
+                model, train_loader, criterion, optimizer, scheduler, device,
+                epoch=epoch + 1, amp_dtype='fp32', max_grad_norm=1., fail_nonfinite=True,
+                return_timing=True)
+            train_timing = train_result[-1]
+        else:
+            train_epoch(model, train_loader, criterion, optimizer, scheduler, device,
+                        epoch=epoch + 1, amp_dtype='fp32', max_grad_norm=1., fail_nonfinite=True)
+            train_timing = None
+        validation_started = time.perf_counter()
         val_loss, val_r2, _, _ = evaluate(model, val_loader, criterion, device,
-                                         scaler=scaler, amp_dtype='fp32')
+                                           scaler=scaler, amp_dtype='fp32')
+        if timing and timing_sink is not None:
+            timing_sink.append(dict(task=task, fold=int(fold_id), epoch=int(epoch + 1),
+                                    train=train_timing,
+                                    validation_seconds=float(time.perf_counter() - validation_started),
+                                    epoch_seconds=float(time.perf_counter() - epoch_started)))
         if not np.isfinite(val_r2) or not np.isfinite(val_loss):
             raise FloatingPointError('nonfinite validation metrics')
         print(json.dumps(dict(task=task, fold=fold_id, epoch=epoch + 1,
@@ -108,11 +124,17 @@ def main():
                         help='bounded train/validation-only task/fold smoke; never reads outer-test')
     parser.add_argument('--formal-shard', action='store_true',
                         help='run exactly one task/fold including outer-test for a grid launcher')
+    parser.add_argument('--clean-cache-gib', type=float, default=0.0,
+                        help='bounded process-local clean Data cache capacity in GiB (0 disables it)')
+    parser.add_argument('--timing', action='store_true',
+                        help='write per-epoch preparation/training/validation timing')
     args = parser.parse_args()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
     if config.get('use_md200') is not False:
         raise ValueError('dual route does not support MD200')
+    if not np.isfinite(args.clean_cache_gib) or args.clean_cache_gib < 0:
+        raise ValueError('--clean-cache-gib must be finite and non-negative')
     selected_tasks = list(args.tasks) if args.tasks else list(TASKS)
     selected_folds = [int(value) for value in args.folds] if args.folds else list(range(5))
     unknown_tasks = sorted(set(selected_tasks) - set(TASKS))
@@ -139,7 +161,7 @@ def main():
                   'outer5_inner20'),
         smoke=bool(args.smoke), formal_shard=bool(args.formal_shard), selected_tasks=selected_tasks,
         selected_folds=selected_folds, outer_test='NOT_RUN' if args.smoke else 'RUN'))
-    all_folds, task_summary = [], {}
+    all_folds, task_summary, timing_records = [], {}, []
     for task in selected_tasks:
         csv_path = Path(args.raw_root) / f'smi_{task}.csv'
         manifest_path = Path(args.split_root) / f'{task}.json'
@@ -160,7 +182,10 @@ def main():
             targets = frame['label'].to_numpy(dtype=np.float64)
             if not np.isfinite(targets).all():
                 raise ValueError('nonfinite labels')
-            dataset = CleanLabeledDataset(source, targets)
+            dataset = CleanLabeledDataset(
+                source, targets,
+                cache_capacity_bytes=int(args.clean_cache_gib * (1024 ** 3)),
+            )
             predictions = np.full(len(dataset), np.nan)
             visits = np.zeros(len(dataset), dtype=np.int64)
             results = []
@@ -188,7 +213,7 @@ def main():
                     best, best_r2, best_epoch, _ = fit_select_and_test(
                         model, scaler, train_loader, val_loader, None, device,
                         optimizer, scheduler, run_config, task=task, fold_id=fold_id,
-                        validation_only=True)
+                        validation_only=True, timing=args.timing, timing_sink=timing_records)
                     smoke_result = dict(
                         task=task, fold=fold_id, smoke=True,
                         protocol='outer5_inner20_smoke',
@@ -211,7 +236,8 @@ def main():
                     continue
                 best, best_r2, best_epoch, result = fit_select_and_test(
                     model, scaler, train_loader, val_loader, loader(test), device,
-                    optimizer, scheduler, run_config, task=task, fold_id=fold_id)
+                    optimizer, scheduler, run_config, task=task, fold_id=fold_id,
+                    timing=args.timing, timing_sink=timing_records)
                 y_true, y_pred = result.pop('_y_true'), result.pop('_y_pred')
                 if not np.isfinite(y_pred).all() or not all(np.isfinite(v) for v in result.values()):
                     raise FloatingPointError('nonfinite test predictions/metrics')
@@ -268,6 +294,11 @@ def main():
             std_definition='sample std across 5 folds (ddof=1)',
             interpretation='development-fold evaluation; not an independent blind test')
     write_json(output / 'summary.json', summary)
+    if args.timing:
+        write_json(output / 'timing.json', dict(
+            protocol=summary['protocol'], records=timing_records,
+            clean_cache=dataset.cache_stats(),
+        ))
 
 
 if __name__ == '__main__':

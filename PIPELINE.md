@@ -581,7 +581,11 @@ sum/count 归约；日志包含任务均值、有效样本数、目标数量、�
 `scripts/pretrain_glt_dual.py` 支持单进程/DDP；默认 microbatch=84，有效 batch=1008，
 累积次数自动取 `1008/(84*world_size)`，不整除即报错。逐 optimizer update 按绝对
 抽样位置分配样本；每 epoch 确定性打乱，跨 epoch 连续填满有效 batch。样本 key、seed、
-绝对位置决定 mask/噪声。数据在主进程按 microbatch 构建，不启动 DataLoader workers。
+绝对位置决定 mask/噪声。默认在主进程按 microbatch 构建；有界提速路径可显式传入
+`--prep-workers N` 使用确定性 CPU prefetch，worker 只按绝对位置准备冻结输入，不改变 mask、噪声、
+样本顺序或累积顺序。`--timing` 仅在短测中记录准备、H2D、forward/backward 和 optimizer 阶段时间，
+默认关闭且不改变训练语义。恢复带 worker 的运行时，先建立 DataLoader iterator 再恢复 checkpoint RNG，
+避免 worker base-seed 初始化消耗公共模型 RNG。
 BF16 仅用于模型，几何和 loss 使用 FP32。AdamW 默认 betas=(0.9,0.999)，weight decay=0。
 
 5000 updates，LR=2e-4，warmup=2000，cosine horizon=20000，end LR=1e-9，每 1000
@@ -599,7 +603,7 @@ BF16 仅用于模型，几何和 loss 使用 FP32。AdamW 默认 betas=(0.9,0.99
 MODE=concat
 mkdir -p logs/glt_dual_three_task
 set -o pipefail
-torchrun --standalone --nproc_per_node=3 scripts/pretrain_glt_dual.py \
+torchrun --standalone --nproc_per_node=4 scripts/pretrain_glt_dual.py \
   --config configs/mts/glt_dual_three_task_${MODE}.json \
   --samples-csv PI1M_CSV --topology-root TOPOLOGY_LAYER --trimer-root TRIMER_LAYER \
   --output results/glt_dual_three_task/${MODE}/pretrain \
@@ -618,11 +622,18 @@ scaler 和 split 生成函数，隔离旧模型工厂与默认参数。固定八
 
 每 fold 独立初始化性质头，加载对应模式的 5000-step 部署包；clean Trimer，无 mask、
 无噪声、无预训练标签。scaler 只拟合 train，standard-label MSE。两路 LR=1e-5，
-fusion/head LR=1e-4，AdamW weight decay=.02，batch=32/eval=64，FP32，worker=0；
+fusion/head LR=1e-4，AdamW weight decay=.02，batch=32/eval=64，FP32，worker=0；clean 输入可通过
+`--dual-static-root` 读取已发布的 `dual_static_v1`，并用 `--clean-cache-gib` 启用有界进程内 clean
+Data LRU（默认 0，关闭；不写磁盘、不缓存 GPU tensor）。
 最多 100 epochs、warmup=5、patience=10、clip=1。非有限 loss/gradient/指标报错。
 按 validation R² 选权重，恢复后 test 只评估一次。每行一次 OOF 预测；五折统计 std
 采用 ddof=1，macro8 为八个任务的 fold-mean R² 均值，pooled OOF 指标另列。
 这是既有开发折评估，不是独立盲测。微调不提供自动断点续跑，不覆盖已有输出目录。
+
+有界 grid 入口 `scripts/run_glt_dual_finetune_grid.py` 使用每个唯一 GPU 一个 shard 的 pending/running
+队列；某个 shard 成功释放槽位后立即派发下一个，失败或启动异常停止新派发并收口已持有进程。该调度优化
+只改变启动时序，不改变 task/fold、seed、模型、optimizer 或输出隔离；须以独立授权的真实 grid 运行验证，
+不能用合成调度测试宣称正式总工期收益。
 
 ```bash
 python scripts/finetune_glt_dual.py \
