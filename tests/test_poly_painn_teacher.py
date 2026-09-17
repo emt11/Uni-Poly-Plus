@@ -3,12 +3,14 @@ import math
 import pytest
 import torch
 from torch_geometric.data import Data
+from torch.utils.data import DataLoader
 
 from src.dataset.poly_painn_teacher import build_teacher_sample, validate_central_mapping
 from src.modules.poly_painn_teacher import (
     PolyPaiNNTeacher, load_teacher_deployment, teacher_deployment_package,
     teacher_global_objective,
 )
+from src.training.glt_dual_runtime import restore_rng, rng_state
 
 
 def _input(pos=None):
@@ -161,3 +163,23 @@ def test_ddp_graph_sum_count_formula():
     assert torch.equal(teacher_global_objective(local, torch.tensor(8.0), 2), torch.tensor(1.5))
     with pytest.raises(ValueError):
         teacher_global_objective(torch.empty(0), 1.0)
+
+
+def test_worker_iterator_rng_restore_is_exact():
+    class Values(torch.utils.data.Dataset):
+        def __len__(self):
+            return 8
+        def __getitem__(self, index):
+            return int(index)
+
+    torch.manual_seed(1234)
+    state = rng_state()
+    loader = DataLoader(Values(), batch_size=None, num_workers=1, persistent_workers=False)
+    iterator = iter(loader)
+    next(iterator)
+    restore_rng(state)
+    after_prefetch = torch.rand(16)
+    restore_rng(state)
+    reference = torch.rand(16)
+    assert torch.equal(after_prefetch, reference)
+    del iterator, loader

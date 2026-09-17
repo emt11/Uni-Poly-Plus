@@ -109,6 +109,15 @@ def _autocast(device, amp_dtype):
             if device.type == "cuda" and amp_dtype == "bf16" else nullcontext())
 
 
+def _hist_quantile(histogram, quantile):
+    total = int(histogram.sum().item())
+    if total <= 0:
+        return 0
+    threshold = max(1, int(math.ceil(float(quantile) * total)))
+    cumulative = torch.cumsum(histogram, dim=0)
+    return int(torch.searchsorted(cumulative, torch.tensor(threshold, device=histogram.device)).item())
+
+
 def _deterministic_average_gradients(model, rank, world):
     """Average gradients in a fixed rank order for the bounded exact-resume smoke.
 
@@ -330,6 +339,9 @@ def main():
                 "scalar_rms": float(torch.stack(scalar_values).mean().item()),
                 "vector_rms": float(torch.stack(vector_values).mean().item()),
                 "neighbor_hist": total_hist.cpu().tolist(),
+                "neighbor_p50": _hist_quantile(total_hist, 0.50),
+                "neighbor_p95": _hist_quantile(total_hist, 0.95),
+                "neighbor_max": int(torch.where(total_hist > 0)[0].max().item()),
                 "neighbor_hit_max_fraction": hit_fraction,
                 "gpu_visible": os.environ.get("CUDA_VISIBLE_DEVICES"), "gpu0_used": False,
             }
