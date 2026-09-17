@@ -133,3 +133,13 @@
 * 证据：既有 r3 focused tests 日志记录 `36 passed, 1 warning`（`logs/cache_opt_r3_tests2.log`），r2 固定 32-key parity 报告为 PASS（`results/cache_optimization_repair_20260916T234930Z/parity.json`），active frozen cache zero-write 与临时预算门控已在报告／实现中保留。上述证据在本次归档中只读复核，未重新运行测试或实验。
 * 重要边界：本周期**没有全量缓存重建、格式迁移或生产迁移**，没有切换或写入 active cache，没有修改模型、配置、checkpoint 或历史结果数字；未执行的 parity 重跑、长 benchmark、payload 全字节历史完整性、断电耐久、模型／训练验证仍为未验证，不因 CLOSED 状态而改变。
 * 交付与后续：`Plan_Cache.md` 与 `Plan.md` 已将缓存专项标记为 CLOSED，专项不再占据下一执行入口。若需生产切换、全量重建或新的优化，应另行制定计划并取得授权；本归档不产生这些操作的授权。
+
+### 2026-09-17 更正与最终收口｜CACHE-20260916-01/r4 已完成
+
+* 授权与角色：用户明确要求“将当前缓存处理设为完毕”。Codex 根据此前审查及本轮最终修正／既有日志核对完成状态更新；r4 代码和测试由执行者交付，Codex 本轮仅修改文档，不重新运行测试或实验。
+* 历史更正：上条 r3 CLOSED 后又发现发布期锁路径、finalize 诊断路径及 snapshot 异常释放缺口，因此 r3 关闭不是最终状态。保留当时记录和失败日志，以本条 r4 最终收口为准。
+* 最终实施与提交：`6877648` 将 flock 移至稳定的 artifact 同级路径、按 static→targets 加锁并在持锁后重新检查发布状态，增加诊断路径的词法／符号链接解析保护及对应合成回归；`84f91323cc274d04dc178beeb4e73a512ecfed1e` 将取得双锁后的 zero_write_snapshot 放入 try/finally，补充 snapshot 抛 OSError 后同进程可重新获取两把锁的测试。科学定义、数据集合、默认容量 2 和不采用容量 64 的决定不变。
+* 验收证据：本轮只读核对最终 diff、生产调用位置、回归测试源码及 `logs/cache_opt_r4_snapshot_final2.log`。实际命令为 `PYTHONPATH=.:tests pytest -q tests/test_glt_dual_static_recovery.py`，既有结果 `13 passed, 1 warning`、`EXIT_CODE=0`，窗口 `Uni-Poly:cache_opt_r4_snapshot_final2`；此前 r4 12 项、r3 focused tests 和 r2 固定 32-key parity 证据保留，不称为本轮新跑结果。
+* 文档操作：修改前 dev 工作树干净、HEAD 为 `84f9132`，pull 为 Already up to date；同步 `Plan_Cache.md` 完成状态与关闭说明、`Plan.md` 当前交接和本条归档；文档 diff／`git diff --check` 自检，提交与远端同步结果见对应 Git 历史和交付回复。没有改代码、缓存、PIPELINE.md、RESULTS.md 或历史指标。
+* 最终结论：**已完成／CLOSED**，仅覆盖本缓存专项约定的审计解释、构建恢复、冻结／互斥、验证工具与证据口径收口。不等于全量化学认证、payload 全字节历史完整性、断电耐久、生产迁移、吞吐或模型收益验收。
+* 下一步：**暂无后续缓存执行任务**。不补跑真实 parity、长 benchmark、训练，不启动全量重建、迁移、紧凑存储或清理；以后新增缓存工作另行规划并获得授权。其他科学计划不因本条自动完成。
