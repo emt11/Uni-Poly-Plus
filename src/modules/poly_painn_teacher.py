@@ -15,9 +15,19 @@ from torch import nn
 from torch_cluster import radius_graph
 
 
-def _scatter_sum(value: torch.Tensor, index: torch.Tensor, size: int) -> torch.Tensor:
+def _segment_sum(value: torch.Tensor, index: torch.Tensor, size: int) -> torch.Tensor:
+    """Deterministic sum by index (no CUDA atomic ``index_add_``).
+
+    Edges are sorted by ``(target, source)`` before this helper is called.  A
+    fixed-order prefix/segment reduction therefore gives identical floating
+    point accumulation across a continuous run and a checkpoint resume.
+    """
     result = value.new_zeros((size,) + value.shape[1:])
-    return result.index_add_(0, index, value)
+    if value.numel() == 0:
+        return result
+    unique, counts = torch.unique_consecutive(index, return_counts=True)
+    reduced = torch.segment_reduce(value, reduce="sum", lengths=counts)
+    return result.index_copy(0, unique, reduced)
 
 
 class _InvariantMLP(nn.Module):
@@ -79,6 +89,12 @@ class _PaiNNLayer(nn.Module):
             relative = pos[source].float() - pos[target].float()
             distance = relative.norm(dim=-1).clamp_min(1e-8)
             direction = relative / distance[:, None]
+            # Canonical edge order removes dependence on the radius-kernel's
+            # internal pair enumeration.  Target is primary (for segments),
+            # source secondary (for a stable order within each segment).
+            order = torch.argsort(target * node_count + source, stable=True)
+            source, target = source[order], target[order]
+            distance, direction = distance[order], direction[order]
         else:
             source = target = torch.empty(0, dtype=torch.long, device=pos.device)
             distance = direction = pos.new_empty((0,)) if not edge_index.numel() else None
@@ -99,8 +115,8 @@ class _PaiNNLayer(nn.Module):
                 sm = f_scalar * source_scalar + f_vector * projected
                 vm = (f_vector * source_scalar)[:, :, None] * unit[:, None, :]
                 vm = vm + f_mix[:, :, None] * source_vector
-                scalar_message.index_add_(0, dst, sm)
-                vector_message.index_add_(0, dst, vm)
+                scalar_message = scalar_message + _segment_sum(sm, dst, node_count)
+                vector_message = vector_message + _segment_sum(vm, dst, node_count)
 
         scalar_norm = vector.norm(dim=-1)
         message_norm = vector_message.norm(dim=-1)
