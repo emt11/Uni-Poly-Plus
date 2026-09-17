@@ -53,20 +53,34 @@ def validate_central_mapping(topology, trimer):
         raise ValueError("canonical-to-Trimer mapping is out of range")
     if not bool(central_mask[mapping_all].all()):
         raise ValueError("canonical-to-Trimer mapping leaves centre RU")
-    if not bool(torch.isin(mapping_all, heavy_all).all()):
-        raise ValueError("canonical-to-Trimer mapping contains non-heavy atoms")
     if not torch.equal(atomic[mapping_all], topology_z):
         raise ValueError("canonical-to-Trimer atomic-number mapping mismatch")
+    canonical_heavy_mask = torch.as_tensor(
+        getattr(trimer, "o8_heavy_mask", topology_z > 1), dtype=torch.bool
+    ).reshape(-1)
+    if canonical_heavy_mask.numel() != canonical_count:
+        raise ValueError("O8 heavy mask/canonical atom count mismatch")
+    canonical_heavy_indices = torch.where(canonical_heavy_mask)[0]
+    if canonical_heavy_indices.numel() == 0:
+        raise ValueError("centre RU has no canonical heavy atoms")
+    # Explicit H/D atoms remain part of the frozen identity table and are
+    # checked above, but are not teacher nodes or denoising targets.  This
+    # preserves the project's published heavy-atom semantics without inventing
+    # a new atom-order mapping.
+    heavy_mapping_all = mapping_all[canonical_heavy_indices]
+    if not bool(torch.isin(heavy_mapping_all, heavy_all).all()):
+        raise ValueError("canonical heavy mapping contains non-heavy atoms")
     heavy_local = torch.full((positions.size(0),), -1, dtype=torch.long)
     heavy_local[heavy_all] = torch.arange(heavy_all.numel(), dtype=torch.long)
-    central_heavy = heavy_local[mapping_all]
+    central_heavy = heavy_local[heavy_mapping_all]
     if bool((central_heavy < 0).any()) or central_heavy.unique().numel() != central_heavy.numel():
         raise ValueError("canonical-to-heavy mapping is not one-to-one")
     return {
         "heavy_all_indices": heavy_all,
         "heavy_atomic_number": atomic[heavy_all],
         "central_heavy_index": central_heavy,
-        "central_all_index": mapping_all,
+        "central_all_index": heavy_mapping_all,
+        "canonical_heavy_indices": canonical_heavy_indices,
         "positions": positions[heavy_all],
     }
 

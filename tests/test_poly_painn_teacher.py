@@ -98,6 +98,14 @@ def test_central_mapping_and_heavy_subset_are_strict():
     bad.trimer_central_ru_mask[2] = False
     with pytest.raises(ValueError, match="centre RU"):
         validate_central_mapping(topology, bad)
+    topology_h = Data(mips_x=torch.zeros(3, 137), z=torch.tensor([6, 1, 7]))
+    trimer_h = _top_trimer()[1]
+    trimer_h.trimer_atomic_number[1] = 1
+    trimer_h.mips_to_trimer_central_index = torch.tensor([0, 1, 2])
+    trimer_h.o8_heavy_mask = torch.tensor([True, False, True])
+    checked_h = validate_central_mapping(topology_h, trimer_h)
+    assert checked_h["canonical_heavy_indices"].tolist() == [0, 2]
+    assert checked_h["central_heavy_index"].tolist() == [0, 2]
 
 
 def test_deterministic_noise_uses_seed_key_and_absolute_position():
