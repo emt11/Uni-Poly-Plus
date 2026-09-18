@@ -4,17 +4,25 @@
 
 | 字段 | 内容 |
 | --- | --- |
-| 计划 | GLT-ENGINEERING-20260918-01 / r1 |
-| 状态 | 待审查；S0–S5 已执行，S6 交接材料已生成，等待 Codex 独立审查 |
+| 计划 | GLT-ENGINEERING-20260918-01 / r2 |
+| 状态 | 待审查；r2 修复、局部测试和有界 worker=3/窗口校验已完成，等待 Codex 独立审查 |
 | 用户要求 | 给出其他模型可直接执行的完整工程方案；完成并验收本方案后，才另行考虑预测性能优化 |
 | 范围 | GLT 双通道的数据准备、诊断、计时、输入复用、传输与调度；不优化预测准确率 |
 | 角色 | Codex 规划与独立验收；接手模型负责实现、局部测试和规定的有界测速，并记录实际执行者 |
-| 核查基线 | dev，执行前为 `6f7c877`；2026-09-18 pull 为 Already up to date；执行期间仅修改本计划与本轮列出的源码/测试文件；此前计划已写入本文件 |
+| 核查基线 | dev，r2 开始前为 `afcfb9a`；2026-09-18 pull 为 Already up to date；保留 r1 的实现、日志和产物，不重做微调预算 |
 | 既有工作 | CACHE-20260916-01/r4、SPEED-20260917-01/r4 均已归档；不重做已完成工作，不复活旧科学计划 |
 
 **给执行模型的指令：**先完整读取 AGENTS.md 和本文。收到用户“执行本计划”的授权后，依次完成 S0→S1→S2→S3→S4→S5→S6；普通实现细节自行处理，不重复询问已授权的小步骤。不要只输出另一份计划。受阻则停止受影响阶段、保留证据，继续不依赖阻断项的代码/测试工作；不得偷偷更换协议、缩小验收集合或扩大预算。最终状态只能先标“待审查”，由 Codex 审查后关闭。
 
 本文中的新增接口均明确标为“拟新增”，实施前不能直接运行。已有 CLI 模板使用已核实参数。文档本身不替代执行授权。
+
+### r2 返修范围（仅处理独立审查指出的执行合同缺口）
+
+- 修正 `run_glt_dual_finetune_grid.py --resume`：必须核对 run/summary/runtime 的模式、单一 task/fold、协议和 outer-test 状态；拒绝 smoke/formal 混用，不把非本次模式的非空 `tasks` 当作完成。
+- 修正预训练 benchmark：保留逐步 CPU 观测作诊断，主 `window_seconds` 改为 warmup 后窗口边界到末端同步的完整墙钟，并汇总各 rank 的完整窗口最大值；不重跑 every20 候选或正式训练。
+- 修正 CPU profile：独立 clean 诊断置于完整 prepare/collate 消费链之外，明确 `pretrain_prepare` 是内部 clean+noisy 准备，不再把重复 clean 构建计入 `complete_sample`。
+- 为 grid 子进程写入 launch/exit 边界时间，未来可获得 launch-to-exit；既有 r1 微调结果只保留为“内部 process wall”，不追加 24 epochs。
+- 追溯并补记既有 parity、DDP/梯度、测试日志和资源证据；有证据则限定适用范围，无证据明确未执行。不增加新的科学候选，不修改 active cache、配置或样本集合。
 
 ## 1. 本轮只做什么、绝不做什么
 
@@ -288,3 +296,23 @@ RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗�
 - 资源与边界：预训练使用3张GPU（0,1,2），微调/调度使用GPU3或2、3；预训练累计132个实际 optimizer updates，微调累计24 epochs；所有真实 smoke 均未访问 outer-test。历史/正式5k、20k、完整OOF和4-GPU正式吞吐均未执行。
 - 失败证据保留：`003412Z/profile.json`/日志记录首次 profile 字段错误及零写入；修正后 profile 单次重跑通过。所有长任务在 `tmux` session `Uni-Poly` 独立 `glt_eng_*` window 中执行。
 - 提交与同步：本轮源码、测试和文档在 `dev` 提交 `d99bc70`，交接记录在 `a90ab16`；`HEAD` 与 `origin/dev` 均为 `a90ab16`，Codex 独立审查尚未进行，状态保持“待审查”。
+
+### r2 返修执行记录（2026-09-18，执行完成，待 Codex 审查）
+
+| 项目 | 实际结果 | 证据与边界 |
+| --- | --- | --- |
+| grid resume 身份隔离 | 已修复；局部测试通过，既有 8 个 smoke unit 的模式/身份核对通过 | `scripts/run_glt_dual_finetune_grid.py`；`tests/test_glt_dual_speed.py`；拒绝 smoke/formal 混用，不重建 resume 框架 |
+| 预训练窗口计时 | 已修复；单次 schema 校验 PASS | `results/glt_engineering_20260918/r2_window_check/benchmark.json`；8 updates=2 warmup+6 measured，6048 samples，窗口 15.7587 s；不作为收益比较 |
+| profile 计时 | 已修复；256 条 PASS、冻结缓存零写入 | `results/glt_engineering_20260918/r2_profile.json`、`logs/glt_engineering_20260918/r2_profile.log`；`pretrain_prepare` 明确包含内部 clean+noisy，`clean_diagnostic` 不计入 `complete_sample` |
+| worker=3 correctness/resume | PASS；3 GPU、每 rank 3 workers，12 个实际 optimizer updates | `results/glt_engineering_20260918/r2_correctness_workers3/correctness_workers3.json`；model/optimizer/scheduler/RNG/position/identity 与 rank-0 loss/target exact |
+| 局部测试 | PASS：34 passed, 1 warning，退出码 0；`py_compile` 与 `git diff --check` 通过 | `logs/glt_engineering_20260918/r2_local_tests.log`；未运行全仓测试 |
+| grid launch-to-exit 记录 | 已加入代码，未对历史 24 epochs 重跑 | 新日志写入 `GRID_LAUNCH_MONOTONIC`、`GRID_EXIT_MONOTONIC`、`GRID_LAUNCH_TO_EXIT_SECONDS`；历史 r1 grid 的 0.9% 差异撤回精确收益解释 |
+
+#### r2 证据补记与未执行项
+
+- 既有 `results/speed_20260917/parity_32.json` 和 `downstream_parity_32.json` 已追溯；它们是 r2 未重跑的 32-key/32-row 输入与标签 parity，只适用于未改变数据算术的路径，不验证新计时字段。
+- 既有 `test_per_graph_and_ddp_gradient_reference` 仍是单进程代数参考；本 r2 未新增真实多 rank“部分/all rank 无几何目标”通信/backward 证据，标记未执行。
+- r1 的微调 24 epochs 预算已用满，原约40%数字仅保留为相同 static 条件下的内部 process wall，不称为完整 launch-to-exit；r2 不追加微调。
+- 首次 worker=3 step=2 命令因误传 `--diagnostic-save-steps 4` 在训练前失败，日志 `.../resume_step2.log` 保留，实际 optimizer updates=0；retry 使用新隔离目录且全部退出码0。
+- r2 预训练累计新增 20 个 updates（worker correctness 12，窗口 schema 校验 8），总计 152/316；没有正式 5k/20k、完整微调、OOF/outer-test、缓存重建或科学性能比较。GPU 峰值资源未独立采样；CPU profile RSS 仍在 profile JSON 中。
+- 当前工作区修改尚未提交；完成审查前不关闭计划。

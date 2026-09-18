@@ -95,8 +95,8 @@ def main():
         indices = torch.randperm(len(source), generator=generator)[:count].tolist()
         sample_keys = [source.samples[int(index)][0].hex() for index in indices]
         phase = {name: [] for name in (
-            'source_read', 'static_read', 'target_read', 'clean_prepare',
-            'noisy_prepare', 'collate', 'complete_sample')}
+            'source_read', 'static_read', 'target_read',
+            'pretrain_prepare', 'collate', 'complete_sample', 'clean_diagnostic')}
         graph_sizes = {'nodes': [], 'bonds': [], 'relations': [], 'valid_relation_steps': []}
         geometry_valid = 0
         for local, raw_index in enumerate(indices):
@@ -110,9 +110,6 @@ def main():
             target_started = time.perf_counter()
             target = source.target_for(index) if args.pretrain_target_root else None
             after_target = time.perf_counter()
-            clean_started = time.perf_counter()
-            clean = build_dual_sample(*record, static=static)
-            after_clean = time.perf_counter()
             prepared_started = time.perf_counter()
             noisy, labels = prepare_pretrain_sample(
                 *record,
@@ -126,13 +123,20 @@ def main():
             collate_started = time.perf_counter()
             pretrain_collate([(noisy, labels)])
             after_collate = time.perf_counter()
+            # The full consumer path above already constructs its own clean
+            # view internally.  Keep this independent clean construction as
+            # a diagnostic phase outside the complete-path timing instead of
+            # counting it twice in ``complete_sample``.
+            clean_diagnostic_started = time.perf_counter()
+            clean = build_dual_sample(*record, static=static)
+            after_clean_diagnostic = time.perf_counter()
             phase['source_read'].append(after_source - started)
             phase['static_read'].append(after_static - static_started)
             phase['target_read'].append(after_target - target_started)
-            phase['clean_prepare'].append(after_clean - clean_started)
-            phase['noisy_prepare'].append(after_prepare - prepared_started)
+            phase['pretrain_prepare'].append(after_prepare - prepared_started)
             phase['collate'].append(after_collate - collate_started)
             phase['complete_sample'].append(after_collate - started)
+            phase['clean_diagnostic'].append(after_clean_diagnostic - clean_diagnostic_started)
             geometry_valid += int(clean.geometry_valid)
             graph_sizes['nodes'].append(int(clean.mips_x.size(0)))
             graph_sizes['bonds'].append(int(clean.bond_distance.numel()))

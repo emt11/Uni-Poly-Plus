@@ -1,5 +1,6 @@
 """Bounded speed-path tests: process-local clean cache and dynamic shard slots."""
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,8 @@ from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Data
 
 from scripts.run_glt_dual_finetune_grid import (
-    _build_shard_command, _run_batched_jobs, _run_dynamic_jobs, _validate_gpu_slots,
+    _build_shard_command, _completed_unit_matches, _run_batched_jobs,
+    _run_dynamic_jobs, _validate_gpu_slots,
 )
 from scripts.pretrain_glt_dual import _diagnostic_update, _time_summary
 from src.training import glt_dual_runtime as runtime
@@ -113,6 +115,38 @@ def test_grid_smoke_command_uses_validation_only_mode():
     assert command[command.index('--clean-cache-gib') + 1] == '4'
 
 
+def _write_grid_unit(unit, *, smoke):
+    protocol = 'outer5_inner20_smoke' if smoke else 'outer5_inner20_formal_shard'
+    outer = 'NOT_RUN' if smoke else 'RUN'
+    summary_outer = 'NOT_RUN' if smoke else 'RUN_ONCE'
+    unit.mkdir()
+    (unit / 'run.json').write_text(json.dumps({
+        'protocol': protocol, 'smoke': smoke, 'formal_shard': not smoke,
+        'selected_tasks': ['eat'], 'selected_folds': [1], 'outer_test': outer,
+    }), encoding='utf-8')
+    task = {'smoke': True, 'outer_test': 'NOT_RUN'} if smoke else {
+        'formal_shard': True, 'outer_test': 'RUN_ONCE'}
+    (unit / 'summary.json').write_text(json.dumps({
+        'protocol': protocol, 'smoke': smoke, 'formal_shard': not smoke,
+        'outer_test': summary_outer, 'tasks': {'eat': task},
+    }), encoding='utf-8')
+    (unit / 'runtime.json').write_text(json.dumps({
+        'status': 'PASS', 'protocol': protocol, 'smoke': smoke,
+        'formal_shard': not smoke, 'selected_tasks': ['eat'],
+        'selected_folds': [1], 'outer_test': outer,
+    }), encoding='utf-8')
+
+
+def test_grid_resume_requires_matching_mode_and_identity(tmp_path):
+    unit = tmp_path / 'eat_fold1'
+    _write_grid_unit(unit, smoke=True)
+    assert _completed_unit_matches(unit, 'eat', 1, True)
+    with pytest.raises(RuntimeError, match='incompatible grid unit'):
+        _completed_unit_matches(unit, 'eat', 1, False)
+    with pytest.raises(RuntimeError, match='incompatible grid unit'):
+        _completed_unit_matches(unit, 'xc', 1, True)
+
+
 def test_batched_scheduler_waits_for_each_batch(tmp_path):
     launch_order = []
 
@@ -126,6 +160,8 @@ def test_batched_scheduler_waits_for_each_batch(tmp_path):
     completed = _run_batched_jobs([('task', 0), ('task', 1), ('task', 2)], ['0', '1'], launch)
     assert [(row['task'], row['fold']) for row in completed] == [('task', 0), ('task', 1), ('task', 2)]
     assert launch_order == [('task', 0, '0'), ('task', 1, '1'), ('task', 2, '0')]
+    assert all(row['launch_to_exit_seconds'] >= 0 for row in completed)
+    assert 'GRID_LAUNCH_TO_EXIT_SECONDS=' in (tmp_path / 'task_0.log').read_text()
 
 
 def test_diagnostic_sampling_is_first_interval_and_explicit_save_steps():

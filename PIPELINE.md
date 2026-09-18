@@ -1050,3 +1050,30 @@ sample。微调 timing 补充 source 打开、首批、best 权重复制、保�
 实际证据：局部命令 `PYTHONPATH=.:tests /opt/conda/bin/python -m pytest -q tests/test_glt_dual_speed.py tests/test_glt_dual_diagnostics.py tests/test_dual_glt_pretrain.py` 为 `33 passed, 1 warning`、退出码0；256条 CPU profile 报告为 `results/glt_engineering_20260918/20260918T003509Z/profile.json`，首次字段错误报告保留在 `20260918T003412Z`；3-GPU correctness/resume 报告 `results/glt_engineering_20260918/20260918T003654Z/correctness.json` 为 PASS；ABBA benchmark 在 `20260918T004314Z/pretrain_*/benchmark.json`，every1 为 325.917/331.940、every20 为 331.669/319.285 samples/s，配对方向相反且未达10% gate；下游 cache A-B-B-A 与四单位两策略 smoke 产物在 `20260918T005342Z`、`20260918T005721Z`，outer-test 均 `NOT_RUN`。
 
 汇总机器可读报告：`results/glt_engineering_20260918/summary.json`。本周期未执行 S4 额外预训练候选、最终组合确认、正式5k/20k、完整微调/OOF、outer-test、新缓存或构象生成；预训练实际132/316 updates，微调实际24/24 smoke epochs。上述结果仅为工程 smoke/profile，不构成模型性能结论。
+
+### GLT-ENGINEERING-20260918-01 / r2 返修（2026-09-18，待 Codex 审查）
+
+r2 只修正执行合同和证据口径，不增加优化候选。`run_glt_dual_finetune_grid.py --resume` 现在同时核对
+`run.json`、`summary.json`、`runtime.json` 的 smoke/formal 模式、协议、单一 task/fold、outer-test
+和 PASS 状态；不兼容的已有 unit 会拒绝跳过，避免把 validation-only smoke 当成 formal shard。
+grid 子进程日志新增 `GRID_LAUNCH_MONOTONIC`、`GRID_EXIT_MONOTONIC` 和
+`GRID_LAUNCH_TO_EXIT_SECONDS`，用于后续完整 launch-to-exit 记录。
+
+预训练 benchmark 的主速度字段改为 warmup 后窗口边界到末端 CUDA 同步的完整窗口墙钟，并取各 rank
+完整窗口时间的最大值；逐步时间保留为 `cpu_observed_without_per_update_cuda_sync`，不再把
+`sum(stepwise max rank)` 当作主窗口。CPU profile 的 `pretrain_prepare` 明确是内部 clean+noisy
+准备，独立 `clean_diagnostic` 在完整消费链之后计时，`complete_sample` 不含该额外构建。
+
+r2 局部测试为 `34 passed, 1 warning`（日志 `logs/glt_engineering_20260918/r2_local_tests.log`）。
+256 条 profile 及 3-GPU、每 rank 3 workers 的 correctness/resume 证据分别为
+`results/glt_engineering_20260918/r2_profile.json` 和
+`results/glt_engineering_20260918/r2_correctness_workers3/correctness_workers3.json`；后者的
+model/optimizer/scheduler/RNG/position/identity 与 rank-0 loss/target 记录 exact。窗口计时 schema
+的单次 8-update 校验为 `results/glt_engineering_20260918/r2_window_check/benchmark.json`，
+不作为 ABBA 或吞吐收益比较。
+
+既有 `results/speed_20260917/parity_32.json` 与 `downstream_parity_32.json` 在 r2 仅作适用范围
+受限的历史证据，未重跑；真实多 rank 无几何目标通信/backward、GPU 峰值采样和含解释器启动的
+历史 launch-to-exit 仍未验证。r1 微调 24 epochs 不追加，原约 40% 数字收窄为内部 process wall；
+r1 grid 约 0.9% 差异不再解释为精确调度收益。r2 没有正式训练、完整微调、OOF/outer-test、缓存
+重建或科学性能结论。

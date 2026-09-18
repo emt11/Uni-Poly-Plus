@@ -283,6 +283,7 @@ def main():
         dense_lo = min(save_steps) - 60 if save_steps else None
         benchmark_mode = bool(args.benchmark_steps)
         benchmark_times, benchmark_graphs = [], []
+        benchmark_window_started = None
         if benchmark_mode:
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
@@ -301,6 +302,7 @@ def main():
                     torch.cuda.synchronize(device)
                 if world > 1:
                     dist.barrier()
+                benchmark_window_started = time.perf_counter()
                 step_started = time.perf_counter()
             timing = {}
             diag_this_step = bool(
@@ -421,9 +423,10 @@ def main():
                                      target_counts.tolist(),
                                      (totals / counts.clamp_min(1)).tolist())
             if benchmark_mode:
-                if device.type == 'cuda':
-                    torch.cuda.synchronize(device)
                 if step_number > start + args.benchmark_warmup:
+                    # This is intentionally a CPU-observed diagnostic only;
+                    # the primary benchmark uses the complete window boundary
+                    # below and performs no per-update CUDA synchronization.
                     benchmark_times.append(time.perf_counter() - step_started)
                     benchmark_graphs.append(float(counts[2].detach().cpu()))
                 continue
@@ -461,17 +464,22 @@ def main():
                 if world > 1:
                     dist.barrier()
         if benchmark_mode:
-            payload = dict(rank=rank, step_seconds=benchmark_times, graph_counts=benchmark_graphs)
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            local_window_seconds = time.perf_counter() - benchmark_window_started
+            payload = dict(rank=rank, step_seconds_cpu_observed=benchmark_times,
+                           graph_counts=benchmark_graphs,
+                           window_seconds=float(local_window_seconds))
             gathered = [None] * world
             if world > 1:
                 dist.all_gather_object(gathered, payload)
             else:
                 gathered[0] = payload
             if rank == 0:
-                slowest = [max(item['step_seconds'][index] for item in gathered)
+                slowest = [max(item['step_seconds_cpu_observed'][index] for item in gathered)
                            for index in range(len(benchmark_times))]
                 measured_updates = len(slowest)
-                window_seconds = float(sum(slowest))
+                window_seconds = float(max(item['window_seconds'] for item in gathered))
                 write_json(output / 'benchmark.json', dict(
                     status='PASS', benchmark_steps=int(args.benchmark_steps),
                     benchmark_warmup=int(args.benchmark_warmup),
@@ -480,9 +488,14 @@ def main():
                     samples=int(measured_updates * batch_size),
                     window_seconds=window_seconds,
                     samples_per_second=float(measured_updates * batch_size / max(window_seconds, 1e-12)),
-                    slowest_rank_step_seconds=slowest,
-                    slowest_rank_timing=_time_summary(slowest),
-                    per_rank_timing={str(item['rank']): _time_summary(item['step_seconds'])
+                    slowest_rank_window_seconds=window_seconds,
+                    per_rank_window_seconds={str(item['rank']): float(item['window_seconds'])
+                                     for item in gathered},
+                    step_timing_scope='cpu_observed_without_per_update_cuda_sync',
+                    slowest_rank_step_seconds_cpu_observed=[
+                        max(item['step_seconds_cpu_observed'][index] for item in gathered)
+                        for index in range(measured_updates)],
+                    per_rank_step_timing={str(item['rank']): _time_summary(item['step_seconds_cpu_observed'])
                                      for item in gathered},
                     graph_count_sum=float(sum(max(item['graph_counts'][index] for item in gathered)
                                               for index in range(measured_updates))),

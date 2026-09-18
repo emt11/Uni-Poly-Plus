@@ -40,6 +40,81 @@ def _build_shard_command(args, task, fold, unit):
     ]
 
 
+def _completed_unit_matches(unit, task, fold, smoke):
+    """Validate a resumable unit's mode and identity before skipping it."""
+
+    unit = Path(unit)
+    paths = {name: unit / f'{name}.json' for name in ('run', 'summary', 'runtime')}
+    if not all(path.is_file() for path in paths.values()):
+        return False
+    try:
+        records = {name: json.loads(path.read_text(encoding='utf-8'))
+                   for name, path in paths.items()}
+    except (OSError, ValueError):
+        return False
+    expected_protocol = 'outer5_inner20_smoke' if smoke else 'outer5_inner20_formal_shard'
+    expected_outer = 'NOT_RUN' if smoke else 'RUN'
+    expected_summary_outer = 'NOT_RUN' if smoke else 'RUN_ONCE'
+    run, summary, runtime = records['run'], records['summary'], records['runtime']
+    mismatches = []
+    for name, record in (('run', run), ('runtime', runtime)):
+        if record.get('protocol') != expected_protocol:
+            mismatches.append(f'{name}.protocol={record.get("protocol")!r}')
+        if bool(record.get('smoke')) != bool(smoke):
+            mismatches.append(f'{name}.smoke={record.get("smoke")!r}')
+        if bool(record.get('formal_shard')) != (not smoke):
+            mismatches.append(f'{name}.formal_shard={record.get("formal_shard")!r}')
+        if record.get('selected_tasks') != [task]:
+            mismatches.append(f'{name}.selected_tasks={record.get("selected_tasks")!r}')
+        if record.get('selected_folds') != [int(fold)]:
+            mismatches.append(f'{name}.selected_folds={record.get("selected_folds")!r}')
+        if record.get('outer_test') != expected_outer:
+            mismatches.append(f'{name}.outer_test={record.get("outer_test")!r}')
+    if summary.get('protocol') != expected_protocol:
+        mismatches.append(f'summary.protocol={summary.get("protocol")!r}')
+    if bool(summary.get('smoke')) != bool(smoke):
+        mismatches.append(f'summary.smoke={summary.get("smoke")!r}')
+    if bool(summary.get('formal_shard')) != (not smoke):
+        mismatches.append(f'summary.formal_shard={summary.get("formal_shard")!r}')
+    if summary.get('outer_test') != expected_summary_outer:
+        mismatches.append(f'summary.outer_test={summary.get("outer_test")!r}')
+    if runtime.get('status') != 'PASS':
+        mismatches.append(f'runtime.status={runtime.get("status")!r}')
+    task_record = summary.get('tasks', {}).get(task) if isinstance(summary.get('tasks'), dict) else None
+    if not isinstance(task_record, dict):
+        mismatches.append('summary.tasks does not contain the selected task')
+    elif smoke and (not task_record.get('smoke') or task_record.get('outer_test') != 'NOT_RUN'):
+        mismatches.append('summary task is not a validation-only smoke')
+    elif not smoke and (not task_record.get('formal_shard') or task_record.get('outer_test') != 'RUN_ONCE'):
+        mismatches.append('summary task is not a formal shard')
+    if mismatches:
+        raise RuntimeError(
+            f'refusing to resume incompatible grid unit {unit}: ' + '; '.join(mismatches))
+    return True
+
+
+def _launch_with_boundary(launch, task, fold, gpu):
+    process, handle, log_path = launch(task, fold, gpu)
+    launched = time.monotonic()
+    handle.write(f'GRID_LAUNCH_MONOTONIC={launched}\n')
+    handle.flush()
+    return task, fold, process, handle, log_path, launched
+
+
+def _finish_child(item):
+    task, fold, process, handle, log_path, launched = item
+    code = process.wait()
+    exited = time.monotonic()
+    elapsed = exited - launched
+    handle.write(
+        f'GRID_EXIT_MONOTONIC={exited}\n'
+        f'GRID_LAUNCH_TO_EXIT_SECONDS={elapsed}\n'
+        f'EXIT_CODE={code}\n')
+    handle.close()
+    return {'task': task, 'fold': fold, 'log': str(log_path),
+            'exit_code': code, 'launch_to_exit_seconds': float(elapsed)}
+
+
 def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
     """Run isolated shards with a free-slot queue instead of batch barriers.
 
@@ -56,12 +131,9 @@ def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
 
     def drain_active():
         """Wait for already-owned children and close their log handles."""
-        for gpu, (task, fold, process, handle, log_path) in list(active.items()):
-            code = process.wait()
-            handle.write(f'EXIT_CODE={code}\n')
-            handle.close()
-            completed.append({'task': task, 'fold': fold, 'log': str(log_path),
-                              'exit_code': code})
+        for gpu, item in list(active.items()):
+            row = _finish_child(item)
+            completed.append(row)
             del active[gpu]
 
     def start_available():
@@ -69,30 +141,29 @@ def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
             task, fold = pending.pop(0)
             gpu = free.pop(0)
             try:
-                process, handle, log_path = launch(task, fold, gpu)
+                item = _launch_with_boundary(launch, task, fold, gpu)
             except BaseException:
                 free.insert(0, gpu)
                 drain_active()
                 raise
-            active[gpu] = (task, fold, process, handle, log_path)
+            active[gpu] = item
 
     start_available()
     while active:
         finished = []
-        for gpu, (task, fold, process, handle, log_path) in list(active.items()):
+        for gpu, item in list(active.items()):
+            task, fold, process, handle, log_path, _ = item
             code = process.poll()
             if code is None:
                 continue
-            handle.write(f'EXIT_CODE={code}\n')
-            handle.close()
+            row = _finish_child(item)
             del active[gpu]
             free.append(gpu)
             finished.append(gpu)
             if code != 0:
-                failures.append({'task': task, 'fold': fold, 'exit_code': code,
-                                 'log': str(log_path)})
+                failures.append(row)
             else:
-                completed.append({'task': task, 'fold': fold, 'log': str(log_path)})
+                completed.append(row)
         if failures:
             # Do not dispatch pending work after a failure.  Existing child
             # processes remain owned and are waited/closed, so no orphaned
@@ -123,20 +194,15 @@ def _run_batched_jobs(jobs, gpus, launch):
         try:
             for task, fold in jobs[offset:offset + len(gpus)]:
                 gpu = gpus[len(active)]
-                process, handle, log_path = launch(task, fold, gpu)
-                active.append((task, fold, process, handle, log_path))
+                active.append(_launch_with_boundary(launch, task, fold, gpu))
         except BaseException:
-            for _, _, process, handle, _ in active:
-                code = process.wait()
-                handle.write(f'EXIT_CODE={code}\n')
-                handle.close()
+            for item in active:
+                _finish_child(item)
             raise
         failures = []
-        for task, fold, process, handle, log_path in active:
-            code = process.wait()
-            handle.write(f'EXIT_CODE={code}\n')
-            handle.close()
-            row = {'task': task, 'fold': fold, 'log': str(log_path), 'exit_code': code}
+        for item in active:
+            row = _finish_child(item)
+            code = row['exit_code']
             if code:
                 failures.append(row)
             else:
@@ -210,10 +276,7 @@ def main():
             summary_path = unit / 'summary.json'
             complete = False
             if summary_path.is_file():
-                try:
-                    complete = bool(json.loads(summary_path.read_text(encoding='utf-8')).get('tasks'))
-                except ValueError:
-                    complete = False
+                complete = _completed_unit_matches(unit, task, fold, args.smoke)
             if complete:
                 skipped.append(f'{task}_fold{fold}')
             else:
