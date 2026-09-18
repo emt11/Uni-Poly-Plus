@@ -2,6 +2,7 @@
 """Clean dual-encoder fine-tuning using fixed outer5_inner20 manifests."""
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -31,6 +32,18 @@ class EvaluationAdapter(nn.Module):
 
     def forward(self, data):
         return self.encoder(data), None
+
+
+def _rss_bytes():
+    """Best-effort parent RSS for the timing provenance record."""
+
+    try:
+        for line in Path('/proc/self/status').read_text(encoding='utf-8').splitlines():
+            if line.startswith('VmRSS:'):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def fixed_manifest(task, csv_path, path):
@@ -84,20 +97,25 @@ def fit_select_and_test(model, scaler, train_loader, val_loader, test_loader, de
         validation_started = time.perf_counter()
         val_loss, val_r2, _, _ = evaluate(model, val_loader, criterion, device,
                                            scaler=scaler, amp_dtype='fp32')
-        if timing and timing_sink is not None:
-            timing_sink.append(dict(task=task, fold=int(fold_id), epoch=int(epoch + 1),
-                                    train=train_timing,
-                                    validation_seconds=float(time.perf_counter() - validation_started),
-                                    epoch_seconds=float(time.perf_counter() - epoch_started)))
+        validation_seconds = time.perf_counter() - validation_started
         if not np.isfinite(val_r2) or not np.isfinite(val_loss):
             raise FloatingPointError('nonfinite validation metrics')
         print(json.dumps(dict(task=task, fold=fold_id, epoch=epoch + 1,
                               validation_r2=val_r2)), flush=True)
         if val_r2 > best_r2:
+            copy_started = time.perf_counter()
             best = {k: v.detach().cpu().clone() for k, v in encoder.state_dict().items()}
+            best_copy_seconds = time.perf_counter() - copy_started
             best_r2, best_epoch, stalled = val_r2, epoch + 1, 0
         else:
+            best_copy_seconds = 0.0
             stalled += 1
+        if timing and timing_sink is not None:
+            timing_sink.append(dict(task=task, fold=int(fold_id), epoch=int(epoch + 1),
+                                    train=train_timing,
+                                    validation_seconds=float(validation_seconds),
+                                    best_copy_seconds=float(best_copy_seconds),
+                                    epoch_seconds=float(time.perf_counter() - epoch_started)))
         if stalled >= config['patience']:
             break
     if best is None:
@@ -129,6 +147,7 @@ def main():
     parser.add_argument('--timing', action='store_true',
                         help='write per-epoch preparation/training/validation timing')
     args = parser.parse_args()
+    process_started = time.perf_counter()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
     if config.get('use_md200') is not False:
@@ -162,6 +181,7 @@ def main():
         smoke=bool(args.smoke), formal_shard=bool(args.formal_shard), selected_tasks=selected_tasks,
         selected_folds=selected_folds, outer_test='NOT_RUN' if args.smoke else 'RUN'))
     all_folds, task_summary, timing_records = [], {}, []
+    source_open_records, cache_records, save_records = [], [], []
     for task in selected_tasks:
         csv_path = Path(args.raw_root) / f'smi_{task}.csv'
         manifest_path = Path(args.split_root) / f'{task}.json'
@@ -170,10 +190,15 @@ def main():
                 f'--smoke requires an existing outer5_inner20 manifest: {manifest_path}'
             )
         manifest = fixed_manifest(task, csv_path, manifest_path)
+        source_started = time.perf_counter()
         source, frame = open_source(
             args.cohort_root, args.cache_root, task=task,
             dual_static_root=args.dual_static_root,
         )
+        source_open_records.append(dict(task=task,
+                                        seconds=float(time.perf_counter() - source_started),
+                                        rows=int(len(frame))))
+        dataset = None
         try:
             if len(frame) != int(manifest['sample_count']):
                 raise ValueError('downstream cohort task row count differs from fixed split')
@@ -221,6 +246,7 @@ def main():
                         outer_test='NOT_RUN', validation_only=True,
                         scaler_fit_split='train', deployment_step=int(run_config['downstream_step']),
                     )
+                    save_started = time.perf_counter()
                     save_checkpoint(folder / 'best.pt', dict(
                         state_dict=best, fusion_mode=run_config['fusion_mode'],
                         architecture=encoder.architecture_name, task=task, fold=fold_id,
@@ -230,6 +256,9 @@ def main():
                         scaler_scale=scaler.scaler.scale_.tolist(),
                     ))
                     write_json(folder / 'metrics.json', smoke_result)
+                    save_records.append(dict(task=task, fold=int(fold_id),
+                                             kind='smoke_best_and_metrics',
+                                             seconds=float(time.perf_counter() - save_started)))
                     results.append(smoke_result)
                     all_folds.append(smoke_result)
                     del model, encoder, optimizer, scheduler
@@ -247,12 +276,16 @@ def main():
                 result.update(task=task, fold=fold_id, protocol='outer5_inner20',
                               formal_shard=bool(args.formal_shard),
                               best_validation_r2=best_r2, best_epoch=best_epoch)
+                save_started = time.perf_counter()
                 pd.DataFrame(dict(row_index=test, target=y_true, prediction=y_pred)).to_csv(folder / 'predictions.csv', index=False)
                 save_checkpoint(folder / 'best.pt', dict(state_dict=best, fusion_mode=run_config['fusion_mode'],
                     architecture=encoder.architecture_name, task=task, fold=fold_id, protocol='outer5_inner20',
                     split=fold, config=run_config, best_validation_r2=best_r2, best_epoch=best_epoch,
                     scaler_mean=scaler.scaler.mean_.tolist(), scaler_scale=scaler.scaler.scale_.tolist()))
                 write_json(folder / 'metrics.json', result)
+                save_records.append(dict(task=task, fold=int(fold_id),
+                                         kind='formal_predictions_best_and_metrics',
+                                         seconds=float(time.perf_counter() - save_started)))
                 results.append(result)
                 all_folds.append(result)
                 del model, encoder, optimizer, scheduler
@@ -278,7 +311,10 @@ def main():
                 mae=float(mean_absolute_error(targets, predictions)), rmse=float(np.sqrt(mean_squared_error(targets, predictions))))
             pd.DataFrame(dict(row_index=np.arange(len(targets)), target=targets, prediction=predictions)).to_csv(output / task / 'oof.csv', index=False)
         finally:
+            if dataset is not None:
+                cache_records.append(dict(task=task, stats=dataset.cache_stats()))
             source.close()
+    final_save_started = time.perf_counter()
     pd.DataFrame(all_folds).to_csv(output / 'all_fold_metrics.csv', index=False)
     if args.formal_shard:
         summary = dict(protocol='outer5_inner20_formal_shard', formal_shard=True,
@@ -297,8 +333,22 @@ def main():
     if args.timing:
         write_json(output / 'timing.json', dict(
             protocol=summary['protocol'], records=timing_records,
-            clean_cache=dataset.cache_stats(),
+            source_open=source_open_records, cache=cache_records,
+            checkpoint_and_metric_saves=save_records,
         ))
+    finalization_seconds = time.perf_counter() - final_save_started
+    write_json(output / 'runtime.json', dict(
+        status='PASS', pid=os.getpid(), command=sys.argv,
+        protocol=summary['protocol'], smoke=bool(args.smoke),
+        formal_shard=bool(args.formal_shard), selected_tasks=selected_tasks,
+        selected_folds=selected_folds, outer_test='NOT_RUN' if args.smoke else 'RUN',
+        clean_cache_gib=float(args.clean_cache_gib), timing=bool(args.timing),
+        source_open=source_open_records, cache=cache_records,
+        checkpoint_and_metric_saves=save_records,
+        finalization_seconds=float(finalization_seconds),
+        process_wall_seconds=float(time.perf_counter() - process_started),
+        rss_bytes_at_end=_rss_bytes(),
+    ))
 
 
 if __name__ == '__main__':

@@ -12,8 +12,9 @@ from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Data
 
 from scripts.run_glt_dual_finetune_grid import (
-    _build_shard_command, _run_dynamic_jobs, _validate_gpu_slots,
+    _build_shard_command, _run_batched_jobs, _run_dynamic_jobs, _validate_gpu_slots,
 )
+from scripts.pretrain_glt_dual import _diagnostic_update, _time_summary
 from src.training import glt_dual_runtime as runtime
 
 
@@ -101,6 +102,48 @@ def test_grid_forwards_clean_cache_capacity():
             _grid_args(capacity), 'xc', 0, Path('out/xc_fold0'))
         marker = command.index('--clean-cache-gib')
         assert command[marker + 1] == expected
+
+
+def test_grid_smoke_command_uses_validation_only_mode():
+    args = _grid_args(4)
+    args.smoke = True
+    command = _build_shard_command(args, 'eat', 1, Path('out/eat_fold1'))
+    assert '--smoke' in command
+    assert '--formal-shard' not in command
+    assert command[command.index('--clean-cache-gib') + 1] == '4'
+
+
+def test_batched_scheduler_waits_for_each_batch(tmp_path):
+    launch_order = []
+
+    def launch(task, fold, gpu):
+        launch_order.append((task, fold, gpu))
+        handle = (tmp_path / f'{task}_{fold}.log').open('w', encoding='utf-8')
+        process = subprocess.Popen([sys.executable, '-c', 'pass'], stdout=handle,
+                                   stderr=subprocess.STDOUT)
+        return process, handle, tmp_path / f'{task}_{fold}.log'
+
+    completed = _run_batched_jobs([('task', 0), ('task', 1), ('task', 2)], ['0', '1'], launch)
+    assert [(row['task'], row['fold']) for row in completed] == [('task', 0), ('task', 1), ('task', 2)]
+    assert launch_order == [('task', 0, '0'), ('task', 1, '1'), ('task', 2, '0')]
+
+
+def test_diagnostic_sampling_is_first_interval_and_explicit_save_steps():
+    selected = [step for step in range(1, 26)
+                if _diagnostic_update(step, 0, 20, [7, 23])]
+    assert selected == [1, 7, 20, 23]
+    resumed = [step for step in range(11, 31)
+               if _diagnostic_update(step, 10, 20, [])]
+    assert resumed == [11, 20]
+
+
+def test_time_summary_is_finite_and_empty_is_explicit():
+    summary = _time_summary([0.2, 0.1, 0.3])
+    assert summary['count'] == 3
+    assert summary['median_seconds'] == 0.2
+    assert all(np.isfinite(summary[key]) for key in ('mean_seconds', 'median_seconds', 'p95_seconds'))
+    empty = _time_summary([])
+    assert empty == {'count': 0, 'mean_seconds': None, 'median_seconds': None, 'p95_seconds': None}
 
 
 def test_clean_dataset_duplicate_key_keeps_row_labels(monkeypatch):

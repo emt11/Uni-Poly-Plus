@@ -307,7 +307,11 @@ def train_epoch(
     started = time.perf_counter()
     losses, predictions, targets = [], [], []
     steps = 0
+    first_batch_ready_seconds = None
+    first_batch_seconds = None
     for batch in tqdm(train_loader, desc="Training"):
+        if first_batch_ready_seconds is None:
+            first_batch_ready_seconds = time.perf_counter() - started
         batch = batch.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with _autocast_context(device, amp_dtype):
@@ -321,6 +325,8 @@ def train_epoch(
         optimizer.step()
         scheduler.step()
         steps += 1
+        if first_batch_seconds is None:
+            first_batch_seconds = time.perf_counter() - started
         losses.append(loss.detach().float())
         predictions.append(output.detach().float())
         targets.append(batch.y.detach().float())
@@ -341,6 +347,8 @@ def train_epoch(
             "training_steps": int(steps),
             "training_seconds": float(elapsed),
             "optimizer_steps_per_second": float(steps / max(elapsed, 1e-12)),
+            "first_batch_ready_seconds": float(first_batch_ready_seconds),
+            "first_batch_seconds": float(first_batch_seconds),
         },)
     return result
 

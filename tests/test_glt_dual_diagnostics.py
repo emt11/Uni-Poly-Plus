@@ -121,6 +121,18 @@ def test_module_grad_norms_aligns_missing_gradients_to_zero():
     assert all(torch.isfinite(torch.tensor(value)) for value in norms.values())
 
 
+def test_forward_diagnostic_override_skips_and_clears_detail():
+    data, labels = _rows()
+    model = _model('concat', True)
+    model(data, labels, collect_diagnostics=True)
+    assert model.last_diagnostics is not None
+    result = model(data, labels, collect_diagnostics=False)
+    assert model.last_diagnostics is None
+    assert 'diagnostics' not in result
+    model(data, labels, collect_diagnostics=True)
+    assert model.last_diagnostics is not None
+
+
 def test_gaussian_diagnostics_come_from_the_real_forward():
     data, labels = _rows()
     model = _model('concat', True)

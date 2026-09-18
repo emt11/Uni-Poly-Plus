@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
+import statistics
 import sys
 import time
 
@@ -78,6 +79,24 @@ def _check_reference(reference, step, lr, target_counts, losses, rtol=1e-3):
                               'observed': value, 'original': float(original)}), flush=True)
 
 
+def _diagnostic_update(step, start, every, save_steps):
+    """Return whether detailed observations are needed for this update."""
+
+    return (step == start + 1 or step % every == 0 or step in save_steps)
+
+
+def _time_summary(values):
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return {"count": 0, "mean_seconds": None, "median_seconds": None, "p95_seconds": None}
+    return {
+        "count": len(ordered),
+        "mean_seconds": float(statistics.fmean(ordered)),
+        "median_seconds": float(statistics.median(ordered)),
+        "p95_seconds": float(ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('config', 'cohort-root', 'cache-root', 'output'):
@@ -106,11 +125,25 @@ def main():
                         help='original run log for the initial-10-step cross-check')
     parser.add_argument('--timing', action='store_true',
                         help='optional bounded phase timing; adds synchronization only for the timing run')
+    parser.add_argument('--diagnostics-every', type=int, default=1,
+                        help='collect detailed diagnostics on the first update, this interval, and save steps')
+    parser.add_argument('--benchmark-steps', type=int, default=0,
+                        help='bounded steady-state benchmark updates; no formal checkpoints/deploy are written')
+    parser.add_argument('--benchmark-warmup', type=int, default=0,
+                        help='benchmark updates to exclude before the measured window')
     args = parser.parse_args()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
     if config.get('use_md200') is not False or config['amp_dtype'] not in ('fp32', 'bf16'):
         raise ValueError('dual route requires no MD200 and fp32/bf16 precision')
+    if args.diagnostics_every <= 0:
+        raise ValueError('--diagnostics-every must be a positive integer')
+    if not args.diagnostics and args.diagnostics_every != 1:
+        raise ValueError('--diagnostics-every requires --diagnostics')
+    if args.benchmark_steps < 0 or args.benchmark_warmup < 0:
+        raise ValueError('--benchmark-steps and --benchmark-warmup must be non-negative')
+    if args.benchmark_steps and args.timing:
+        raise ValueError('--benchmark-steps cannot be combined with synchronized --timing')
     if (min(config['microbatch'], config['global_batch'], config['max_optimizer_steps'], config['save_every']) <= 0
             or config['warmup_steps'] < 0
             or config['schedule_total_steps'] < max(config['max_optimizer_steps'], config['warmup_steps'])
@@ -193,9 +226,18 @@ def main():
         if args.stop_after_step:
             if not args.diagnostics:
                 raise ValueError('--stop-after-step requires --diagnostics')
+            if args.benchmark_steps:
+                raise ValueError('--stop-after-step cannot be combined with --benchmark-steps')
             if not start < int(args.stop_after_step) <= config['max_optimizer_steps']:
                 raise ValueError('--stop-after-step must satisfy start < stop <= config.max_optimizer_steps')
             stop = int(args.stop_after_step)
+        if args.benchmark_steps:
+            remaining = config['max_optimizer_steps'] - start
+            if args.benchmark_steps > remaining:
+                raise ValueError('--benchmark-steps exceeds the configured remaining updates')
+            if args.benchmark_warmup >= args.benchmark_steps:
+                raise ValueError('--benchmark-warmup must satisfy 0 <= warmup < benchmark-steps')
+            stop = start + args.benchmark_steps
         save_steps = sorted({int(value) for value in args.diagnostic_save_steps})
         for value in save_steps:
             if not start < value <= stop:
@@ -204,7 +246,17 @@ def main():
             write_json(output / 'run.json', dict(identity=identity, command=sys.argv,
                 accumulation=accumulation, diagnostics=bool(args.diagnostics),
                 geometry_head_norm=bool(args.geometry_head_norm or config.get('geometry_head_norm', False)),
-                stop_after_step=stop, diagnostic_save_steps=save_steps))
+                stop_after_step=stop, diagnostic_save_steps=save_steps,
+                diagnostics_every=int(args.diagnostics_every),
+                benchmark_steps=int(args.benchmark_steps),
+                benchmark_warmup=int(args.benchmark_warmup),
+                benchmark_mode=bool(args.benchmark_steps)))
+            write_json(output / 'runtime.json', dict(
+                status='RUNNING', command=sys.argv, config=config, identity=identity,
+                rank=rank, world_size=world, device=str(device), prep_workers=int(args.prep_workers),
+                diagnostics=bool(args.diagnostics), diagnostics_every=int(args.diagnostics_every),
+                benchmark_steps=int(args.benchmark_steps), benchmark_warmup=int(args.benchmark_warmup),
+                started_at_monotonic=time.perf_counter()))
         stream = OrderedSampleStream(len(source), config['seed'])
         # Optional CPU prefetch.  The prepared items are identical to the
         # inline path (pure function of sample and absolute position); only
@@ -229,9 +281,31 @@ def main():
         diagnostics_path = output / 'diagnostics_steps.jsonl'
         timing_path = output / 'timing_steps.jsonl'
         dense_lo = min(save_steps) - 60 if save_steps else None
+        benchmark_mode = bool(args.benchmark_steps)
+        benchmark_times, benchmark_graphs = [], []
+        if benchmark_mode:
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            if world > 1:
+                dist.barrier()
+        rank_record_path = (output / f'records_rank{rank}.jsonl'
+                            if args.diagnostics or args.timing or benchmark_mode else None)
         for step in range(start, stop):
-            timing = {}
+            step_number = step + 1
             step_started = time.perf_counter()
+            # All ranks finish warmup before the first timed update.  The
+            # barrier is deliberately at the transition, rather than relying
+            # on wall-clock sleep, so the benchmark window is deterministic.
+            if benchmark_mode and step_number == start + args.benchmark_warmup + 1:
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                if world > 1:
+                    dist.barrier()
+                step_started = time.perf_counter()
+            timing = {}
+            diag_this_step = bool(
+                args.diagnostics and _diagnostic_update(
+                    step_number, start, args.diagnostics_every, save_steps))
             prep_started = time.perf_counter()
             if prefetch is not None:
                 prepared = [next(prefetch) for _ in range(accumulation)]
@@ -285,7 +359,8 @@ def main():
                         torch.cuda.synchronize(device)
                     forward_backward_started = time.perf_counter()
                     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config['amp_dtype'] == 'bf16'):
-                        result = module(moved_data, moved_labels)
+                        result = module(moved_data, moved_labels,
+                                        collect_diagnostics=diag_this_step)
                         loss = global_objective(result['sums'], counts, world, config['loss_weights'])
                     if not torch.isfinite(loss):
                         raise FloatingPointError('nonfinite pretraining loss')
@@ -317,10 +392,13 @@ def main():
                               step_seconds=time.perf_counter() - step_started)
                 record['timing'] = timing
             print(json.dumps(record), flush=True)
+            if rank_record_path is not None:
+                with rank_record_path.open('a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + '\n')
             if args.timing and rank == 0:
                 with timing_path.open('a', encoding='utf-8') as handle:
                     handle.write(json.dumps(record, sort_keys=True) + '\n')
-            if args.diagnostics and rank == 0 and base.last_diagnostics is not None:
+            if diag_this_step and rank == 0 and base.last_diagnostics is not None:
                 components = base.last_diagnostics['components']
                 record = dict(step=step + 1, lr=float(lr), grad_total_preclip=grad_total_preclip,
                               grad_norms=_module_grad_norms(base),
@@ -342,6 +420,13 @@ def main():
                     _check_reference(reference, step + 1, float(lr),
                                      target_counts.tolist(),
                                      (totals / counts.clamp_min(1)).tolist())
+            if benchmark_mode:
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                if step_number > start + args.benchmark_warmup:
+                    benchmark_times.append(time.perf_counter() - step_started)
+                    benchmark_graphs.append(float(counts[2].detach().cpu()))
+                continue
             if args.diagnostics:
                 if (step + 1) in save_steps:
                     states = [None] * world
@@ -375,6 +460,39 @@ def main():
                     save_checkpoint(output / f'deploy_{step + 1:05d}.pt', deployment_package(base, step + 1))
                 if world > 1:
                     dist.barrier()
+        if benchmark_mode:
+            payload = dict(rank=rank, step_seconds=benchmark_times, graph_counts=benchmark_graphs)
+            gathered = [None] * world
+            if world > 1:
+                dist.all_gather_object(gathered, payload)
+            else:
+                gathered[0] = payload
+            if rank == 0:
+                slowest = [max(item['step_seconds'][index] for item in gathered)
+                           for index in range(len(benchmark_times))]
+                measured_updates = len(slowest)
+                window_seconds = float(sum(slowest))
+                write_json(output / 'benchmark.json', dict(
+                    status='PASS', benchmark_steps=int(args.benchmark_steps),
+                    benchmark_warmup=int(args.benchmark_warmup),
+                    measured_updates=measured_updates, world_size=world,
+                    global_batch=int(batch_size),
+                    samples=int(measured_updates * batch_size),
+                    window_seconds=window_seconds,
+                    samples_per_second=float(measured_updates * batch_size / max(window_seconds, 1e-12)),
+                    slowest_rank_step_seconds=slowest,
+                    slowest_rank_timing=_time_summary(slowest),
+                    per_rank_timing={str(item['rank']): _time_summary(item['step_seconds'])
+                                     for item in gathered},
+                    graph_count_sum=float(sum(max(item['graph_counts'][index] for item in gathered)
+                                              for index in range(measured_updates))),
+                    records_path=[str(output / f"records_rank{item['rank']}.jsonl") for item in gathered],
+                ))
+        if rank == 0:
+            runtime = json.loads((output / 'runtime.json').read_text(encoding='utf-8'))
+            runtime.update(status='PASS', completed_steps=int(stop - start),
+                           benchmark_mode=benchmark_mode, finished_at_monotonic=time.perf_counter())
+            write_json(output / 'runtime.json', runtime)
     finally:
         source.close()
         if dist.is_initialized():

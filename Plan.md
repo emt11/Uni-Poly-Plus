@@ -5,11 +5,11 @@
 | 字段 | 内容 |
 | --- | --- |
 | 计划 | GLT-ENGINEERING-20260918-01 / r1 |
-| 状态 | 待授权执行；本轮仅交付最终计划，尚未实施或启动验证 |
+| 状态 | 待审查；S0–S5 已执行，S6 交接材料已生成，等待 Codex 独立审查 |
 | 用户要求 | 给出其他模型可直接执行的完整工程方案；完成并验收本方案后，才另行考虑预测性能优化 |
 | 范围 | GLT 双通道的数据准备、诊断、计时、输入复用、传输与调度；不优化预测准确率 |
 | 角色 | Codex 规划与独立验收；接手模型负责实现、局部测试和规定的有界测速，并记录实际执行者 |
-| 核查基线 | dev，`f1dfd4d`；2026-09-18 修改前工作树干净，pull 为 Already up to date；此前 Plan.md 为空 |
+| 核查基线 | dev，执行前为 `6f7c877`；2026-09-18 pull 为 Already up to date；执行期间仅修改本计划与本轮列出的源码/测试文件；此前计划已写入本文件 |
 | 既有工作 | CACHE-20260916-01/r4、SPEED-20260917-01/r4 均已归档；不重做已完成工作，不复活旧科学计划 |
 
 **给执行模型的指令：**先完整读取 AGENTS.md 和本文。收到用户“执行本计划”的授权后，依次完成 S0→S1→S2→S3→S4→S5→S6；普通实现细节自行处理，不重复询问已授权的小步骤。不要只输出另一份计划。受阻则停止受影响阶段、保留证据，继续不依赖阻断项的代码/测试工作；不得偷偷更换协议、缩小验收集合或扩大预算。最终状态只能先标“待审查”，由 Codex 审查后关闭。
@@ -270,13 +270,20 @@ RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗�
 
 | 阶段 | 状态 | 实际commit/命令/window | 日志/报告/退出码 | 偏差/预算累计 |
 | --- | --- | --- | --- | --- |
-| S0 基线与环境 | 未执行 | — | — | — |
-| S1 完整计时 | 未执行 | — | — | — |
-| S2 诊断采样 | 未执行 | — | — | — |
-| S3 微调/调度 | 未执行 | — | — | — |
-| S4 单候选或暂缓 | 未执行 | — | — | — |
-| S5 公平测速 | 未执行 | — | — | — |
-| S6 报告/交接 | 未执行 | — | — | — |
-| Codex独立审查 | 未执行 | — | — | — |
+| S0 基线与环境 | PASS（执行者自检，待 Codex 审查） | `6f7c877`；`git pull --ff-only origin dev`；环境核对命令；无独立长任务 | `results/glt_engineering_20260918/20260918T000000Z/execution.json`；资源与输入路径均存在 | GPU 0–3 空闲（仅查询）；未占用设备；预算未消耗 |
+| S1 完整计时 | PASS（执行者自检，待 Codex 审查） | `scripts/profile_glt_dual_runtime.py`；256条 CPU profile；`glt_eng_profile_003509` | `results/glt_engineering_20260918/20260918T003509Z/profile.json`；`logs/glt_engineering_20260918/20260918T003509Z/profile.log`；退出码0 | 首次字段名错误留存于 `003412Z`，修正后仅重跑1次；冻结主缓存零写入；profile预算1/1 |
+| S2 诊断采样 | PASS（执行者自检，待 Codex 审查） | 33项局部测试；3-GPU baseline4/candidate4/resume2→4，共12 updates；`glt_eng_corr_*` | `results/glt_engineering_20260918/20260918T003654Z/correctness.json`；对应4份日志；退出码均0 | model/optimizer/scheduler/keys/position/rank RNG exact；候选诊断步为1/2/4；无正式checkpoint/deploy |
+| S3 微调/调度 | PASS（执行者自检，待 Codex 审查） | cache A-B-B-A 4×2 epochs；两GPU batched/dynamic 各4单位×2epochs；`glt_eng_ft_*`、`glt_eng_grid_*` | `results/glt_engineering_20260918/20260918T005342Z/`、`20260918T005721Z/grid_smoke.json`；所有子进程退出码0 | cache4两配对约40% wall-clock收益且验证 exact；调度 makespan差约0.9%，不宣称收益；outer-test全NOT_RUN |
+| S4 单候选或暂缓 | 暂缓（执行者自检，待 Codex 审查） | 依据256 profile与S5 ABBA结果，不新增 `targets_only`/pin 候选 | 结论写入 `results/glt_engineering_20260918/summary.json` | source读取/随机长尾主导；诊断every20配对方向不一致且未达10% gate；保持legacy/default |
+| S5 公平测速 | PASS（执行者自检，待 Codex 审查） | 3-GPU、3 workers、ABBA；every1/every20各2次，每次30 updates（10 warmup+20计时） | `results/glt_engineering_20260918/20260918T004314Z/pretrain_*/benchmark.json`；4份日志；退出码均0 | 预训练本轮累计132/316 updates；未执行最终组合确认（无候选入选） |
+| S6 报告/交接 | 待审查 | 汇总 `summary.json`、本计划与 PIPELINE 待更新；当前工作树待提交 | `results/glt_engineering_20260918/summary.json`；日志/产物路径见各行 | 未执行正式5k/20k、完整微调、OOF/outer-test、4-GPU正式吞吐；不写性能提升结论 |
+| Codex独立审查 | 未执行 | — | — | 需审查本轮源码、测试、日志和报告后再归档 |
 
-本轮计划交付只核对了现有代码、路径、历史证据和Git状态；没有修改训练代码、启动模型、测试、benchmark或缓存操作。
+### 本轮执行摘要（执行者记录，待 Codex 审查）
+
+- 实际修改：`scripts/pretrain_glt_dual.py`、`src/modules/glt_dual_pretrain.py`、`scripts/profile_glt_dual_runtime.py`、`scripts/finetune_glt_dual.py`、`src/utils.py`、`scripts/run_glt_dual_finetune_grid.py` 及两份相关测试文件；未修改模型科学配置、active cache、manifest、checkpoint 或样本集合。
+- 计时口径：CPU profile 使用 seed=42 的256个不同随机索引，记录 source/static/target/clean/noisy/collate/完整样本及图大小；微调记录 source打开、首批、train/validation、best CPU copy、保存和进程总耗时；预训练记录每rank窗口及最慢rank。
+- S5 预训练 only：every1 samples/s 为 325.917、331.940；every20 为 331.669、319.285，配对方向相反，未通过10%性能门槛。S4不实施额外候选；不执行最终确认组。
+- S3 cache smoke：`clean-cache-gib=0` 进程墙钟 20.149/19.983 s，`=4` 为 11.921/11.872 s；四个调度单位两策略均完整、验证结果逐单位 exact，动态 makespan仅较批处理快约0.244 s。
+- 资源与边界：预训练使用3张GPU（0,1,2），微调/调度使用GPU3或2、3；预训练累计132个实际 optimizer updates，微调累计24 epochs；所有真实 smoke 均未访问 outer-test。历史/正式5k、20k、完整OOF和4-GPU正式吞吐均未执行。
+- 失败证据保留：`003412Z/profile.json`/日志记录首次 profile 字段错误及零写入；修正后 profile 单次重跑通过。所有长任务在 `tmux` session `Uni-Poly` 独立 `glt_eng_*` window 中执行。

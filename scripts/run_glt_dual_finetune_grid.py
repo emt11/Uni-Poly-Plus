@@ -27,6 +27,7 @@ def _validate_gpu_slots(gpus):
 
 
 def _build_shard_command(args, task, fold, unit):
+    mode = '--smoke' if getattr(args, 'smoke', False) else '--formal-shard'
     return [
         sys.executable, 'scripts/finetune_glt_dual.py',
         '--config', args.config, '--checkpoint', args.checkpoint,
@@ -34,7 +35,8 @@ def _build_shard_command(args, task, fold, unit):
         '--cache-root', args.cache_root, '--dual-static-root', args.dual_static_root,
         '--clean-cache-gib', format(args.clean_cache_gib, 'g'),
         '--output', str(unit), '--split-root', args.split_root,
-        '--task', task, '--fold', str(fold), '--formal-shard',
+        '--task', task, '--fold', str(fold), mode,
+        *(['--timing'] if getattr(args, 'timing', False) else []),
     ]
 
 
@@ -112,17 +114,58 @@ def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
     return completed
 
 
+def _run_batched_jobs(jobs, gpus, launch):
+    """Reference scheduler: wait for a whole GPU batch before dispatching more."""
+
+    completed = []
+    for offset in range(0, len(jobs), len(gpus)):
+        active = []
+        try:
+            for task, fold in jobs[offset:offset + len(gpus)]:
+                gpu = gpus[len(active)]
+                process, handle, log_path = launch(task, fold, gpu)
+                active.append((task, fold, process, handle, log_path))
+        except BaseException:
+            for _, _, process, handle, _ in active:
+                code = process.wait()
+                handle.write(f'EXIT_CODE={code}\n')
+                handle.close()
+            raise
+        failures = []
+        for task, fold, process, handle, log_path in active:
+            code = process.wait()
+            handle.write(f'EXIT_CODE={code}\n')
+            handle.close()
+            row = {'task': task, 'fold': fold, 'log': str(log_path), 'exit_code': code}
+            if code:
+                failures.append(row)
+            else:
+                completed.append(row)
+        if failures:
+            raise RuntimeError('batched smoke shard failed: ' +
+                               json.dumps({'failures': failures}, sort_keys=True))
+    return completed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('config', 'checkpoint', 'raw-root', 'cohort-root', 'cache-root', 'dual-static-root', 'output'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--split-root', default='data/splits/mips_outer5_inner20')
     parser.add_argument('--task', action='append', dest='tasks')
+    parser.add_argument('--fold', action='append', type=int, dest='folds',
+                        help='select fold(s); required with --smoke')
+    parser.add_argument('--smoke', action='store_true',
+                        help='run selected task/fold units as validation-only smokes')
+    parser.add_argument('--batch-wait', action='store_true',
+                        help='smoke reference scheduler: wait for each GPU batch before dispatching more')
     parser.add_argument('--gpu', action='append', dest='gpus', required=True,
                         help='one CUDA device per concurrent shard; repeat up to 4')
     parser.add_argument('--log-root', required=True)
     parser.add_argument('--clean-cache-gib', type=float, default=0.0,
                         help='forwarded process-local clean cache capacity in GiB (default: 0)')
+    parser.add_argument('--timing', action='store_true',
+                        help='forward per-epoch timing to each child shard')
     parser.add_argument('--resume', action='store_true',
                         help='continue an existing grid root: skip units that already have a '
                              'completed summary.json, and refuse to touch partial units')
@@ -130,9 +173,19 @@ def main():
     tasks = list(args.tasks) if args.tasks else list(TASKS)
     if sorted(set(tasks)) != sorted(tasks) or any(task not in TASKS for task in tasks):
         raise ValueError('unknown or duplicate task selection')
+    folds = [int(value) for value in args.folds] if args.folds else list(range(5))
+    if any(value < 0 or value >= 5 for value in folds) or len(set(folds)) != len(folds):
+        raise ValueError('unknown or duplicate fold selection')
+    if args.smoke:
+        if not args.tasks or not args.folds:
+            raise ValueError('--smoke requires explicit --task and --fold selections')
+    elif args.folds:
+        raise ValueError('--fold selection requires --smoke')
     if not math.isfinite(args.clean_cache_gib) or args.clean_cache_gib < 0:
         raise ValueError('--clean-cache-gib must be finite and non-negative')
     gpus = _validate_gpu_slots(args.gpus)
+    if args.batch_wait and (not args.smoke or len(gpus) < 2):
+        raise ValueError('--batch-wait requires --smoke with at least two GPU slots')
     output = Path(args.output).resolve()
     log_root = Path(args.log_root).resolve()
     if args.resume:
@@ -145,7 +198,7 @@ def main():
     for task in tasks:
         fixed_manifest(task, Path(args.raw_root) / f'smi_{task}.csv',
                        Path(args.split_root) / f'{task}.json')
-    jobs = [(task, fold) for task in tasks for fold in range(5)]
+    jobs = [(task, fold) for task in tasks for fold in folds]
     skipped, partial = [], []
     if args.resume:
         pending = []
@@ -181,8 +234,10 @@ def main():
                                    env=env, stdout=handle, stderr=subprocess.STDOUT)
         return process, handle, log_path
 
-    completed = _run_dynamic_jobs(jobs, gpus, launch)
-    print({'status': 'PASS', 'completed': completed, 'count': len(completed),
+    completed = (_run_batched_jobs(jobs, gpus, launch) if args.batch_wait
+                 else _run_dynamic_jobs(jobs, gpus, launch))
+    print({'status': 'PASS', 'scheduler': 'batched' if args.batch_wait else 'dynamic',
+           'smoke': bool(args.smoke), 'completed': completed, 'count': len(completed),
            'skipped_existing': skipped})
 
 

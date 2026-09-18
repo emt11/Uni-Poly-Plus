@@ -64,9 +64,14 @@ class DualPretrainer(nn.Module):
         self.geometry_norm = (nn.LayerNorm(512, elementwise_affine=False)
                               if self.geometry_head_norm else None)
 
-    def forward(self, data, labels):
+    def forward(self, data, labels, *, collect_diagnostics=None):
+        diagnostics_enabled = (self.collect_diagnostics
+                               if collect_diagnostics is None else bool(collect_diagnostics))
+        # Do not let a sampled update's detached observations leak into an
+        # unsampled update when diagnostics are decimated by the caller.
+        self.last_diagnostics = None
         captured, handles = {}, []
-        if self.collect_diagnostics:
+        if diagnostics_enabled:
             # Read-only hooks: they copy the pre-tanh angle output and the 3D
             # layer states; the computations themselves are unchanged.
             handles.append(self.angle_head[2].register_forward_hook(
@@ -114,7 +119,7 @@ class DualPretrainer(nn.Module):
                 targets=torch.stack([mask.sum(), data.bond_center.sum(),
                                      labels['angle_graph'].new_tensor(a.numel()), fp_valid.sum() * 2048]),
                 angle_graphs=angle_valid.sum())
-            if self.collect_diagnostics:
+            if diagnostics_enabled:
                 pre_tanh = captured.get('pre_tanh')
                 # One valid path step per row marks a real one-hop angle; rows
                 # that are padding or the synthetic self relation are counted

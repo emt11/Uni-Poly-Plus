@@ -588,6 +588,13 @@ sum/count 归约；日志包含任务均值、有效样本数、目标数量、�
 避免 worker base-seed 初始化消耗公共模型 RNG。
 BF16 仅用于模型，几何和 loss 使用 FP32。AdamW 默认 betas=(0.9,0.999)，weight decay=0。
 
+诊断短测可显式使用 `--diagnostics-every N`（默认1；仅与 `--diagnostics` 同时使用），只在首个
+update、绝对 `N` 的倍数和显式保存步安装详细 hooks/统计；未采样 update 仍记录普通 loss、有效计数和
+有限性检查。有界稳态测速可使用 `--benchmark-steps N --benchmark-warmup W`（默认关闭，`0<=W<N`），
+只报告 warmup 之后的最慢 rank 窗口，不写正式 deploy；运行参数写入 `runtime.json`，逐 rank 记录写入
+`records_rank*.jsonl`，聚合计时写入 `benchmark.json`。这些开关不改变原配置的 max steps、scheduler
+horizon、抽样顺序或有效 batch。
+
 资源配置需区分历史正式协议与本轮提速 smoke：历史 fixed-geonorm formal 使用
 `world_size=3, microbatch=84, accumulation=4, global_batch=1008`；
 `SPEED-20260917-01` 的 bounded smoke 使用 `world_size=4, microbatch=84,
@@ -611,12 +618,17 @@ mkdir -p logs/glt_dual_three_task
 set -o pipefail
 torchrun --standalone --nproc_per_node="${WORLD_SIZE}" scripts/pretrain_glt_dual.py \
   --config configs/mts/glt_dual_three_task_${MODE}.json \
-  --samples-csv PI1M_CSV --topology-root TOPOLOGY_LAYER --trimer-root TRIMER_LAYER \
+  --cohort-root data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1 \
+  --cache-root data/processed/mips_trimer_scage \
+  --dual-static-root data/processed/glt_dual_v2/pi1m/dual_static_v1 \
+  --pretrain-target-root data/processed/glt_dual_v2/pi1m/pretrain_targets_v1 \
   --output results/glt_dual_three_task/${MODE}/pretrain \
   2>&1 | tee logs/glt_dual_three_task/${MODE}_pretrain.log
 ```
 
 同一命令增加 `--resume results/.../resume_01000.pt` 恢复；必须使用原输出目录。
+有界诊断测速可在上述命令增加 `--prep-workers 3 --diagnostics --diagnostics-every 20
+--benchmark-steps 30 --benchmark-warmup 10 --no-deploy`；正式训练不应携带这些短测参数。
 这些命令需要用户单独授权执行，不属于当前已运行产物。
 
 ### 下游五折与指标
@@ -631,6 +643,10 @@ scaler 和 split 生成函数，隔离旧模型工厂与默认参数。固定八
 fusion/head LR=1e-4，AdamW weight decay=.02，batch=32/eval=64，FP32，worker=0；clean 输入可通过
 `--dual-static-root` 读取已发布的 `dual_static_v1`，并用 `--clean-cache-gib` 启用有界进程内 clean
 Data LRU（默认 0，关闭；不写磁盘、不缓存 GPU tensor）。
+短测可显式加 `--smoke --task eat --fold 0 --timing`，它只训练/验证最多两 epoch，明确写入
+`outer_test=NOT_RUN`。多 shard 的 `scripts/run_glt_dual_finetune_grid.py` 默认仍为 formal-shard；
+有界 validation-only 调度需显式 `--smoke --task ... --fold ...`，`--batch-wait` 是旧式两槽批处理
+参考，省略时使用动态补位。两种模式都原样转发 `--clean-cache-gib`，默认仍为 `0`。
 最多 100 epochs、warmup=5、patience=10、clip=1。非有限 loss/gradient/指标报错。
 按 validation R² 选权重，恢复后 test 只评估一次。每行一次 OOF 预测；五折统计 std
 采用 ddof=1，macro8 为八个任务的 fold-mean R² 均值，pooled OOF 指标另列。
@@ -646,7 +662,9 @@ Data LRU（默认 0，关闭；不写磁盘、不缓存 GPU tensor）。
 python scripts/finetune_glt_dual.py \
   --config configs/mts/glt_dual_three_task_${MODE}.json \
   --checkpoint results/glt_dual_three_task/${MODE}/pretrain/deploy_05000.pt \
-  --raw-root data/raw --topology-root DOWNSTREAM_TOPOLOGY_LAYER --trimer-root DOWNSTREAM_TRIMER_LAYER \
+  --raw-root data/raw --cohort-root data/processed/glt_dual_v2/downstream/cohort_1545eda5a8f6a1 \
+  --cache-root data/processed/mips_trimer_scage_downstream \
+  --dual-static-root data/processed/glt_dual_v2/downstream/dual_static_v1 \
   --split-root data/splits/mips_outer5_inner20 \
   --output results/glt_dual_three_task/${MODE}/downstream \
   2>&1 | tee logs/glt_dual_three_task/${MODE}_finetune.log
@@ -660,7 +678,9 @@ helper 的合成回归已执行（`37 passed`，见上节日志）；身份/审�
 （`logs/glt_v2_regression_final21_20260911.log`）。`finetune_glt_dual.py` 新增
 `--smoke --task eat --fold 0`，只构建 train/validation loader、只用 train 拟合 scaler、
 最多两 epoch，并明确把 outer-test/OOF 标为 `NOT_RUN`；默认不带 `--smoke` 仍是完整
-八任务五折行为。该 smoke 入口尚未执行。
+八任务五折行为。本工程周期已在 `results/glt_engineering_20260918/20260918T005342Z/` 执行
+`xc/fold0` 的 cache 0/4 GiB A-B-B-A，并在 `20260918T005721Z/` 执行 `xc/eat` folds 0/1 的
+两策略 validation-only 调度 smoke；这些结果只用于工程计时，不能外推正式性能或 OOF。
 
 真实双记录入口使用：
 
@@ -674,8 +694,10 @@ python scripts/validate_dual_glt.py --audit-only --topology-root TOPOLOGY_LAYER 
 内存中 step=0 包的严格加载、clean 下游 forward。step=0 仅为验证包，不冒充已训练模型。
 测试涵盖 mask 泄漏、目标几何、fingerprint reference、DDP 梯度归约的代数参考、优化器/RNG
 恢复、绝对位置抽样、部署加载与 300 条分折；以隔离 mock 检查 validation 选模后 test
-只运行一次。人工测试坐标不是实际构象。当前没有实际 DDP、真实记录模型前后向或预训练
-smoke 验证。
+只运行一次。人工测试坐标不是实际构象。该真实入口本身没有实际 DDP、真实记录模型前后向或预训练
+smoke 验证。`GLT-ENGINEERING-20260918-01` 另行完成了有界 3-GPU 预训练 DDP
+correctness/恢复和 benchmark，以及下游 validation-only smoke；它们属于工程验证，不是
+正式训练或模型性能结果，证据见 `results/glt_engineering_20260918/summary.json`。
 
 ### 数据保真审查后的局部修复（2026-09-11，本轮状态）
 
@@ -1015,3 +1037,16 @@ r4 仅修复发布期 writer 互斥和 finalize 诊断路径保护。builder 使
 仅重跑同一相关测试。针对 snapshot 异常窗口，在 `Uni-Poly:cache_opt_r4_snapshot_final2` 再执行同一局部命令，结果
 `13 passed, 1 warning`、退出码 0，日志为 `logs/cache_opt_r4_snapshot_final2.log`；另有 `py_compile` 与 `git diff --check`
 均退出码 0。未重跑 r2/r3 parity、长 benchmark 或任何模型／训练，当前状态为返修完成、待 Codex 审查。
+
+### GLT-ENGINEERING-20260918-01 工程提速执行记录（执行者自检，待 Codex 审查）
+
+本周期只改进计时可见性、诊断采样和有界输入复用／调度接口；未改模型科学定义、训练配置、active
+cache、manifest、checkpoint 或样本集合。新增 `--diagnostics-every`、`--benchmark-steps`／
+`--benchmark-warmup`，并让预训练写入 `runtime.json`、每 rank records 与 `benchmark.json`；CPU
+profile 现在用 seed=42 的 256 个不同索引分开统计 source/static/target/clean/noisy/collate 和完整
+sample。微调 timing 补充 source 打开、首批、best 权重复制、保存和进程总耗时；grid 增加显式
+`--smoke --fold`、`--batch-wait` 和 timing 转发，默认 formal-shard 与 clean cache=0 保持不变。
+
+实际证据：局部命令 `PYTHONPATH=.:tests /opt/conda/bin/python -m pytest -q tests/test_glt_dual_speed.py tests/test_glt_dual_diagnostics.py tests/test_dual_glt_pretrain.py` 为 `33 passed, 1 warning`、退出码0；256条 CPU profile 报告为 `results/glt_engineering_20260918/20260918T003509Z/profile.json`，首次字段错误报告保留在 `20260918T003412Z`；3-GPU correctness/resume 报告 `results/glt_engineering_20260918/20260918T003654Z/correctness.json` 为 PASS；ABBA benchmark 在 `20260918T004314Z/pretrain_*/benchmark.json`，every1 为 325.917/331.940、every20 为 331.669/319.285 samples/s，配对方向相反且未达10% gate；下游 cache A-B-B-A 与四单位两策略 smoke 产物在 `20260918T005342Z`、`20260918T005721Z`，outer-test 均 `NOT_RUN`。
+
+汇总机器可读报告：`results/glt_engineering_20260918/summary.json`。本周期未执行 S4 额外预训练候选、最终组合确认、正式5k/20k、完整微调/OOF、outer-test、新缓存或构象生成；预训练实际132/316 updates，微调实际24/24 smoke epochs。上述结果仅为工程 smoke/profile，不构成模型性能结论。
