@@ -163,3 +163,14 @@
 * 结论边界：**Codex review PASS / CLOSED** 仅覆盖 r4 约定的执行合同和有界提速证据。微调提速有 bounded evidence；预训练正式 throughput 未测。没有正式 5k/20k 预训练、Concat/KFuse 完整训练、正式 grid、8×5 微调、独立模型性能比较或全量缓存重建，因此不能把本周期写成正式性能提升或完整科学实验完成。
 * 未执行与限制：没有重跑 PI1M/downstream parity、CPU 长 benchmark 或 baseline；没有启动 speed r5、正式预训练、完整微调、outer-test、构象生成、缓存迁移或新科学路线。合成测试与 bounded GPU smoke 不外推到全量训练吞吐；历史 5000-sample profile 未完成，不作为正式 throughput 证据。
 * 归档操作：本轮仅修改 `Plan.md` 与本文件，未改 `.py`、config、cache、results 数字，未运行测试、benchmark、模型或训练。`Plan.md` 已切换为 `GLT-SCI-20260917-01 / r1`，状态为“待授权”；后续科学周期须由用户明确给出数据、模型包、task/fold、epoch/step 和比较预算后再执行。本归档不产生正式实验授权。
+
+## DOCS-20260918-01｜GLT 工程提速最终执行方案交付
+
+* 授权与角色：用户要求提供其他模型可直接执行的最终方案，明确先完成整个工程阶段，暂不涉及预测性能优化。Codex负责本轮规划、文档修改与自检，没有独立审查者；实施及有界测速仍待用户交付执行授权，不把文档当成已运行任务。
+* 基线与同步：dev，`f1dfd4d`，工作树干净，修改前pull为Already up to date；当前Plan.md为空。读取现行AGENTS、实际GLT CLI、已有SPEED归档/报告并确认关键部署包和split存在；不恢复旧缓存计划，不推断其他路线的执行状态或授权。
+* 最终计划：新建GLT-ENGINEERING-20260918-01/r1完整交接。S0锁定基线/资源，S1补source/static/targets/准备及进程全流程计时，S2真正按步采集详细诊断，S3同static条件下做clean cache独立对照并验证现有动态grid，S4按profile至多选择一个clean目标准备或pin传输候选，否则有据暂缓，S5做同协议ABBA及最终组合确认，S6交付采用/否决结论、启动/回退命令和独立审查材料。
+* 科学边界：GLT双通道Concat、3GPU×84×4、global1008、原初始化/样本流/噪声/精度/loss/schedule及微调split不变；不改模型、融合、readout、目标权重或数据。不做预测性能调参，不读outer-test，不启动5k/20k/8×5、EQ3D或其他科学实验，不写active缓存或生成构象。
+* 固定验证预算：CPU profile256条；PI1M/downstream parity各至多32；预训练总计至多316个实际updates（含短轨迹/恢复、诊断、两个单因素矩阵及组合确认），失败重跑占原预算；微调xc/fold0 cache对照8epochs，加eat/xc folds0/1两种调度smoke16epochs，总24epochs；长任务墙钟3小时、产物20GiB先到即停，GPU/worker任务仅Uni-Poly独立窗口且低频监控。没有收益可否决，不追加sweep；必要验证缺失不得宣称整个方案完成。
+* 证据口径：旧约60→10.5秒是static与clean-cache组合且计时不含完整启动/保存；旧CPU准备计时漏static/target读取；旧4GPU恢复不等于3GPU正式吞吐。这些作为新方案必须解决的测量问题，不改写旧报告。原有LRU、动态grid、角度向量化、BF16/no_sync和恢复修复继续复用。
+* 实际修改：Plan.md写入可独立执行的阶段、固定路径、已有/拟新增CLI、命令、预算、停止与验收条件及空白执行记录；本文件归档本次文档周期。未改生产代码、PIPELINE、RESULTS、缓存或产物；未运行模型、测试、benchmark。文档检查和git diff --check自检，提交/推送信息见对应Git历史与交付回复。
+* 下一步：用户授权“执行本计划”后接手模型按S0–S6执行，Codex独立审查。工程验收完成后仅标暂无后续执行，预测性能优化必须另立计划并授权，不自动衔接启动。
