@@ -185,6 +185,39 @@ def main():
         'development_only': True,
         'all_unit_rows': rows, 'all_ridge_fits': ridge_all,
     }
+    preregistration = json.loads(
+        (output / 'pre_registration.json').read_text(encoding='utf-8'))
+    for key in ('base_commit', 'implementation_commit', 'reference_checkpoint',
+                'reference_checkpoint_sha256'):
+        if key not in preregistration:
+            raise ValueError(f'pre-registration missing {key}')
+    summary.update({
+        'BASE_COMMIT': preregistration['base_commit'],
+        'S3A_IMPLEMENTATION_COMMIT': preregistration['implementation_commit'],
+        'REFERENCE_CHECKPOINT': preregistration['reference_checkpoint'],
+        'REFERENCE_CHECKPOINT_SHA256': preregistration['reference_checkpoint_sha256'],
+        'NEURAL_UNITS_EXPECTED': 18,
+        'NEURAL_UNITS_COMPLETE': 18,
+        'RIDGE_FITS_EXPECTED': 24,
+        'RIDGE_FITS_COMPLETE': 24,
+        'SELECTED_ADAPTATION': selected,
+        'SELECTION_REASON': reason,
+        'OUTER_TEST_ACCESSED': 'NO',
+        'OOF_RUN': 'NO',
+        'FORMAL_PRETRAIN_RUN': 'NO',
+        'S3B_STARTED': 'NO',
+        'ACTIVE_CACHE_MODIFIED': 'NO',
+        'PLAN_MD_MODIFIED': 'NO',
+        'FINAL_STATUS': 'WAITING_FOR_CODEX_REVIEW',
+    })
+    for policy in POLICIES:
+        prefix = policy.upper()
+        for task in TASKS:
+            summary[f'{prefix}_{task.upper()}_MEAN_VALID_R2'] = (
+                policy_summary[policy][task]['mean_validation_r2'])
+        if policy != 'full':
+            summary[f'{prefix}_ELIGIBLE'] = eligibility[policy]['eligible']
+    summary['RIDGE_SELECTED_ALPHAS'] = selected_alphas
     target = Path(args.summary_json)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n', encoding='utf-8')
