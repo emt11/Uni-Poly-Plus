@@ -33,7 +33,7 @@
   "sample_index_artifact": "results/glt_pred_20260918/s3b_prep/pretrain_split_v1.json",
   "sample_index_split": "train",
   "common_init_artifact": "results/glt_pred_20260918/s3b_prep/common_init_v1.pt",
-  "expected_world_size": 3,
+  "expected_world_size": 4,
   "third_task": "fgr",
   "fgr_mu": 1.3571292437646856,
   "fgr_sigma": 0.1360748073854848,

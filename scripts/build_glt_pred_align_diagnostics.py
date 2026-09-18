@@ -15,28 +15,30 @@ from src.training.glt_dual_runtime import load_sample_index_artifact, open_sourc
 _WORKER_SOURCE = None
 _WORKER_INDICES = None
 _WORKER_STREAM = None
+_WORKER_POOL = None
 
 
-def _worker_init(cohort_root, cache_root, dual_static_root, indices):
+def _worker_init(cohort_root, cache_root, dual_static_root, indices, pool):
     """Each worker opens its own read-only view and replays the same stream."""
 
-    global _WORKER_SOURCE, _WORKER_INDICES, _WORKER_STREAM
+    global _WORKER_SOURCE, _WORKER_INDICES, _WORKER_STREAM, _WORKER_POOL
     _WORKER_SOURCE, _ = open_source(cohort_root, cache_root, dual_static_root=dual_static_root)
     _WORKER_INDICES = np.asarray(indices, dtype=np.int64)
     _WORKER_STREAM = OrderedSampleStream(_WORKER_INDICES.size, 42)
+    _WORKER_POOL = int(pool)
 
 
-def _scan_microsteps(source, indices, stream, start, end):
+def _scan_microsteps(source, indices, stream, start, end, pool):
     """Per-microstep pool composition for positions [start, end) of the stream."""
 
     records = source.cohort['records']
     rows = []
     geometry_invalid_samples = 0
     no_center_samples = 0
-    for offset in range(start, end, 252):
+    for offset in range(start, end, pool):
         identities = []
         keep_flags = []
-        for position in range(offset, min(offset + 252, indices.size)):
+        for position in range(offset, min(offset + pool, indices.size)):
             logical_index = stream.index_at(position)
             source_index = int(indices[logical_index])
             row = records[source_index]
@@ -60,7 +62,7 @@ def _scan_microsteps(source, indices, stream, start, end):
 def _worker_chunk(payload):
     ordinal, start, end = payload
     rows, geometry_invalid, no_center = _scan_microsteps(
-        _WORKER_SOURCE, _WORKER_INDICES, _WORKER_STREAM, start, end)
+        _WORKER_SOURCE, _WORKER_INDICES, _WORKER_STREAM, start, end, _WORKER_POOL)
     return {'ordinal': int(ordinal), 'rows': rows,
             'geometry_invalid': int(geometry_invalid), 'no_center': int(no_center)}
 
@@ -106,14 +108,15 @@ def build(args):
                 raise ValueError('normalized identity maps to multiple sample keys')
         if len(key_to_identity) != len(identity_to_key) or len(identity_to_key) != len(indices):
             raise ValueError('P_train sample_key/normalized_identity is not bijective')
-        spans = [(ordinal, start, min(start + 252 * int(args.chunk_microsteps), len(indices)))
+        pool_size = int(args.world_size) * int(args.microbatch)
+        spans = [(ordinal, start, min(start + pool_size * int(args.chunk_microsteps), len(indices)))
                  for ordinal, start in enumerate(
-                     range(0, len(indices), 252 * int(args.chunk_microsteps)))]
+                     range(0, len(indices), pool_size * int(args.chunk_microsteps)))]
         chunk_rows = []
         if int(args.workers) == 1:
             for ordinal, start, end in spans:
                 rows, geometry_invalid, no_center = _scan_microsteps(
-                    source, indices, stream, start, end)
+                    source, indices, stream, start, end, pool_size)
                 chunk_rows.append((ordinal, rows, geometry_invalid, no_center))
                 if (ordinal + 1) % int(args.progress_every) == 0:
                     print(json.dumps({'chunks': ordinal + 1, 'total_chunks': len(spans),
@@ -126,13 +129,13 @@ def build(args):
             source = None
             with mp.Pool(processes=int(args.workers), initializer=_worker_init,
                          initargs=(args.pi1m_cohort_root, args.cache_root,
-                                   args.dual_static_root, indices)) as pool:
+                                   args.dual_static_root, indices, pool_size)) as pool:
                 for ordinal, result in enumerate(pool.imap(_worker_chunk, spans), 1):
                     chunk_rows.append((result['ordinal'], result['rows'],
                                        result['geometry_invalid'], result['no_center']))
                     if ordinal % int(args.progress_every) == 0:
                         print(json.dumps({'chunks': ordinal, 'total_chunks': len(spans),
-                                          'processed': min(ordinal * 252 * int(args.chunk_microsteps),
+                                          'processed': min(ordinal * pool_size * int(args.chunk_microsteps),
                                                            len(indices)),
                                           'total': len(indices),
                                           'elapsed_seconds': time.perf_counter() - started}),
@@ -152,9 +155,9 @@ def build(args):
             source.close()
     payload = {
         'seed': 42,
-        'world_size': 3,
-        'microbatch': 84,
-        'distributed_microbatch': 252,
+        'world_size': int(args.world_size),
+        'microbatch': int(args.microbatch),
+        'distributed_microbatch': int(args.world_size) * int(args.microbatch),
         'p_train_count': int(len(indices)),
         'microstep_count': int(microstep_count),
         'valid_pair_count': _summary(valid_pairs),
@@ -186,11 +189,15 @@ def main():
     parser.add_argument('--progress-every', type=int, default=100)
     parser.add_argument('--workers', type=int, default=1)
     parser.add_argument('--chunk-microsteps', type=int, default=64)
+    parser.add_argument('--world-size', type=int, default=3)
+    parser.add_argument('--microbatch', type=int, default=84)
     args = parser.parse_args()
     if args.progress_every <= 0:
         raise ValueError('--progress-every must be positive')
     if args.workers <= 0 or args.chunk_microsteps <= 0:
         raise ValueError('--workers and --chunk-microsteps must be positive')
+    if args.world_size <= 0 or args.microbatch <= 0:
+        raise ValueError('--world-size and --microbatch must be positive')
     print(json.dumps(build(args), ensure_ascii=False, indent=2, sort_keys=True), flush=True)
 
 

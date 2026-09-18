@@ -33,7 +33,7 @@
   "sample_index_artifact": "results/glt_pred_20260918/s3b_prep/pretrain_split_v1.json",
   "sample_index_split": "train",
   "common_init_artifact": "results/glt_pred_20260918/s3b_prep/common_init_v1.pt",
-  "expected_world_size": 3,
+  "expected_world_size": 4,
   "third_task": "align",
   "align_temperature": 0.1
 }

@@ -103,9 +103,9 @@ def build(args):
     for config in configs:
         if config.get('sample_index_split') != 'train':
             raise AssertionError('formal configs must use sample_index_split=train')
-        if int(config.get('expected_world_size', -1)) != 3 or int(config['global_batch']) != 1008 \
+        if int(config.get('expected_world_size', -1)) != 4 or int(config['global_batch']) != 1008 \
                 or int(config['microbatch']) != 84:
-            raise AssertionError('formal configs must keep the 3-GPU microbatch/global-batch contract')
+            raise AssertionError('formal configs must keep the 4-GPU microbatch/global-batch contract')
 
     subset = {'positions': int(args.positions), 'tasks': {}}
     reference = None

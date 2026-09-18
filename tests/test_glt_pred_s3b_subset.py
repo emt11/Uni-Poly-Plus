@@ -148,7 +148,7 @@ def test_formal_configs_share_one_data_and_init_contract():
         assert config['sample_index_split'] == 'train'
         assert config['sample_index_artifact'] == first['sample_index_artifact']
         assert config['common_init_artifact'] == first['common_init_artifact']
-        assert int(config['expected_world_size']) == 3
+        assert int(config['expected_world_size']) == 4
         assert int(config['microbatch']) == 84 and int(config['global_batch']) == 1008
         assert int(config['max_optimizer_steps']) == 5000 and int(config['save_every']) == 1000
         assert config['fusion_mode'] == 'concat' and config['geometry_head_norm'] is True
