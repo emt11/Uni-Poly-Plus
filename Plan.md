@@ -5,7 +5,7 @@
 | 字段 | 内容 |
 | --- | --- |
 | 计划 | GLT-ENGINEERING-20260918-01 / r4 |
-| 状态 | 待审查；r4 最小修复与相关调度测试已完成，等待 Codex 独立审查 |
+| 状态 | 已完成；Codex review PASS / CLOSED（仅限本周期有界工程合同；完整端到端提速未建立） |
 | 用户要求 | 给出其他模型可直接执行的完整工程方案；完成并验收本方案后，才另行考虑预测性能优化 |
 | 范围 | GLT 双通道的数据准备、诊断、计时、输入复用、传输与调度；不优化预测准确率 |
 | 角色 | Codex 规划与独立验收；接手模型负责实现、局部测试和规定的有界测速，并记录实际执行者 |
@@ -371,3 +371,21 @@ checkpoint、DDP、parity、ABBA、profile 或微调预算。
 本轮提交为 `54798fd`，已推送 `origin/dev`；推送后核对
 `HEAD == origin/dev == 54798fd22bfe657f8c3e002e9f446dc28f864870`，工作树干净。
 该提交代表 r4 执行交付，不代表 Codex 独立验收或完整性能提速成立。
+
+### Codex 独立审查与归档结论（2026-09-18）
+
+Codex 已按 r4 范围复核实现 diff、确定性调度回归、r3 DDP 报告及既有 r1/r2 证据：稳定原始
+任务序号修复成立，B→A→C 的 batched 完成顺序返回 A/B/C 且各一次；并行 poll、退出观察后
+wait、batch barrier、dynamic 补位和失败收口未被改变。r4 相关测试为 `17 passed, 1 warning`，
+退出码 0；未追加任何模型或训练执行。因此本周期结论为：
+
+```text
+ENGINEERING_INTERFACE_AND_CORRECTNESS = CLOSED
+FULL_PRETRAIN_SPEEDUP = NOT_ESTABLISHED
+FULL_FINETUNE_SPEEDUP = NOT_ESTABLISHED
+PREDICTION_PERFORMANCE_COMPARISON = NOT_RUN
+```
+
+本周期没有正式 5k/20k、完整微调、outer-test/OOF、ABBA 重跑、parity 重跑或 cache rebuild，
+也没有修改 active cache、配置、checkpoint 或历史结果。r1→r4 的最终归档已追加至
+`PROJECT_HISTORY.md`。后续预测性能优化必须另立计划并取得授权，不自动启动。

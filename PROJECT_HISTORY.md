@@ -174,3 +174,15 @@
 * 证据口径：旧约60→10.5秒是static与clean-cache组合且计时不含完整启动/保存；旧CPU准备计时漏static/target读取；旧4GPU恢复不等于3GPU正式吞吐。这些作为新方案必须解决的测量问题，不改写旧报告。原有LRU、动态grid、角度向量化、BF16/no_sync和恢复修复继续复用。
 * 实际修改：Plan.md写入可独立执行的阶段、固定路径、已有/拟新增CLI、命令、预算、停止与验收条件及空白执行记录；本文件归档本次文档周期。未改生产代码、PIPELINE、RESULTS、缓存或产物；未运行模型、测试、benchmark。文档检查和git diff --check自检，提交/推送信息见对应Git历史与交付回复。
 * 下一步：用户授权“执行本计划”后接手模型按S0–S6执行，Codex独立审查。工程验收完成后仅标暂无后续执行，预测性能优化必须另立计划并授权，不自动衔接启动。
+
+## GLT-ENGINEERING-20260918-01｜r1→r4 工程周期最终归档（2026-09-18）
+
+* 授权与角色：用户授权执行 GLT 双通道工程提速计划及后续最小返修；Codex 负责规划与本次独立审查归档，执行者完成 r1–r4 的实现、局部测试和有界 smoke。归档范围仅为工程接口、正确性、恢复与调度合同，不延伸为预测性能实验。
+* 修订链：r1 建立计时、static/target 读取、clean cache、动态 grid 和有限候选范围；r2 修正 grid resume 身份隔离、预训练窗口计时、CPU profile 边界并补 worker=3 证据；r3 修正 launch-to-exit 计时的起点和退出观察边界，增加并行 batched 收割及真实 3-rank partial/all-zero geometry DDP；r4 修正 batched 完成结果因 active 列表压缩而可能错序的问题。
+* 最终实现与文档提交：r3 实现提交 `4826c90`，r3 执行记录链为 `ed7a782`、`46e9e9c`、`7542369`；r4 最小修复提交 `54798fd`，最终交接文档提交 `4690d3d`。当前 `dev` 已推送并核对至 `4690d3de3f69cbfad97e2b48e61db313037bd202`，工作树干净。
+* r4 独立审查证据：审查确认 `run_glt_dual_finetune_grid.py` 为每个 shard 保留稳定的原始任务序号，batched 仍并行 poll、先观察退出再 wait、保持 batch barrier；确定性假进程测试模拟 B→A→C，返回 A/B/C 且各任务一次。授权调度测试日志 `logs/glt_engineering_20260918/r4_grid_tests.log` 记录 `17 passed, 1 warning`、退出码 0；`py_compile` 和 `git diff --check` 通过。
+* r3 及既有证据范围：r3 局部测试为 `27 passed, 1 warning`；真实 3-rank NCCL 报告 `results/glt_engineering_20260918/r3_no_geometry_ddp.json` 显示 partial-zero 全局计数 `[3,1,3]`、all-zero `[3,0,3]`，两 case 的 loss、backward 和 chemistry/fingerprint gradients finite，且 optimizer updates=0。r2 的 worker=3 恢复、窗口 schema 和 profile 证据按 `Plan.md` 与对应报告保留；不重复运行历史证据。
+* Codex 审查结论：**Codex review PASS / CLOSED（有界工程合同）**。已确认 r4 没有改变 dynamic 补位、失败收口、模型科学定义、训练配置、数据划分、cache、checkpoint 或已有实验数字；没有发现会阻断本周期工程接口收口的剩余问题。
+* 明确边界：`FULL_PRETRAIN_SPEEDUP=NOT_ESTABLISHED`、`FULL_FINETUNE_SPEEDUP=NOT_ESTABLISHED`。本周期没有正式 5k/20k、完整 Concat/KFuse 训练、8×5 微调、outer-test/OOF、全量 parity、ABBA 重跑或 cache rebuild；微调 bounded evidence 和历史预训练观察不外推为完整端到端收益，也没有比较预测性能。
+* 本次归档操作：仅追加本条 `PROJECT_HISTORY.md` 记录并更新 `Plan.md` 状态；不运行测试、模型、训练、benchmark、DDP、profile，不修改 `.py`、config、cache、results 数字或 checkpoint。
+* 后续：本工程周期已完成，暂无自动后续执行。任何预测性能优化必须另立科学计划，明确 reference、controlled change、task/fold、预算和停止条件，并取得用户授权；本归档不产生启动授权。
