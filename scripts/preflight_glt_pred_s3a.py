@@ -127,7 +127,7 @@ def main():
         'expected_step': int(args.expected_step),
         'checks': {
             'metadata_ok': metadata_ok,
-            'strict_load_error': strict_load_error,
+            'strict_load_ok': strict_load_error is None,
             'predictor_initial_state_exact_across_policies': predictor_identity,
             'trainability_contract': trainability_ok,
             'lora_k_slice_unchanged': k_slice_ok,
