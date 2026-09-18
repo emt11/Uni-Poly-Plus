@@ -1,391 +1,391 @@
-# GLT-V2 工程提速最终执行方案
+# GLT-V2 预测性能优化：融合预训练、Trimer–RU 对齐与 XC 适应
 
-## 0. 交接头与执行指令
+## 0. 交接头、授权与完成口径
 
 | 字段 | 内容 |
 | --- | --- |
-| 计划 | GLT-ENGINEERING-20260918-01 / r4 |
-| 状态 | 已完成；Codex review PASS / CLOSED（仅限本周期有界工程合同；完整端到端提速未建立） |
-| 用户要求 | 给出其他模型可直接执行的完整工程方案；完成并验收本方案后，才另行考虑预测性能优化 |
-| 范围 | GLT 双通道的数据准备、诊断、计时、输入复用、传输与调度；不优化预测准确率 |
-| 角色 | Codex 规划与独立验收；接手模型负责实现、局部测试和规定的有界测速，并记录实际执行者 |
-| 核查基线 | dev，r4 开始前为 `7542369`；2026-09-18 pull 为 Already up to date；保留 r1–r3 的实现、日志和产物，不重做微调预算 |
-| 既有工作 | CACHE-20260916-01/r4、SPEED-20260917-01/r4 均已归档；不重做已完成工作，不复活旧科学计划 |
+| 计划 ID | GLT-PRED-20260918-01 / r1 |
+| 状态 | 待授权；仅方案编制完成，代码、验证、训练和预测比较均未执行 |
+| 用户要求 | 全面优化预训练、2D/3D、Trimer 与单 RU 融合、XC 微调及参数；考虑替换 7-RU FP；供其他模型执行 |
+| 本轮授权 | 编写本计划及必要文档归档、提交同步；不授权启动科学实验 |
+| 角色 | Codex 规划与后续独立审查；接手模型执行并记录实际执行者；不默认启动子代理 |
+| 代码基线 | dev@6d44ed9；修改前 pull --ff-only 为 Already up to date |
+| 用户已有改动 | Plan.md 已被用户清空；按明确请求写入新计划，不恢复被清空的旧正文 |
+| 上一周期 | GLT-ENGINEERING-20260918-01/r4 已归档；工程正确性关闭，不代表完整提速或预测提升 |
+| 当前范围 | 科学设计与分阶段执行合同；只有另获授权的阶段才可实施、运行 |
 
-**给执行模型的指令：**先完整读取 AGENTS.md 和本文。收到用户“执行本计划”的授权后，依次完成 S0→S1→S2→S3→S4→S5→S6；普通实现细节自行处理，不重复询问已授权的小步骤。不要只输出另一份计划。受阻则停止受影响阶段、保留证据，继续不依赖阻断项的代码/测试工作；不得偷偷更换协议、缩小验收集合或扩大预算。最终状态只能先标“待审查”，由 Codex 审查后关闭。
+**执行端先读 AGENTS.md 和本计划，再核对实时仓库、配置、产物和进程。不要把本文件中的拟新增接口当作已有 CLI。**
 
-本文中的新增接口均明确标为“拟新增”，实施前不能直接运行。已有 CLI 模板使用已核实参数。文档本身不替代执行授权。
+授权分层：用户后续说“实现并验证本计划”，默认指 S0–S2 的实施与必要有界验证；S3/S4/S5 的研究训练预算和 outer-test 必须明确包含在用户授权中。用户明确授权全部阶段时按本合同顺序执行，不重复申请已授权步骤；条件不满足时停止晋级，不用剩余预算机械补跑。历史科学实验授权不自动迁移至本计划。
 
-### r2 返修范围（仅处理独立审查指出的执行合同缺口）
+科学成功不预设 R² 必须达到 0.87。候选均无效也可完成一轮有边界研究；不得将负结果写成提升，或为达到目标自动加组、加 seed、加构象。
 
-- 修正 `run_glt_dual_finetune_grid.py --resume`：必须核对 run/summary/runtime 的模式、单一 task/fold、协议和 outer-test 状态；拒绝 smoke/formal 混用，不把非本次模式的非空 `tasks` 当作完成。
-- 修正预训练 benchmark：保留逐步 CPU 观测作诊断，主 `window_seconds` 改为 warmup 后窗口边界到末端同步的完整墙钟，并汇总各 rank 的完整窗口最大值；不重跑 every20 候选或正式训练。
-- 修正 CPU profile：独立 clean 诊断置于完整 prepare/collate 消费链之外，明确 `pretrain_prepare` 是内部 clean+noisy 准备，不再把重复 clean 构建计入 `complete_sample`。
-- 为 grid 子进程写入 launch/exit 边界时间，未来可获得 launch-to-exit；既有 r1 微调结果只保留为“内部 process wall”，不追加 24 epochs。
-- 追溯并补记既有 parity、DDP/梯度、测试日志和资源证据；有证据则限定适用范围，无证据明确未执行。不增加新的科学候选，不修改 active cache、配置或样本集合。
+## 1. 事实基线与证据索引
 
-## 1. 本轮只做什么、绝不做什么
+### 1.1 当前主线
 
-### 1.1 唯一目标
+当前对象为 `O8-BondPath-GalformerTrimer-Hop2`、Concat、geometry_head_norm、5k；不是旧 N+1/N+2 蒸馏，也不是退役融合模型。无 MD200、教师、InfoNCE。
 
-在相同模型、数据和训练工作量下，降低预训练每个 optimizer update 的墙钟时间、微调完整短任务耗时和多任务调度等待，给出可复现的启动命令、保守推荐值和关闭优化的回退命令。
-
-吞吐、时间、内存、I/O 和正确性是本轮验收指标。loss、validation 输出只作数值一致性与异常检查，不作为选模型、调参或科学结论依据。
-
-### 1.2 冻结不变项
-
-- 当前架构 `O8-BondPath-GalformerTrimer-Hop2`；主比较固定 Concat、无 MD200，无教师/蒸馏。
-- O8/GLT 均6层、512维、8 heads；2D路径、3D物理键与1/2-hop关系、中心readout、attention方向/缩放均不改。
-- 不改三任务目标、权重1/1/0.1、30%mask、0.03 Å噪声、geonorm科学定义、参数初始化、optimizer、LR、scheduler、dropout、样本顺序及各rank分配。
-- 预训练固定3 ranks×84×accumulation4=1008、BF16、seed42、原5000-step配置及20000-step scheduler horizon。短测提前停止，不改原配置以伪造更短schedule。
-- 微调固定FP32、train32/eval64、原LR/weight decay、train-only scaler、outer5_inner20；验证频率和选择规则不改。短测沿用已有 `--smoke` 的两epoch语义，不宣称复现100epoch完整轨迹。
-- 无效几何、单原子、N=0、无角度、重复物理关系、有效图分母全部保持；不会因提速丢弃大图/异常样本或改变cohort。
-- 不修改active缓存/manifest/`.frozen`，不生成构象、不全量重建/迁移、不清理历史产物、不改变mmap默认容量2。
-
-### 1.3 明确排除
-
-不做预测性能优化、模型结构/融合/readout修改、损失调权、扭转/非键输入、多构象、任务采样、精度或batch改动、torch.compile/CUDA Graph/attention替换、DDP `find_unused_parameters` 修改。不得运行正式5k/20k、8×5、outer-test/OOF，不新增seed，不启动或干预EQ3D及其他路线。
-
-**本计划全部完成且审查通过，仅表示工程阶段结束；不会自动授权下一阶段预测性能研究。**
-
-## 2. 已存在的功能和证据，不重复开发
-
-| 项目 | 当前事实 | 本轮处理 |
-| --- | --- | --- |
-| static/target读取 | 已有，历史fixed-geonorm正式run已使用 | 所有主对照均开启，不拿无static慢路径冒充当前baseline |
-| clean CPU Data LRU | 已有，`--clean-cache-gib`默认0，返回独立副本并附当前标签 | 做相同static条件下的0 vs 4 GiB配对比较 |
-| 动态grid | 已有空闲槽位补位、重复GPU拒绝和失败收口 | 复用，补有界真实smoke调度观察，不重写 |
-| 中心角度筛选 | 已向量化 | 不再次作为新优化计数 |
-| BF16/no_sync/预取 | 已有，正式run为每rank3workers | 保持，不把从0workers改3算成本轮收益 |
-| 恢复RNG | 已有worker恢复修复；旧4GPU恢复报告PASS | 本轮若改诊断/准备/运行控制，在锁定3GPU上局部确认 |
-
-旧证据路径：`results/speed_20260917/`、`logs/speed_r4_scoped_tests.log`、`PROJECT_HISTORY.md` 的 SPEED归档。
-
-必须保留的解释限制：旧xc两epoch约60秒→10.5秒，同时改变static和clean cache；不是cache单因素收益。旧 `epoch_seconds` 不含启动及best权重复制/最终保存。256条CPU profile没有把static/target读取纳入准备计时。旧4GPU正确性smoke不是3GPU正式吞吐基线。本轮报告只追加新结论，不覆盖旧JSON/日志。
-
-## 3. 环境、固定输入与输出
-
-工作目录 `/root/workspace/Uni-Poly-Plus-master`；当前Python `/opt/conda/bin/python`，执行前确认其环境可用，不安装/升级依赖。GPU需要3张空闲且没有已登记即将占用的设备；不足时等待用户协调，不擅自换world size、挤占或kill其他任务。
-
-| 用途 | 固定路径 |
+| 项目 | 核实的当前实现 |
 | --- | --- |
-| 预训练配置 | `configs/mts/glt_dual_three_task_concat_geonorm.json` |
-| 预训练cohort | `data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1` |
-| 预训练基础缓存 | `data/processed/mips_trimer_scage` |
-| static / target | `data/processed/glt_dual_v2/pi1m/dual_static_v1` / `pretrain_targets_v1`（同级） |
-| 微调配置 | `configs/mts/glt_dual_three_task_concat.json` |
-| 微调部署包 | `results/glt_dual_static_pretrain_5k_concat_geonorm/deploy_05000.pt` |
-| 微调raw / split | `data/raw` / `data/splits/mips_outer5_inner20` |
-| 微调cohort | `data/processed/glt_dual_v2/downstream/cohort_1545eda5a8f6a1` |
-| 微调基础缓存 | `data/processed/mips_trimer_scage_downstream` |
-| 微调static | `data/processed/glt_dual_v2/downstream/dual_static_v1` |
+| 2D | 周期 canonical RU；137 原子特征＋1 backbone；138→512；6 层、8 heads、FFN 2048；SPD/path-node/bond-path bias |
+| 3D | 冻结开放 Trimer 的每条物理键独立 state；端点元素、键长、路径键角；6 层、512、8 heads；没有显式扭转或非键距离 |
+| 读出 | O8 真实 canonical 原子 mean；GLT 中心内部键 mean；分别 LN 后拼成 1024 |
+| 下游 | 1024→512→1；train-only standard scaler、MSE、validation R² 选模、outer5_inner20 |
+| 预训练 | motif 原子 mask 0.30，元素 CE；坐标噪声 0.03 Å 后中心键长/角度去噪；0.1×7-RU rooted FP BCE |
+| 参数 | O8 18,998,040；GLT 20,021,854；两个 LN 共 2,048；deploy 39,021,942；不含下游性质头 |
+| 优化器 | 预训练 AdamW lr 2e-4、wd 0、BF16、global batch 1008；5k updates、warmup 2000、cosine horizon 20k |
+| 微调 | encoder lr 1e-5、fusion/head 1e-4、wd 0.02；batch 32/eval 64；100 epochs、warmup 5、patience 10 |
 
-复用现有身份/strict-load检查，缺失或不兼容立即报告，不猜替代路径、不新增全量hash机制。
+事实源：`src/modules/glt_dual.py`、`glt_dual_pretrain.py`、`mips_local_graph.py`、`src/dataset/glt_dual*.py`、`scripts/finetune_glt_dual.py`、`configs/mts/glt_dual_three_task_concat_geonorm.json`。源码签名以执行时为准。
 
-每轮使用新的 `results/glt_engineering_20260918/<UTC时间戳>/` 和对应 `logs/glt_engineering_20260918/<UTC时间戳>/`，不覆盖历史目录。允许用shell新建输出目录；脚本和文档用apply_patch编辑。
+### 1.2 必须保留的参考产物
 
-GPU、worker、超过一分钟及写训练产物的命令只能放在 `tmux` session `Uni-Poly` 独立window（前缀 `glt_eng_`）。先查session/进程/自动后续任务，记录cwd、window、设备、完整命令、日志、输出和退出码。stdout/stderr保留到日志；使用 `tee` 时检查真正任务的退出码，不能把tee成功当作训练成功。
+- fixed deploy：`results/glt_dual_static_pretrain_5k_concat_geonorm/deploy_05000.pt`。
+- 原始配置/来源：同目录 `run.json`，及 `results/glt_v2_fixed_concat_5k_20260916/deploy_05000_validation.json`。
+- 七任务参考：`results/glt_v2_fixed_concat_5k_20260916/aggregation_review_7task/summary.json`。
+- O8 归因：`results/glt_sci_o8ctrl_20260917/final_comparison/summary.json` 及 formal 下各 arm 的 run/summary/predictions。
+- splits：`data/splits/mips_outer5_inner20/`；原始性质表：`data/raw/smi_<task>.csv`。
+- 预训练 cohort：`data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1`；静态缓存同级 `dual_static_v1`；实际 parent bundle 由 run/store 解析，不猜测或切换。
+- 下游 cohort：`data/processed/glt_dual_v2/downstream/cohort_1545eda5a8f6a1`；静态缓存同级 `dual_static_v1`；cache root 从原 run 核对。
 
-资源监控每30秒一次，人工状态检查5–10分钟或阶段结束；失败即时汇报。不清系统page cache，不执行swapoff，不让监控本身占主要时间。
+| 既有描述性结果 | macro7 R² | XC R² |
+| --- | ---: | ---: |
+| fixed Concat | 0.777210 | 0.308668 |
+| A：双路包提取 O8，独立微调 | 0.776328 | 0.319058 |
+| B：独立 O8-only 预训练/微调 | 0.777674 | 0.336078 |
 
-## 4. 分阶段实施合同
+当前没有证据支持完整 GLT 在 XC 上优于 O8。以上是开发 folds 的历史结果，不是新的独立盲测；不据此逐折挑最优模型。旧七任务不含 egc，禁止与八任务 macro 混排。
 
-### S0 — 同步与基线固定
+### 1.3 XC 基线
 
-1. 检查git status、branch、remote，按AGENTS pull，再读最新代码与本文件。保护用户改动，不stash/reset/恢复空Plan来覆盖别人工作。
-2. 核对第3节路径及上述现有功能；执行提交相对 `f1dfd4d` 有变化时记录相关diff。不要求HEAD永远等于规划基线，但科学接口有变须暂停确认。
-3. 检查现有进程、GPU、RAM、共享内存、磁盘与fd限制。其他自动训练循环可能重新启动任务，不能只看某一秒GPU为0%。确认专用测速窗口后再占设备。
-4. 写入本轮 `execution.json`：实际baseline commit、解释器/库版本、设备、原配置、输入路径和既有身份、输出目录、预算计数器。复用现有字段，不新建schema或运行框架。
+本地 432 条，Xc 范围 0.13–98.81；各折 train=276，validation=69/70，test=87/86；432 个不同原始 SMILES 不等于完成 polymer identity 去重。单 heavy 原子记录 `*C*`、47.8，仅一条，不能解释整个任务低分。XC 的原始标签定义、实验/计算来源及条件应追溯，不能先假设全是实验结晶度或全部由 DFT 得到。
 
-**完成条件：**基线可加载、设备可独占测速、输出隔离明确。无资源时CPU代码/测试可继续，GPU阶段标阻断，不声称完成。
+## 2. 论文依据与项目新增部分
 
-### S1 — 修正计时口径（必做）
+主要窗口为 2024-09 至 2026-09。执行端引用时核对正式版本；预印本如实标记。
 
-主要文件：`scripts/profile_glt_dual_runtime.py`、`scripts/pretrain_glt_dual.py`、`scripts/finetune_glt_dual.py`。共享utils只在确有必要时改，默认行为不能影响其他路线。
-
-1. CPU profile逐项计入source读取、static读取、target读取、clean/noisy准备、collate及完整样本时间。使用固定seed的随机256个不同索引；保存实际key/顺序，所有路径使用同一集合。记录打开数据耗时、p50/p95、图大小/关系数、资源；不遗漏移到计时边界外的工作。
-2. 预训练增加**拟新增** `--benchmark-steps N --benchmark-warmup W`：N为本次实际执行总updates，W为其中不计入稳定窗口的前W步；0<=W<N，不能超过原配置剩余步数。允许不打开重型diagnostics，不改变原配置、LR horizon、有效batch或样本流。默认关闭；与旧stop接口同时指定时报错；benchmark正常结束不写正式deploy，不触发5000-step完成标志。
-3. benchmark稳定窗口在所有rank就绪后计时，窗口末同步并报告最慢rank墙钟、实际图数/updates及samples/s。每rank的逐步耗时用于分布诊断，最终聚合一次，不为了每步计时新增一串all_reduce。逐步异步CPU计时必须注明，不能冒充GPU独立kernel时间。
-4. 保留旧 `--timing` 为有同步扰动的诊断工具，正式ABBA测速不用它。若需GPU分段，用少量CUDA events集中读回；profile段与正常吞吐段分开报告。step/窗口时间包含实际日志开销；保存耗时另计，不偷偷移出全流程总时间。
-5. 微调增加从入口至全部产物保存结束的内部总时间；外层记录子进程启动到exit的总墙钟。保留train/validation段，并单列source打开、首批准备、best权重CPU复制和最后保存。clean-cache冷启动成本必须在总时间中。
-6. 输出 `runtime.json`（运行参数和资源）与 `benchmark.json`（计时和计数），允许复用已有JSON扩展字段；诊断日志不能依靠从交错DDP stdout提取JSON，写每rank独立机器可读记录，最终rank0汇总。
-
-**验收：**计数/计时相关合成测试通过；旧CLI无新开关时保持行为；profile不写冻结缓存；配置max_steps/scheduler未被短测参数改写。
-
-### S2 — 非必要诊断按步采集（必做，第一预训练候选）
-
-主要文件：`scripts/pretrain_glt_dual.py`、`src/modules/glt_dual_pretrain.py`、相关测试。
-
-1. 增加**拟新增** `--diagnostics-every N`（正整数，默认1），只在 `--diagnostics` 存在时有效；采样绝对update为首步、N的倍数及明确诊断保存步。所有rank、同一update内所有accumulation microbatch使用一致开关。
-2. 未采样步必须真正跳过hook、quantile/RMS等详细统计及模块梯度统计，不只是少写JSON。保留所有更新、全局loss/有效计数、finite/gradient检查和错误输出；本轮不同时降低普通loss日志频率。
-3. 不改变模型参数/buffer集合、forward返回的训练sums/counts、RNG和optimizer。清除或标记旧 `last_diagnostics`，禁止把上次统计写成本step结果。rank-local最后microbatch统计与全局loss分开标记，不伪称全局统计。
-4. 候选固定every20，baseline every1；同样的3workers、static/targets、计时和保存规则。收益明确称为诊断开销节省，不归因为模型计算加速。
-
-**验收：**诊断ON/OFF及1/20的固定输入forward、梯度和短轨迹满足第6节；未采样步确实没有详细统计调用；所有rank同步策略不变。
-
-### S3 — 微调独立对照与调度收口（必做）
-
-不重写CleanLabeledDataset或动态grid。只补必要计时、发现真实缺陷时局部修复。
-
-1. 固定geonorm部署包、static开启、xc/fold0、两epoch；A=`--clean-cache-gib 0`，B=`--clean-cache-gib 4`。按A-B-B-A共4个独立进程运行，同设备和环境，不接续权重，不改变数据顺序。
-2. 比较完整子进程时间、两epoch内段、cache命中/淘汰、RSS/PSS。baseline和candidate的validation输出、best epoch及最终权重仅用于一致性核对；不得按validation高低选开关。测试不读取outer-test。
-3. 调度验证固定4个smoke单位：`[(xc,0),(eat,0),(xc,1),(eat,1)]`，每单位2epochs，固定两张GPU，单GPU一进程。建立最多一个简单辅助脚本，调用现有 `_run_dynamic_jobs`；child始终使用 `--smoke`，不要用生产grid的 `--formal-shard` 冒充smoke。每单位static开启、cache4 GiB；A为仅测试用的旧式两槽分批等待，B为现有动态补位，各运行一次，输出隔离。
-4. A/B单位集合、命令、seed、预算一致；记录实际启动/结束及GPU空闲时间，失败停止新派发并收口自己创建的进程。此小样本只验证真实smoke能调度，不外推正式8×5收益，也不要求为了获得更好百分比反复重跑。
-
-**验收：**S3.1无static混杂、计时完整；S3.3八个子进程全部合法smoke退出且outer-test=NOT_RUN，无重复单位/漏跑。真实grid若没有可观察尾部空闲，记录收益不足，不扩任务。
-
-### S4 — 至多一个额外预训练候选（条件执行，不穷举）
-
-先完成S1实测。选中项、占比和理由写入Plan执行记录，再实现。按以下决策，不让接手模型自由扩成多项实验：
-
-| 证据 | 唯一允许的候选 | 限制 |
+| 原文 | 采用的依据 | 本项目新增，不宣称原文已验证 |
 | --- | --- | --- |
-| CPU准备在消费等待中显著，clean完整物化/重复字段组装是其可定位热点 | 将clean target提取与noisy输入组装分离；复用已验证静态索引，减少clean整图复制 | 不新增磁盘缓存；旧分支保留为默认reference，拟新增 `--prepare-mode legacy\|targets_only` 默认legacy |
-| 等待主要与H2D相关，准备不是主要热点 | 对已有Data/labels正确pin，并nonblocking传输 | 拟新增 `--pin-input-memory` 默认false；worker仍3、prefetch仍4，不同时调参 |
-| 主要在source/static随机读取、GPU算子，或证据不足 | 本轮不新增候选，记录暂缓原因 | 不改缓存格式/容量、不换attention、不乱加worker |
+| [GRIN, NeurIPS 2025](https://papers.nips.cc/paper_files/paper/2025/hash/7fe3921147c968d0b57a224c0d07e21d-Abstract-Conference.html) | RU 重复表示一致性与拓扑增强 | 中心物理 Trimer 与 canonical RU 对齐；三 RU 的理论条件不是实际构象充分性证明 |
+| [FlexMol, CIKM 2025](https://arxiv.org/html/2510.07035v1) | 跨模态交互和重建、缺失模态处理 | 本文融合条件距离任务、原子—物理键桥，不是完整 FlexMol 复现 |
+| [Masking Design, TMLR 2025](https://arxiv.org/abs/2512.07064) | 语义目标与编码器匹配比复杂 mask 更值得优先验证 | 周期原子环境目标与保留现有 mask |
+| [SCAGE, Nature Communications 2025](https://www.nature.com/articles/s41467-025-59634-0) | 化学/几何多任务和功能团知识 | 不照搬其任务数量或声称聚合物最优 |
+| [Token-Mol, Nature Communications 2025](https://www.nature.com/articles/s41467-025-59628-y) | 显式扭转承载构象信息 | 标量 GLT 的局部扭转增量，不引入 SMILES LLM |
+| [DenoiseVAE, ICLR 2025](https://proceedings.iclr.cc/paper_files/paper/2025/hash/37e9e62294ff6607f6f7c170cc993f2c-Abstract-Conference.html) | 噪声机制与分子结构应匹配 | 初轮仍固定 0.03 Å，不直接实现 Noise Generator |
+| [PolyConFM, 2025 预印本](https://arxiv.org/abs/2510.16023) | RU 局部构象与 RU 间相对构型分开建模 | 不以单冻结 Trimer 冒充长链 MD 或构象分布 |
+| [ELoRA, ICML 2025](https://proceedings.mlr.press/v267/wang25al.html) | 低数据下受限参数更新 | 当前标量网络采用普通 LoRA，不声称实现 SO(3) ELoRA |
+| [TabPFN, Nature 2025](https://www.nature.com/articles/s41586-024-08328-6) | 小样本表格读出参照 | 仅后续候选；初轮用 Ridge，避免新增依赖和模型数量 |
 
-若两项都满足，选占完整update比例更高且预计可节省时间更大的一个；只可择一。优化的受影响段不足总时间10%时原则上不实施，避免用很小局部提升换取复杂度。
+## 3. 核心问题与总体顺序
 
-`targets_only`必须保留clean distance/cosine target、顺序和多重性；不能把 `angle_pairs` 直接当成line row indices，不能缓存带可学习参数的Gaussian embedding，不能将clean几何送入noisy输入。严格比较全部tensor与分母。
+Q1：当前表示已有信息是否被全量微调破坏？→ 冻结读出/LoRA。
 
-候选无收益或验证失败则关闭，保留baseline并记录否决；不替换另一个候选继续试，不追加第三条路径。
+Q2：7-RU FP 能否被更贴合双路预测的任务替换？→ FP / 无 FP / 融合条件几何重建三组。
 
-### S5 — 预训练公平测速与最终组合确认（必做）
+Q3：中心内部键 GAP 是否丢失跨 RU 的局部对应？→ 原子锚定融合，固定目标做对照。
 
-主矩阵：
+Q4：键长/键角之外的构象信息是否有用？→ 单独添加扭转，不同时添加非键邻域。
 
-| 比较 | A | B | 顺序和预算 |
+Q5：化学监督语义是否不足？→ 用原子环境替换元素目标，固定架构。
+
+执行顺序为 S0 审计 → S1 XC 适应模块 → S2 FP 替换及边界实现 → S3 适应/目标开发比较 → S4 条件架构与语义增量 → S5 锁定后正式确认。S4 各分支有独立开关，不要求全部晋级。
+
+## 4. 不变项、数据划分与选择纪律
+
+### 4.1 数据与资产
+
+- 不改 active topology/Trimer/static/targets、manifest 或 `.frozen`；不覆盖既有 checkpoint/results。
+- 复用实际冻结单构象，不生成新构象、RU±2 几何、晶胞或长链。7-RU 原任务只使用拓扑，不曾意味着 7-RU 几何。
+- 移除 FP 训练消费不等于删除旧 target cache；BRICS 等公共字段照常读取。
+- 中心 canonical↔O8↔实际 Trimer 原子/键映射必须可证明；不可依赖数组位置或任意 atom order。
+- 初轮比较使用相同预训练 cohort、全部同序样本；不得按某新任务有效性过滤样本。化学、局部几何、融合几何各有独立 mask/分母。
+- 不引入 MD200；不重跑旧蒸馏。新结构有独立 architecture/task 配置身份，沿用现有严格加载能力，禁止伪装成旧 deploy。
+
+### 4.2 预训练验证与来源
+
+S0 建立按 polymer identity 的 95%/5% P_train/P_val 划分，seed=42，四舍五入方式写入实际数量；同 identity 的重复表示不得跨集合。禁止以正式任务标签构造此划分。
+
+查 PI1M 与八任务的身份重叠。主科学比较优先排除全部 benchmark 身份后建立公共 P；不修改旧 cohort，使用独立只读索引列表。所有新参考/候选使用同一 P。若 identity 无法证明，相关严格泛化声明阻断；历史 checkpoint 可用于适应诊断，但保留来源限制，不称独立盲测。
+
+这会使新参考不同于历史训练；必须重训新 B_FP，历史 5k 只作参考，不用它替代新 matched baseline。过滤后样本数及预算对应暴露数由审计确认，不预填 PASS。
+
+目标统计、环境词表只拟合 P_train；P_val 用固定 mask/噪声/目标集合。训练样本顺序和随机流在实验组间匹配；新增 head 的初始化、采样使用独立 generator，不扰动公共 dropout/mask/噪声序列。
+
+### 4.3 下游选择与评估
+
+- 保留现有 outer5_inner20 manifest；scaler 仅拟合最终 train，validation 早停和选配置；不 refit train+validation。
+- S1/S3/S4 开发只用 folds 0/1 的 train/validation，outer-test loader 不实例化、不读取预测文件来调参；开发最大30 epochs、warmup5、patience10，所有组同 schedule 长度。
+- 开发任务固定 xc、eps、eat，分别覆盖主问题、低数据相关风险和高分保护任务。历史 test 结果可描述，但不能反复据此选候选。
+- folds 0/1 的 train 会包含其他 folds 的 outer-test 身份：该开发方式不能声称最终五折是严格嵌套独立测试。最终五折标记 development-CV；若需独立泛化结论，另立外部测试或真正嵌套计划。
+- checkpoint 选择用各自预训练验证检查和锁定开发 probe；不同损失数值不可直接排名。主比较统一用第5000步部署，不能每个任务用 outer-test 挑预训练步数。
+- 不跨任务注入同一 held-out polymer 的监督标签；多任务监督训练不纳入初轮。
+
+## 5. FP 替换：Fusion-Conditioned Geometry Reconstruction（FGR）
+
+### 5.1 为什么不是“把 FP 改成 fusion”
+
+当前 FP 已经从融合表示预测，但标签由拓扑决定，融合可能不需要独有的几何信息。Fusion 是运算，不是监督目标。本计划选择可实现的替代：**同一预测融合表示参与中心 RU 原子对的干净距离重建**。
+
+FGR 是 FlexMol-inspired 的项目条件几何重建，不是完整跨模态生成、3D教师蒸馏或证明两路必不可少的目标。仅有 loss 下降不能证明跨模态利用；必须做分支消融和下游比较。初轮不额外加入 InfoNCE、EMA teacher 或 matching classifier。
+
+### 5.2 固定目标身份与采样
+
+1. 只取中心 q=0 的两个不同实际重原子；在真实 Trimer 化学图上 shortest-path distance 为2或3的无序物理原子对。禁止以 canonical 索引“捷径”构造不存在的物理路径。
+2. 目标为两中心原子的干净欧氏距离；SPD=3 可提供超越两个独立键角的构象约束。不使用 q=±1 的同名多值目标，避免 decoder 无法辨识左右目标。
+3. 每图最多32对：SPD2/SPD3 各最多16，某层不足将剩余额度给另一层；超过时无放回均匀采样。采样由 sample identity、epoch/absolute-position 和独立任务 seed 决定；验证固定。记录每层覆盖，不能只挑短距离或成功样本。
+4. 候选由拓扑决定，不按 clean 距离排序选择；重编号 fixture 使用同步映射后的固定候选检验不变性，不要求两个独立随机抽样集合逐位一致。
+5. 无候选、无效几何、中心内部键数0的样本不进入 FGR 分母，保留原子任务；明确记录 FGR 在小 RU 上的覆盖限制，不扩大目标到侧 RU 来隐藏低覆盖。
+6. `t_ij=(log1p(d_ij / 1Å)-mu)/sigma`，mu/sigma 从 P_train 全部上述候选统计一次，sigma 有有限正下界；P_val和下游不参与拟合。
+
+### 5.3 输入、decoder 与损失
+
+继续原有 O8 motif mask 和整 Trimer 坐标副本0.03 Å噪声。所有 encoder 几何输入从 noisy 坐标计算；clean 坐标仅在监督构建器中。FGR 初版不新增几何 mask、不使用 clean pair distance 作输入，称“条件去噪重建”，不称“无几何线索的遮蔽恢复”。
+
+定义 O8 canonical atom state 为 H，模型共用融合输出为 g_f；当前 Concat 下 g_f 为1024维，预训练/微调必须调用同一个 `fuse()`。
+
+$$
+\hat t_{ij}=D_{\rm FGR}([\operatorname{LN}(H_i+H_j),\operatorname{LN}(|H_i-H_j|),g_f]).
+$$
+
+decoder 为 `2048→256→1` GELU MLP，两个局部 LN 无 affine；g_f 已使用现有分支 LN。不输入 raw坐标、原子ID、clean目标、距离rank。对称端点组合确保交换 i/j 不改变结果。
+
+$$
+L_{\rm FGR}=\frac{1}{|V_{\rm FGR}|}\sum_{b\in V_{\rm FGR}}\frac{1}{|P_b|}\sum_{\{i,j\}\in P_b}\operatorname{Huber}_{0.5}(\hat t_{ij}-t_{ij}).
+$$
+
+主替代目标：`L = L_chem + L_geo + 0.1 L_FGR`。保留 geometry_head_norm 和原 geometry 分母语义。0.1 是固定起点，不代表与 FP 有相同梯度规模；记录各分支梯度贡献，不能仅比 loss 标量。空集合返回与图连接的有限零；各任务按全局有效图数归一化，DDP梯度累积不得平均microbatch均值。
+
+### 5.4 必跑目标矩阵
+
+| ID | 架构 | 目标 | 控制问题 |
 | --- | --- | --- | --- |
-| 诊断候选 | static/targets＋3workers＋every1 | 完全相同，只every20 | A-B-B-A，4×30updates，每次前10warmup、后20计时 |
-| S4候选（仅实施时） | 原准备/传输路径、固定every20 | 仅S4单项改变，every20 | A-B-B-A，4×30updates；不能把诊断收益重复计算 |
-| 最终确认 | 本轮reference：every1＋legacy＋不pin | 通过正确性及单项收益检查的组合 | A/B各30updates；即使只诊断入选也记录一次最终确认 |
+| B_FP | 原 Concat | chem＋geo＋0.1 FP | 新数据协议下 matched baseline |
+| B_NONE | 原 Concat | chem＋geo | 去掉 FP 本身的影响 |
+| T_FGR | 原 Concat | chem＋geo＋0.1 FGR | 替换 FP 的总效果；相对 B_NONE 是 FGR 增量 |
 
-每次从相同随机初始化开始，固定seed/key/position、同一3张GPU、相同参数更新顺序与线程环境；绝不在candidate上接着baseline训练。样本来自完整固定cohort的原采样流，不为测速挑小分子。最终确认没有候选入选时明确跳过，保留baseline。
+这些组共享 encoder 初始化、chem/geo head 初始化、样本/公共随机流、训练与下游预算。FP/FGR head 参数量不同，如实报告，不称参数完全相同；最终 deploy 结构相同。B_NONE 的未受预训练监督的融合 LN 明确记录为初始化状态，不与已受训练者混称同一预训练路径。
 
-测速运行不写大checkpoint、不启用旧同步式 `--timing`；correctness/resume阶段另存必要checkpoint。baseline和candidate普通日志频率一致。窗口起止同步和整体进程时间都报告；不把有初始化成本的进程墙钟与steady-state samples/s混算。
+T_FGR 稳定有效才允许补一项 `FP+FGR`，回答替换还是互补；该项在本轮核心预算外，不能自动执行。
 
-若多GPU其他任务导致负载变化，本次配对作无效记录；预算允许时最多重做一次受污染单run，仍占总updates上限，否则判证据不足。不得拿历史3GPU和本次4GPU比较，也不以CPU-only profile推算正式吞吐倍数。
+### 5.5 防泄漏和有效性检查
 
-### S6 — 推荐配置、文档和独立验收
+- 对选中 pair 的 clean距离做独立扰动，只能改变 label，不能改变 encoder输入；对 noisy坐标改变，应一致改变全部相应输入，label保持固定。
+- 当前输入无非键 pair距离。未来若加入，必须屏蔽/扰动目标距离及其反向、所有直接副本和派生输入，另修任务版本。
+- 仅反传 FGR，O8、GLT、实际 fusion参数在非退化fixture上须有有效梯度；不要求每个参数每batch非零。
+- 固定同一 checkpoint，分别置零/置乱图级3D与局部2D decoder通路，记录验证FGR响应；这只查依赖，不能作为泛化或跨模态协同证明。
+- 重建改善但下游无益时停止晋级；不自动增大权重直到 test变好。
+- 若以后新增融合化学预测，需同步遮蔽所有物理副本的端点元素及元素条件几何类型。该任务不在初版，以免3D直接泄漏被遮蔽元素。
 
-1. 汇总 `report.md` 与机器可读 `summary.json`：基线、精确改变项、每次原始时间、配对差值、资源、正确性结果、收益成立/不成立/未验证、未执行及原因。保留失败原始日志。
-2. 推荐仅写成显式启动参数，不修改现有科学JSON或悄悄切全仓默认：clean cache4、诊断every20或S4候选仅在本轮证据支持时列为建议；未入选项保持默认。
-3. 给出一份完整已验证的预训练短测命令、一份微调smoke命令、一份未来正式启动模板（明确“未执行，需另行授权”），及关闭优化的baseline命令。候选旧checkpoint能否恢复及部署包兼容结论写清楚。
-4. 更新PIPELINE对应CLI/计时/推荐参数，并纠正已过期的samples-csv/topology-root示例；不改历史RESULTS数值。执行记录写回本文件。按AGENTS显式暂存负责文件、commit/push并验证远端。
-5. Codex独立审查diff、原始日志和产物；审查通过后归档PROJECT_HISTORY，Plan标“已完成；暂无后续执行”。预测性能研究留待用户另行授权，不在本报告列可自动执行的科学改造任务。
+## 6. Trimer–RU 原子锚定融合（条件阶段）
 
-## 5. 命令模板与输出合同
+### 6.1 身份和语义
 
-以下命令在第3节规定的tmux/log承载下执行。`RUN_ROOT`、`RUN_OUT`、`GPU_SET`、`FT_GPU`必须由执行者设置为本次新输出绝对路径、具体三GPU列表和单GPU编号，且写入日志；不得用HOME/CODEX_HOME作临时变量。每个run使用全新RUN_OUT。
+继续维护 E_trimer 个独立物理键 state，不平均三份坐标、不提前按 canonical ID 合并物理键。给每个中心实际原子建立与其相连的真实键 incidence，包含跨 RU 键的中心端点；同原子双连接保留两个实际键及多重性。
 
-已有CPU profile入口（先完成S1计时修正）：
+中心原子i的几何摘要：`U_i = mean{Z_e : e incident to actual atom (i,0)}`。空集合为零。物理键通过既有GLT从整个Trimer收集上下文，不直接将侧RU末端原子的state无差别平均给中心。
 
-```bash
-/opt/conda/bin/python scripts/profile_glt_dual_runtime.py \
-  --cache-root data/processed/mips_trimer_scage \
-  --cohort-root data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1 \
-  --dual-static-root data/processed/glt_dual_v2/pi1m/dual_static_v1 \
-  --pretrain-target-root data/processed/glt_dual_v2/pi1m/pretrain_targets_v1 \
-  --samples 256 --seed 42 --report-json "$RUN_ROOT/profile.json"
-```
+不使用原始 q 正负作为可学习方向标签；只用可证明的中心身份与真实连接。中心锚定不保证任意 RU 重新切分或无限链不变性，另行测试、如实限制。
 
-**S1/S2实现并验证help后才可执行**的预训练模板（A every1，B改20）：
+### 6.2 固定首版数学接口
 
-```bash
-CUDA_VISIBLE_DEVICES="$GPU_SET" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-/opt/conda/bin/python -m torch.distributed.run --standalone --nproc_per_node=3 \
-  scripts/pretrain_glt_dual.py \
-  --config configs/mts/glt_dual_three_task_concat_geonorm.json \
-  --cohort-root data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1 \
-  --cache-root data/processed/mips_trimer_scage \
-  --dual-static-root data/processed/glt_dual_v2/pi1m/dual_static_v1 \
-  --pretrain-target-root data/processed/glt_dual_v2/pi1m/pretrain_targets_v1 \
-  --prep-workers 3 --diagnostics --diagnostics-every 1 \
-  --benchmark-steps 30 --benchmark-warmup 10 --no-deploy --output "$RUN_OUT"
-```
+$$
+H'_i=H_i+m_i\,\sigma(G[\operatorname{LN}(H_i),\operatorname{LN}(U_i)])\odot W\operatorname{LN}(U_i).
+$$
 
-已有微调模板（A cache0，B只改4；所有组保留dual-static-root）：
+`G:1024→512`、`W:512→512`，门bias初始化使 sigmoid=0.05；不把W也置零。m_i要求原几何有效、有中心内部键、且该中心原子有incidence。整个增量（含bias）在m_i=0时精确为零。
 
-```bash
-CUDA_VISIBLE_DEVICES="$FT_GPU" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-/opt/conda/bin/python scripts/finetune_glt_dual.py \
-  --config configs/mts/glt_dual_three_task_concat.json \
-  --checkpoint results/glt_dual_static_pretrain_5k_concat_geonorm/deploy_05000.pt \
-  --raw-root data/raw --split-root data/splits/mips_outer5_inner20 \
-  --cohort-root data/processed/glt_dual_v2/downstream/cohort_1545eda5a8f6a1 \
-  --cache-root data/processed/mips_trimer_scage_downstream \
-  --dual-static-root data/processed/glt_dual_v2/downstream/dual_static_v1 \
-  --task xc --fold 0 --smoke --timing --clean-cache-gib 0 --output "$RUN_OUT"
-```
+保持最后输出1024：`g_f=[LN(mean_i H'_i), LN(mean_center Z)]`，第二半沿原规则mask；性质head和FGR decoder维度不变。此首版保留中心键分支，避免同时更换全部readout。旧 Concat 是新增桥关闭的回退。
 
-必要局部测试基础入口为 `PYTHONPATH=.:tests /opt/conda/bin/python -m pytest -q tests/test_glt_dual_speed.py tests/test_glt_dual_diagnostics.py`；如S4修改准备路径，再选择test_glt_dual_static中直接相关的测试，不默认跑全仓或全缓存恢复测试。新增测试放现有文件或至多一个针对本轮的测试文件；允许一个薄的执行/汇总辅助脚本，不建设通用任务平台。
+化学头仍读取融合前H，防止未遮蔽3D元素造成shortcut；FGR decoder局部端点仍读取融合前H，但共享g_f依赖H'，保证融合桥有监督梯度。
 
-每次运行至少保存完整命令、exit code、配置/输入引用、真实执行步数/样本数、计时、资源及状态；报告必须能定位每个数字的run，不只有截图或平均值。产生checkpoint的correctness/smoke目录与无checkpoint测速目录分开。
+**N=0保持原科学定义**：中心readout为空、geo/FGR均不监督，首版关闭桥，仅原子任务/2D预测参与。将N=0跨键信息接入下游是单独后续研究，不能在此暗中改变规则。
 
-## 6. 正确性验证与数值规则
+### 6.3 对照与推广
 
-1. 从旧parity manifest复用最多32个PI1M key和32个下游行，不新增随机大审计；在当前改动路径上比较输入、collate、target和有效分母。缺N=0/无角度/invalid等真实边界时明确使用已有fixture，不能静默skip。
-2. 诊断和cache等不改变tensor算术的改动，CPU输入/整数/mask/顺序/RNG要求exact。GPU受既有非确定性影响的浮点项使用原报告有据可依的容差；若旧报告未定义，预登记FP32 atol=rtol=1e-5、BF16路径浮点loss/gradient/state atol=rtol=1e-4。对同配置A-A都超过阈值的情况先定位非确定性，不自动放宽阈值，不将其算作candidate通过。
-3. 同一初始化baseline连续4步、最终candidate连续4步，逐步核对sample position、mask/noise、loss有效计数、LR、loss、gradients及更新权重。candidate再2步保存并恢复至4步，与candidate连续轨迹比较模型、optimizer、scheduler和每rank RNG。baseline/candidate可能有不同运行时开关，但检查点核心参数和数据身份不应静默失配。
-4. 比较诊断采样前后不使用不同模型seed；resume在worker迭代器建立后恢复模型公共RNG的现有正确顺序保持不变。任何新的loader generator不得重新改变历史连续baseline轨迹。
-5. DDP synthetic fixture覆盖部分rank及全部rank无几何目标，最多各一次forward/backward；保留原任务有效分母与collective，不改unused-parameter设置躲错误。
-6. clean cache重复key不同label、target override、clone/move不污染、容量淘汰；pin候选则验证data和labels确实pinned且没有异步生命周期问题。新候选必须经过实际消费路径，不能只测helper函数。
-7. static字段、clean/noisy目标、N=0和loss分母的差异视为正确性失败。允许候选被否决、关闭；不允许用速度收益抵消正确性失败。
+在选定目标不变的前提下比较同预算旧Concat与ANCHOR；共享参数显式复制初始化，新增参数单独seed。报告新增参数和训练成本；可归因为“加入原子锚定模块的整体变化”，不能声称纯对齐而排除容量影响。
 
-顺序说明：每个候选进入S5前先完成对应局部测试、fixture的forward/gradient比较及受影响真实输入parity；第3项的12-update完整轨迹/恢复检查在最终候选组合确定后完成。首次发现数值异常即停，不以“后面还有恢复测试”为由继续测速。若需额外A-A GPU轨迹来定位非确定性，只能从第7节未使用的updates额度内调配并记录；没有剩余额度则报告阻断，不自行追加。
+两个模块都有效后才组合；不直接升级为多层cross-attention。新增架构从匹配初始化重新预训练，热启动作为另一类实验不混入主对照。
 
-## 7. 总预算与停止条件
+## 7. 构象信息、2D目标与其他结构候选（逐项选择）
 
-| 项目 | 上限 |
+### 7.1 扭转增量：首个3D输入候选
+
+- 从同一冻结Trimer的连续四个不同重原子、三条真实化学键构建二面角，要求中间键接触中心RU；不添加坐标、不从canonical索引拼接假四元组。
+- 首版用 `[cos(phi), cos(2phi)]`，避免任意有向符号及反射问题；明确损失了手性符号辨识力，不宣称完整立体/立构序列表示。
+- 退化/近共线四元组mask，不以epsilon伪造有效角；同一物理路径与反向只计一次，关系多重性有明确记录。
+- 使用 `MLP(2→64→512)`，按中间物理键归一化聚合，在初始token上加小门控残差，tanh门初值0.02；encoder用noisy扭转，不能预缓存clean扭转当noise输入。
+- 第一轮仅改变输入，沿用选定损失，不新增扭转监督。对照保持模块/路径/mask相同，仅将cos特征换成固定零；这是角度值增量对照，不是无几何对照。
+- 若多数样本无有效覆盖，记录而不是转为非键距离模块继续跑。非键中心query路线排在后续，需独立设计半径/邻域和FGR目标屏蔽。
+
+### 7.2 语义化学目标候选
+
+保留30% motif mask，先用周期 rooted radius-1 原子环境类别替换单元素类别：中心Z、中心化学状态、无序邻接的(Z,bond type)多重集合；沿显式periodic edge识别真实邻接，不靠开放端帽。P_train建词表，频次<20归UNK，评估UNK比例；超过20%则停止该版本，不擅自扩词表。
+
+头结构沿原graph decoder，仅输出类别数改变；target不作为输入。保留独立元素准确率作诊断但不额外加入元素loss，避免把“替换”变成“增加”。先在锁定架构、锁定第三任务下比较，不同时修改mask或训练时长。
+
+### 7.3 全面路线图中暂不自动执行的项目
+
+1. O8全局attention或motif token：先证明长程化学瓶颈；不同时增hop/层数/readout。
+2. 拓扑RU重复一致性：先审计合法等价表示；不得强迫不同有限链坐标相同，更不能假设真实分子量无影响。
+3. GLT降至256维/4层、独立2D/3D LR、attention温度：各为独立后续候选，不作为本轮顺手调参。
+4. 5k scheduler horizon对齐或延长20k：当前5k含2000 warmup、20k horizon；本轮保留以隔离目标/架构收益，调度研究另列。
+5. 多构象/长链/条件变量/多任务/ensemble：需要数据来源、预算和跨任务身份划分的新计划。
+6. 不默认恢复MD200、旧KD或KFuse；已有单knowledge KFuse退化softmax不能称有效跨模态选择。
+
+## 8. XC 适应研究的精确合同
+
+### 8.1 S0 数据诊断
+
+追溯Xc标签来源、范围、重复身份、stereo声明、未知条件、有效几何/N=0和各train/validation分布。不得按test残差定制子群或删异常值。文献432条的最大98.41与本地98.81不一致，仅记来源差异，不能自动修改CSV。
+
+已有outer-test只作冻结历史描述。本轮不新增test残差挖掘；未能溯源时保留代理标签解释，不声称预测真实加工条件下结晶度。
+
+### 8.2 固定候选，不全面扫参
+
+S3适应比较先只用同一个fixed Concat 5k checkpoint：
+
+| 方式 | 可训练参数 | 超参数 |
+| --- | --- | --- |
+| FULL | 全模型，现行对照 | encoder1e-5，head/norm1e-4，wd0.02 |
+| HEAD | 仅性质head；encoder及norm冻结eval | head1e-4，wd0.02，原512隐藏head |
+| LORA | 两路每层Q/V低秩增量＋性质head；base与norm冻结 | rank8，alpha8，adapter dropout0，adapter/head1e-4，wd0.02 |
+| RIDGE | 冻结1024 graph features＋线性读出 | alpha={0.1,1,10,100}，仅validation选 |
+
+QKV为合并Linear时，仅对Q/V切片加低秩更新，K与base不变，不能顺手改变source-Q/target-K或缩放。LoRA A按独立seed初始化，B=0；首步A梯度可合法为0，不能据此判失败。冻结base dropout关闭，与FULL的正则状态差异明确报告为适应策略的一部分。HEAD/RIDGE encoder.eval；公共masked训练不进入下游。
+
+RIDGE feature scaler只fit train，标签标准化同理；不得把全部432条先做PCA或特征筛选。初版不需PCA/TabPFN。
+
+适应结果只决定一个全局下游策略用于后续目标比较；不可每个实验组用不同最优策略。若XC最佳策略显著损害eps/eat，则保留FULL为通用策略，XC-specific策略另报，不混成单模型总收益。
+
+不变项：现有manifest、train样本、MSE、batch、early-stop规则、无train+val refit。禁止同轮改损失/标签变换/采样来掩盖负结果。
+
+## 9. 实施文件、接口和部署
+
+优先复用现有runner、DDP归约、static reader、严格deploy和恢复逻辑；不建立新通用训练框架。建议按职责增补，实际文件位置由执行端核实：
+
+| 职责 | 现有或拟修改位置 |
 | --- | --- |
-| CPU完整profile | 固定256条、1次；失败修复后最多重跑1次，总CPU profile墙钟不超过20分钟 |
-| 真实parity | PI1M最多32key、下游最多32行；fixture补边界，不构建新缓存 |
-| GPU分段诊断 | 最多4个预训练optimizer updates，独立于吞吐结果 |
-| 预训练单因素测速 | 诊断120updates；S4如实施另120updates |
-| 最终组合确认 | 最多60updates |
-| 训练正确性/恢复 | baseline4＋candidate4＋candidate2/恢复2，共12updates |
-| 预训练总上限 | 316个实际optimizer updates（上述4+120+120+60+12）；失败/污染重跑也占此上限 |
-| 微调cache比较 | 4runs×2epochs=8epochs，仅xc/fold0，NOT_RUN outer-test |
-| 真实调度smoke | 4单位×2策略×2epochs=16epochs，仅eat/xc folds0/1，NOT_RUN outer-test |
-| 微调总上限 | 24epochs；不追加seed/task/fold |
-| 资源 | 最多3GPU同时使用；测速组彼此不并行，其他模型任务不与测速共享设备 |
-| 总限额 | 长任务累计墙钟3小时、独立产物20GiB；任一先到即停，不能自动扩预算；等待资源不计训练预算但须报告 |
+| FGR targets/incidence/torsion | `src/dataset/glt_dual_pretrain.py`；必要时新增局部helper，不改旧缓存 |
+| FGR头和分任务sum/count | `src/modules/glt_dual_pretrain.py` |
+| 原子锚定及扭转模块 | `src/modules/glt_dual.py` 或独立小模块，旧factory默认不变 |
+| 目标/架构配置与恢复 | `scripts/pretrain_glt_dual.py`、现有runtime |
+| HEAD/LoRA/RIDGE | `scripts/finetune_glt_dual.py`及必要的小型适应helper |
+| 选择与outer-test隔离 | 现有grid/evaluate，新增development模式而非滥用旧smoke的2epoch语义 |
+| 测试 | 复用dual_glt/pretrain/speed tests，新增针对FGR/anchor/PEFT的少量用例 |
 
-RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗尽风险，停止新增任务并记录；不以释放别人的内存或删除别人的文件解决。GPU OOM、NaN/Inf、身份不匹配、通信挂起、预计覆盖正式目录时立即停止受影响run。不要用改batch、删样本、清缓存重建或跳过检查恢复运行。
+拟新增配置字段：`third_task=fp|none|fgr`、`fusion_variant=concat|anchor`、`geometry_features=length_angle|length_angle_torsion`、`chem_target=element|environment`、`adaptation=full|head|lora|ridge`、`evaluation_mode=smoke|development|formal`。这些现在不是已有CLI。
 
-必要测试失败先局部定位；无法在预算内完成则列出已执行、未执行和阻断。不因“最终方案”四个字强行把不完整证据写成通过。
+配置需拒绝不支持的组合、遗漏真实路径、错误step/task身份；沿用必要的现有metadata检查，不另造全套hash系统。保存完整resolved config。移除FP时不得在dataset无条件构建7-RU指纹，测试monkeypatch该构建器以验证没有调用；BRICS读取不受影响。
 
-## 8. 晋级、完成定义与下一阶段边界
+新FGR label在CPU准备阶段产生，batch只传必要target/index；不把clean坐标传encoder。来源路径只读，若现有static缺少incidence，可从同一冻结物理拓扑派生，先小样本验证；未经授权不全量写新的派生缓存。
 
-### 8.1 优化项判定
+deploy仅包含推理encoder、融合、适配器和必要norm；FGR/chem/geo训练头与目标均不依赖。LoRA部署必须保存base身份和adapter，并验证合并前后数值一致；不得把不兼容新结构部分加载成旧模型。
 
-- 必须先通过正确性。性能工程采用参考：两个配对方向一致且完整相关耗时中位数下降至少10%，资源无持续增长，p95无明显恶化（超过5%需解释）。小样本阈值不当作统计显著性。
-- 未达到阈值：标“收益不足/证据不足”，默认不采用；不追加sweep。诊断采样若收益不足仍可作为可选调试功能，但不能宣传提速。
-- 报告区分steady-state预训练速度、微调完整子进程时间、动态调度makespan；不能相乘推算一个未经测量的总加速倍数。
-- 参数启用推荐由本轮证据决定。baseline回退必须可运行，历史checkpoint/schema兼容结论清晰。
+## 10. 阶段、预算与运行条件
 
-### 8.2 整个方案完成须同时满足
+### 10.1 全阶段通用约束
 
-1. S0–S3全部有实际交付；S4执行或依决策表给出有证据的暂缓/否决；S5的实际适用比较和最终确认齐全。
-2. 相关局部测试、真实parity、短轨迹及恢复通过；调度真实smoke无漏跑/重复，outer-test均NOT_RUN。
-3. 有不混淆冷启动/稳定期、static/cache、诊断/计算的时间与资源报告，且每项有采用/不采用结论。
-4. 最终启动/回退命令、PIPELINE、执行记录、commit/push完成，并由Codex审查通过。
-5. 所有失败与未验证边界如实保留。若全体新候选均无收益但检查齐全，可称“工程评估完成，保持baseline”，不能称“已实现提速”。必要验证受阻则不能关闭整个计划。
+所有预算均为未来授权上限，不是已运行。失败的实际updates/epochs计入预算；到上限或STOP即交回，不自动重跑。短轨迹不代表正式预训练有效，30epoch开发不是100epoch正式结果。
 
-完成后明确写：**工程阶段已验收；本轮未优化、未比较模型预测性能；暂无后续执行。** 即使validation偶然更好，也不产生预测性能结论。后续科学阶段必须另立计划并取得授权，不从本轮自动启动。
+GPU/worker/>1分钟任务只能在Linux本机 `tmux Uni-Poly` 独立window中执行并留日志。先检查现有进程，不停止其他路线；正常监控每10分钟一次，明显错误立即检查，避免高频轮询。
 
-## 9. 执行记录（接手者填写，不能提前填PASS）
+输出独立根：`results/glt_pred_20260918/`、`logs/glt_pred_20260918/`；每组/fold/seed独立目录。不覆盖历史；在阶段开始按实测吞吐与checkpoint大小估算时间/磁盘，并确认可用余量。不能为适应资源默改batch、样本或精度。
 
-| 阶段 | 状态 | 实际commit/命令/window | 日志/报告/退出码 | 偏差/预算累计 |
+### 10.2 阶段表
+
+| 阶段 | 内容与最大预算 | 交付/停止点 |
+| --- | --- | --- |
+| S0 | 只读来源/split/XC/重复身份审计；新目标覆盖只抽至多1024条P_train；全量identity匹配为元数据扫描、不跑模型 | 基线身份、P划分、有效覆盖、运行资源；合同错误先停止 |
+| S1 | 实现HEAD/LoRA/RIDGE与validation-only开发路径；局部单测；fixed checkpoint xc/fold0至多2epochs | 无test访问、冻结/加载/梯度正确；不作排名 |
+| S2 | 实现B_FP/B_NONE/T_FGR；局部单测；至多32条不同真实样本组成固定smoke集合，允许重复用于以下正确性步数；三路径各2updates；FGR连续4与2+resume到4共8updates；加最多2updates失败定位，总上限16；partial/all-zero 3rank各1次backward、0updates | mask/有效分母/复现/旧路径回退；小集合重复不是正式样本流或泛化证据 |
+| S3a | 适应开发：3种神经适应×3tasks×2folds×最多30epochs=540epoch上限；RIDGE6个单元×4alpha=24次fit，无GPU训练epochs | 锁定后续统一适应方式；outer-test NOT_RUN |
+| S3b | B_FP/B_NONE/T_FGR 三条新5k轨迹=15,000updates，seed42；三组×3tasks×2folds×30epochs=540epoch上限 | 目标替换是否晋级；未通过则停止架构叠加 |
+| S4 | 最多3个新增5k轨迹=15,000updates；每轨迹同3tasks×2folds×30epochs，累计540epoch上限；每新实现最多4updates correctness，总12updates；包含必要的扭转OFF控制 | 在额度内按第11节选择分支，不能执行全排列 |
+| S5 | 最多3组×8tasks×5folds×100epochs=12,000epoch上限，seed42；不新增预训练；只部署锁定step5000 | 组别固定为新B_FP、最终候选、O8参照；无候选则不为填满预算做S5 |
+
+S1的2epochs、S2的16updates、S4的12updates单独计入总账；研究预训练上限30,000updates＋28 correctness updates。开发神经微调上限1620＋2epochs；S5另计。正式最多120个task/fold，仅全部相应授权后可运行。
+
+S4默认优先ANCHOR与环境目标，各一轨迹；如果将名额用于扭转，必须占两轨迹（TOR/TOFF），与ANCHOR构成三条，不再运行环境目标。选择在S3审查后、启动S4前写明，不能看test决定。S4旧参考直接复用S3锁定轨迹，不重复预训练。
+
+S5 O8参照优先使用现存B的部署包和一致的微调协议，但来源P与新参考不一致时只能称历史参照；若需要严格matched O8，必须在S4三个预训练名额中预留一条O8-only，而不能临时追加第四条。初始授权若不含此项，则S5仅B_FP与候选两组80单元，O8历史结果旁列不作纯因果比较。
+
+主预训练保持3GPU×84×accum4、1008、BF16、lr2e-4、wd0、warmup2000、horizon20000、seed42及现行clip；新增头初始化隔离。若授权改资源，另记数值/随机流差异，不能宣称bitwise matched。
+
+新B_FP在P_train按位置顺序重新训练；所有组第5000步为主checkpoint，P_val每1000步检查健康，不以任务test选择checkpoint。P_val评估固定至多1024条身份分层样本，所有组同集合；小覆盖类别另报，不以它宣称全量重建验证。
+
+S0的1024条目标审计用于决定FGR是否可实施；须单列无目标比例、SPD3覆盖以及各RU大小分布。若总体FGR有效覆盖低于50%，停止S3b并交回修订目标范围，不能自行加入侧RU多值目标；此阈值是执行可行性起点，不是论文结论。S3正式统计可扫描P_train全部候选以拟合mu/sigma，属于授权研究准备，须在tmux记录时间/数量；不把这次全量统计说成S0的1024条抽查。
+
+## 11. 晋级和停止规则
+
+### 11.1 开发晋级
+
+各组使用相同validation样本、相同fold配对；选择规则预登记为：优先XC两fold平均validation R²增量≥0.01，且任一fold不下降超过0.03；eps/eat平均均不下降超过0.01。阈值仅为工程筛选，不是显著性保证。
+
+- T_FGR同时报告相对B_FP和B_NONE，不能把去掉FP收益归因于FGR。若只优于B_FP、不优于B_NONE，优先保留简单B_NONE，不宣称融合目标有增量。
+- S4模块相对其直接parent比较；候选不超两项组成的新增机制，避免无限堆叠。S4最多选一条作为最终候选。
+- 若结果混合或接近零，记录INCONCLUSIVE并停止扩大；本计划不自动追加seed。需要确认seed时另修预算，并同时补参考。
+- 对不同参数量/预训练头，报告模型、训练头、可训练参数、样本暴露、时间和峰值显存。不称同steps等于同FLOPs。
+
+### 11.2 正式结论
+
+S5固定全部配置后，每fold独立选validation最佳、恢复后test一次。报告R²/MAE/RMSE mean±std（ddof=0）、每fold配对差值和独立列示pooled OOF；每个样本每组恰好一次OOF。不以最佳fold、逐任务最优包络代表单模型。
+
+主要比较candidate−B_FP；XC目标为平均R²正增量、至少3/5fold为正，整体macro8不下降超过0.005；如只能达成XC-specific收益，明确不能替换通用路线。这些是决策阈值，不是统计显著性结论。报告fold相关性与不确定性；不把5fold当5个独立实验。
+
+### 11.3 立即停止受影响阶段
+
+- 身份/物理路径/原子映射错误、跨样本或split泄漏；clean标签进入encoder。
+- N=0被伪造中心监督，invalid几何被乘零掩盖NaN；DDP某rank不参与必要collective。
+- teacher/旧checkpoint/schema误加载、出现持续NaN/Inf、writer冲突、覆盖已发布资产。
+- 为维持收益需绕过现有parity/加载检查、删样本、换split或修改未授权结构。
+- 超预算、资源不足或来源不清。可以继续只读定位，不自动扩大执行范围。
+
+## 12. 必要测试与验收清单
+
+1. 原B_FP开关默认保持旧输入/forward/loss和deploy行为；公共初始化可按名称核对，不仅“同seed”。
+2. FGR中心pair身份、SPD2/3、无重复、采样覆盖、单位/归一化、对称端点、空pair、安全sum/count。
+3. FP=none/fgr时不调用7-RU指纹构建，不读取无用FP标签；BRICS公共输入一致。
+4. clean/noisy知识流测试、FGR对共享fusion的梯度、decoder无raw坐标入口。
+5. N=0优先找真实冻结样本并记录key；找不到明确记录，用最小确定性fixture，禁止静默skip后声称覆盖；学生原子任务保留。
+6. 普通连接、同原子双连接、左右不同键长、周期多重关系；所有物理身份分别保留。
+7. 刚体平移/旋转、反射（首版cos扭转）、原子同步重编号、端点互换；固定关系浮点参考与重新构图分开测。
+8. ANCHOR增量OFF复现原Concat；invalid/N=0时无bias残余，新增模块第一步存在合理梯度。
+9. LoRA初始输出与冻结base一致，K/base不更新；HEAD/RIDGE冻结eval；adapter保存/恢复和合并预测一致。
+10. train-only scaler/词表/统计；开发禁止test访问；resume拒绝smoke/development/formal混用和不同task身份。
+11. 3rank partial/all-zero分别验证geo和FGR有效分母、finite backward；不要求所有合法参数每步非零。
+12. 新head/采样恢复4步连续与2+恢复到4，包括各rank RNG、optimizer、scheduler、样本位置；复用工程日志尾部处理，不重写恢复框架。
+13. 最终deploy移除训练目标与头仍可预测；读取同一冻结几何，缺失时走明示fallback；**当前方案不是纯2D部署**，不能宣称不依赖几何。
+
+局部测试通过只表示实现合同通过。新增目标重建变好、loss下降、attention非零均不能单独作为性质提升证据。
+
+## 13. 产物与交接格式
+
+不另建通用handoff框架；执行记录回填本文件。沿用现有run/summary/runtime/预测/部署格式，增加必要的任务和适应字段。
+
+每阶段至少记录：实际命令、cwd、tmux window、日志、退出码、配置、来源与split、git commit、实际累计预算、失败/修复、是否读取outer-test。训练组另存loss/有效分母/梯度摘要、best validation、逐fold预测与参数/资源统计。
+
+阶段报告只写已运行指标；未运行留空或NOT_RUN，不填模拟结果。S0审计产物、新目标统计和选型记录独立于active缓存。结果报告更新RESULTS，实际接口更新PIPELINE，完成审查后由Codex实质性归档PROJECT_HISTORY。
+
+## 14. 交给执行模型的启动指令
+
+1. 核对用户授予的阶段及预算；未授权研究训练时只完成允许实施/验证。
+2. 检查git/remote/活动任务，安全pull，重新读取本计划；保护用户改动。
+3. S0先确认参考、Xc来源、P划分及目标覆盖；不得直接启动三条5k。
+4. S1/S2完成最小实现与表内验证，保留旧路径；输出实际`--help`和已验证的smoke/development命令。拟新增命令未经实现不得伪称已可运行。
+5. 交回Codex审查；已获授权且验收满足后按S3→条件S4→S5推进，未满足条件停止并报告，不反复申请已授权的小步骤。
+6. 每轮改动按AGENTS提交/推送并核对远端；只暂存本轮文件，不提交缓存、checkpoint、密钥或无关改动。
+7. 执行者最后标“待审查”，不自行宣称计划关闭或模型性能提升。
+
+## 15. 执行记录与下一步
+
+| 阶段 | 状态 | 命令/日志/产物 | 实际预算 | 审查 |
 | --- | --- | --- | --- | --- |
-| S0 基线与环境 | PASS（执行者自检，待 Codex 审查） | `6f7c877`；`git pull --ff-only origin dev`；环境核对命令；无独立长任务 | `results/glt_engineering_20260918/20260918T000000Z/execution.json`；资源与输入路径均存在 | GPU 0–3 空闲（仅查询）；未占用设备；预算未消耗 |
-| S1 完整计时 | PASS（执行者自检，待 Codex 审查） | `scripts/profile_glt_dual_runtime.py`；256条 CPU profile；`glt_eng_profile_003509` | `results/glt_engineering_20260918/20260918T003509Z/profile.json`；`logs/glt_engineering_20260918/20260918T003509Z/profile.log`；退出码0 | 首次字段名错误留存于 `003412Z`，修正后仅重跑1次；冻结主缓存零写入；profile预算1/1 |
-| S2 诊断采样 | PASS（执行者自检，待 Codex 审查） | 33项局部测试；3-GPU baseline4/candidate4/resume2→4，共12 updates；`glt_eng_corr_*` | `results/glt_engineering_20260918/20260918T003654Z/correctness.json`；对应4份日志；退出码均0 | model/optimizer/scheduler/keys/position/rank RNG exact；候选诊断步为1/2/4；无正式checkpoint/deploy |
-| S3 微调/调度 | PASS（执行者自检，待 Codex 审查） | cache A-B-B-A 4×2 epochs；两GPU batched/dynamic 各4单位×2epochs；`glt_eng_ft_*`、`glt_eng_grid_*` | `results/glt_engineering_20260918/20260918T005342Z/`、`20260918T005721Z/grid_smoke.json`；所有子进程退出码0 | cache4两配对约40% wall-clock收益且验证 exact；调度 makespan差约0.9%，不宣称收益；outer-test全NOT_RUN |
-| S4 单候选或暂缓 | 暂缓（执行者自检，待 Codex 审查） | 依据256 profile与S5 ABBA结果，不新增 `targets_only`/pin 候选 | 结论写入 `results/glt_engineering_20260918/summary.json` | source读取/随机长尾主导；诊断every20配对方向不一致且未达10% gate；保持legacy/default |
-| S5 公平测速 | PASS（执行者自检，待 Codex 审查） | 3-GPU、3 workers、ABBA；every1/every20各2次，每次30 updates（10 warmup+20计时） | `results/glt_engineering_20260918/20260918T004314Z/pretrain_*/benchmark.json`；4份日志；退出码均0 | 预训练本轮累计132/316 updates；未执行最终组合确认（无候选入选） |
-| S6 报告/交接 | 待审查 | 汇总 `summary.json`、本计划与 PIPELINE 已更新；实现提交 `d99bc70`、交接记录提交 `a90ab16` | `results/glt_engineering_20260918/summary.json`；日志/产物路径见各行；两次提交均已推送 `origin/dev` | 未执行正式5k/20k、完整微调、OOF/outer-test、4-GPU正式吞吐；不写性能提升结论 |
-| Codex独立审查 | 未执行 | — | — | 需审查本轮源码、测试、日志和报告后再归档 |
+| 文档规划 | 已编制；Codex文档自检，非独立科学验收 | 本文件、当前Git提交 | 0训练/0实验 | 等待用户选择授权范围 |
+| S0 | 未执行 | — | 0 | — |
+| S1/S2 | 未执行 | — | 0 | — |
+| S3 | 未授权、未执行 | — | 0 | — |
+| S4 | 条件阶段、未授权 | — | 0 | — |
+| S5 | 正式阶段、未授权 | — | 0 | — |
 
-### 本轮执行摘要（执行者记录，待 Codex 审查）
-
-- 实际修改：`scripts/pretrain_glt_dual.py`、`src/modules/glt_dual_pretrain.py`、`scripts/profile_glt_dual_runtime.py`、`scripts/finetune_glt_dual.py`、`src/utils.py`、`scripts/run_glt_dual_finetune_grid.py` 及两份相关测试文件；未修改模型科学配置、active cache、manifest、checkpoint 或样本集合。
-- 计时口径：CPU profile 使用 seed=42 的256个不同随机索引，记录 source/static/target/clean/noisy/collate/完整样本及图大小；微调记录 source打开、首批、train/validation、best CPU copy、保存和进程总耗时；预训练记录每rank窗口及最慢rank。
-- S5 预训练 only：every1 samples/s 为 325.917、331.940；every20 为 331.669、319.285，配对方向相反，未通过10%性能门槛。S4不实施额外候选；不执行最终确认组。
-- S3 cache smoke：`clean-cache-gib=0` 进程墙钟 20.149/19.983 s，`=4` 为 11.921/11.872 s；四个调度单位两策略均完整、验证结果逐单位 exact，动态 makespan仅较批处理快约0.244 s。
-- 资源与边界：预训练使用3张GPU（0,1,2），微调/调度使用GPU3或2、3；预训练累计132个实际 optimizer updates，微调累计24 epochs；所有真实 smoke 均未访问 outer-test。历史/正式5k、20k、完整OOF和4-GPU正式吞吐均未执行。
-- 失败证据保留：`003412Z/profile.json`/日志记录首次 profile 字段错误及零写入；修正后 profile 单次重跑通过。所有长任务在 `tmux` session `Uni-Poly` 独立 `glt_eng_*` window 中执行。
-- r1 提交与同步记录：源码/测试/文档为 `d99bc70`，交接记录为 `a90ab16`；该历史状态保留，不代表 r2 当前 HEAD。
-
-### r2 返修执行记录（2026-09-18，执行完成，待 Codex 审查）
-
-| 项目 | 实际结果 | 证据与边界 |
-| --- | --- | --- |
-| grid resume 身份隔离 | 已修复；局部测试通过，既有 8 个 smoke unit 的模式/身份核对通过 | `scripts/run_glt_dual_finetune_grid.py`；`tests/test_glt_dual_speed.py`；拒绝 smoke/formal 混用，不重建 resume 框架 |
-| 预训练窗口计时 | 已修复；单次 schema 校验 PASS | `results/glt_engineering_20260918/r2_window_check/benchmark.json`；8 updates=2 warmup+6 measured，6048 samples，窗口 15.7587 s；不作为收益比较 |
-| profile 计时 | 已修复；256 条 PASS、冻结缓存零写入 | `results/glt_engineering_20260918/r2_profile.json`、`logs/glt_engineering_20260918/r2_profile.log`；`pretrain_prepare` 明确包含内部 clean+noisy，`clean_diagnostic` 不计入 `complete_sample` |
-| worker=3 correctness/resume | PASS；3 GPU、每 rank 3 workers，12 个实际 optimizer updates | `results/glt_engineering_20260918/r2_correctness_workers3/correctness_workers3.json`；model/optimizer/scheduler/RNG/position/identity 与 rank-0 loss/target exact |
-| 局部测试 | PASS：34 passed, 1 warning，退出码 0；`py_compile` 与 `git diff --check` 通过 | `logs/glt_engineering_20260918/r2_local_tests.log`；未运行全仓测试 |
-| grid launch-to-exit 记录 | 已加入代码，未对历史 24 epochs 重跑 | 新日志写入 `GRID_LAUNCH_MONOTONIC`、`GRID_EXIT_MONOTONIC`、`GRID_LAUNCH_TO_EXIT_SECONDS`；历史 r1 grid 的 0.9% 差异撤回精确收益解释 |
-
-#### r2 证据补记与未执行项
-
-- 既有 `results/speed_20260917/parity_32.json` 和 `downstream_parity_32.json` 已追溯；它们是 r2 未重跑的 32-key/32-row 输入与标签 parity，只适用于未改变数据算术的路径，不验证新计时字段。
-- 既有 `test_per_graph_and_ddp_gradient_reference` 仍是单进程代数参考；本 r2 未新增真实多 rank“部分/all rank 无几何目标”通信/backward 证据，标记未执行。
-- r1 的微调 24 epochs 预算已用满，原约40%数字仅保留为相同 static 条件下的内部 process wall，不称为完整 launch-to-exit；r2 不追加微调。
-- 首次 worker=3 step=2 命令因误传 `--diagnostic-save-steps 4` 在训练前失败，日志 `.../resume_step2.log` 保留，实际 optimizer updates=0；retry 使用新隔离目录且全部退出码0。
-- r2 预训练累计新增 20 个 updates（worker correctness 12，窗口 schema 校验 8），总计 152/316；没有正式 5k/20k、完整微调、OOF/outer-test、缓存重建或科学性能比较。GPU 峰值资源未独立采样；CPU profile RSS 仍在 profile JSON 中。
-- r2 提交与同步：修复提交 `3f2d2bc`、交接记录 `39c8f99` 已推送；当前 `HEAD` 与 `origin/dev` 均为 `39c8f99`，Codex 独立审查前不关闭计划。
-
-### r3 执行记录（2026-09-18，执行者完成，待 Codex 审查）
-
-本轮基线为 `dev@285354f`。执行前重新运行 `git pull --ff-only origin dev`，结果为
-`Already up to date`；工作树干净、没有 GLT 训练/微调/validator 进程，GPU 0–3 空闲。r1/r2
-日志和产物均保留；没有修改 active cache、manifest、checkpoint、配置或样本集合。
-
-| 项目 | 状态 | 实施与证据 |
-| --- | --- | --- |
-| grid launch 起点 | PASS（执行者自检，待 Codex 审查） | `scripts/run_glt_dual_finetune_grid.py` 在 launch helper 前记录 `launch_started_monotonic`，并记录 `process_ready_observed_monotonic`；row/log 同时保留 `launch_to_exit_seconds`。 |
-| grid exit 观察 | PASS（执行者自检，待 Codex 审查） | 所有正常调度先轮询，首次 `poll()!=None` 取 `exit_observed_monotonic`，之后才 `wait()`；日志明确为 controller observation。 |
-| batched 并行收割/屏障 | PASS（执行者自检，待 Codex 审查） | batched 轮询整批并按输入顺序返回，下一批仅在 active 为空后派发；新增短/长 CPU 子进程测试验证 B 先观测、C 等 A 完成。 |
-| dynamic 语义 | PASS（执行者自检，待 Codex 审查） | 保留完成即释放 slot、失败停止 pending 派发、收口已启动 child 的逻辑；既有 dynamic/failure tests 保留。 |
-| 真实 3-rank partial-zero DDP | PASS（执行者自检，待 Codex 审查） | `results/glt_engineering_20260918/r3_no_geometry_ddp.json`：NCCL、GPU 0/1/2、local counts geometry=1/0/0、global `[3,1,3]`，finite loss/backward/chemistry/fingerprint gradients。 |
-| 真实 3-rank all-zero DDP | PASS（执行者自检，待 Codex 审查） | 同一报告：local geometry=0/0/0、global `[3,0,3]`，finite loss/backward/chemistry/fingerprint gradients；`optimizer_updates=0`。 |
-| 局部测试 | PASS（执行者自检，待 Codex 审查） | `PYTHONPATH=.:tests /opt/conda/bin/python -m pytest -q tests/test_glt_dual_speed.py tests/test_dual_glt_pretrain.py`：`27 passed, 1 warning`，退出码0；日志 `logs/glt_engineering_20260918/r3_local_tests.log`。第一次未带 PYTHONPATH 的导入失败保留于 `r3_local_tests_import_failure.log`，不作为代码测试结果。 |
-| 资产/训练边界 | PASS（执行者自检，待 Codex 审查） | DDP 仅两 case forward/backward、0 optimizer update；未写 checkpoint/deploy；active cache 未修改。 |
-
-新增文件为 `scripts/validate_glt_dual_no_geometry_ddp.py`；代码/测试修改为 grid 计时收割与
-`tests/test_glt_dual_speed.py`，流程说明追加到 `PIPELINE.md`。所有长命令均在
-`tmux Uni-Poly` 独立 window：局部测试 `glt_eng_r3_local_tests3`（已结束）、DDP
-`glt_eng_r3_ddp`（已结束）；完整命令及退出码见对应日志。
-
-明确未执行：32-key/downstream parity、ABBA、旧 benchmark、CPU profile、微调 epoch、正式
-5k/20k、8×5、outer-test/OOF、cache rebuild、新构象、EQ3D/Student。完整端到端预训练和微调
-提速保持 `NOT_ESTABLISHED`；本轮 GPU peak 不作为正式性能证据。当前计划状态改为“待审查”，
-等待 Codex 独立检查 diff、日志和报告后决定是否关闭。
-
-本轮实现提交为 `4826c90`，执行记录提交为 `ed7a782`，随后修正文档提交为 `46e9e9c`，均已
-推送 `origin/dev`；当前核对 `HEAD == origin/dev == 46e9e9cbb7e6acb219ab63e722efca3372d5e24c`，
-工作树干净。上述提交只代表执行交付，不代表 Codex 独立验收或完整性能提速成立。
-
-### r4 最小返修执行记录（2026-09-18，执行者完成，待 Codex 审查）
-
-执行前基线为 `dev@7542369`；已执行 `git pull --ff-only origin dev`，结果为
-`Already up to date`。工作树干净，没有 GLT 训练、微调或 grid 进程；保留全部 r1–r3
-历史日志与报告。本轮仅处理 batched `completed` 返回顺序，不触碰 active cache、配置、
-checkpoint、DDP、parity、ABBA、profile 或微调预算。
-
-| 项目 | 状态 | 实施与证据 |
-| --- | --- | --- |
-| 稳定原始任务序号 | PASS（执行者自检，待 Codex 审查） | `scripts/run_glt_dual_finetune_grid.py` 为每个已启动 shard 保存 `offset + local_index`，收割时只保留该序号，不使用压缩后的 `active` 列表位置。 |
-| 并行 poll / wait / batch barrier | PASS（执行者自检，待 Codex 审查） | 仅替换顺序索引；并行 `poll()`、观察后 `wait()`、下一批屏障、dynamic 补位和失败收口逻辑未改变。 |
-| 确定性顺序回归 | PASS（执行者自检，待 Codex 审查） | `tests/test_glt_dual_speed.py::test_batched_completed_order_uses_stable_task_sequence` 使用可控假进程 poll 序列 B→A→C，断言返回 A/B/C 且各一次。 |
-| 相关调度测试 | PASS（执行者自检，待 Codex 审查） | `PYTHONPATH=.:tests /opt/conda/bin/python -m pytest -q tests/test_glt_dual_speed.py`：`17 passed, 1 warning`，退出码0；日志 `logs/glt_engineering_20260918/r4_grid_tests.log`。既有真实短/长子进程测试继续通过。 |
-| 资产与实验边界 | PASS（执行者自检，待 Codex 审查） | 未启动 GPU/worker 长任务；未新增 optimizer updates；未修改 cache、配置或 checkpoint；未重跑 DDP、parity、ABBA、profile 或微调。 |
-
-必要检查：`py_compile` 与 `git diff --check` 通过。r4 只修改
-`scripts/run_glt_dual_finetune_grid.py`、`tests/test_glt_dual_speed.py` 和本计划记录。
-完整预训练及微调提速仍分别为 `NOT_ESTABLISHED`，不产生预测性能结论。完成提交与远端核对后，
-状态保持“待审查”。
-
-本轮提交为 `54798fd`，已推送 `origin/dev`；推送后核对
-`HEAD == origin/dev == 54798fd22bfe657f8c3e002e9f446dc28f864870`，工作树干净。
-该提交代表 r4 执行交付，不代表 Codex 独立验收或完整性能提速成立。
-
-### Codex 独立审查与归档结论（2026-09-18）
-
-Codex 已按 r4 范围复核实现 diff、确定性调度回归、r3 DDP 报告及既有 r1/r2 证据：稳定原始
-任务序号修复成立，B→A→C 的 batched 完成顺序返回 A/B/C 且各一次；并行 poll、退出观察后
-wait、batch barrier、dynamic 补位和失败收口未被改变。r4 相关测试为 `17 passed, 1 warning`，
-退出码 0；未追加任何模型或训练执行。因此本周期结论为：
-
-```text
-ENGINEERING_INTERFACE_AND_CORRECTNESS = CLOSED
-FULL_PRETRAIN_SPEEDUP = NOT_ESTABLISHED
-FULL_FINETUNE_SPEEDUP = NOT_ESTABLISHED
-PREDICTION_PERFORMANCE_COMPARISON = NOT_RUN
-```
-
-本周期没有正式 5k/20k、完整微调、outer-test/OOF、ABBA 重跑、parity 重跑或 cache rebuild，
-也没有修改 active cache、配置、checkpoint 或历史结果。r1→r4 的最终归档已追加至
-`PROJECT_HISTORY.md`。后续预测性能优化必须另立计划并取得授权，不自动启动。
+**下一步建议：先授权S0–S2，完成XC适应接口与FP→FGR替换的正确性闭环；科学训练按S3预算另行明确。** 这是分阶段启动建议，不把完整路线截断为只写代码，也不将本文视为已获得全部实验授权。

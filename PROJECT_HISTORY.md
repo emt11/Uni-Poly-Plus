@@ -186,3 +186,14 @@
 * 明确边界：`FULL_PRETRAIN_SPEEDUP=NOT_ESTABLISHED`、`FULL_FINETUNE_SPEEDUP=NOT_ESTABLISHED`。本周期没有正式 5k/20k、完整 Concat/KFuse 训练、8×5 微调、outer-test/OOF、全量 parity、ABBA 重跑或 cache rebuild；微调 bounded evidence 和历史预训练观察不外推为完整端到端收益，也没有比较预测性能。
 * 本次归档操作：仅追加本条 `PROJECT_HISTORY.md` 记录并更新 `Plan.md` 状态；不运行测试、模型、训练、benchmark、DDP、profile，不修改 `.py`、config、cache、results 数字或 checkpoint。
 * 后续：本工程周期已完成，暂无自动后续执行。任何预测性能优化必须另立科学计划，明确 reference、controlled change、task/fold、预算和停止条件，并取得用户授权；本归档不产生启动授权。
+
+## GLT-PRED-20260918-01｜r1 规划文档交付（2026-09-18；科学周期未启动）
+
+* 授权与角色：用户要求根据当前GLT分析制定完整预测优化计划，特别考虑将7-RU FP改为3D–2D融合监督，并写入Plan.md。Codex编制与文档自检，无独立审查者；本条只归档文档交付，不关闭或宣称完成科学周期。
+* 基线与既有改动：dev@6d44ed9，用户已清空Plan.md；修改前检查remote/status并pull --ff-only成功（Already up to date）。按请求写入新计划，不恢复旧正文；工程r4完整归档已存在，未重复归档或重启。
+* 最终规划：GLT-PRED-20260918-01/r1，状态待授权。S0核对Xc/来源/身份/预训练划分；S1实现FULL/HEAD/LoRA/Ridge适应接口；S2建立B_FP/B_NONE/T_FGR，FGR以共享融合表示和对称O8端点预测中心RU内SPD2/3原子对干净log距离，保留局部几何去噪与原子任务。S3先适应开发再三组matched预训练；S4条件推进中心原子—真实物理键桥、扭转或原子环境目标；S5锁定配置后正式开发五折确认。
+* 重要边界：FGR为FlexMol-inspired项目条件重建，不是已证明的双模态协同或完整论文复现。不新增构象、修改active缓存、恢复MD200/旧KD；N=0仍无中心geo/FGR监督、保留原子任务。源P_train/P_val及benchmark重叠独立审计；旧checkpoint不能冒充新划分matched baseline。开发不读取outer-test，最终既有folds仍不能称全新盲测。
+* 拟议上限而非授权：S1两epochs；S2最多16updates及两case零update DDP；S3三条5k；S4最多三条5k与12 correctness updates。开发神经微调最多1620+2epochs，S5最多三组8×5×100epochs（120单元），同组完整预算仍须明确授权。无收益不填满预算，不自动加seed/组。所有GPU/worker/长任务只在Uni-Poly独立window留日志，默认10分钟监控。
+* 论文依据：GRIN、FlexMol、TMLR masking design、SCAGE、Token-Mol、DenoiseVAE、PolyConFM（预印本）、ELoRA及TabPFN；原文机制与项目改造分开，链接保存在本轮Plan及Git版本中。
+* 实际修改与检查：只编写Plan.md并追加本条；核对现行代码/配置与参考路径，复查相关论文原始页面；文档格式、引用路径、预算逻辑和git diff --check自检。不运行单测、模型、预训练、微调、benchmark或缓存构建，不修改PIPELINE/RESULTS的既有科学结论。提交与推送信息见本轮Git历史和交付回复。
+* 下一步：建议先授权S0–S2实施和有界验证；S3–S5研究训练/正式评估另行明确。已有授权若明确覆盖全部阶段则按合同条件推进，不重复申请小步骤。科学周期保持待授权，后续由执行者回填记录、Codex独立审查。
