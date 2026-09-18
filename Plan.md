@@ -276,7 +276,7 @@ RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗�
 | S3 微调/调度 | PASS（执行者自检，待 Codex 审查） | cache A-B-B-A 4×2 epochs；两GPU batched/dynamic 各4单位×2epochs；`glt_eng_ft_*`、`glt_eng_grid_*` | `results/glt_engineering_20260918/20260918T005342Z/`、`20260918T005721Z/grid_smoke.json`；所有子进程退出码0 | cache4两配对约40% wall-clock收益且验证 exact；调度 makespan差约0.9%，不宣称收益；outer-test全NOT_RUN |
 | S4 单候选或暂缓 | 暂缓（执行者自检，待 Codex 审查） | 依据256 profile与S5 ABBA结果，不新增 `targets_only`/pin 候选 | 结论写入 `results/glt_engineering_20260918/summary.json` | source读取/随机长尾主导；诊断every20配对方向不一致且未达10% gate；保持legacy/default |
 | S5 公平测速 | PASS（执行者自检，待 Codex 审查） | 3-GPU、3 workers、ABBA；every1/every20各2次，每次30 updates（10 warmup+20计时） | `results/glt_engineering_20260918/20260918T004314Z/pretrain_*/benchmark.json`；4份日志；退出码均0 | 预训练本轮累计132/316 updates；未执行最终组合确认（无候选入选） |
-| S6 报告/交接 | 待审查 | 汇总 `summary.json`、本计划与 PIPELINE 待更新；当前工作树待提交 | `results/glt_engineering_20260918/summary.json`；日志/产物路径见各行 | 未执行正式5k/20k、完整微调、OOF/outer-test、4-GPU正式吞吐；不写性能提升结论 |
+| S6 报告/交接 | 待审查 | 汇总 `summary.json`、本计划与 PIPELINE 已更新；实现/文档首笔提交 `d99bc70` | `results/glt_engineering_20260918/summary.json`；日志/产物路径见各行；提交前 `git diff --cached --check` 通过 | 未执行正式5k/20k、完整微调、OOF/outer-test、4-GPU正式吞吐；不写性能提升结论 |
 | Codex独立审查 | 未执行 | — | — | 需审查本轮源码、测试、日志和报告后再归档 |
 
 ### 本轮执行摘要（执行者记录，待 Codex 审查）
@@ -287,3 +287,4 @@ RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗�
 - S3 cache smoke：`clean-cache-gib=0` 进程墙钟 20.149/19.983 s，`=4` 为 11.921/11.872 s；四个调度单位两策略均完整、验证结果逐单位 exact，动态 makespan仅较批处理快约0.244 s。
 - 资源与边界：预训练使用3张GPU（0,1,2），微调/调度使用GPU3或2、3；预训练累计132个实际 optimizer updates，微调累计24 epochs；所有真实 smoke 均未访问 outer-test。历史/正式5k、20k、完整OOF和4-GPU正式吞吐均未执行。
 - 失败证据保留：`003412Z/profile.json`/日志记录首次 profile 字段错误及零写入；修正后 profile 单次重跑通过。所有长任务在 `tmux` session `Uni-Poly` 独立 `glt_eng_*` window 中执行。
+- 提交与同步：本轮源码、测试和文档已在 `dev` 提交 `d99bc70`；推送前仍需完成远端核对，Codex 独立审查尚未进行，状态保持“待审查”。
