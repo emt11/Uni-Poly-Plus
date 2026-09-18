@@ -239,11 +239,14 @@ def _run_batched_jobs(jobs, gpus, launch, *, poll_interval=0.05):
     for offset in range(0, len(jobs), len(gpus)):
         active = []
         try:
-            for task, fold in jobs[offset:offset + len(gpus)]:
+            for local_index, (task, fold) in enumerate(
+                    jobs[offset:offset + len(gpus)]):
                 gpu = gpus[len(active)]
-                active.append(_launch_with_boundary(launch, task, fold, gpu))
+                task_index = offset + local_index
+                active.append((task_index,
+                               _launch_with_boundary(launch, task, fold, gpu)))
         except BaseException:
-            _drain_active({index: item for index, item in enumerate(active)},
+            _drain_active({task_index: item for task_index, item in active},
                           poll_interval=poll_interval)
             raise
         # Keep the batch barrier, but harvest all children concurrently.  A
@@ -252,16 +255,17 @@ def _run_batched_jobs(jobs, gpus, launch, *, poll_interval=0.05):
         observed_rows = []
         while active:
             observed_any = False
-            for index, item in list(enumerate(active)):
+            remaining = []
+            for task_index, item in active:
                 code = item[2].poll()
                 if code is None:
+                    remaining.append((task_index, item))
                     continue
                 observed = time.monotonic()
-                observed_rows.append((index, _finish_child(
+                observed_rows.append((task_index, _finish_child(
                     item, code=code, exited=observed)))
-                active[index] = None
                 observed_any = True
-            active = [item for item in active if item is not None]
+            active = remaining
             if active and not observed_any:
                 time.sleep(float(poll_interval))
         rows = [row for _, row in sorted(observed_rows, key=lambda pair: pair[0])]

@@ -4,12 +4,12 @@
 
 | 字段 | 内容 |
 | --- | --- |
-| 计划 | GLT-ENGINEERING-20260918-01 / r3 |
-| 状态 | 待审查；r3 实现、局部测试与真实 3-rank 无 geometry DDP 已完成，等待 Codex 独立审查 |
+| 计划 | GLT-ENGINEERING-20260918-01 / r4 |
+| 状态 | 待审查；r4 最小修复与相关调度测试已完成，等待 Codex 独立审查 |
 | 用户要求 | 给出其他模型可直接执行的完整工程方案；完成并验收本方案后，才另行考虑预测性能优化 |
 | 范围 | GLT 双通道的数据准备、诊断、计时、输入复用、传输与调度；不优化预测准确率 |
 | 角色 | Codex 规划与独立验收；接手模型负责实现、局部测试和规定的有界测速，并记录实际执行者 |
-| 核查基线 | dev，r3 开始前为 `285354f`；2026-09-18 pull 为 Already up to date；保留 r1/r2 的实现、日志和产物，不重做微调预算 |
+| 核查基线 | dev，r4 开始前为 `7542369`；2026-09-18 pull 为 Already up to date；保留 r1–r3 的实现、日志和产物，不重做微调预算 |
 | 既有工作 | CACHE-20260916-01/r4、SPEED-20260917-01/r4 均已归档；不重做已完成工作，不复活旧科学计划 |
 
 **给执行模型的指令：**先完整读取 AGENTS.md 和本文。收到用户“执行本计划”的授权后，依次完成 S0→S1→S2→S3→S4→S5→S6；普通实现细节自行处理，不重复询问已授权的小步骤。不要只输出另一份计划。受阻则停止受影响阶段、保留证据，继续不依赖阻断项的代码/测试工作；不得偷偷更换协议、缩小验收集合或扩大预算。最终状态只能先标“待审查”，由 Codex 审查后关闭。
@@ -347,3 +347,23 @@ RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗�
 本轮实现提交为 `4826c90`，执行记录提交为 `ed7a782`，随后修正文档提交为 `46e9e9c`，均已
 推送 `origin/dev`；当前核对 `HEAD == origin/dev == 46e9e9cbb7e6acb219ab63e722efca3372d5e24c`，
 工作树干净。上述提交只代表执行交付，不代表 Codex 独立验收或完整性能提速成立。
+
+### r4 最小返修执行记录（2026-09-18，执行者完成，待 Codex 审查）
+
+执行前基线为 `dev@7542369`；已执行 `git pull --ff-only origin dev`，结果为
+`Already up to date`。工作树干净，没有 GLT 训练、微调或 grid 进程；保留全部 r1–r3
+历史日志与报告。本轮仅处理 batched `completed` 返回顺序，不触碰 active cache、配置、
+checkpoint、DDP、parity、ABBA、profile 或微调预算。
+
+| 项目 | 状态 | 实施与证据 |
+| --- | --- | --- |
+| 稳定原始任务序号 | PASS（执行者自检，待 Codex 审查） | `scripts/run_glt_dual_finetune_grid.py` 为每个已启动 shard 保存 `offset + local_index`，收割时只保留该序号，不使用压缩后的 `active` 列表位置。 |
+| 并行 poll / wait / batch barrier | PASS（执行者自检，待 Codex 审查） | 仅替换顺序索引；并行 `poll()`、观察后 `wait()`、下一批屏障、dynamic 补位和失败收口逻辑未改变。 |
+| 确定性顺序回归 | PASS（执行者自检，待 Codex 审查） | `tests/test_glt_dual_speed.py::test_batched_completed_order_uses_stable_task_sequence` 使用可控假进程 poll 序列 B→A→C，断言返回 A/B/C 且各一次。 |
+| 相关调度测试 | PASS（执行者自检，待 Codex 审查） | `PYTHONPATH=.:tests /opt/conda/bin/python -m pytest -q tests/test_glt_dual_speed.py`：`17 passed, 1 warning`，退出码0；日志 `logs/glt_engineering_20260918/r4_grid_tests.log`。既有真实短/长子进程测试继续通过。 |
+| 资产与实验边界 | PASS（执行者自检，待 Codex 审查） | 未启动 GPU/worker 长任务；未新增 optimizer updates；未修改 cache、配置或 checkpoint；未重跑 DDP、parity、ABBA、profile 或微调。 |
+
+必要检查：`py_compile` 与 `git diff --check` 通过。r4 只修改
+`scripts/run_glt_dual_finetune_grid.py`、`tests/test_glt_dual_speed.py` 和本计划记录。
+完整预训练及微调提速仍分别为 `NOT_ESTABLISHED`，不产生预测性能结论。完成提交与远端核对后，
+状态保持“待审查”。

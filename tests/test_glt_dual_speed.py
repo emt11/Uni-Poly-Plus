@@ -165,6 +165,51 @@ def test_batched_scheduler_waits_for_each_batch(tmp_path):
     assert 'GRID_LAUNCH_TO_EXIT_SECONDS=' in (tmp_path / 'task_0.log').read_text()
 
 
+def test_batched_completed_order_uses_stable_task_sequence(tmp_path):
+    """Completion order B/A/C must not become the returned order A/C/B."""
+
+    class FakeHandle:
+        def __init__(self, path):
+            self.path = path
+            self.closed = False
+
+        def write(self, value):
+            self.path.write_text(self.path.read_text() + value if self.path.exists() else value)
+
+        def flush(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self, polls):
+            self.polls = list(polls)
+            self.waited = False
+
+        def poll(self):
+            return self.polls.pop(0)
+
+        def wait(self):
+            self.waited = True
+            return 0
+
+    schedules = {'A': [None, 0], 'B': [0], 'C': [None, None, 0]}
+
+    def launch(task, fold, gpu):
+        del fold, gpu
+        path = tmp_path / f'{task}.log'
+        return FakeProcess(schedules[task]), FakeHandle(path), path
+
+    completed = _run_batched_jobs(
+        [('A', 0), ('B', 0), ('C', 0)], ['0', '1', '2'], launch,
+        poll_interval=0,
+    )
+    tasks = [row['task'] for row in completed]
+    assert tasks == ['A', 'B', 'C']
+    assert len(tasks) == len(set(tasks)) == 3
+
+
 def test_batched_scheduler_observes_short_child_before_long_child(tmp_path):
     """Exit observation is polled concurrently while the batch barrier stays."""
 
