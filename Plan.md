@@ -4,13 +4,13 @@
 
 | 字段 | 内容 |
 | --- | --- |
-| 计划 ID | GLT-PRED-20260918-01 / r1 |
+| 计划 ID | GLT-PRED-20260918-01 / r2 |
 | 状态 | 待授权；仅方案编制完成，代码、验证、训练和预测比较均未执行 |
-| 用户要求 | 全面优化预训练、2D/3D、Trimer 与单 RU 融合、XC 微调及参数；考虑替换 7-RU FP；供其他模型执行 |
+| 用户要求 | 全面优化预训练、2D/3D、Trimer 与单 RU 融合、XC 微调及参数；考虑替换 7-RU FP；r2另加入独立2D–3D对齐预训练实验；供其他模型执行 |
 | 本轮授权 | 编写本计划及必要文档归档、提交同步；不授权启动科学实验 |
 | 角色 | Codex 规划与后续独立审查；接手模型执行并记录实际执行者；不默认启动子代理 |
-| 代码基线 | dev@6d44ed9；修改前 pull --ff-only 为 Already up to date |
-| 用户已有改动 | Plan.md 已被用户清空；按明确请求写入新计划，不恢复被清空的旧正文 |
+| 代码基线 | r1为dev@6d44ed9；r2文档修订前为dev@cd3af56，pull --ff-only 为 Already up to date |
+| 用户已有改动 | r1按请求填充用户清空的Plan.md；r2开始时工作树干净，保留r1全部未执行计划 |
 | 上一周期 | GLT-ENGINEERING-20260918-01/r4 已归档；工程正确性关闭，不代表完整提速或预测提升 |
 | 当前范围 | 科学设计与分阶段执行合同；只有另获授权的阶段才可实施、运行 |
 
@@ -19,6 +19,8 @@
 授权分层：用户后续说“实现并验证本计划”，默认指 S0–S2 的实施与必要有界验证；S3/S4/S5 的研究训练预算和 outer-test 必须明确包含在用户授权中。用户明确授权全部阶段时按本合同顺序执行，不重复申请已授权步骤；条件不满足时停止晋级，不用剩余预算机械补跑。历史科学实验授权不自动迁移至本计划。
 
 科学成功不预设 R² 必须达到 0.87。候选均无效也可完成一轮有边界研究；不得将负结果写成提升，或为达到目标自动加组、加 seed、加构象。
+
+**r2变更：**增加§5.6图级ALIGN，与FGR并列而非默认叠加；S3b从3组增为4组，拟议研究预训练总上限30k→35k，开发神经微调1620→1800epochs（另加原2epoch smoke），correctness总上限28→40updates。S4/S5名额不增加。本次授权仅为计划修订，新增实验尚未启动、尚未获运行授权。
 
 ## 1. 事实基线与证据索引
 
@@ -81,7 +83,7 @@
 
 Q1：当前表示已有信息是否被全量微调破坏？→ 冻结读出/LoRA。
 
-Q2：7-RU FP 能否被更贴合双路预测的任务替换？→ FP / 无 FP / 融合条件几何重建三组。
+Q2：7-RU FP 能否被更贴合双路预测的任务替换？→ FP / 无 FP / 融合条件几何重建 / 图级2D–3D对齐四组；区分重建几何和对齐表示。
 
 Q3：中心内部键 GAP 是否丢失跨 RU 的局部对应？→ 原子锚定融合，固定目标做对照。
 
@@ -127,7 +129,7 @@ S0 建立按 polymer identity 的 95%/5% P_train/P_val 划分，seed=42，四舍
 
 当前 FP 已经从融合表示预测，但标签由拓扑决定，融合可能不需要独有的几何信息。Fusion 是运算，不是监督目标。本计划选择可实现的替代：**同一预测融合表示参与中心 RU 原子对的干净距离重建**。
 
-FGR 是 FlexMol-inspired 的项目条件几何重建，不是完整跨模态生成、3D教师蒸馏或证明两路必不可少的目标。仅有 loss 下降不能证明跨模态利用；必须做分支消融和下游比较。初轮不额外加入 InfoNCE、EMA teacher 或 matching classifier。
+FGR 是 FlexMol-inspired 的项目条件几何重建，不是完整跨模态生成、3D教师蒸馏或证明两路必不可少的目标。仅有 loss 下降不能证明跨模态利用；必须做分支消融和下游比较。T_FGR本身不加入InfoNCE；r2另设T_ALIGN，二者不混用。初轮不加入EMA teacher或matching classifier。
 
 ### 5.2 固定目标身份与采样
 
@@ -163,10 +165,13 @@ $$
 | B_FP | 原 Concat | chem＋geo＋0.1 FP | 新数据协议下 matched baseline |
 | B_NONE | 原 Concat | chem＋geo | 去掉 FP 本身的影响 |
 | T_FGR | 原 Concat | chem＋geo＋0.1 FGR | 替换 FP 的总效果；相对 B_NONE 是 FGR 增量 |
+| T_ALIGN | 原 Concat | chem＋geo＋lambda_align(k) ALIGN | 替换FP为图级对齐；相对B_NONE是对齐增量，与T_FGR比较两类第三任务 |
 
-这些组共享 encoder 初始化、chem/geo head 初始化、样本/公共随机流、训练与下游预算。FP/FGR head 参数量不同，如实报告，不称参数完全相同；最终 deploy 结构相同。B_NONE 的未受预训练监督的融合 LN 明确记录为初始化状态，不与已受训练者混称同一预训练路径。
+这些组共享 encoder 初始化、chem/geo head 初始化、样本/公共随机流、训练与下游预算。FP/FGR/ALIGN head参数量不同，如实报告，不称参数完全相同；最终deploy结构相同。B_NONE的未受预训练监督的融合LN明确记录为初始化状态，不与已受训练者混称同一预训练路径。ALIGN使用现有norm2/norm3后接独立投影头，使这两个部署LN接受对齐梯度。
 
 T_FGR 稳定有效才允许补一项 `FP+FGR`，回答替换还是互补；该项在本轮核心预算外，不能自动执行。
+
+`FGR+ALIGN`和`FP+ALIGN`同样不在核心四组内。若两个单项均有下游信号，可另修组合实验及预算；不因论文同时使用多个目标便直接叠加。
 
 ### 5.5 防泄漏和有效性检查
 
@@ -176,6 +181,67 @@ T_FGR 稳定有效才允许补一项 `FP+FGR`，回答替换还是互补；该�
 - 固定同一 checkpoint，分别置零/置乱图级3D与局部2D decoder通路，记录验证FGR响应；这只查依赖，不能作为泛化或跨模态协同证明。
 - 重建改善但下游无益时停止晋级；不自动增大权重直到 test变好。
 - 若以后新增融合化学预测，需同步遮蔽所有物理副本的端点元素及元素条件几何类型。该任务不在初版，以免3D直接泄漏被遮蔽元素。
+
+### 5.6 独立实验：Graph-Level 2D–3D Alignment（ALIGN）
+
+#### 5.6.1 适用性与不适用边界
+
+适合回答“同一聚合物的化学表示与局部几何表示是否能学到更可迁移的共享语义”。FGR预测具体几何量，ALIGN拉近两路表示，二者不是同一任务。[FlexMol §3.1.3（CIKM 2025）](https://arxiv.org/html/2510.07035v1)使用跨模态InfoNCE提供直接依据；本文的中心RU范围、多正例身份处理和分布式合同是项目适配，不是完整复现。
+
+首版只做图级，不强迫O8原子与GLT键逐token一一相等，也不对齐整个3RU无差别GAP。旧N+1/N+2采用教师蒸馏，本实验是两路联合更新；不能把旧蒸馏失败或论文成功直接当成本实验结论。
+
+两路共享化学身份，但2D不唯一决定某个构象。用独立小投影空间对齐，保留原512维表示及chem/geo目标，不直接最小化原始H/U全维MSE。即使如此仍可能损害几何特有信息，须通过XC/eps/eat开发结果裁定。
+
+#### 5.6.2 表示、视图与参数
+
+- `g2 = norm2(mean canonical O8 atoms)`，`g3 = norm3(mean center internal GLT bonds)`，均为512维、均在跨模态融合之前；norm2/norm3是现有Concat部署参数。
+- 分别使用不共享的 `P2/P3: Linear(512,256)→GELU→Linear(256,128)`，无BatchNorm、无dropout，输出以FP32 L2 normalize（eps=1e-8）。两路encoder、LN和投影头均接收梯度，不stop-gradient、不冻结教师。
+- 复用本次forward的原O8 30% motif mask与GLT 0.03 Å noisy输入，不额外运行clean encoder，不为ALIGN改变公共视图或随机流。把不同mask/噪声的差异视为扰动，不宣称为多构象。
+- cosine temperature固定tau=0.1，不学习、不扫参；独立初始化seed保存。第k个optimizer update（k从1计）`lambda_align(k)=0.1*min(k/1000,1)`，与LR warmup分开记录。该ramp是目标政策的一部分，不宣称与固定FP/FGR系数梯度强度完全匹配。
+- 下游移除两个投影头，保留原Concat/norm/predictor；初轮没有新增推理容量。ALIGN直接训练两路表示与分支LN，不是学会了原子级融合。
+
+#### 5.6.3 有效集合与多正例
+
+每个分布式microstep收集全部rank的有效配对记录V，条件为2D图有效、真实几何有效、中心内部键数>0、polymer identity已验证。invalid/N=0不作为anchor、positive或negative，仍参加其适用的其他任务，不能从训练数据集删除。
+
+anchor i的正例集合`P(i)`是V中相同polymer identity的对侧记录，**包含其自身配对行**；不同身份为负例，不能用`j!=i`删除本应存在的跨模态正例。重复key、等价RU写法若已证明同一identity则为多正例，不当负例。无法证明等价关系时先做S0身份审计，不用相同元素组成/相同指纹替代身份。
+
+仅有0条、1条配对或全为同一identity时，没有有效负例，整个microstep ALIGN返回连接两路投影计算图的零；不把多正例自身的softmax竞争作为学习信号。正负数量只依赖身份/有效性，不能按当前embedding相似度动态丢样本。结构相似但不同身份仍可能是语义上的假负例；记录此限制，初轮不新增hard-negative挖掘、队列或teacher。
+
+#### 5.6.4 精确损失
+
+令`z2_i=normalize(P2(g2_i))`、`z3_j=normalize(P3(g3_j))`，`s_ij = dot(z2_i,z3_j)/tau`。有至少两个不同identity的microstep使用正例log概率的平均，而非含义不明的“多正例InfoNCE”：
+
+$$
+\ell_i^{2\to3}=-\frac{1}{|P(i)|}\sum_{j\in P(i)}\left(s_{ij}-\log\sum_{k\in V}\exp(s_{ik})\right),\qquad
+L_{\rm ALIGN}=\frac{1}{2|V|}\sum_{i\in V}\left(\ell_i^{2\to3}+\ell_i^{3\to2}\right).
+$$
+
+`3→2`方向交换两路并重建同identity正例mask；用FP32 logsumexp。正例包含在分母中。每条有效样本作为anchor等权，重复身份出现多次会增加其采样权重，如实记录，不宣称identity均匀采样。
+
+`L_total=L_chem+L_geo+lambda_align(k)*L_ALIGN`。对齐只替代FP，不新增FGR。没有ALIGN样本时仅此项为零，其他任务与optimizer/scheduler正常执行。
+
+#### 5.6.5 DDP和梯度累积：必须实现同一个目标
+
+3rank×84，每个microstep对比池最多252条，而不是optimizer global batch1008。4次累积的对比池彼此独立，不保留跨microstep图、不引入队列；必须在config/report写明`contrastive_pool=distributed_microbatch`，不可声称1008个负例。实际负例数扣除invalid与多正例。
+
+按rank固定槽位padding收集embedding、valid mask和identity。浮点embedding的all-gather必须支持跨rank梯度，并在backward把远端key贡献SUM回源rank；identity/mask不需要梯度。不能detach远端key后仍声称完整对称InfoNCE。
+
+每rank只算本地有效anchor的`0.5*(两个方向loss之和)`，再对本地anchor求sum；跨rank、跨本次4个microstep的有效anchor总数A为统一分母（无负例microstep的anchor不计入A），rank局部sum乘`world_size/A`以抵消DDP参数梯度平均。对齐A可通过预备的identity/valid元数据在累积窗口前求得，不保留4份模型计算图；A=0安全返回零。不得先平均各microstep或各rank的均值，亦不得对已归一化ALIGN再额外乘world_size。
+
+全部rank无论本地是否有有效几何，均按相同顺序执行collective与backward；零rank使用连接投影参数的安全占位，padding绝不成为负例。DDP no_sync的参数同步策略不能抑制loss所需的embedding gather/backward通信。
+
+用单进程拼接相同数据（投影无dropout）作数学参考，先比浮点loss和两个投影/输入embedding梯度，再验证真实3rank；FP32参考容差起点atol/rtol=1e-5，记录硬件/实际容差。不得用“有限”代替正确的梯度比例验证。
+
+#### 5.6.6 验收、诊断与晋级
+
+- 独立覆盖跨rank重复identity、多正例、零rank、all-zero、全同identity、仅一有效pair、padding、两方向、累积不等有效数；no-negative场景有限零，不发生空均值。
+- 验证正例相似度、负例相似度、跨样本方差/有效秩、投影前后范数、梯度范数、有效anchor/negative数和无负例microstep比例；崩塌不靠加大lambda掩盖。
+- P_val每次固定同一组至多1024条记录和排序，eval后在此固定池上计算双向多正例检索与loss；明确其池大小与训练microbatch不同，不直接比较数值绝对高低。集合小于2个identity则不报告检索分数。
+- 在同一P_val记录上做一次几何特征固定化诊断：按P_train统计的键类型距离/角度均值代替数值，保留化学类型和拓扑，观察对齐检索变化。只能称输入响应检查，不能视为训练消融或独立性能证据；现有几何模块不接受这种替换时记录未执行，不静默改拓扑。
+- 因GLT自带元素/键类型，对齐可以靠共同化学身份完成；高检索率不是“3D独有信息有效”的证据。开发XC/eps/eat和geometry健康仍是晋级依据。
+- T_ALIGN必须相对B_NONE和B_FP报告，并与T_FGR同预算比较。仅对齐loss变好但下游无增量时不晋级，不默认叠加FGR或追加seed。
+- ANCHOR位于本实验对齐读出之后，ALIGN不会训练该新桥。若S3选择ALIGN为parent，S4不得直接运行“仅ALIGN＋ANCHOR”并称桥已预训练；可研究环境目标/扭转或matched O8，或另行修订有桥监督的组合实验与预算。
 
 ## 6. Trimer–RU 原子锚定融合（条件阶段）
 
@@ -267,20 +333,20 @@ RIDGE feature scaler只fit train，标签标准化同理；不得把全部432条
 | 职责 | 现有或拟修改位置 |
 | --- | --- |
 | FGR targets/incidence/torsion | `src/dataset/glt_dual_pretrain.py`；必要时新增局部helper，不改旧缓存 |
-| FGR头和分任务sum/count | `src/modules/glt_dual_pretrain.py` |
+| FGR/ALIGN头和分任务sum/count | `src/modules/glt_dual_pretrain.py`；ALIGN使用有梯度gather的小型loss helper |
 | 原子锚定及扭转模块 | `src/modules/glt_dual.py` 或独立小模块，旧factory默认不变 |
 | 目标/架构配置与恢复 | `scripts/pretrain_glt_dual.py`、现有runtime |
 | HEAD/LoRA/RIDGE | `scripts/finetune_glt_dual.py`及必要的小型适应helper |
 | 选择与outer-test隔离 | 现有grid/evaluate，新增development模式而非滥用旧smoke的2epoch语义 |
 | 测试 | 复用dual_glt/pretrain/speed tests，新增针对FGR/anchor/PEFT的少量用例 |
 
-拟新增配置字段：`third_task=fp|none|fgr`、`fusion_variant=concat|anchor`、`geometry_features=length_angle|length_angle_torsion`、`chem_target=element|environment`、`adaptation=full|head|lora|ridge`、`evaluation_mode=smoke|development|formal`。这些现在不是已有CLI。
+拟新增配置字段：`third_task=fp|none|fgr|align`、`fusion_variant=concat|anchor`、`geometry_features=length_angle|length_angle_torsion`、`chem_target=element|environment`、`adaptation=full|head|lora|ridge`、`evaluation_mode=smoke|development|formal`。ALIGN另记`projection_dim=128`、`temperature=0.1`、`alignment_ramp_updates=1000`、`contrastive_pool=distributed_microbatch`和identity来源。这些现在不是已有CLI。
 
 配置需拒绝不支持的组合、遗漏真实路径、错误step/task身份；沿用必要的现有metadata检查，不另造全套hash系统。保存完整resolved config。移除FP时不得在dataset无条件构建7-RU指纹，测试monkeypatch该构建器以验证没有调用；BRICS读取不受影响。
 
 新FGR label在CPU准备阶段产生，batch只传必要target/index；不把clean坐标传encoder。来源路径只读，若现有static缺少incidence，可从同一冻结物理拓扑派生，先小样本验证；未经授权不全量写新的派生缓存。
 
-deploy仅包含推理encoder、融合、适配器和必要norm；FGR/chem/geo训练头与目标均不依赖。LoRA部署必须保存base身份和adapter，并验证合并前后数值一致；不得把不兼容新结构部分加载成旧模型。
+deploy仅包含推理encoder、融合、适配器和必要norm；FGR/ALIGN/chem/geo训练头与目标均不依赖。ALIGN两个投影头只存在于训练resume包，推理不需要负例、identity对齐标签或其他batch样本。LoRA部署必须保存base身份和adapter，并验证合并前后数值一致；不得把不兼容新结构部分加载成旧模型。
 
 ## 10. 阶段、预算与运行条件
 
@@ -298,15 +364,17 @@ GPU/worker/>1分钟任务只能在Linux本机 `tmux Uni-Poly` 独立window中执
 | --- | --- | --- |
 | S0 | 只读来源/split/XC/重复身份审计；新目标覆盖只抽至多1024条P_train；全量identity匹配为元数据扫描、不跑模型 | 基线身份、P划分、有效覆盖、运行资源；合同错误先停止 |
 | S1 | 实现HEAD/LoRA/RIDGE与validation-only开发路径；局部单测；fixed checkpoint xc/fold0至多2epochs | 无test访问、冻结/加载/梯度正确；不作排名 |
-| S2 | 实现B_FP/B_NONE/T_FGR；局部单测；至多32条不同真实样本组成固定smoke集合，允许重复用于以下正确性步数；三路径各2updates；FGR连续4与2+resume到4共8updates；加最多2updates失败定位，总上限16；partial/all-zero 3rank各1次backward、0updates | mask/有效分母/复现/旧路径回退；小集合重复不是正式样本流或泛化证据 |
+| S2 | 实现B_FP/B_NONE/T_FGR/T_ALIGN；至多32条不同真实smoke样本可复用；原三路径与FGR恢复/失败定位最多16updates；ALIGN额外2updates smoke＋连续4/2+resume到4共8updates＋最多2updates失败定位，总上限28；原geo/FGR partial/all-zero两case之外，ALIGN再3个3rank backward-only case（partial含重复identity、all-zero、全同identity），均0updates | 局部数学参考、全梯度归约/恢复/旧路径回退；小集合重复不是正式样本流或泛化证据 |
 | S3a | 适应开发：3种神经适应×3tasks×2folds×最多30epochs=540epoch上限；RIDGE6个单元×4alpha=24次fit，无GPU训练epochs | 锁定后续统一适应方式；outer-test NOT_RUN |
-| S3b | B_FP/B_NONE/T_FGR 三条新5k轨迹=15,000updates，seed42；三组×3tasks×2folds×30epochs=540epoch上限 | 目标替换是否晋级；未通过则停止架构叠加 |
+| S3b | B_FP/B_NONE/T_FGR/T_ALIGN 四条新5k轨迹=20,000updates，seed42；四组×3tasks×2folds×30epochs=720epoch上限 | 对齐与重建分别比较；未通过则停止架构叠加 |
 | S4 | 最多3个新增5k轨迹=15,000updates；每轨迹同3tasks×2folds×30epochs，累计540epoch上限；每新实现最多4updates correctness，总12updates；包含必要的扭转OFF控制 | 在额度内按第11节选择分支，不能执行全排列 |
 | S5 | 最多3组×8tasks×5folds×100epochs=12,000epoch上限，seed42；不新增预训练；只部署锁定step5000 | 组别固定为新B_FP、最终候选、O8参照；无候选则不为填满预算做S5 |
 
-S1的2epochs、S2的16updates、S4的12updates单独计入总账；研究预训练上限30,000updates＋28 correctness updates。开发神经微调上限1620＋2epochs；S5另计。正式最多120个task/fold，仅全部相应授权后可运行。
+S1的2epochs、S2的28updates、S4的12updates单独计入总账；研究预训练上限35,000updates＋40 correctness updates。开发神经微调上限1800＋2epochs；S5另计。相对r1新增一条5k、180开发epochs及12 correctness updates，不新增S4/S5组或seed。正式最多120个task/fold，仅全部相应授权后可运行。
 
 S4默认优先ANCHOR与环境目标，各一轨迹；如果将名额用于扭转，必须占两轨迹（TOR/TOFF），与ANCHOR构成三条，不再运行环境目标。选择在S3审查后、启动S4前写明，不能看test决定。S4旧参考直接复用S3锁定轨迹，不重复预训练。
+
+上段默认安排仅适用于FP/FGR parent。若parent为ALIGN，遵守§5.6的桥梯度限制，默认环境目标一条，或TOR/TOFF两条；余下名额可留给matched O8，不为填满名额引入新模块。若需要ALIGN＋FGR组合，须另行修订而非无监督地预训练ANCHOR。
 
 S5 O8参照优先使用现存B的部署包和一致的微调协议，但来源P与新参考不一致时只能称历史参照；若需要严格matched O8，必须在S4三个预训练名额中预留一条O8-only，而不能临时追加第四条。初始授权若不含此项，则S5仅B_FP与候选两组80单元，O8历史结果旁列不作纯因果比较。
 
@@ -314,7 +382,7 @@ S5 O8参照优先使用现存B的部署包和一致的微调协议，但来源P�
 
 新B_FP在P_train按位置顺序重新训练；所有组第5000步为主checkpoint，P_val每1000步检查健康，不以任务test选择checkpoint。P_val评估固定至多1024条身份分层样本，所有组同集合；小覆盖类别另报，不以它宣称全量重建验证。
 
-S0的1024条目标审计用于决定FGR是否可实施；须单列无目标比例、SPD3覆盖以及各RU大小分布。若总体FGR有效覆盖低于50%，停止S3b并交回修订目标范围，不能自行加入侧RU多值目标；此阈值是执行可行性起点，不是论文结论。S3正式统计可扫描P_train全部候选以拟合mu/sigma，属于授权研究准备，须在tmux记录时间/数量；不把这次全量统计说成S0的1024条抽查。
+S0的1024条目标审计用于决定FGR是否可实施；须单列无目标比例、SPD3覆盖以及各RU大小分布。若总体FGR有效覆盖低于50%，停止T_FGR并交回修订目标范围，不能自行加入侧RU多值目标；此阈值是执行可行性起点，不是论文结论。B_FP/B_NONE/T_ALIGN若各自条件满足且已获授权可以继续，不因FGR低覆盖而扩大ALIGN样本集合。ALIGN另统计按真实microbatch分组的有效pair数、不同identity数与无负例比例；身份无法证明时停止ALIGN。S3正式统计可扫描P_train全部候选以拟合mu/sigma，属于授权研究准备，须在tmux记录时间/数量；不把这次全量统计说成S0的1024条抽查。
 
 ## 11. 晋级和停止规则
 
@@ -323,6 +391,7 @@ S0的1024条目标审计用于决定FGR是否可实施；须单列无目标比�
 各组使用相同validation样本、相同fold配对；选择规则预登记为：优先XC两fold平均validation R²增量≥0.01，且任一fold不下降超过0.03；eps/eat平均均不下降超过0.01。阈值仅为工程筛选，不是显著性保证。
 
 - T_FGR同时报告相对B_FP和B_NONE，不能把去掉FP收益归因于FGR。若只优于B_FP、不优于B_NONE，优先保留简单B_NONE，不宣称融合目标有增量。
+- T_ALIGN同样相对B_FP/B_NONE报告，并与T_FGR使用相同开发协议；不按两个不可比的预训练loss排序。对齐检索改善但XC/保护任务未达同一门槛则不晋级。四组共同使用锁定的下游适应方式，不能给ALIGN额外挑选LoRA/seed。
 - S4模块相对其直接parent比较；候选不超两项组成的新增机制，避免无限堆叠。S4最多选一条作为最终候选。
 - 若结果混合或接近零，记录INCONCLUSIVE并停止扩大；本计划不自动追加seed。需要确认seed时另修预算，并同时补参考。
 - 对不同参数量/预训练头，报告模型、训练头、可训练参数、样本暴露、时间和峰值显存。不称同steps等于同FLOPs。
@@ -345,7 +414,7 @@ S5固定全部配置后，每fold独立选validation最佳、恢复后test一次
 
 1. 原B_FP开关默认保持旧输入/forward/loss和deploy行为；公共初始化可按名称核对，不仅“同seed”。
 2. FGR中心pair身份、SPD2/3、无重复、采样覆盖、单位/归一化、对称端点、空pair、安全sum/count。
-3. FP=none/fgr时不调用7-RU指纹构建，不读取无用FP标签；BRICS公共输入一致。
+3. FP=none/fgr/align时不调用7-RU指纹构建，不读取无用FP标签；BRICS公共输入一致。
 4. clean/noisy知识流测试、FGR对共享fusion的梯度、decoder无raw坐标入口。
 5. N=0优先找真实冻结样本并记录key；找不到明确记录，用最小确定性fixture，禁止静默skip后声称覆盖；学生原子任务保留。
 6. 普通连接、同原子双连接、左右不同键长、周期多重关系；所有物理身份分别保留。
@@ -356,6 +425,8 @@ S5固定全部配置后，每fold独立选validation最佳、恢复后test一次
 11. 3rank partial/all-zero分别验证geo和FGR有效分母、finite backward；不要求所有合法参数每步非零。
 12. 新head/采样恢复4步连续与2+恢复到4，包括各rank RNG、optimizer、scheduler、样本位置；复用工程日志尾部处理，不重写恢复框架。
 13. 最终deploy移除训练目标与头仍可预测；读取同一冻结几何，缺失时走明示fallback；**当前方案不是纯2D部署**，不能宣称不依赖几何。
+14. ALIGN跨rank多正例、仅一pair、无负例、padding、归约scale、远端key梯度、4次累积不等有效数，按§5.6单进程参考与真实DDP核对；全同identity必须有限零。关闭ALIGN后公共forward/RNG不漂移。
+15. ALIGN部署前后预测一致；单样本预测不依赖推理batch内其他样本，不将对比学习温度/投影头带进性质预测。
 
 局部测试通过只表示实现合同通过。新增目标重建变好、loss下降、attention非零均不能单独作为性质提升证据。
 
@@ -371,7 +442,7 @@ S5固定全部配置后，每fold独立选validation最佳、恢复后test一次
 
 1. 核对用户授予的阶段及预算；未授权研究训练时只完成允许实施/验证。
 2. 检查git/remote/活动任务，安全pull，重新读取本计划；保护用户改动。
-3. S0先确认参考、Xc来源、P划分及目标覆盖；不得直接启动三条5k。
+3. S0先确认参考、Xc来源、P划分及目标覆盖；不得直接启动四条5k。
 4. S1/S2完成最小实现与表内验证，保留旧路径；输出实际`--help`和已验证的smoke/development命令。拟新增命令未经实现不得伪称已可运行。
 5. 交回Codex审查；已获授权且验收满足后按S3→条件S4→S5推进，未满足条件停止并报告，不反复申请已授权的小步骤。
 6. 每轮改动按AGENTS提交/推送并核对远端；只暂存本轮文件，不提交缓存、checkpoint、密钥或无关改动。
@@ -388,4 +459,4 @@ S5固定全部配置后，每fold独立选validation最佳、恢复后test一次
 | S4 | 条件阶段、未授权 | — | 0 | — |
 | S5 | 正式阶段、未授权 | — | 0 | — |
 
-**下一步建议：先授权S0–S2，完成XC适应接口与FP→FGR替换的正确性闭环；科学训练按S3预算另行明确。** 这是分阶段启动建议，不把完整路线截断为只写代码，也不将本文视为已获得全部实验授权。
+**下一步建议：先授权r2的S0–S2，完成XC适应接口、FP→FGR与独立ALIGN的正确性闭环；科学训练按四组S3预算另行明确。** 这是分阶段启动建议，不把完整路线截断为只写代码，也不将本文视为已获得全部实验授权。

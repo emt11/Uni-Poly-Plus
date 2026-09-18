@@ -197,3 +197,12 @@
 * 论文依据：GRIN、FlexMol、TMLR masking design、SCAGE、Token-Mol、DenoiseVAE、PolyConFM（预印本）、ELoRA及TabPFN；原文机制与项目改造分开，链接保存在本轮Plan及Git版本中。
 * 实际修改与检查：只编写Plan.md并追加本条；核对现行代码/配置与参考路径，复查相关论文原始页面；文档格式、引用路径、预算逻辑和git diff --check自检。不运行单测、模型、预训练、微调、benchmark或缓存构建，不修改PIPELINE/RESULTS的既有科学结论。提交与推送信息见本轮Git历史和交付回复。
 * 下一步：建议先授权S0–S2实施和有界验证；S3–S5研究训练/正式评估另行明确。已有授权若明确覆盖全部阶段则按合同条件推进，不重复申请小步骤。科学周期保持待授权，后续由执行者回填记录、Codex独立审查。
+
+## GLT-PRED-20260918-01｜r2 对齐实验规划修订（2026-09-18；科学周期未启动）
+
+* 授权与角色：用户要求判断2D–3D对齐是否合适并加入计划；Codex仅修订Plan.md与本条文档记录并自检，非独立科学验收。修订前dev@cd3af56工作树干净，安全pull成功；不改变r1已记录的历史状态。
+* 最终增量：新增T_ALIGN，保留chem/geo、以独立图级双向多正例InfoNCE替换FP；同身份为跨模态正例、非同身份为负例，invalid/N=0剔除对齐集合但保留其他任务。O8原子GAP与GLT中心内部键GAP经现有LN及独立512→256→128投影对齐，tau0.1，lambda前1000updates线性升至0.1；保留原512维推理表示，不默认叠加FGR/FP或引入teacher。直接依据FlexMol（CIKM2025）的跨模态对齐，聚合物多正例/中心读出为项目适配。
+* 分布式与边界：对比池为3×84的distributed microbatch（最多252），不是累积global1008；远端embedding gather保留梯度，按全局累积有效anchor数归一化。补多正例/全零/全同身份/单pair/padding/远端key梯度与数学参考要求；原子锚定桥不受prefusion ALIGN监督，禁止无监督地晋级该组合。高检索率不证明独有几何知识或XC提升。
+* 拟议预算增量：S3b三组改四组，新增5000研究updates和180开发epochs；S2新增最多12 correctness updates及3个0update DDP case。研究总上限35,000updates＋40 correctness，开发1800＋2epochs；S4/S5名额及seed不增加。全部仍待运行授权，未启动任何实验。
+* 交付与检查：更新矩阵、配置、部署、覆盖/晋级、S4桥依赖及预算总账，保留r1目标。文档格式与git diff --check自检；复核论文原始正文。未运行代码测试、模型、预训练、微调、缓存构建或清理；commit/push见本轮Git历史与交付回复。
+* 下一步：用户可授权r2 S0–S2实现与有界验证；四组科学比较需明确授权S3预算。计划保持待授权，不把本条文档修订归档写成科学周期已完成。
