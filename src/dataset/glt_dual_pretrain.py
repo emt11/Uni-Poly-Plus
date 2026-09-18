@@ -22,11 +22,15 @@ def sample_generator(seed, key, position):
     return torch.Generator().manual_seed(value)
 
 
-@lru_cache(maxsize=512)
-def chemical_targets(smiles):
+def chemical_groups(smiles):
+    """Build only the common 3-RU BRICS groups.
+
+    FP-free objectives still need the deterministic motif partition, but must
+    not pay for or accidentally consume the 7-RU Morgan target.
+    """
     source = Chem.MolFromSmiles(str(smiles))
     if source is None:
-        raise ValueError("invalid P-SMILES for chemical targets")
+        raise ValueError("invalid P-SMILES for chemical groups")
     # BRICS groups and the fingerprint roots are model-side identities.  The
     # input spelling is a provenance view and may use a different RDKit atom
     # order, so canonicalize before extracting any integer atom ids.
@@ -52,6 +56,16 @@ def chemical_targets(smiles):
         center = sorted(i - size for i in component if size <= i < 2 * size)
         if center:
             groups.append(tuple(center))
+    return tuple(sorted(groups))
+
+
+@lru_cache(maxsize=512)
+def chemical_targets(smiles):
+    groups = chemical_groups(str(smiles))
+    source = Chem.MolFromSmiles(str(smiles))
+    if source is None:
+        raise ValueError("invalid P-SMILES for chemical targets")
+    normalized = Chem.MolToSmiles(source, canonical=True)
     large, info = build_periodic_multimer_mol(
         normalized, 7, close_periodic=False
     )
@@ -62,7 +76,70 @@ def chemical_targets(smiles):
         raise ValueError('7-RU topology does not cover center Morgan radius plus boundary context')
     generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048, includeChirality=False)
     fingerprint = torch.from_numpy(generator.GetFingerprintAsNumPy(large, fromAtoms=roots).copy()).float()
-    return tuple(sorted(groups)), fingerprint
+    return groups, fingerprint
+
+
+def fgr_pairs(topology, trimer, *, seed, key, position, mu=0.0, sigma=1.0,
+              max_pairs=32):
+    """Return deterministic centre-RU SPD2/3 atom pairs and clean labels.
+
+    Pair identity comes from the frozen canonical shortest-path table and the
+    coordinate label is read through the explicit canonical→Trimer mapping.
+    Self images are excluded even when a lifted periodic relation has a
+    nonzero SPD.  No pair is selected by its distance.
+    """
+    if not math.isfinite(float(mu)) or not math.isfinite(float(sigma)) or sigma <= 0:
+        raise ValueError('FGR normalization requires finite mu and positive sigma')
+    if int(max_pairs) <= 0:
+        raise ValueError('FGR max_pairs must be positive')
+    if not bool(getattr(trimer, 'trimer_geometry_valid', False)):
+        return torch.empty((0, 2), dtype=torch.long), torch.empty(0), torch.empty(0, dtype=torch.long)
+    edge_index = torch.as_tensor(topology.lga_edge_index).long()
+    spd = torch.as_tensor(topology.lga_spd).long()
+    mapping = torch.as_tensor(getattr(trimer, 'mips_to_trimer_central_index', torch.empty(0))).long()
+    positions = torch.as_tensor(getattr(trimer, 'trimer_pos', torch.empty((0, 3)))).float()
+    if edge_index.ndim != 2 or edge_index.shape[0] != 2 or spd.numel() != edge_index.shape[1]:
+        raise ValueError('invalid canonical shortest-path table for FGR')
+    if mapping.numel() != int(topology.mips_x.size(0)):
+        raise ValueError('FGR canonical-to-Trimer mapping length mismatch')
+    candidates = {}
+    for column, value in enumerate(spd.tolist()):
+        if value not in (2, 3):
+            continue
+        left, right = (int(edge_index[0, column]), int(edge_index[1, column]))
+        if left == right:
+            continue
+        pair = (min(left, right), max(left, right))
+        candidates[pair] = int(value)
+    generator = sample_generator(seed, f'{key}:fgr', position)
+    ordered = []
+    # Keep the prescribed SPD2/SPD3 cap independent of the order of the
+    # shortest-path table.  The two classes are sampled without replacement;
+    # all remaining capacity is naturally used when one class has fewer than
+    # its cap, while no class can exceed 16 entries.
+    remaining = int(max_pairs)
+    for hop in (2, 3):
+        if remaining <= 0:
+            break
+        class_pairs = sorted(pair for pair in candidates if candidates[pair] == hop)
+        cap = min(16, remaining, len(class_pairs))
+        if len(class_pairs) > cap:
+            chosen = torch.randperm(len(class_pairs), generator=generator)[:cap].tolist()
+            class_pairs = [class_pairs[index] for index in sorted(chosen)]
+        ordered.extend(class_pairs)
+        remaining -= len(class_pairs)
+    ordered = sorted(ordered, key=lambda pair: (candidates[pair], pair[0], pair[1]))
+    if not ordered:
+        return torch.empty((0, 2), dtype=torch.long), torch.empty(0), torch.empty(0, dtype=torch.long)
+    pair_tensor = torch.as_tensor(ordered, dtype=torch.long)
+    mapped = mapping[pair_tensor]
+    if int(mapped.max()) >= positions.size(0) or int(mapped.min()) < 0:
+        raise ValueError('FGR mapped coordinate index is out of range')
+    distances = torch.linalg.vector_norm(positions[mapped[:, 0]] - positions[mapped[:, 1]], dim=-1)
+    if not bool(torch.isfinite(distances).all()) or bool((distances <= 0).any()):
+        raise ValueError('FGR clean pair distance is invalid')
+    normalized = (torch.log1p(distances) - float(mu)) / float(sigma)
+    return pair_tensor, normalized, torch.as_tensor([candidates[pair] for pair in ordered], dtype=torch.long)
 
 
 def motif_mask(topology, groups, generator, ratio=0.3):
@@ -120,22 +197,36 @@ def _unpack_fingerprint(packed):
 
 
 def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
-                            sigma=0.03, ratio=0.3, static=None, target=None):
+                            sigma=0.03, ratio=0.3, static=None, target=None,
+                            third_task='fp', fgr_mu=0.0, fgr_sigma=1.0,
+                            fgr_max_pairs=32):
     if not bool(topology.graph_available):
         raise ValueError('three-task training requires valid canonical 2D topology')
     if not math.isfinite(sigma) or sigma < 0 or not 0 < ratio < 1:
         raise ValueError('invalid noise sigma or masking ratio')
     generator = sample_generator(seed, key, position)
+    third_task = str(third_task).lower()
+    if third_task not in {'fp', 'none', 'fgr', 'align'}:
+        raise ValueError('unsupported third pretraining task')
     if target is not None:
-        if 'brics_groups' not in target or 'fingerprint_packed' not in target:
-            raise ValueError('pretrain target row is missing required fields')
+        if 'brics_groups' not in target:
+            raise ValueError('pretrain target row is missing BRICS groups')
         groups = tuple(tuple(int(atom) for atom in group)
                        for group in target['brics_groups'])
-        fingerprint = _unpack_fingerprint(target['fingerprint_packed'])
+        if third_task == 'fp':
+            if 'fingerprint_packed' not in target:
+                raise ValueError('FP target row is missing fingerprint_packed')
+            fingerprint = _unpack_fingerprint(target['fingerprint_packed'])
+        else:
+            fingerprint = torch.zeros(2048)
         identity = None
     else:
         identity = resolve_normalized_identity(topology, smiles, require_fields=True)
-        groups, fingerprint = chemical_targets(identity["normalized_smiles"])
+        if third_task == 'fp':
+            groups, fingerprint = chemical_targets(identity["normalized_smiles"])
+        else:
+            groups = chemical_groups(identity["normalized_smiles"])
+            fingerprint = torch.zeros(2048)
     mask, fallback = motif_mask(topology, groups, generator, ratio)
     # Static chemistry/connectivity/path is a pure function of
     # (topology, smiles): build it once and share it between the clean and
@@ -187,26 +278,52 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
         reasons.append('geo:no_center_bonds')
     elif not pairs.numel():
         reasons.append('angle:no_center_angles')
+    fgr_index, fgr_target, fgr_spd = (fgr_pairs(
+        topology, trimer, seed=seed, key=key, position=position,
+        mu=fgr_mu, sigma=fgr_sigma, max_pairs=fgr_max_pairs)
+        if third_task == 'fgr' else
+        (torch.empty((0, 2), dtype=torch.long), torch.empty(0), torch.empty(0, dtype=torch.long)))
     targets = dict(atom_mask=mask, atom_label=topology.mips_x[:, :101].argmax(-1),
         distance=clean.bond_distance[clean.bond_center].clone(),
         angle_pairs=pairs.reshape(-1, 2),
         angle_cos=cosines if cosines.numel() else torch.empty(0),
-        fingerprint=fingerprint.clone(), fallback=fallback, skip_reasons=reasons)
+        fingerprint=fingerprint.clone(), fallback=fallback, skip_reasons=reasons,
+        fgr_pair_index=fgr_index, fgr_target=fgr_target, fgr_spd=fgr_spd,
+        fgr_valid=bool(fgr_target.numel()),
+        align_identity=str(key),
+        align_valid=bool(clean.geometry_valid and clean.bond_center.any()),
+        third_task=third_task)
     return noisy, targets
 
 
 def pretrain_collate(records):
     inputs, targets = zip(*records)
     data = dual_glt_collate(inputs)
-    bond_offset, pairs, angle_graph = 0, [], []
+    atom_offset = bond_offset = 0
+    pairs, angle_graph, fgr_pairs_list, fgr_targets, fgr_graph = [], [], [], [], []
+    fgr_spd, fgr_graph_valid = [], []
     for graph, (item, target) in enumerate(records):
         pairs.append(target['angle_pairs'] + bond_offset)
         angle_graph.append(torch.full((target['angle_pairs'].size(0),), graph, dtype=torch.long))
+        if target['fgr_pair_index'].numel():
+            fgr_pairs_list.append(target['fgr_pair_index'] + atom_offset)
+            fgr_targets.append(target['fgr_target'])
+            fgr_spd.append(target['fgr_spd'])
+            fgr_graph.append(torch.full((target['fgr_target'].numel(),), graph, dtype=torch.long))
+        fgr_graph_valid.append(bool(target['fgr_valid']))
+        atom_offset += item.mips_x.size(0)
         bond_offset += item.bond_distance.numel()
     labels = {name: torch.cat([t[name] for t in targets]) for name in
               ('atom_mask', 'atom_label', 'distance', 'angle_cos')}
     labels.update(angle_pairs=torch.cat(pairs), angle_graph=torch.cat(angle_graph),
         fingerprint=torch.stack([t['fingerprint'] for t in targets]),
+        fgr_pair_index=(torch.cat(fgr_pairs_list) if fgr_pairs_list else torch.empty((0, 2), dtype=torch.long)),
+        fgr_target=(torch.cat(fgr_targets) if fgr_targets else torch.empty(0)),
+        fgr_spd=(torch.cat(fgr_spd) if fgr_spd else torch.empty(0, dtype=torch.long)),
+        fgr_graph=(torch.cat(fgr_graph) if fgr_graph else torch.empty(0, dtype=torch.long)),
+        fgr_graph_valid=torch.tensor(fgr_graph_valid, dtype=torch.bool),
+        align_identity=[t['align_identity'] for t in targets],
+        align_valid=torch.tensor([bool(t['align_valid']) for t in targets], dtype=torch.bool),
         fallback_count=sum(t['fallback'] for t in targets),
         skip_reasons=[reason for t in targets for reason in t['skip_reasons']])
     return data, labels

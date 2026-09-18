@@ -15,7 +15,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from src.dataset.glt_dual_pretrain import prepare_pretrain_sample, pretrain_collate
-from src.modules.glt_dual_pretrain import DualPretrainer, global_objective, deployment_package
+from src.modules.glt_dual_pretrain import (DualPretrainer, global_objective,
+                                            deployment_package,
+                                            alignment_local_anchor_count)
 from src.training.glt_dual_runtime import (require_tmux, open_source, save_checkpoint, write_json,
                                          rng_state, restore_rng, scheduled_lr, move_labels,
                                          OrderedSampleStream, RankMicrobatchStream)
@@ -31,10 +33,16 @@ def _module_grad_norms(model):
         'length_head': model.length_head,
         'angle_head': model.angle_head,
         'fp_head': model.fp_head,
+        'fgr_head': model.fgr_head,
+        'align_proj2': model.align_proj2,
+        'align_proj3': model.align_proj3,
         'atom_head': model.atom_head,
     }
     seen, report = set(), {}
     for name, module in groups.items():
+        if module is None:
+            report[name] = 0.0
+            continue
         params = [p for p in module.parameters() if p.requires_grad]
         seen.update(id(p) for p in params)
         flat = [p.grad.detach().reshape(-1) for p in params if p.grad is not None]
@@ -121,6 +129,16 @@ def main():
     parser.add_argument('--geometry-head-norm', action='store_true',
                         help='P2 single change: non-affine LayerNorm of the 3D bond state '
                              'feeding the geometry heads only')
+    parser.add_argument('--third-task', choices=('fp', 'none', 'fgr', 'align'),
+                        help='third objective; defaults to config third_task or fp')
+    parser.add_argument('--fgr-mu', type=float,
+                        help='P_train FGR log-distance mean (required for a formal FGR run)')
+    parser.add_argument('--fgr-sigma', type=float,
+                        help='P_train FGR log-distance scale (required positive)')
+    parser.add_argument('--fgr-max-pairs', type=int,
+                        help='maximum deterministic FGR pairs per graph (default 32)')
+    parser.add_argument('--align-temperature', type=float,
+                        help='fixed graph ALIGN temperature (default 0.1)')
     parser.add_argument('--reference-log',
                         help='original run log for the initial-10-step cross-check')
     parser.add_argument('--timing', action='store_true',
@@ -134,6 +152,21 @@ def main():
     args = parser.parse_args()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
+    third_task = str(args.third_task or config.get('third_task', 'fp')).lower()
+    fgr_mu = float(args.fgr_mu if args.fgr_mu is not None else config.get('fgr_mu', 0.0))
+    fgr_sigma = float(args.fgr_sigma if args.fgr_sigma is not None else config.get('fgr_sigma', 1.0))
+    fgr_max_pairs = int(args.fgr_max_pairs if args.fgr_max_pairs is not None
+                        else config.get('fgr_max_pairs', 32))
+    align_temperature = float(args.align_temperature if args.align_temperature is not None
+                              else config.get('align_temperature', 0.1))
+    if third_task not in {'fp', 'none', 'fgr', 'align'}:
+        raise ValueError('unsupported third task')
+    if not torch.isfinite(torch.tensor(fgr_mu)) or not torch.isfinite(torch.tensor(fgr_sigma)) or fgr_sigma <= 0:
+        raise ValueError('FGR normalization must be finite with positive sigma')
+    if fgr_max_pairs <= 0:
+        raise ValueError('FGR max pairs must be positive')
+    if not torch.isfinite(torch.tensor(align_temperature)) or align_temperature <= 0:
+        raise ValueError('ALIGN temperature must be finite and positive')
     if config.get('use_md200') is not False or config['amp_dtype'] not in ('fp32', 'bf16'):
         raise ValueError('dual route requires no MD200 and fp32/bf16 precision')
     if args.diagnostics_every <= 0:
@@ -173,7 +206,9 @@ def main():
     source, frame = open_source(
         args.cohort_root, args.cache_root,
         dual_static_root=args.dual_static_root,
-        pretrain_target_root=args.pretrain_target_root,
+        # FP is the only objective that consumes the 7-RU Morgan target.
+        # Non-FP branches intentionally do not open that cache.
+        pretrain_target_root=(args.pretrain_target_root if third_task == 'fp' else None),
     )
     try:
         micro, batch_size = config['microbatch'], config['global_batch']
@@ -183,7 +218,10 @@ def main():
         set_global_seed(config['seed'])
         base = DualPretrainer(config['fusion_mode'],
                               collect_diagnostics=bool(args.diagnostics),
-                              geometry_head_norm=bool(args.geometry_head_norm or config.get('geometry_head_norm', False))).to(device)
+                              geometry_head_norm=bool(args.geometry_head_norm or config.get('geometry_head_norm', False)),
+                              third_task=third_task, fgr_mu=fgr_mu,
+                              fgr_sigma=fgr_sigma,
+                              align_temperature=align_temperature).to(device)
         optimizer = torch.optim.AdamW(base.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
         module = DistributedDataParallel(base, device_ids=[device.index] if device.type == 'cuda' else None,
                                          find_unused_parameters=True) if world > 1 else base
@@ -196,7 +234,10 @@ def main():
                         dual_static_manifest_hash=(source.static_cache.manifest_hash
                                                    if source.static_cache is not None else None),
                         pretrain_target_manifest_hash=(source.target_cache.manifest_hash
-                                                       if source.target_cache is not None else None))
+                                                       if source.target_cache is not None else None),
+                        third_task=third_task, fgr_mu=fgr_mu,
+                        fgr_sigma=fgr_sigma, fgr_max_pairs=fgr_max_pairs,
+                        align_temperature=align_temperature)
         # Exact ordered identities, without adding a separate cache schema.
         ordered_keys = [key.hex() for key, _ in source.samples]
         resume_rng = None
@@ -250,12 +291,16 @@ def main():
                 diagnostics_every=int(args.diagnostics_every),
                 benchmark_steps=int(args.benchmark_steps),
                 benchmark_warmup=int(args.benchmark_warmup),
-                benchmark_mode=bool(args.benchmark_steps)))
+                benchmark_mode=bool(args.benchmark_steps), third_task=third_task,
+                fgr_mu=fgr_mu, fgr_sigma=fgr_sigma, fgr_max_pairs=fgr_max_pairs,
+                align_temperature=align_temperature))
             write_json(output / 'runtime.json', dict(
                 status='RUNNING', command=sys.argv, config=config, identity=identity,
                 rank=rank, world_size=world, device=str(device), prep_workers=int(args.prep_workers),
                 diagnostics=bool(args.diagnostics), diagnostics_every=int(args.diagnostics_every),
                 benchmark_steps=int(args.benchmark_steps), benchmark_warmup=int(args.benchmark_warmup),
+                third_task=third_task, fgr_mu=fgr_mu, fgr_sigma=fgr_sigma,
+                fgr_max_pairs=fgr_max_pairs, align_temperature=align_temperature,
                 started_at_monotonic=time.perf_counter()))
         stream = OrderedSampleStream(len(source), config['seed'])
         # Optional CPU prefetch.  The prepared items are identical to the
@@ -270,6 +315,8 @@ def main():
                 microbatch=micro, accumulation=accumulation,
                 start_step=start, max_steps=stop,
                 sigma=config['noise_sigma'], ratio=config['atom_mask_ratio'],
+                third_task=third_task, fgr_mu=fgr_mu, fgr_sigma=fgr_sigma,
+                fgr_max_pairs=fgr_max_pairs,
             )
             prefetch = iter(torch.utils.data.DataLoader(
                 dataset, batch_size=None, num_workers=int(args.prep_workers),
@@ -323,15 +370,28 @@ def main():
                             key=source.samples[index][0].hex(), position=position,
                             sigma=config['noise_sigma'], ratio=config['atom_mask_ratio'],
                             static=source.static_for(index),
-                            target=source.target_for(index)))
+                            target=(source.target_for(index) if third_task == 'fp' else None),
+                            third_task=third_task, fgr_mu=fgr_mu,
+                            fgr_sigma=fgr_sigma, fgr_max_pairs=fgr_max_pairs))
                     prepared.append(pretrain_collate(rows))
             timing['preparation_seconds'] = time.perf_counter() - prep_started
             counts = torch.zeros(3, device=device)
             for data, labels in prepared:
                 masked = torch.bincount(data.canonical_graph_index[labels['atom_mask']], minlength=data.graph_available.numel())
                 centers = torch.bincount(data.bond_batch[data.bond_center], minlength=data.graph_available.numel())
-                counts += torch.tensor([(masked > 0).sum(), ((centers > 0) & data.geometry_valid).sum(),
-                                        data.graph_available.sum()], device=device)
+                if third_task == 'fp':
+                    third_count = data.graph_available.sum()
+                elif third_task == 'fgr':
+                    third_count = (labels['fgr_graph_valid'].to(device)
+                                   & data.geometry_valid.to(device).bool()).sum()
+                elif third_task == 'align':
+                    third_count = alignment_local_anchor_count(
+                        labels['align_identity'], labels['align_valid'], device=device)
+                else:
+                    third_count = torch.tensor(0., device=device)
+                counts += torch.stack([(masked > 0).sum().to(device),
+                                       ((centers > 0) & data.geometry_valid).sum().to(device),
+                                       third_count.to(device)])
             if world > 1:
                 dist.all_reduce(counts)
             lr = scheduled_lr(step, **{key: config[key] for key in ('lr', 'warmup_steps', 'schedule_total_steps', 'end_lr')})
@@ -342,6 +402,9 @@ def main():
             target_counts = torch.zeros(4, device=device)
             fallbacks, reasons = 0, {}
             h2d_seconds = forward_backward_seconds = optimizer_seconds = 0.0
+            objective_weights = list(config['loss_weights'])
+            if third_task == 'align':
+                objective_weights[2] = 0.1 * min(float(step_number) / 1000., 1.)
             for offset, (data, labels) in enumerate(prepared):
                 fallbacks += labels['fallback_count']
                 for reason in labels['skip_reasons']:
@@ -363,7 +426,7 @@ def main():
                     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config['amp_dtype'] == 'bf16'):
                         result = module(moved_data, moved_labels,
                                         collect_diagnostics=diag_this_step)
-                        loss = global_objective(result['sums'], counts, world, config['loss_weights'])
+                        loss = global_objective(result['sums'], counts, world, objective_weights)
                     if not torch.isfinite(loss):
                         raise FloatingPointError('nonfinite pretraining loss')
                     loss.backward()

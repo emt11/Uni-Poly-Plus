@@ -531,13 +531,13 @@ python scripts/validate_dual_glt.py --topology-root TOPOLOGY_LAYER --trimer-root
 Star-Linking 为 `REVIEW`（两侧落在同一 boundary atom）；模型状态为 `NOT_RUN`，因此
 没有执行真实记录 forward/backward。
 
-## 18. GLT 双路三任务预训练与 outer5_inner20 微调（实现；本轮未执行）
+## 18. GLT 双路三任务预训练与 outer5_inner20 微调（实现；S0–S2 已执行，S3–S5 未执行）
 
 本节是独立新入口；第 17 节模型及冻结输入不再需要借用旧 C0/C1/C2 runner。
 两种模式分别使用 `configs/mts/glt_dual_three_task_concat.json` 与
 `configs/mts/glt_dual_three_task_kfuse.json`。无 MD200、教师、蒸馏或 InfoNCE。
-本轮未启动预训练、微调、DDP 或缓存构建；相关合成回归已在第 17 节记录，以下正式
-命令仍仅供通过真实数据阻断复核后的环境使用。
+本周期已完成 S0–S2 的只读审计、适应接口、第三任务实现及有界验证；没有启动正式预训练、
+完整微调、outer-test 或缓存构建。以下正式命令仍需后续阶段单独授权。
 
 ### 数据、目标与共享融合
 
@@ -1106,3 +1106,39 @@ finite。几何 flag 只在 collated Data 内存副本修改，active cache 未�
 本 r3 未重跑 32-key parity、ABBA、CPU profile、旧 benchmark、微调 epoch 或正式训练；完整端到端预训练／
 微调提速仍为 `NOT_ESTABLISHED`，GPU peak 仅不涉及本轮正式性能口径。工程结论仅能写为有界接口、调度和
 真实多 rank 无 geometry backward 校验完成，等待 Codex 独立审查后再决定是否关闭周期。
+
+### GLT-PRED-20260918-01 / r2：S0–S2 执行补记（2026-09-18）
+
+本补记只覆盖用户授权的 S0–S2；S3 适应开发、S4 条件架构和 S5 正式确认均未执行。
+
+* S0 只读审计产物为 `results/glt_pred_20260918/s0/s0_audit_r2.json`，日志为
+  `logs/glt_pred_20260918/s0/audit_r2.log`。PI1M 959,588 条记录对应 959,588 个规范化身份，
+  无重复；下游 6,265 行对应 3,655 个身份，PI1M/下游身份重叠 229。seed=42 的 identity split
+  为 train 911,391、validation 47,968；1,024 条 P_train 抽查的 FGR pair coverage 为
+  0.9990234375，SPD3 为 0（当前 frozen lga 最大 hop=2），因此没有以 SPD3 缺失冒充 FGR 阻断。
+  XC 原始标签 `data/raw/smi_xc.csv` 的 432 行、有限性和重复 SMILES 通过；`outer_test_accessed=false`、
+  `cache_modified=false`。
+* S1 在 `src/modules/glt_adaptation.py` 和 `scripts/finetune_glt_dual.py` 增加 FULL/HEAD/LoRA/RIDGE
+  validation-only 接口。LoRA 只更新合并 QKV 的 Q/V 切片，K/base 冻结；Ridge 只使用 train scaler
+  和 validation，开发路径禁止 outer-test。局部测试 `tests/test_glt_pred_adaptation.py` 为 2 passed；
+  与旧预训练/诊断集合合并为 25 passed、1 warning。`xc/fold0` 的 full/head/lora/ridge smoke 及
+  development ridge 均写入 `results/glt_pred_20260918/s1/`，所有成功记录 outer-test 为 `NOT_RUN`；
+  首次 LoRA 设备放置错误保留在 `logs/glt_pred_20260918/s1/xc0_lora.log`，修复后的 retry 才作为通过证据。
+* S2 将第三任务显式设为 `fp|none|fgr|align`。NONE/FGR/ALIGN 不打开 7-RU target cache；FGR
+  只从 canonical shortest-path SPD2/3 选择中心 pair（每层最多16、总数最多32），clean distance
+  只作归一化监督，decoder 只读 noisy encoder state 和 fusion；ALIGN 使用 128 维独立投影、
+  多正例身份池、无负例安全零及可微 distributed all-gather。新增局部测试为 4 passed；合并 S0–S2
+  相关集合为 25 passed、1 warning，`py_compile` 和 `--help` 均通过。
+* S2 真实单进程 GPU smoke 使用 4 条 PI1M 记录，结果为
+  `results/glt_pred_20260918/s2/real_smoke.json`，日志 `logs/glt_pred_20260918/s2/real_smoke.log`；
+  FP/NONE/FGR/ALIGN 均 finite loss/backward，`outer_test_accessed=false`。runner 1-update smoke
+  使用临时非生产配置（已删除），FP/NONE/ALIGN 的结果在 `logs/glt_pred_20260918/s2/runner/`，
+  FGR 首次 CPU/GPU 设备检查错误保留于 `fgr.log`，修复后 `fgr_retry.log` 退出码为0；没有写 deploy。
+* S2 3-rank NCCL 边界 smoke 使用 GPU 0/1/2、0 optimizer update，报告
+  `results/glt_pred_20260918/s2/ddp_s2_r3.json`，最终日志 `logs/glt_pred_20260918/s2/ddp_s2_r3.log`。
+  FGR partial/all-zero、ALIGN 跨 rank partial-repeat、all-zero、全同 identity 五个 case 均 finite
+  loss/backward；ALIGN partial global valid anchors=2，all-zero/全同 identity 为0。早期 ALIGN collective
+  顺序错误的失败日志保留在 `ddp_s2.log`、`ddp_s2_r2.log` 和 `ddp_s2_dbg.log`，修复后不再重现。
+
+上述结果属于 S0 审计、S1 接口 smoke 和 S2 目标/通信边界验证，不是预训练性能、下游性能或正式科学比较。
+S3–S5 仍须新的明确授权；没有访问 outer-test、修改 active cache、生成构象或启动正式训练。

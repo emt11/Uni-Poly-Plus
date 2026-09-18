@@ -5,14 +5,14 @@
 | 字段 | 内容 |
 | --- | --- |
 | 计划 ID | GLT-PRED-20260918-01 / r2 |
-| 状态 | 待授权；仅方案编制完成，代码、验证、训练和预测比较均未执行 |
+| 状态 | 待审查；S0–S2 已由执行者完成自检与有界验证，S3–S5 未执行 |
 | 用户要求 | 全面优化预训练、2D/3D、Trimer 与单 RU 融合、XC 微调及参数；考虑替换 7-RU FP；r2另加入独立2D–3D对齐预训练实验；供其他模型执行 |
-| 本轮授权 | 编写本计划及必要文档归档、提交同步；不授权启动科学实验 |
+| 本轮授权 | 用户明确授权执行 S0–S2 的实现与必要有界验证；不授权 S3–S5、正式训练、完整微调或 outer-test |
 | 角色 | Codex 规划与后续独立审查；接手模型执行并记录实际执行者；不默认启动子代理 |
-| 代码基线 | r1为dev@6d44ed9；r2文档修订前为dev@cd3af56，pull --ff-only 为 Already up to date |
+| 代码基线 | r2执行前为 dev@ffce46d；本轮开始前 `git pull --ff-only origin dev` 为 Already up to date |
 | 用户已有改动 | r1按请求填充用户清空的Plan.md；r2开始时工作树干净，保留r1全部未执行计划 |
 | 上一周期 | GLT-ENGINEERING-20260918-01/r4 已归档；工程正确性关闭，不代表完整提速或预测提升 |
-| 当前范围 | 科学设计与分阶段执行合同；只有另获授权的阶段才可实施、运行 |
+| 当前范围 | S0 身份/来源审计、S1 XC 适应接口、S2 FP/NONE/FGR/ALIGN 实现与有界验证；S3–S5 仍待另行授权 |
 
 **执行端先读 AGENTS.md 和本计划，再核对实时仓库、配置、产物和进程。不要把本文件中的拟新增接口当作已有 CLI。**
 
@@ -452,11 +452,22 @@ S5固定全部配置后，每fold独立选validation最佳、恢复后test一次
 
 | 阶段 | 状态 | 命令/日志/产物 | 实际预算 | 审查 |
 | --- | --- | --- | --- | --- |
-| 文档规划 | 已编制；Codex文档自检，非独立科学验收 | 本文件、当前Git提交 | 0训练/0实验 | 等待用户选择授权范围 |
-| S0 | 未执行 | — | 0 | — |
-| S1/S2 | 未执行 | — | 0 | — |
+| 文档规划 | 已编制；Codex文档自检，非独立科学验收 | 本文件、当前Git提交 | 0训练/0正式实验 | 用户随后明确授权 S0–S2 |
+| S0 | 执行者自检完成，待 Codex 审查 | `scripts/audit_glt_pred_s0.py`；`Uni-Poly:glt_pred_s0`、`glt_pred_s0_r2` | 0 optimizer update；1,024 条 P_train 抽查 | `results/glt_pred_20260918/s0/s0_audit_r2.json`；`logs/glt_pred_20260918/s0/audit_r2.log`；退出码0 |
+| S1 | 执行者自检完成，待 Codex 审查 | `tests/test_glt_pred_adaptation.py`；`Uni-Poly:glt_pred_s1_smokes`、`glt_pred_s1_retry`、`glt_pred_s1_dev` | xc/fold0 full/head/LoRA/Ridge smoke；development ridge；outer-test未访问 | `results/glt_pred_20260918/s1/`；对应 logs；局部测试2 passed，合并集合25 passed |
+| S2 | 执行者自检完成，待 Codex 审查 | `src/dataset/glt_dual_pretrain.py`、`src/modules/glt_dual_pretrain.py`、`scripts/pretrain_glt_dual.py`；`Uni-Poly:glt_pred_s2_real`、`glt_pred_s2_runner`、`glt_pred_s2_ddp_r3` | 4 条真实记录四目标前后向；runner各1 update；3-rank五case backward-only，0 optimizer update | `results/glt_pred_20260918/s2/`；`logs/glt_pred_20260918/s2/`；失败/修复日志保留，最终DDP报告PASS |
 | S3 | 未授权、未执行 | — | 0 | — |
 | S4 | 条件阶段、未授权 | — | 0 | — |
 | S5 | 正式阶段、未授权 | — | 0 | — |
 
-**下一步建议：先授权r2的S0–S2，完成XC适应接口、FP→FGR与独立ALIGN的正确性闭环；科学训练按四组S3预算另行明确。** 这是分阶段启动建议，不把完整路线截断为只写代码，也不将本文视为已获得全部实验授权。
+### S0–S2 执行补记（2026-09-18）
+
+本轮仅执行用户明确授权的 S0–S2，当前状态仍为“待审查”，以下为执行者自检记录，不是 Codex 独立验收。
+
+- S0 只读审计完成：PI1M 959,588 条记录、下游 6,265 条 property rows / 3,655 个唯一身份；PI1M 与下游规范化身份重叠 229，排除后可用 PI1M 为 959,359；seed=42 的 P_train/P_val 身份划分为 911,391/47,968。抽查 1,024 条 P_train，1,023 条得到有效 FGR pair，未修改缓存、构象或模型，`outer_test_accessed=false`。首次审计中把非零周期 shift 的 self image 误计入 FGR pair，已修正并保留首轮日志与第二次 `s0_audit_r2.json`。
+- S1 适应接口已实现并保留 full reference：head、LoRA(Q/V merged-QKV) 与 train-only Ridge development 路径均完成 xc/fold0 有界 smoke；LoRA 首次设备放置错误和重试日志均保留。成功结果的 `outer_test=NOT_RUN`，不构成性质性能结论。
+- S2 已实现 `fp|none|fgr|align` 四种第三任务分支。NONE/FGR/ALIGN 仅构建 3-RU chemical groups，不再运行 7-RU Morgan；FGR 使用确定性 SPD2/3 pair（每类最多 16、总数受 `fgr_max_pairs` 限制），ALIGN 使用多正例 bidirectional InfoNCE 及跨 rank padding gather。局部测试最终为 `25 passed, 1 warning`；4 条真实 PI1M 记录的四分支 forward/backward 均 finite；runner 每分支 1 个 optimizer update；3-rank NCCL 五个 partial/all-zero/same-identity backward-only case PASS，0 optimizer update。
+- 失败与修复边界：S0 首轮计数、S1 LoRA 设备、S2 FGR count device、ALIGN DDP collective 的失败日志均保留；最终结果只采用修正后的重试证据。S2 DDP 仅验证 forward/backward 和有效分母，不等同正式训练或长程 resume。
+- 未执行：S3 开发预算、S4/S5 预训练候选和公平测速、正式 5k/20k、完整微调、outer-test/OOF、缓存重建、新构象及其他科学路线。本轮不声明模型性能提升。
+
+**下一步建议：由 Codex 独立审查本轮 S0–S2 的源码、局部测试、真实 smoke 与失败修复证据；审查通过后，若要继续，仅另立/明确授权 S3 的四组开发预算。** 本轮不自动进入科学训练、完整微调或 outer-test。

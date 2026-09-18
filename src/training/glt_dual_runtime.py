@@ -45,7 +45,8 @@ class RankMicrobatchStream(Dataset):
     """
 
     def __init__(self, source, *, seed, world, rank, microbatch, accumulation,
-                 start_step, max_steps, sigma, ratio):
+                 start_step, max_steps, sigma, ratio, third_task='fp',
+                 fgr_mu=0.0, fgr_sigma=1.0, fgr_max_pairs=32):
         from src.dataset.glt_dual_pretrain import (  # local: avoid import cycles
             prepare_pretrain_sample, pretrain_collate,
         )
@@ -64,6 +65,10 @@ class RankMicrobatchStream(Dataset):
         self.steps = max(0, int(max_steps) - self.start_step)
         self.sigma = float(sigma)
         self.ratio = float(ratio)
+        self.third_task = str(third_task)
+        self.fgr_mu = float(fgr_mu)
+        self.fgr_sigma = float(fgr_sigma)
+        self.fgr_max_pairs = int(fgr_max_pairs)
 
     def __len__(self):
         return self.steps * self.accumulation
@@ -82,7 +87,9 @@ class RankMicrobatchStream(Dataset):
                 *self.source[index], seed=self.seed, key=key.hex(),
                 position=position, sigma=self.sigma, ratio=self.ratio,
                 static=self.source.static_for(index),
-                target=self.source.target_for(index),
+                target=(self.source.target_for(index) if self.third_task == 'fp' else None),
+                third_task=self.third_task, fgr_mu=self.fgr_mu,
+                fgr_sigma=self.fgr_sigma, fgr_max_pairs=self.fgr_max_pairs,
             ))
         return self._collate(rows)
 
