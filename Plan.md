@@ -344,6 +344,6 @@ RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗�
 提速保持 `NOT_ESTABLISHED`；本轮 GPU peak 不作为正式性能证据。当前计划状态改为“待审查”，
 等待 Codex 独立检查 diff、日志和报告后决定是否关闭。
 
-本轮实现提交为 `4826c90`，已推送 `origin/dev`；推送后核对 `HEAD == origin/dev ==
-4826c90b478e8e3cf649cddaa2a2cc0d0338f5cc`，工作树干净。该提交只代表执行交付，不代表 Codex
-独立验收或完整性能提速成立。
+本轮实现提交为 `4826c90`，执行记录提交为 `ed7a782`，随后修正文档提交为 `46e9e9c`，均已
+推送 `origin/dev`；当前核对 `HEAD == origin/dev == 46e9e9cbb7e6acb219ab63e722efca3372d5e24c`，
+工作树干净。上述提交只代表执行交付，不代表 Codex 独立验收或完整性能提速成立。
