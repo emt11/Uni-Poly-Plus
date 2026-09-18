@@ -295,7 +295,7 @@ RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗�
 - S3 cache smoke：`clean-cache-gib=0` 进程墙钟 20.149/19.983 s，`=4` 为 11.921/11.872 s；四个调度单位两策略均完整、验证结果逐单位 exact，动态 makespan仅较批处理快约0.244 s。
 - 资源与边界：预训练使用3张GPU（0,1,2），微调/调度使用GPU3或2、3；预训练累计132个实际 optimizer updates，微调累计24 epochs；所有真实 smoke 均未访问 outer-test。历史/正式5k、20k、完整OOF和4-GPU正式吞吐均未执行。
 - 失败证据保留：`003412Z/profile.json`/日志记录首次 profile 字段错误及零写入；修正后 profile 单次重跑通过。所有长任务在 `tmux` session `Uni-Poly` 独立 `glt_eng_*` window 中执行。
-- 提交与同步：本轮源码、测试和文档在 `dev` 提交 `d99bc70`，交接记录在 `a90ab16`；`HEAD` 与 `origin/dev` 均为 `a90ab16`，Codex 独立审查尚未进行，状态保持“待审查”。
+- r1 提交与同步记录：源码/测试/文档为 `d99bc70`，交接记录为 `a90ab16`；该历史状态保留，不代表 r2 当前 HEAD。
 
 ### r2 返修执行记录（2026-09-18，执行完成，待 Codex 审查）
 
@@ -315,4 +315,4 @@ RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗�
 - r1 的微调 24 epochs 预算已用满，原约40%数字仅保留为相同 static 条件下的内部 process wall，不称为完整 launch-to-exit；r2 不追加微调。
 - 首次 worker=3 step=2 命令因误传 `--diagnostic-save-steps 4` 在训练前失败，日志 `.../resume_step2.log` 保留，实际 optimizer updates=0；retry 使用新隔离目录且全部退出码0。
 - r2 预训练累计新增 20 个 updates（worker correctness 12，窗口 schema 校验 8），总计 152/316；没有正式 5k/20k、完整微调、OOF/outer-test、缓存重建或科学性能比较。GPU 峰值资源未独立采样；CPU profile RSS 仍在 profile JSON 中。
-- 当前工作区修改尚未提交；完成审查前不关闭计划。
+- r2 提交与同步：修复提交 `3f2d2bc` 已创建；完成推送后核对 `origin/dev`，Codex 独立审查前不关闭计划。
