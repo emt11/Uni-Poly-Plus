@@ -2,6 +2,7 @@
 """Explicit three-task training entry; never builds frozen layers."""
 import argparse
 from contextlib import nullcontext
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -103,6 +104,26 @@ def _time_summary(values):
         "median_seconds": float(statistics.median(ordered)),
         "p95_seconds": float(ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]),
     }
+
+
+def _third_stream_signature(prepared, third_task):
+    """Hash task-specific identities without changing the public RNG stream."""
+
+    digest = hashlib.sha256()
+    for _, labels in prepared:
+        if third_task == 'fgr':
+            for name in ('fgr_pair_index', 'fgr_spd', 'fgr_graph'):
+                value = labels[name].detach().cpu().contiguous()
+                digest.update(name.encode('utf-8'))
+                digest.update(str(tuple(value.shape)).encode('ascii'))
+                digest.update(value.numpy().tobytes())
+        elif third_task == 'align':
+            payload = list(zip(
+                [str(value) for value in labels['align_identity']],
+                [bool(value) for value in labels['align_valid'].tolist()],
+            ))
+            digest.update(json.dumps(payload, separators=(',', ':'), sort_keys=False).encode('utf-8'))
+    return digest.hexdigest()
 
 
 def main():
@@ -449,7 +470,9 @@ def main():
                 dist.all_reduce(target_counts)
             record = dict(step=step + 1, rank=rank, lr=float(lr),
                 losses=(totals / counts.clamp_min(1)).tolist(), valid_graphs=counts.tolist(),
-                target_counts=target_counts.tolist(), local_fallbacks=fallbacks, local_skip_reasons=reasons)
+                target_counts=target_counts.tolist(), local_fallbacks=fallbacks, local_skip_reasons=reasons,
+                third_stream_signature=_third_stream_signature(prepared, third_task),
+                third_task=third_task)
             if args.timing:
                 timing.update(h2d_seconds=h2d_seconds,
                               forward_backward_seconds=forward_backward_seconds,

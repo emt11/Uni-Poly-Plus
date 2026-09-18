@@ -79,14 +79,79 @@ def chemical_targets(smiles):
     return groups, fingerprint
 
 
-def fgr_pairs(topology, trimer, *, seed, key, position, mu=0.0, sigma=1.0,
-              max_pairs=32):
-    """Return deterministic centre-RU SPD2/3 atom pairs and clean labels.
+def _fgr_canonical_mapping(topology, trimer, identity, molecule, metadata):
+    """Validate normalized graph, canonical atoms and central coordinates."""
+    base_count = int(metadata.get("base_atom_count", -1))
+    units = metadata.get("unit_atoms") or []
+    if len(units) != 3 or any(len(unit) != base_count for unit in units):
+        raise ValueError("FGR true-Trimer unit mapping is incomplete")
+    canonical_to_base = torch.as_tensor(
+        identity.get("canonical_to_normalized_base"), dtype=torch.long
+    ).reshape(-1)
+    canonical_count = int(topology.mips_x.size(0))
+    if (canonical_to_base.numel() != canonical_count
+            or sorted(canonical_to_base.tolist()) != list(range(base_count))):
+        raise ValueError("FGR canonical-to-normalized mapping is not a permutation")
+    topology_mapping = torch.as_tensor(
+        getattr(topology, "canonical_to_trimer_base_atom_id", canonical_to_base),
+        dtype=torch.long,
+    ).reshape(-1)
+    if not torch.equal(topology_mapping, canonical_to_base):
+        raise ValueError("FGR cached canonical-to-Trimer mapping disagrees with normalized identity")
+    topology_z = torch.as_tensor(
+        getattr(topology, "atomic_numbers", getattr(topology, "z", torch.empty(0))),
+        dtype=torch.long,
+    ).reshape(-1)
+    if topology_z.numel() != canonical_count:
+        raise ValueError("FGR canonical element table length mismatch")
+    central_atoms = torch.as_tensor(units[1], dtype=torch.long)
+    normalized_z = torch.tensor(
+        [int(molecule.GetAtomWithIdx(int(atom)).GetAtomicNum()) for atom in central_atoms],
+        dtype=torch.long,
+    )
+    if not torch.equal(normalized_z[canonical_to_base], topology_z):
+        raise ValueError("FGR canonical/normalized atomic-number mapping mismatch")
+    central_mapping = torch.as_tensor(
+        getattr(trimer, "mips_to_trimer_central_index", torch.empty(0)),
+        dtype=torch.long,
+    ).reshape(-1)
+    positions = torch.as_tensor(
+        getattr(trimer, "trimer_pos", torch.empty((0, 3))), dtype=torch.float32
+    )
+    if (central_mapping.numel() != canonical_count
+            or central_mapping.unique().numel() != canonical_count
+            or positions.ndim != 2 or positions.size(1) != 3
+            or (central_mapping.numel() and (
+                int(central_mapping.min()) < 0
+                or int(central_mapping.max()) >= positions.size(0)))):
+        raise ValueError("FGR canonical-to-central coordinate mapping is invalid")
+    central_mask = getattr(trimer, "trimer_central_ru_mask", None)
+    if central_mask is not None:
+        central_mask = torch.as_tensor(central_mask, dtype=torch.bool).reshape(-1)
+        if (central_mask.numel() != positions.size(0)
+                or not bool(central_mask[central_mapping].all())):
+            raise ValueError("FGR canonical mapping leaves the central RU")
+    trimer_z = torch.as_tensor(
+        getattr(trimer, "trimer_atomic_number", torch.empty(0)), dtype=torch.long
+    ).reshape(-1)
+    if (trimer_z.numel() != positions.size(0)
+            or not torch.equal(trimer_z[central_mapping], topology_z)):
+        raise ValueError("FGR central coordinate atomic-number mapping mismatch")
+    inverse = torch.full((base_count,), -1, dtype=torch.long)
+    inverse[canonical_to_base] = torch.arange(canonical_count, dtype=torch.long)
+    if bool((inverse < 0).any()):
+        raise ValueError("FGR normalized-to-canonical mapping is incomplete")
+    return central_atoms, inverse, central_mapping, positions
 
-    Pair identity comes from the frozen canonical shortest-path table and the
-    coordinate label is read through the explicit canonical→Trimer mapping.
-    Self images are excluded even when a lifted periodic relation has a
-    nonzero SPD.  No pair is selected by its distance.
+
+def fgr_pairs(topology, trimer, smiles=None, *, identity=None, seed, key, position,
+              mu=0.0, sigma=1.0, max_pairs=32):
+    """Return deterministic centre-RU SPD2/3 pairs from the real 3-RU graph.
+
+    Pair identity is defined only by RDKit shortest paths in the open chemical
+    Trimer. Periodic lifted relations and coordinates are not consulted for
+    candidate selection; coordinates are used only after strict mapping checks
+    to produce the clean distance label.
     """
     if not math.isfinite(float(mu)) or not math.isfinite(float(sigma)) or sigma <= 0:
         raise ValueError('FGR normalization requires finite mu and positive sigma')
@@ -94,23 +159,36 @@ def fgr_pairs(topology, trimer, *, seed, key, position, mu=0.0, sigma=1.0,
         raise ValueError('FGR max_pairs must be positive')
     if not bool(getattr(trimer, 'trimer_geometry_valid', False)):
         return torch.empty((0, 2), dtype=torch.long), torch.empty(0), torch.empty(0, dtype=torch.long)
-    edge_index = torch.as_tensor(topology.lga_edge_index).long()
-    spd = torch.as_tensor(topology.lga_spd).long()
-    mapping = torch.as_tensor(getattr(trimer, 'mips_to_trimer_central_index', torch.empty(0))).long()
-    positions = torch.as_tensor(getattr(trimer, 'trimer_pos', torch.empty((0, 3)))).float()
-    if edge_index.ndim != 2 or edge_index.shape[0] != 2 or spd.numel() != edge_index.shape[1]:
-        raise ValueError('invalid canonical shortest-path table for FGR')
-    if mapping.numel() != int(topology.mips_x.size(0)):
-        raise ValueError('FGR canonical-to-Trimer mapping length mismatch')
+    if identity is None:
+        if smiles is None:
+            raise ValueError('FGR requires normalized identity provenance')
+        identity = resolve_normalized_identity(topology, smiles, require_fields=True)
+    molecule, metadata = build_periodic_multimer_mol(
+        str(identity["normalized_smiles"]), num_repeat_units=3, close_periodic=False
+    )
+    central_atoms, inverse, mapping, positions = _fgr_canonical_mapping(
+        topology, trimer, identity, molecule, metadata
+    )
+    base_index = {int(atom): index for index, atom in enumerate(central_atoms.tolist())}
+    heavy_atoms = [
+        int(atom) for atom in central_atoms.tolist()
+        if int(molecule.GetAtomWithIdx(int(atom)).GetAtomicNum()) > 1
+    ]
     candidates = {}
-    for column, value in enumerate(spd.tolist()):
-        if value not in (2, 3):
-            continue
-        left, right = (int(edge_index[0, column]), int(edge_index[1, column]))
-        if left == right:
-            continue
-        pair = (min(left, right), max(left, right))
-        candidates[pair] = int(value)
+    for left_offset, left in enumerate(heavy_atoms):
+        for right in heavy_atoms[left_offset + 1:]:
+            path = tuple(int(value) for value in Chem.GetShortestPath(molecule, left, right))
+            hop = len(path) - 1
+            if hop not in (2, 3):
+                continue
+            left_canonical = int(inverse[base_index[left]])
+            right_canonical = int(inverse[base_index[right]])
+            if left_canonical == right_canonical:
+                raise ValueError('FGR true-Trimer candidate produced a self pair')
+            pair = (min(left_canonical, right_canonical), max(left_canonical, right_canonical))
+            if pair in candidates and candidates[pair] != hop:
+                raise ValueError('FGR shortest-path identity is ambiguous')
+            candidates[pair] = int(hop)
     generator = sample_generator(seed, f'{key}:fgr', position)
     ordered = []
     # Keep the prescribed SPD2/SPD3 cap independent of the order of the
@@ -208,6 +286,11 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
     third_task = str(third_task).lower()
     if third_task not in {'fp', 'none', 'fgr', 'align'}:
         raise ValueError('unsupported third pretraining task')
+    identity = None
+    # FGR candidate identity is independent of the optional target cache, but
+    # still requires the strict source→normalized→canonical mapping contract.
+    if third_task == 'fgr' and identity is None:
+        identity = resolve_normalized_identity(topology, smiles, require_fields=True)
     if target is not None:
         if 'brics_groups' not in target:
             raise ValueError('pretrain target row is missing BRICS groups')
@@ -279,7 +362,7 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
     elif not pairs.numel():
         reasons.append('angle:no_center_angles')
     fgr_index, fgr_target, fgr_spd = (fgr_pairs(
-        topology, trimer, seed=seed, key=key, position=position,
+        topology, trimer, smiles, identity=identity, seed=seed, key=key, position=position,
         mu=fgr_mu, sigma=fgr_sigma, max_pairs=fgr_max_pairs)
         if third_task == 'fgr' else
         (torch.empty((0, 2), dtype=torch.long), torch.empty(0), torch.empty(0, dtype=torch.long)))

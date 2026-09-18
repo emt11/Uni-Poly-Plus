@@ -159,7 +159,9 @@ def alignment_loss(graph_2d, graph_3d, identities, valid, *, temperature=0.1):
     if not bool(anchor.any()):
         return (z2.sum() * 0 + z3.sum() * 0), torch.tensor(0., device=graph_2d.device)
     def directional(logits, positives):
-        log_den = torch.logsumexp(logits, dim=1)
+        valid_columns = all_valid.to(device=logits.device).unsqueeze(0)
+        masked_logits = logits.masked_fill(~valid_columns, -torch.inf)
+        log_den = torch.logsumexp(masked_logits, dim=1)
         positive_count = positives.sum(1).clamp_min(1).float()
         return -(logits.masked_fill(~positives, 0).sum(1) / positive_count - log_den)
     local_loss = .5 * (directional(logits23, positive23) + directional(logits32, positive32))
