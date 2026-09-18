@@ -1090,8 +1090,8 @@ r3 只关闭两个工程合同缺口，不改变模型、损失、batch、worker
 新增 CPU 回归覆盖真实短/长子进程、子进程 `child_done_monotonic`、并行收割及下一批屏障。新增
 `scripts/validate_glt_dual_no_geometry_ddp.py`，在不写 checkpoint/deploy、0 optimizer update 的前提下，
 使用冻结 cohort 的真实 sample key `21dd75e884e0f7907e5dec64869db1794ba7c65eeb5a36a577460016e76ee36a`
-和当前 static/target candidate，运行 3-rank NCCL：partial-zero 的本地 geometry counts 为 `[1,0,0]`、
-全局为 `1`，all-zero 全局为 `0`；两种 case 均 finite loss、backward 完成，chemistry/fingerprint gradient
+和当前 static/target candidate，运行 3-rank NCCL：partial-zero 的 rank0/1/2 geometry counts 分别为
+`1/0/0`、全局为 `1`，all-zero 全局为 `0`；两种 case 均 finite loss、backward 完成，chemistry/fingerprint gradient
 finite。几何 flag 只在 collated Data 内存副本修改，active cache 未写入。
 
 实际 r3 证据：
