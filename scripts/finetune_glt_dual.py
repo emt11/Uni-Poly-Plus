@@ -140,7 +140,8 @@ def fit_ridge_validation(encoder, dataset, scaler, train_indices, validation_ind
 
 def fit_select_and_test(model, scaler, train_loader, val_loader, test_loader, device,
                         optimizer, scheduler, config, *, task, fold_id,
-                        validation_only=False, timing=False, timing_sink=None):
+                        validation_only=False, timing=False, timing_sink=None,
+                        validation_summary=None):
     encoder, criterion = model.encoder, nn.MSELoss()
     best, best_r2, best_epoch, stalled = None, -float('inf'), -1, 0
     for epoch in range(config['epochs']):
@@ -156,10 +157,20 @@ def fit_select_and_test(model, scaler, train_loader, val_loader, test_loader, de
                         epoch=epoch + 1, amp_dtype='fp32', max_grad_norm=1., fail_nonfinite=True)
             train_timing = None
         validation_started = time.perf_counter()
-        val_loss, val_r2, _, _ = evaluate(model, val_loader, criterion, device,
-                                           scaler=scaler, amp_dtype='fp32')
+        val_loss, val_r2, val_targets, val_predictions = evaluate(
+            model, val_loader, criterion, device, scaler=scaler, amp_dtype='fp32')
+        if validation_summary is not None:
+            val_mae = float(mean_absolute_error(val_targets, val_predictions))
+            val_rmse = float(np.sqrt(mean_squared_error(val_targets, val_predictions)))
+        else:
+            # Keep the established helper contract for callers/tests that use
+            # a lightweight evaluate stub returning no prediction arrays.
+            val_mae = val_rmse = None
         validation_seconds = time.perf_counter() - validation_started
-        if not np.isfinite(val_r2) or not np.isfinite(val_loss):
+        finite_values = [val_loss, val_r2]
+        if validation_summary is not None:
+            finite_values.extend((val_mae, val_rmse))
+        if not all(np.isfinite(value) for value in finite_values):
             raise FloatingPointError('nonfinite validation metrics')
         print(json.dumps(dict(task=task, fold=fold_id, epoch=epoch + 1,
                               validation_r2=val_r2)), flush=True)
@@ -168,6 +179,13 @@ def fit_select_and_test(model, scaler, train_loader, val_loader, test_loader, de
             best = {k: v.detach().cpu().clone() for k, v in encoder.state_dict().items()}
             best_copy_seconds = time.perf_counter() - copy_started
             best_r2, best_epoch, stalled = val_r2, epoch + 1, 0
+            if validation_summary is not None:
+                validation_summary.update(
+                    validation_loss=float(val_loss),
+                    validation_r2=float(val_r2),
+                    validation_mae=val_mae,
+                    validation_rmse=val_rmse,
+                )
         else:
             best_copy_seconds = 0.0
             stalled += 1
@@ -313,6 +331,7 @@ def main():
             folds = [fold for fold in manifest['folds'] if fold['fold'] in selected_folds]
             for fold in folds:
                 fold_id = fold['fold']
+                fold_started = time.perf_counter()
                 folder = output / task / f'fold{fold_id}'
                 folder.mkdir(parents=True, exist_ok=False)
                 set_global_seed(run_config['seed'] + fold_id)
@@ -329,6 +348,10 @@ def main():
                 adaptation_meta = configure_adaptation(
                     encoder, adaptation, rank=args.lora_rank,
                     alpha=args.lora_alpha, dropout=args.lora_dropout)
+                total_parameter_count = int(sum(parameter.numel()
+                    for parameter in encoder.parameters()))
+                trainable_parameter_count = int(sum(parameter.numel()
+                    for parameter in encoder.parameters() if parameter.requires_grad))
                 if adaptation == 'ridge':
                     ridge_result = fit_ridge_validation(
                         encoder, dataset, scaler, train, validation, device,
@@ -339,7 +362,10 @@ def main():
                                   if args.development else 'outer5_inner20_smoke'),
                         outer_test='NOT_RUN', validation_only=True,
                         scaler_fit_split='train',
-                        deployment_step=int(run_config['downstream_step']))
+                        deployment_step=int(run_config['downstream_step']),
+                        trainable_parameter_count=trainable_parameter_count,
+                        total_parameter_count=total_parameter_count,
+                        wall_seconds=float(time.perf_counter() - fold_started))
                     write_json(folder / 'metrics.json', ridge_result)
                     results.append(ridge_result)
                     all_folds.append(ridge_result)
@@ -355,10 +381,12 @@ def main():
                 scheduler = _cosine_scheduler(optimizer, run_config['epochs'] * len(train_loader),
                                                run_config['finetune_warmup'] * len(train_loader))
                 if validation_only:
+                    validation_summary = {}
                     best, best_r2, best_epoch, _ = fit_select_and_test(
                         model, scaler, train_loader, val_loader, None, device,
                         optimizer, scheduler, run_config, task=task, fold_id=fold_id,
-                        validation_only=True, timing=args.timing, timing_sink=timing_records)
+                        validation_only=True, timing=args.timing, timing_sink=timing_records,
+                        validation_summary=validation_summary)
                     smoke_result = dict(
                         task=task, fold=fold_id, smoke=bool(args.smoke),
                         development=bool(args.development), adaptation=adaptation,
@@ -367,7 +395,13 @@ def main():
                         best_validation_r2=float(best_r2), best_epoch=int(best_epoch),
                         outer_test='NOT_RUN', validation_only=True,
                         scaler_fit_split='train', deployment_step=int(run_config['downstream_step']),
+                        train_sample_count=int(len(train)),
+                        validation_sample_count=int(len(validation)),
+                        trainable_parameter_count=trainable_parameter_count,
+                        total_parameter_count=total_parameter_count,
+                        wall_seconds=float(time.perf_counter() - fold_started),
                     )
+                    smoke_result.update(validation_summary)
                     save_started = time.perf_counter()
                     save_checkpoint(folder / 'best.pt', dict(
                         state_dict=best, fusion_mode=run_config['fusion_mode'],
