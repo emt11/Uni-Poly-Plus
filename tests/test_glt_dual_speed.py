@@ -3,6 +3,7 @@
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -162,6 +163,44 @@ def test_batched_scheduler_waits_for_each_batch(tmp_path):
     assert launch_order == [('task', 0, '0'), ('task', 1, '1'), ('task', 2, '0')]
     assert all(row['launch_to_exit_seconds'] >= 0 for row in completed)
     assert 'GRID_LAUNCH_TO_EXIT_SECONDS=' in (tmp_path / 'task_0.log').read_text()
+
+
+def test_batched_scheduler_observes_short_child_before_long_child(tmp_path):
+    """Exit observation is polled concurrently while the batch barrier stays."""
+
+    durations = {0: 0.45, 1: 0.08, 2: 0.0}
+    launch_times = {}
+
+    def launch(task, fold, gpu):
+        launch_times[(task, fold)] = time.monotonic()
+        del gpu
+        start_path = tmp_path / f'{task}_{fold}.start'
+        done_path = tmp_path / f'{task}_{fold}.done'
+        handle = (tmp_path / f'{task}_{fold}.log').open('w', encoding='utf-8')
+        process = subprocess.Popen(
+            _timed_child(start_path, done_path, durations[fold]),
+            stdout=handle, stderr=subprocess.STDOUT,
+        )
+        return process, handle, tmp_path / f'{task}_{fold}.log'
+
+    completed = _run_batched_jobs(
+        [('task', 0), ('task', 1), ('task', 2)], ['0', '1'], launch,
+        poll_interval=0.01,
+    )
+    rows = {(row['task'], row['fold']): row for row in completed}
+    short, long = rows[('task', 1)], rows[('task', 0)]
+    assert short['exit_observed_monotonic'] < long['exit_observed_monotonic']
+    assert short['launch_to_exit_seconds'] + 0.15 < long['launch_to_exit_seconds']
+    for fold, row in ((1, short), (0, long)):
+        assert row['launch_started_monotonic'] <= row['process_ready_observed_monotonic']
+        assert row['process_ready_observed_monotonic'] <= row['exit_observed_monotonic']
+        child_done = float((tmp_path / f'task_{fold}.done').read_text())
+        assert row['exit_observed_monotonic'] >= child_done
+        # Poll interval plus a generous CI scheduling margin, not a precise
+        # kernel-exit timestamp claim.
+        assert row['exit_observed_monotonic'] - child_done < 0.40
+    # The third shard is not launched until the whole first batch is drained.
+    assert launch_times[('task', 2)] >= long['exit_observed_monotonic']
 
 
 def test_diagnostic_sampling_is_first_interval_and_explicit_save_steps():

@@ -4,12 +4,12 @@
 
 | 字段 | 内容 |
 | --- | --- |
-| 计划 | GLT-ENGINEERING-20260918-01 / r2 |
-| 状态 | 待审查；r2 修复、局部测试和有界 worker=3/窗口校验已完成，等待 Codex 独立审查 |
+| 计划 | GLT-ENGINEERING-20260918-01 / r3 |
+| 状态 | 待审查；r3 实现、局部测试与真实 3-rank 无 geometry DDP 已完成，等待 Codex 独立审查 |
 | 用户要求 | 给出其他模型可直接执行的完整工程方案；完成并验收本方案后，才另行考虑预测性能优化 |
 | 范围 | GLT 双通道的数据准备、诊断、计时、输入复用、传输与调度；不优化预测准确率 |
 | 角色 | Codex 规划与独立验收；接手模型负责实现、局部测试和规定的有界测速，并记录实际执行者 |
-| 核查基线 | dev，r2 开始前为 `afcfb9a`；2026-09-18 pull 为 Already up to date；保留 r1 的实现、日志和产物，不重做微调预算 |
+| 核查基线 | dev，r3 开始前为 `285354f`；2026-09-18 pull 为 Already up to date；保留 r1/r2 的实现、日志和产物，不重做微调预算 |
 | 既有工作 | CACHE-20260916-01/r4、SPEED-20260917-01/r4 均已归档；不重做已完成工作，不复活旧科学计划 |
 
 **给执行模型的指令：**先完整读取 AGENTS.md 和本文。收到用户“执行本计划”的授权后，依次完成 S0→S1→S2→S3→S4→S5→S6；普通实现细节自行处理，不重复询问已授权的小步骤。不要只输出另一份计划。受阻则停止受影响阶段、保留证据，继续不依赖阻断项的代码/测试工作；不得偷偷更换协议、缩小验收集合或扩大预算。最终状态只能先标“待审查”，由 Codex 审查后关闭。
@@ -316,3 +316,30 @@ RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗�
 - 首次 worker=3 step=2 命令因误传 `--diagnostic-save-steps 4` 在训练前失败，日志 `.../resume_step2.log` 保留，实际 optimizer updates=0；retry 使用新隔离目录且全部退出码0。
 - r2 预训练累计新增 20 个 updates（worker correctness 12，窗口 schema 校验 8），总计 152/316；没有正式 5k/20k、完整微调、OOF/outer-test、缓存重建或科学性能比较。GPU 峰值资源未独立采样；CPU profile RSS 仍在 profile JSON 中。
 - r2 提交与同步：修复提交 `3f2d2bc`、交接记录 `39c8f99` 已推送；当前 `HEAD` 与 `origin/dev` 均为 `39c8f99`，Codex 独立审查前不关闭计划。
+
+### r3 执行记录（2026-09-18，执行者完成，待 Codex 审查）
+
+本轮基线为 `dev@285354f`。执行前重新运行 `git pull --ff-only origin dev`，结果为
+`Already up to date`；工作树干净、没有 GLT 训练/微调/validator 进程，GPU 0–3 空闲。r1/r2
+日志和产物均保留；没有修改 active cache、manifest、checkpoint、配置或样本集合。
+
+| 项目 | 状态 | 实施与证据 |
+| --- | --- | --- |
+| grid launch 起点 | PASS（执行者自检，待 Codex 审查） | `scripts/run_glt_dual_finetune_grid.py` 在 launch helper 前记录 `launch_started_monotonic`，并记录 `process_ready_observed_monotonic`；row/log 同时保留 `launch_to_exit_seconds`。 |
+| grid exit 观察 | PASS（执行者自检，待 Codex 审查） | 所有正常调度先轮询，首次 `poll()!=None` 取 `exit_observed_monotonic`，之后才 `wait()`；日志明确为 controller observation。 |
+| batched 并行收割/屏障 | PASS（执行者自检，待 Codex 审查） | batched 轮询整批并按输入顺序返回，下一批仅在 active 为空后派发；新增短/长 CPU 子进程测试验证 B 先观测、C 等 A 完成。 |
+| dynamic 语义 | PASS（执行者自检，待 Codex 审查） | 保留完成即释放 slot、失败停止 pending 派发、收口已启动 child 的逻辑；既有 dynamic/failure tests 保留。 |
+| 真实 3-rank partial-zero DDP | PASS（执行者自检，待 Codex 审查） | `results/glt_engineering_20260918/r3_no_geometry_ddp.json`：NCCL、GPU 0/1/2、local counts geometry=1/0/0、global `[3,1,3]`，finite loss/backward/chemistry/fingerprint gradients。 |
+| 真实 3-rank all-zero DDP | PASS（执行者自检，待 Codex 审查） | 同一报告：local geometry=0/0/0、global `[3,0,3]`，finite loss/backward/chemistry/fingerprint gradients；`optimizer_updates=0`。 |
+| 局部测试 | PASS（执行者自检，待 Codex 审查） | `PYTHONPATH=.:tests /opt/conda/bin/python -m pytest -q tests/test_glt_dual_speed.py tests/test_dual_glt_pretrain.py`：`27 passed, 1 warning`，退出码0；日志 `logs/glt_engineering_20260918/r3_local_tests.log`。第一次未带 PYTHONPATH 的导入失败保留于 `r3_local_tests_import_failure.log`，不作为代码测试结果。 |
+| 资产/训练边界 | PASS（执行者自检，待 Codex 审查） | DDP 仅两 case forward/backward、0 optimizer update；未写 checkpoint/deploy；active cache 未修改。 |
+
+新增文件为 `scripts/validate_glt_dual_no_geometry_ddp.py`；代码/测试修改为 grid 计时收割与
+`tests/test_glt_dual_speed.py`，流程说明追加到 `PIPELINE.md`。所有长命令均在
+`tmux Uni-Poly` 独立 window：局部测试 `glt_eng_r3_local_tests3`（已结束）、DDP
+`glt_eng_r3_ddp`（已结束）；完整命令及退出码见对应日志。
+
+明确未执行：32-key/downstream parity、ABBA、旧 benchmark、CPU profile、微调 epoch、正式
+5k/20k、8×5、outer-test/OOF、cache rebuild、新构象、EQ3D/Student。完整端到端预训练和微调
+提速保持 `NOT_ESTABLISHED`；本轮 GPU peak 不作为正式性能证据。当前计划状态改为“待审查”，
+等待 Codex 独立检查 diff、日志和报告后决定是否关闭。

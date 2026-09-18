@@ -94,25 +94,76 @@ def _completed_unit_matches(unit, task, fold, smoke):
 
 
 def _launch_with_boundary(launch, task, fold, gpu):
+    # Start the controller boundary before calling the launch helper.  This
+    # includes log creation, Popen, and any helper-side setup in the measured
+    # launch-to-exit interval.
+    launch_started = time.monotonic()
     process, handle, log_path = launch(task, fold, gpu)
-    launched = time.monotonic()
-    handle.write(f'GRID_LAUNCH_MONOTONIC={launched}\n')
-    handle.flush()
-    return task, fold, process, handle, log_path, launched
-
-
-def _finish_child(item):
-    task, fold, process, handle, log_path, launched = item
-    code = process.wait()
-    exited = time.monotonic()
-    elapsed = exited - launched
+    process_ready_observed = time.monotonic()
     handle.write(
+        f'GRID_LAUNCH_STARTED_MONOTONIC={launch_started}\n'
+        # Keep the historical field as a compatibility alias, but document
+        # that it now means the pre-launch controller boundary.
+        f'GRID_LAUNCH_MONOTONIC={launch_started}\n'
+        f'GRID_PROCESS_READY_OBSERVED_MONOTONIC={process_ready_observed}\n')
+    handle.flush()
+    return (task, fold, process, handle, log_path, launch_started,
+            process_ready_observed)
+
+
+def _finish_child(item, *, code=None, exited=None):
+    """Record a child after ``poll`` observed completion, then reap it.
+
+    ``exited`` is intentionally supplied by the polling loop.  Calling
+    ``wait`` is only resource reaping and must not define the exit timestamp.
+    """
+
+    task, fold, process, handle, log_path, launch_started, process_ready = item
+    if code is None:
+        code = process.poll()
+        if code is None:
+            raise RuntimeError('cannot finish a child before poll observes exit')
+        exited = time.monotonic()
+    elif exited is None:
+        raise RuntimeError('a polled child requires its observation timestamp')
+    # Reap only after the observation timestamp has been captured.
+    process.wait()
+    elapsed = exited - launch_started
+    handle.write(
+        f'GRID_EXIT_OBSERVED_MONOTONIC={exited}\n'
+        # Compatibility alias; this is controller observation time, not an
+        # operating-system process-exit timestamp.
         f'GRID_EXIT_MONOTONIC={exited}\n'
+        f'GRID_LAUNCH_STARTED_MONOTONIC={launch_started}\n'
+        f'GRID_PROCESS_READY_OBSERVED_MONOTONIC={process_ready}\n'
         f'GRID_LAUNCH_TO_EXIT_SECONDS={elapsed}\n'
         f'EXIT_CODE={code}\n')
     handle.close()
     return {'task': task, 'fold': fold, 'log': str(log_path),
-            'exit_code': code, 'launch_to_exit_seconds': float(elapsed)}
+            'exit_code': code,
+            'launch_started_monotonic': float(launch_started),
+            'process_ready_observed_monotonic': float(process_ready),
+            'exit_observed_monotonic': float(exited),
+            'launch_to_exit_seconds': float(elapsed)}
+
+
+def _drain_active(active, *, poll_interval):
+    """Poll all owned children until they finish, closing every handle."""
+
+    rows = []
+    while active:
+        observed_any = False
+        for key, item in list(active.items()):
+            code = item[2].poll()
+            if code is None:
+                continue
+            observed = time.monotonic()
+            rows.append(_finish_child(item, code=code, exited=observed))
+            del active[key]
+            observed_any = True
+        if active and not observed_any:
+            time.sleep(float(poll_interval))
+    return rows
 
 
 def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
@@ -129,13 +180,6 @@ def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
     active = {}
     completed, failures = [], []
 
-    def drain_active():
-        """Wait for already-owned children and close their log handles."""
-        for gpu, item in list(active.items()):
-            row = _finish_child(item)
-            completed.append(row)
-            del active[gpu]
-
     def start_available():
         while pending and free and not failures:
             task, fold = pending.pop(0)
@@ -144,7 +188,8 @@ def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
                 item = _launch_with_boundary(launch, task, fold, gpu)
             except BaseException:
                 free.insert(0, gpu)
-                drain_active()
+                completed.extend(_drain_active(active, poll_interval=poll_interval))
+                active.clear()
                 raise
             active[gpu] = item
 
@@ -152,11 +197,13 @@ def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
     while active:
         finished = []
         for gpu, item in list(active.items()):
-            task, fold, process, handle, log_path, _ = item
+            task, fold, process, handle, log_path, _, _ = item
             code = process.poll()
             if code is None:
                 continue
-            row = _finish_child(item)
+            # Capture the controller observation boundary immediately after
+            # poll reports completion; wait() below only reaps the process.
+            row = _finish_child(item, code=code, exited=time.monotonic())
             del active[gpu]
             free.append(gpu)
             finished.append(gpu)
@@ -185,7 +232,7 @@ def _run_dynamic_jobs(jobs, gpus, launch, *, poll_interval=0.05):
     return completed
 
 
-def _run_batched_jobs(jobs, gpus, launch):
+def _run_batched_jobs(jobs, gpus, launch, *, poll_interval=0.05):
     """Reference scheduler: wait for a whole GPU batch before dispatching more."""
 
     completed = []
@@ -196,17 +243,30 @@ def _run_batched_jobs(jobs, gpus, launch):
                 gpu = gpus[len(active)]
                 active.append(_launch_with_boundary(launch, task, fold, gpu))
         except BaseException:
-            for item in active:
-                _finish_child(item)
+            _drain_active({index: item for index, item in enumerate(active)},
+                          poll_interval=poll_interval)
             raise
-        failures = []
-        for item in active:
-            row = _finish_child(item)
-            code = row['exit_code']
-            if code:
-                failures.append(row)
-            else:
-                completed.append(row)
+        # Keep the batch barrier, but harvest all children concurrently.  A
+        # short child may therefore be observed before an earlier long child;
+        # no next batch is launched until this active list is empty.
+        observed_rows = []
+        while active:
+            observed_any = False
+            for index, item in list(enumerate(active)):
+                code = item[2].poll()
+                if code is None:
+                    continue
+                observed = time.monotonic()
+                observed_rows.append((index, _finish_child(
+                    item, code=code, exited=observed)))
+                active[index] = None
+                observed_any = True
+            active = [item for item in active if item is not None]
+            if active and not observed_any:
+                time.sleep(float(poll_interval))
+        rows = [row for _, row in sorted(observed_rows, key=lambda pair: pair[0])]
+        failures = [row for row in rows if row['exit_code']]
+        completed.extend(row for row in rows if not row['exit_code'])
         if failures:
             raise RuntimeError('batched smoke shard failed: ' +
                                json.dumps({'failures': failures}, sort_keys=True))

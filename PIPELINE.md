@@ -1077,3 +1077,32 @@ model/optimizer/scheduler/RNG/position/identity 与 rank-0 loss/target 记录 ex
 历史 launch-to-exit 仍未验证。r1 微调 24 epochs 不追加，原约 40% 数字收窄为内部 process wall；
 r1 grid 约 0.9% 差异不再解释为精确调度收益。r2 没有正式训练、完整微调、OOF/outer-test、缓存
 重建或科学性能结论。
+
+### GLT-ENGINEERING-20260918-01 / r3 边界修复（2026-09-18，待 Codex 审查）
+
+r3 只关闭两个工程合同缺口，不改变模型、损失、batch、worker、cache 或科学定义。`run_glt_dual_finetune_grid.py`
+现在在 launch helper 调用前记录 `launch_started_monotonic`，在所有活动子进程上并行 `poll()`；首次观察到
+`poll()!=None` 的时刻写入 `exit_observed_monotonic`，随后才调用 `wait()` 回收。日志同时保留兼容字段，
+但 `GRID_EXIT_MONOTONIC` 明确表示 controller observation，而不是内核精确退出时间，误差约为 poll interval
+加 scheduler jitter。batched 模式仍有 batch barrier：短进程先完成不会提前派发下一批；dynamic 模式仍在成功
+完成时释放自己的 slot，失败后停止新派发并收口已启动进程。
+
+新增 CPU 回归覆盖真实短/长子进程、子进程 `child_done_monotonic`、并行收割及下一批屏障。新增
+`scripts/validate_glt_dual_no_geometry_ddp.py`，在不写 checkpoint/deploy、0 optimizer update 的前提下，
+使用冻结 cohort 的真实 sample key `21dd75e884e0f7907e5dec64869db1794ba7c65eeb5a36a577460016e76ee36a`
+和当前 static/target candidate，运行 3-rank NCCL：partial-zero 的本地 geometry counts 为 `[1,0,0]`、
+全局为 `1`，all-zero 全局为 `0`；两种 case 均 finite loss、backward 完成，chemistry/fingerprint gradient
+finite。几何 flag 只在 collated Data 内存副本修改，active cache 未写入。
+
+实际 r3 证据：
+
+- 局部命令（第一次遗漏既有 `PYTHONPATH=.:tests` 的导入失败已保留，退出码2；按项目命令重跑）最终
+  `27 passed, 1 warning`、退出码0，日志 `logs/glt_engineering_20260918/r3_local_tests.log`；初次失败
+  `logs/glt_engineering_20260918/r3_local_tests_import_failure.log`。
+- DDP 命令在 `Uni-Poly:glt_eng_r3_ddp`，3 GPU `0,1,2`，退出码0；日志
+  `logs/glt_engineering_20260918/r3_no_geometry_ddp.log`，报告
+  `results/glt_engineering_20260918/r3_no_geometry_ddp.json`，`optimizer_updates=0`。
+
+本 r3 未重跑 32-key parity、ABBA、CPU profile、旧 benchmark、微调 epoch 或正式训练；完整端到端预训练／
+微调提速仍为 `NOT_ESTABLISHED`，GPU peak 仅不涉及本轮正式性能口径。工程结论仅能写为有界接口、调度和
+真实多 rank 无 geometry backward 校验完成，等待 Codex 独立审查后再决定是否关闭周期。
