@@ -315,4 +315,4 @@ RAM可用低于32GiB、共享内存持续超过75%、出现持续换页或FD耗�
 - r1 的微调 24 epochs 预算已用满，原约40%数字仅保留为相同 static 条件下的内部 process wall，不称为完整 launch-to-exit；r2 不追加微调。
 - 首次 worker=3 step=2 命令因误传 `--diagnostic-save-steps 4` 在训练前失败，日志 `.../resume_step2.log` 保留，实际 optimizer updates=0；retry 使用新隔离目录且全部退出码0。
 - r2 预训练累计新增 20 个 updates（worker correctness 12，窗口 schema 校验 8），总计 152/316；没有正式 5k/20k、完整微调、OOF/outer-test、缓存重建或科学性能比较。GPU 峰值资源未独立采样；CPU profile RSS 仍在 profile JSON 中。
-- r2 提交与同步：修复提交 `3f2d2bc` 已创建；完成推送后核对 `origin/dev`，Codex 独立审查前不关闭计划。
+- r2 提交与同步：修复提交 `3f2d2bc`、交接记录 `39c8f99` 已推送；当前 `HEAD` 与 `origin/dev` 均为 `39c8f99`，Codex 独立审查前不关闭计划。
