@@ -367,3 +367,7 @@ checkpoint、DDP、parity、ABBA、profile 或微调预算。
 `scripts/run_glt_dual_finetune_grid.py`、`tests/test_glt_dual_speed.py` 和本计划记录。
 完整预训练及微调提速仍分别为 `NOT_ESTABLISHED`，不产生预测性能结论。完成提交与远端核对后，
 状态保持“待审查”。
+
+本轮提交为 `54798fd`，已推送 `origin/dev`；推送后核对
+`HEAD == origin/dev == 54798fd22bfe657f8c3e002e9f446dc28f864870`，工作树干净。
+该提交代表 r4 执行交付，不代表 Codex 独立验收或完整性能提速成立。
