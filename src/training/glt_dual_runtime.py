@@ -1,5 +1,6 @@
 """Isolated dual-route I/O and training utilities; importing starts no work."""
 import json
+import hashlib
 import os
 import random
 import subprocess
@@ -17,6 +18,176 @@ from src.dataset.glt_dual_static import CHUNK_CACHE_CAPACITY
 
 
 TASKS = ('eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc')
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def sha256_int64(values):
+    array = np.asarray(values, dtype='<i8')
+    if array.ndim != 1:
+        raise ValueError('sample index array must be one-dimensional')
+    return hashlib.sha256(array.tobytes(order='C')).hexdigest()
+
+
+def ordered_text_hash(values):
+    digest = hashlib.sha256()
+    for value in values:
+        raw = str(value).encode('utf-8')
+        digest.update(len(raw).to_bytes(8, 'little'))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def load_sample_index_artifact(path, split):
+    """Load and verify a read-only source-index subset contract."""
+
+    if path is None:
+        if split is not None:
+            raise ValueError('sample index split requires --sample-index-artifact')
+        return None
+    artifact_path = Path(path).resolve()
+    if not artifact_path.is_file():
+        raise FileNotFoundError(f'sample index artifact is missing: {artifact_path}')
+    payload = json.loads(artifact_path.read_text(encoding='utf-8'))
+    if payload.get('schema_version') != 'glt-pred-pretrain-split-v1':
+        raise ValueError('unsupported sample index artifact schema')
+    split = str(split or 'train')
+    names = {'train': 'train_source_indices',
+             'validation': 'validation_source_indices',
+             'fixed_validation': 'fixed_validation_source_indices'}
+    if split not in names:
+        raise ValueError(f'unsupported sample index split: {split}')
+    npz_path = artifact_path.with_suffix('.npz')
+    if not npz_path.is_file():
+        raise FileNotFoundError(f'sample index npz is missing: {npz_path}')
+    expected_npz = payload.get('npz_sha256')
+    if expected_npz and sha256_file(npz_path) != expected_npz:
+        raise ValueError('sample index npz hash mismatch')
+    with np.load(npz_path, allow_pickle=False) as archive:
+        if names[split] not in archive.files:
+            raise ValueError(f'sample index npz is missing {names[split]}')
+        indices = np.asarray(archive[names[split]], dtype=np.int64).copy()
+    if indices.ndim != 1 or len(indices) != len(set(indices.tolist())):
+        raise ValueError('sample index subset must be a unique one-dimensional array')
+    expected_count = payload.get(f'{split}_count')
+    if expected_count is not None and int(expected_count) != int(indices.size):
+        raise ValueError(f'{split} source index count mismatch')
+    expected_hash = payload.get(f'{split}_source_index_sha256')
+    if expected_hash and sha256_int64(indices) != expected_hash:
+        raise ValueError(f'{split} source index hash mismatch')
+    return {
+        'path': str(artifact_path),
+        'sha256': sha256_file(artifact_path),
+        'schema_version': payload['schema_version'],
+        'split': split,
+        'indices': indices,
+        'payload': payload,
+        'npz_path': str(npz_path),
+    }
+
+
+def apply_common_initialization(model, path):
+    """Copy a frozen common-state initialization into one task variant."""
+
+    artifact_path = Path(path).resolve()
+    if not artifact_path.is_file():
+        raise FileNotFoundError(f'common initialization artifact is missing: {artifact_path}')
+    payload = torch.load(artifact_path, map_location='cpu', weights_only=False)
+    state = payload.get('common_state_dict') if isinstance(payload, dict) else None
+    if not isinstance(state, dict) or not state:
+        raise ValueError('common initialization artifact has no common_state_dict')
+    current = model.state_dict()
+    missing = [name for name, value in state.items()
+               if name not in current or tuple(current[name].shape) != tuple(value.shape)]
+    if missing:
+        raise ValueError('common initialization state is incompatible: ' + ','.join(missing[:5]))
+    with torch.no_grad():
+        for name, value in state.items():
+            current[name].copy_(value)
+    return {
+        'path': str(artifact_path),
+        'sha256': sha256_file(artifact_path),
+        'schema_version': payload.get('schema_version'),
+        'common_state_sha256': payload.get('common_state_sha256'),
+    }
+
+
+class _IndexedSamples:
+    """Light read-only Sequence mapping logical subset indices to source rows."""
+
+    def __init__(self, base_samples, source_indices):
+        self._base = base_samples
+        self._indices = np.asarray(source_indices, dtype=np.int64)
+
+    def __len__(self):
+        return int(self._indices.size)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[int(i)] for i in range(*index.indices(len(self)))]
+        return self._base[int(self._indices[int(index)])]
+
+
+class IndexedFrozenDualSource(Dataset):
+    """Read-only logical view over a frozen source without copying artifacts."""
+
+    def __init__(self, base, source_indices):
+        self.base = base
+        self.source_indices = np.asarray(source_indices, dtype=np.int64).copy()
+        if self.source_indices.ndim != 1:
+            raise ValueError('subset source indices must be one-dimensional')
+        if self.source_indices.size and (
+                int(self.source_indices.min()) < 0
+                or int(self.source_indices.max()) >= len(base)):
+            raise IndexError('subset source index is outside the frozen source')
+        if len(set(self.source_indices.tolist())) != int(self.source_indices.size):
+            raise ValueError('subset source indices must be unique')
+        self.samples = _IndexedSamples(base.samples, self.source_indices)
+
+    def __len__(self):
+        return len(self.source_indices)
+
+    def __getitem__(self, index):
+        return self.base[int(self.source_indices[int(index)])]
+
+    def static_for(self, index):
+        return self.base.static_for(int(self.source_indices[int(index)]))
+
+    def target_for(self, index):
+        return self.base.target_for(int(self.source_indices[int(index)]))
+
+    @property
+    def cohort(self):
+        return self.base.cohort
+
+    @property
+    def bundle(self):
+        return self.base.bundle
+
+    @property
+    def topology(self):
+        return self.base.topology
+
+    @property
+    def trimer(self):
+        return self.base.trimer
+
+    @property
+    def static_cache(self):
+        return self.base.static_cache
+
+    @property
+    def target_cache(self):
+        return self.base.target_cache
+
+    def close(self):
+        self.base.close()
 
 
 class OrderedSampleStream:

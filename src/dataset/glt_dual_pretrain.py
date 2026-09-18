@@ -144,21 +144,17 @@ def _fgr_canonical_mapping(topology, trimer, identity, molecule, metadata):
     return central_atoms, inverse, central_mapping, positions
 
 
-def fgr_pairs(topology, trimer, smiles=None, *, identity=None, seed, key, position,
-              mu=0.0, sigma=1.0, max_pairs=32):
-    """Return deterministic centre-RU SPD2/3 pairs from the real 3-RU graph.
+def fgr_true_trimer_candidates(topology, trimer, smiles=None, *, identity=None):
+    """Return every canonical SPD2/SPD3 candidate and its clean distance.
 
-    Pair identity is defined only by RDKit shortest paths in the open chemical
-    Trimer. Periodic lifted relations and coordinates are not consulted for
-    candidate selection; coordinates are used only after strict mapping checks
-    to produce the clean distance label.
+    Candidate identity is defined only by RDKit shortest paths in the open
+    chemical Trimer.  Sampling and normalization remain in :func:`fgr_pairs`;
+    this pure helper is used by the full P_train statistics pass so that the
+    fitted moments cannot depend on a random 32-pair subsample.
     """
-    if not math.isfinite(float(mu)) or not math.isfinite(float(sigma)) or sigma <= 0:
-        raise ValueError('FGR normalization requires finite mu and positive sigma')
-    if int(max_pairs) <= 0:
-        raise ValueError('FGR max_pairs must be positive')
     if not bool(getattr(trimer, 'trimer_geometry_valid', False)):
-        return torch.empty((0, 2), dtype=torch.long), torch.empty(0), torch.empty(0, dtype=torch.long)
+        return (torch.empty((0, 2), dtype=torch.long),
+                torch.empty(0), torch.empty(0, dtype=torch.long))
     if identity is None:
         if smiles is None:
             raise ValueError('FGR requires normalized identity provenance')
@@ -189,26 +185,10 @@ def fgr_pairs(topology, trimer, smiles=None, *, identity=None, seed, key, positi
             if pair in candidates and candidates[pair] != hop:
                 raise ValueError('FGR shortest-path identity is ambiguous')
             candidates[pair] = int(hop)
-    generator = sample_generator(seed, f'{key}:fgr', position)
-    ordered = []
-    # Keep the prescribed SPD2/SPD3 cap independent of the order of the
-    # shortest-path table.  The two classes are sampled without replacement;
-    # all remaining capacity is naturally used when one class has fewer than
-    # its cap, while no class can exceed 16 entries.
-    remaining = int(max_pairs)
-    for hop in (2, 3):
-        if remaining <= 0:
-            break
-        class_pairs = sorted(pair for pair in candidates if candidates[pair] == hop)
-        cap = min(16, remaining, len(class_pairs))
-        if len(class_pairs) > cap:
-            chosen = torch.randperm(len(class_pairs), generator=generator)[:cap].tolist()
-            class_pairs = [class_pairs[index] for index in sorted(chosen)]
-        ordered.extend(class_pairs)
-        remaining -= len(class_pairs)
-    ordered = sorted(ordered, key=lambda pair: (candidates[pair], pair[0], pair[1]))
+    ordered = sorted(candidates, key=lambda pair: (candidates[pair], pair[0], pair[1]))
     if not ordered:
-        return torch.empty((0, 2), dtype=torch.long), torch.empty(0), torch.empty(0, dtype=torch.long)
+        return (torch.empty((0, 2), dtype=torch.long),
+                torch.empty(0), torch.empty(0, dtype=torch.long))
     pair_tensor = torch.as_tensor(ordered, dtype=torch.long)
     mapped = mapping[pair_tensor]
     if int(mapped.max()) >= positions.size(0) or int(mapped.min()) < 0:
@@ -216,8 +196,42 @@ def fgr_pairs(topology, trimer, smiles=None, *, identity=None, seed, key, positi
     distances = torch.linalg.vector_norm(positions[mapped[:, 0]] - positions[mapped[:, 1]], dim=-1)
     if not bool(torch.isfinite(distances).all()) or bool((distances <= 0).any()):
         raise ValueError('FGR clean pair distance is invalid')
+    return pair_tensor, distances, torch.as_tensor(
+        [candidates[pair] for pair in ordered], dtype=torch.long)
+
+
+def fgr_pairs(topology, trimer, smiles=None, *, identity=None, seed, key, position,
+              mu=0.0, sigma=1.0, max_pairs=32):
+    """Return deterministic sampled, normalized centre-RU SPD2/3 pairs."""
+    if not math.isfinite(float(mu)) or not math.isfinite(float(sigma)) or sigma <= 0:
+        raise ValueError('FGR normalization requires finite mu and positive sigma')
+    if int(max_pairs) <= 0:
+        raise ValueError('FGR max_pairs must be positive')
+    pair_tensor, distances, spd = fgr_true_trimer_candidates(
+        topology, trimer, smiles, identity=identity)
+    if not pair_tensor.numel():
+        return pair_tensor, distances, spd
+    generator = sample_generator(seed, f'{key}:fgr', position)
+    chosen_indices = []
+    remaining = int(max_pairs)
+    for hop in (2, 3):
+        if remaining <= 0:
+            break
+        class_indices = torch.where(spd == hop)[0]
+        cap = min(16, remaining, int(class_indices.numel()))
+        if int(class_indices.numel()) > cap:
+            selected = torch.randperm(int(class_indices.numel()), generator=generator)[:cap]
+            class_indices = class_indices[selected.sort().values]
+        chosen_indices.extend(class_indices.tolist())
+        remaining -= int(class_indices.numel())
+    chosen_indices = sorted(chosen_indices, key=lambda index: (
+        int(spd[index]), int(pair_tensor[index, 0]), int(pair_tensor[index, 1])))
+    selected = torch.as_tensor(chosen_indices, dtype=torch.long)
+    pair_tensor = pair_tensor[selected]
+    distances = distances[selected]
+    spd = spd[selected]
     normalized = (torch.log1p(distances) - float(mu)) / float(sigma)
-    return pair_tensor, normalized, torch.as_tensor([candidates[pair] for pair in ordered], dtype=torch.long)
+    return pair_tensor, normalized, spd
 
 
 def motif_mask(topology, groups, generator, ratio=0.3):

@@ -21,7 +21,9 @@ from src.modules.glt_dual_pretrain import (DualPretrainer, global_objective,
                                             alignment_local_anchor_count)
 from src.training.glt_dual_runtime import (require_tmux, open_source, save_checkpoint, write_json,
                                          rng_state, restore_rng, scheduled_lr, move_labels,
-                                         OrderedSampleStream, RankMicrobatchStream)
+                                         OrderedSampleStream, RankMicrobatchStream,
+                                         IndexedFrozenDualSource, load_sample_index_artifact,
+                                         apply_common_initialization)
 from src.utils import set_global_seed
 
 
@@ -134,6 +136,12 @@ def main():
                         help='training-ready dual_static_v1 artifact')
     parser.add_argument('--pretrain-target-root',
                         help='pretrain_targets_v1 artifact')
+    parser.add_argument('--sample-index-artifact',
+                        help='read-only pretrain source-index split artifact')
+    parser.add_argument('--sample-index-split', choices=('train', 'validation', 'fixed_validation'),
+                        help='logical split exposed by --sample-index-artifact')
+    parser.add_argument('--common-init-artifact',
+                        help='frozen common encoder/head initialization artifact')
     parser.add_argument('--resume')
     parser.add_argument('--prep-workers', type=int, default=0,
                         help='DataLoader workers per rank for input prefetch '
@@ -204,6 +212,9 @@ def main():
             or len(config['loss_weights']) != 3):
         raise ValueError('invalid training budget, schedule or objective weights')
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
+    expected_world = config.get('expected_world_size')
+    if expected_world is not None and int(world) != int(expected_world):
+        raise ValueError(f'config requires world size {int(expected_world)}, got {world}')
     device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0))) if torch.cuda.is_available() else torch.device('cpu')
     if device.type == 'cuda':
         torch.cuda.set_device(device)
@@ -232,6 +243,16 @@ def main():
         pretrain_target_root=(args.pretrain_target_root if third_task == 'fp' else None),
     )
     try:
+        sample_index_path = args.sample_index_artifact or config.get('sample_index_artifact')
+        sample_index_split = args.sample_index_split or config.get('sample_index_split')
+        sample_index = load_sample_index_artifact(sample_index_path, sample_index_split)
+        if sample_index is not None:
+            if len(source) != int(sample_index['payload'].get('pi1m_record_count', len(source))):
+                raise ValueError('sample index base cohort count mismatch')
+            expected_manifest = sample_index['payload'].get('pi1m_manifest_hash')
+            if expected_manifest and expected_manifest != source.cohort['manifest_hash']:
+                raise ValueError('sample index/base cohort manifest mismatch')
+            source = IndexedFrozenDualSource(source, sample_index['indices'])
         micro, batch_size = config['microbatch'], config['global_batch']
         if batch_size % (micro * world):
             raise ValueError('microbatch * accumulation * world must equal global_batch')
@@ -243,6 +264,10 @@ def main():
                               third_task=third_task, fgr_mu=fgr_mu,
                               fgr_sigma=fgr_sigma,
                               align_temperature=align_temperature).to(device)
+        common_init = None
+        common_init_path = args.common_init_artifact or config.get('common_init_artifact')
+        if common_init_path:
+            common_init = apply_common_initialization(base, common_init_path)
         optimizer = torch.optim.AdamW(base.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
         module = DistributedDataParallel(base, device_ids=[device.index] if device.type == 'cuda' else None,
                                          find_unused_parameters=True) if world > 1 else base
@@ -258,7 +283,10 @@ def main():
                                                        if source.target_cache is not None else None),
                         third_task=third_task, fgr_mu=fgr_mu,
                         fgr_sigma=fgr_sigma, fgr_max_pairs=fgr_max_pairs,
-                        align_temperature=align_temperature)
+                        align_temperature=align_temperature,
+                        sample_index_artifact_sha256=(sample_index['sha256'] if sample_index else None),
+                        sample_index_split=(sample_index['split'] if sample_index else None),
+                        common_init_artifact_sha256=(common_init['sha256'] if common_init else None))
         # Exact ordered identities, without adding a separate cache schema.
         ordered_keys = [key.hex() for key, _ in source.samples]
         resume_rng = None
