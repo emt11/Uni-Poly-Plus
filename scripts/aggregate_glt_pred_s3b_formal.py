@@ -26,7 +26,16 @@ def load_unit(root, arm, task, fold):
     assert d['protocol'] == 'outer5_inner20_development', (arm, task, fold, d['protocol'])
     assert d['development'] is True and d['validation_only'] is True, (arm, task, fold)
     assert d['outer_test'] == 'NOT_RUN', (arm, task, fold, d['outer_test'])
+    assert d['adaptation'] == 'full', (arm, task, fold, d['adaptation'])
+    assert int(d['deployment_step']) == 5000, (arm, task, fold, d['deployment_step'])
     return d
+
+
+def _command_checkpoint(root, arm):
+    """The --checkpoint value recorded in this arm's development run.json."""
+    run = json.loads((root / arm / 'development' / 'run.json').read_text(encoding='utf-8'))
+    command = run['command']
+    return command[command.index('--checkpoint') + 1]
 
 
 def gate(candidate, reference, r2):
@@ -64,10 +73,14 @@ def main():
                'increment': {}, 'selected_parent': None, 's3b_verdict': None}
     for arm in ARMS:
         runtime = json.loads((root / arm / 'pretrain' / 'runtime.json').read_text())
+        expected = str(root / arm / 'pretrain' / 'deploy_05000.pt')
+        used = _command_checkpoint(root, arm)
+        assert Path(used).resolve() == Path(expected).resolve(), (arm, used)
         summary['pretrain'][arm] = {
             'status': runtime['status'],
             'completed_steps': int(runtime['completed_steps']),
-            'deploy_05000': str(root / arm / 'pretrain' / 'deploy_05000.pt'),
+            'deploy_05000': expected,
+            'finetune_checkpoint_used': used,
         }
         units = {}
         r2 = {}
