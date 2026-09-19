@@ -141,7 +141,40 @@ def fit_ridge_validation(encoder, dataset, scaler, train_indices, validation_ind
 def fit_select_and_test(model, scaler, train_loader, val_loader, test_loader, device,
                         optimizer, scheduler, config, *, task, fold_id,
                         validation_only=False, timing=False, timing_sink=None,
-                        validation_summary=None):
+                        validation_summary=None, outer_test_guard=None):
+    if outer_test_guard is not None:
+        # Exactly-once outer-test access: the marker is written before the
+        # first test inference and upgraded to COMPLETED only after the
+        # predictions and metrics are on disk.  A shard that already carries a
+        # marker (STARTED or COMPLETED) must never run outer-test again.
+        marker = outer_test_guard['marker']
+        if marker.exists():
+            raise RuntimeError(
+                'outer-test already accessed for this shard; refusing to rerun: '
+                f'{marker}')
+        write_json(marker, dict(task=outer_test_guard['task'],
+                                fold=outer_test_guard['fold'],
+                                arm=outer_test_guard['arm'],
+                                status='STARTED'))
+    try:
+        return _fit_select_and_test_inner(
+            model, scaler, train_loader, val_loader, test_loader, device,
+            optimizer, scheduler, config, task=task, fold_id=fold_id,
+            validation_only=validation_only, timing=timing,
+            timing_sink=timing_sink, validation_summary=validation_summary,
+            outer_test_guard=outer_test_guard)
+    except Exception:
+        if outer_test_guard is not None:
+            print(json.dumps({'outer_test_access': 'STARTED_NOT_COMPLETED',
+                              'marker': str(outer_test_guard['marker'])}),
+                  flush=True)
+        raise
+
+
+def _fit_select_and_test_inner(model, scaler, train_loader, val_loader, test_loader, device,
+                               optimizer, scheduler, config, *, task, fold_id,
+                               validation_only=False, timing=False, timing_sink=None,
+                               validation_summary=None, outer_test_guard=None):
     encoder, criterion = model.encoder, nn.MSELoss()
     best, best_r2, best_epoch, stalled = None, -float('inf'), -1, 0
     for epoch in range(config['epochs']):
@@ -426,18 +459,28 @@ def main():
                     all_folds.append(smoke_result)
                     del model, encoder, optimizer, scheduler
                     continue
+                test_guard = None if validation_only else dict(
+                    marker=folder / 'outer_test_access.json',
+                    task=task, fold=int(fold_id),
+                    arm=Path(args.checkpoint).resolve().parent.parent.name)
                 best, best_r2, best_epoch, result = fit_select_and_test(
                     model, scaler, train_loader, val_loader, loader(test), device,
                     optimizer, scheduler, run_config, task=task, fold_id=fold_id,
-                    timing=args.timing, timing_sink=timing_records)
+                    timing=args.timing, timing_sink=timing_records,
+                    outer_test_guard=test_guard)
                 y_true, y_pred = result.pop('_y_true'), result.pop('_y_pred')
                 if not np.isfinite(y_pred).all() or not all(np.isfinite(v) for v in result.values()):
                     raise FloatingPointError('nonfinite test predictions/metrics')
                 if visits[test].any():
                     raise ValueError('outer test indices predicted more than once')
                 predictions[test], visits[test] = y_pred, visits[test] + 1
-                result.update(task=task, fold=fold_id, protocol='outer5_inner20',
+                result.update(task=task, fold=fold_id,
+                              protocol=('outer5_inner20_formal_shard'
+                                        if args.formal_shard else 'outer5_inner20'),
                               formal_shard=bool(args.formal_shard),
+                              adaptation=adaptation,
+                              deployment_step=int(run_config['downstream_step']),
+                              outer_test='RUN_ONCE' if args.formal_shard else 'RUN',
                               best_validation_r2=best_r2, best_epoch=best_epoch)
                 save_started = time.perf_counter()
                 pd.DataFrame(dict(row_index=test, target=y_true, prediction=y_pred)).to_csv(folder / 'predictions.csv', index=False)
@@ -446,6 +489,11 @@ def main():
                     split=fold, config=run_config, best_validation_r2=best_r2, best_epoch=best_epoch,
                     scaler_mean=scaler.scaler.mean_.tolist(), scaler_scale=scaler.scaler.scale_.tolist()))
                 write_json(folder / 'metrics.json', result)
+                if test_guard is not None:
+                    marker_state = json.loads(test_guard['marker'].read_text(encoding='utf-8'))
+                    assert marker_state['status'] == 'STARTED'
+                    marker_state['status'] = 'COMPLETED'
+                    write_json(test_guard['marker'], marker_state)
                 save_records.append(dict(task=task, fold=int(fold_id),
                                          kind='formal_predictions_best_and_metrics',
                                          seconds=float(time.perf_counter() - save_started)))
