@@ -16,6 +16,13 @@ ARMS = ('s4_env', 's4_tor_off', 's4_tor_on')
 REFERENCE = 'b_none'
 
 
+def _command_checkpoint(root, arm):
+    """The --checkpoint value recorded in this arm's development run.json."""
+    run = json.loads((root / arm / 'development' / 'run.json').read_text(encoding='utf-8'))
+    command = run['command']
+    return command[command.index('--checkpoint') + 1]
+
+
 def load_unit(root, arm, task, fold):
     path = root / arm / 'development' / task / f'fold{fold}' / 'metrics.json'
     d = json.loads(path.read_text(encoding='utf-8'))
@@ -52,10 +59,16 @@ def main():
     r2 = load_reference_r2(s3b)
     for arm in ARMS:
         runtime = json.loads((root / arm / 'pretrain' / 'runtime.json').read_text())
+        assert runtime['status'] == 'PASS', (arm, runtime['status'])
+        assert int(runtime['completed_steps']) == 5000, (arm, runtime['completed_steps'])
+        expected = str(root / arm / 'pretrain' / 'deploy_05000.pt')
+        used = _command_checkpoint(root, arm)
+        assert Path(used).resolve() == Path(expected).resolve(), (arm, used)
         summary['pretrain'][arm] = {
             'status': runtime['status'],
             'completed_steps': int(runtime['completed_steps']),
-            'deploy_05000': str(root / arm / 'pretrain' / 'deploy_05000.pt'),
+            'deploy_05000': expected,
+            'finetune_checkpoint_used': used,
         }
         units = {}
         r2[arm] = {}
