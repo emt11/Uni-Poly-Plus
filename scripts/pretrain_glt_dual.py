@@ -196,6 +196,22 @@ def main():
         raise ValueError('FGR max pairs must be positive')
     if not torch.isfinite(torch.tensor(align_temperature)) or align_temperature <= 0:
         raise ValueError('ALIGN temperature must be finite and positive')
+    atom_target = str(config.get('atom_target', 'element')).lower()
+    if atom_target not in {'element', 'environment'}:
+        raise ValueError('unsupported atom pretraining target')
+    env_vocab = None
+    env_vocab_path = config.get('env_vocab')
+    if atom_target == 'environment':
+        if not env_vocab_path:
+            raise ValueError('environment atom target requires config env_vocab')
+        vocab_payload = json.loads(Path(env_vocab_path).read_text(encoding='utf-8'))
+        if vocab_payload.get('categories', {}).get('<unk>') is None:
+            raise ValueError('environment vocabulary is missing categories/<unk>')
+        env_vocab = vocab_payload['categories']
+    torsion_mode = config.get('torsion_mode')
+    if torsion_mode is not None and str(torsion_mode).lower() not in {'on', 'off'}:
+        raise ValueError('torsion_mode must be on or off when present')
+    torsion_mode = str(torsion_mode).lower() if torsion_mode else None
     if config.get('use_md200') is not False or config['amp_dtype'] not in ('fp32', 'bf16'):
         raise ValueError('dual route requires no MD200 and fp32/bf16 precision')
     if args.diagnostics_every <= 0:
@@ -263,11 +279,17 @@ def main():
                               geometry_head_norm=bool(args.geometry_head_norm or config.get('geometry_head_norm', False)),
                               third_task=third_task, fgr_mu=fgr_mu,
                               fgr_sigma=fgr_sigma,
-                              align_temperature=align_temperature).to(device)
+                              align_temperature=align_temperature,
+                              atom_target=atom_target,
+                              env_vocab_size=(len(env_vocab) if env_vocab is not None else None),
+                              torsion=torsion_mode is not None).to(device)
         common_init = None
         common_init_path = args.common_init_artifact or config.get('common_init_artifact')
         if common_init_path:
-            common_init = apply_common_initialization(base, common_init_path)
+            # The environment output head has a different output space; every
+            # other shared parameter must come from the same step-0 state.
+            exclude = ('atom_head.head.weight', 'atom_head.head.bias') if atom_target == 'environment' else ()
+            common_init = apply_common_initialization(base, common_init_path, exclude=exclude)
         optimizer = torch.optim.AdamW(base.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
         module = DistributedDataParallel(base, device_ids=[device.index] if device.type == 'cuda' else None,
                                          find_unused_parameters=True) if world > 1 else base
@@ -284,6 +306,10 @@ def main():
                         third_task=third_task, fgr_mu=fgr_mu,
                         fgr_sigma=fgr_sigma, fgr_max_pairs=fgr_max_pairs,
                         align_temperature=align_temperature,
+                        atom_target=atom_target,
+                        atom_target_vocab_size=(len(env_vocab) if env_vocab is not None else None),
+                        torsion_mode=torsion_mode,
+                        env_vocab_path=(str(Path(env_vocab_path).resolve()) if env_vocab_path else None),
                         sample_index_artifact_sha256=(sample_index['sha256'] if sample_index else None),
                         sample_index_split=(sample_index['split'] if sample_index else None),
                         common_init_artifact_sha256=(common_init['sha256'] if common_init else None))
@@ -350,6 +376,7 @@ def main():
                 benchmark_steps=int(args.benchmark_steps), benchmark_warmup=int(args.benchmark_warmup),
                 third_task=third_task, fgr_mu=fgr_mu, fgr_sigma=fgr_sigma,
                 fgr_max_pairs=fgr_max_pairs, align_temperature=align_temperature,
+                atom_target=atom_target, torsion_mode=torsion_mode,
                 started_at_monotonic=time.perf_counter()))
         stream = OrderedSampleStream(len(source), config['seed'])
         # Optional CPU prefetch.  The prepared items are identical to the
@@ -366,6 +393,8 @@ def main():
                 sigma=config['noise_sigma'], ratio=config['atom_mask_ratio'],
                 third_task=third_task, fgr_mu=fgr_mu, fgr_sigma=fgr_sigma,
                 fgr_max_pairs=fgr_max_pairs,
+                atom_target=atom_target, env_vocab=env_vocab,
+                torsion_mode=torsion_mode,
             )
             prefetch = iter(torch.utils.data.DataLoader(
                 dataset, batch_size=None, num_workers=int(args.prep_workers),
@@ -421,7 +450,9 @@ def main():
                             static=source.static_for(index),
                             target=(source.target_for(index) if third_task == 'fp' else None),
                             third_task=third_task, fgr_mu=fgr_mu,
-                            fgr_sigma=fgr_sigma, fgr_max_pairs=fgr_max_pairs))
+                            fgr_sigma=fgr_sigma, fgr_max_pairs=fgr_max_pairs,
+                            atom_target=atom_target, env_vocab=env_vocab,
+                            torsion_mode=torsion_mode))
                     prepared.append(pretrain_collate(rows))
             timing['preparation_seconds'] = time.perf_counter() - prep_started
             counts = torch.zeros(3, device=device)

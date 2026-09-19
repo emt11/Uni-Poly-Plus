@@ -8,10 +8,10 @@ from .glt_dual import build_dual_glt_model, mean_pool
 
 
 class AtomGraphDecoder(nn.Module):
-    def __init__(self):
+    def __init__(self, num_classes=101):
         super().__init__()
         self.layers = nn.ModuleList([nn.Linear(1024, 512) for _ in range(2)])
-        self.head = nn.Linear(512, 101)
+        self.head = nn.Linear(512, int(num_classes))
 
     def forward(self, states, edge_index):
         source, target = edge_index
@@ -173,9 +173,12 @@ def math_is_finite_positive(value):
 
 
 class DualPretrainer(nn.Module):
+    ENV_HEAD_INIT_SEED = 20260918
+
     def __init__(self, fusion_mode='concat', *, collect_diagnostics=False,
                  geometry_head_norm=False, third_task='fp', fgr_mu=0.0,
-                 fgr_sigma=1.0, align_temperature=0.1):
+                 fgr_sigma=1.0, align_temperature=0.1, atom_target='element',
+                 env_vocab_size=None, torsion=False):
         super().__init__()
         third_task = str(third_task).lower()
         if third_task not in {'fp', 'none', 'fgr', 'align'}:
@@ -184,9 +187,21 @@ class DualPretrainer(nn.Module):
             raise ValueError('ALIGN temperature must be finite and positive')
         if not math_is_finite_positive(fgr_sigma):
             raise ValueError('FGR sigma must be finite and positive')
-        self.encoder = build_dual_glt_model(fusion_mode)
+        atom_target = str(atom_target).lower()
+        if atom_target not in {'element', 'environment'}:
+            raise ValueError('unsupported atom pretraining target')
+        if (atom_target == 'environment') != (env_vocab_size is not None):
+            raise ValueError('environment atom target requires the vocabulary size')
+        self.atom_target = atom_target
+        self.encoder = build_dual_glt_model(fusion_mode, torsion=bool(torsion))
         self.encoder.predictor = nn.Identity()
-        self.atom_head = AtomGraphDecoder()
+        self.atom_head = AtomGraphDecoder(101 if atom_target == 'element' else int(env_vocab_size))
+        if atom_target == 'environment':
+            # Environment-specific output parameters get their own fixed seed;
+            # every shared parameter is overwritten by the common initialization.
+            generator = torch.Generator(device='cpu').manual_seed(self.ENV_HEAD_INIT_SEED)
+            nn.init.normal_(self.atom_head.head.weight, std=0.02, generator=generator)
+            nn.init.zeros_(self.atom_head.head.bias)
         self.length_head = nn.Sequential(nn.Linear(512, 256), nn.GELU(), nn.Linear(256, 1))
         self.angle_head = nn.Sequential(nn.Linear(1024, 256), nn.GELU(), nn.Linear(256, 1), nn.Tanh())
         self.third_task = third_task
@@ -427,6 +442,7 @@ def global_objective(sums, global_counts, world_size=1, weights=(1., 1., .1)):
 def deployment_package(pretrainer, step):
     return dict(architecture=pretrainer.encoder.architecture_name,
         fusion_mode=pretrainer.encoder.fusion_mode, step=int(step), use_md200=False,
+        torsion_modules=bool(pretrainer.encoder.glt.torsion_mlp is not None),
         state_dict={k: v.detach().cpu().clone() for k, v in pretrainer.encoder.state_dict().items()
                     if not k.startswith('predictor.')})
 

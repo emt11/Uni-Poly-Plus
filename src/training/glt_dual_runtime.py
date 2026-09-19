@@ -92,8 +92,13 @@ def load_sample_index_artifact(path, split):
     }
 
 
-def apply_common_initialization(model, path):
-    """Copy a frozen common-state initialization into one task variant."""
+def apply_common_initialization(model, path, *, exclude=()):
+    """Copy a frozen common-state initialization into one task variant.
+
+    ``exclude`` names parameters this task variant replaces with a different
+    output space; they keep their own fixed initialization and are never
+    overwritten by the shared state.
+    """
 
     artifact_path = Path(path).resolve()
     if not artifact_path.is_file():
@@ -102,13 +107,18 @@ def apply_common_initialization(model, path):
     state = payload.get('common_state_dict') if isinstance(payload, dict) else None
     if not isinstance(state, dict) or not state:
         raise ValueError('common initialization artifact has no common_state_dict')
+    skipped = set(exclude)
     current = model.state_dict()
     missing = [name for name, value in state.items()
-               if name not in current or tuple(current[name].shape) != tuple(value.shape)]
+               if name not in skipped
+               and (name not in current
+                    or tuple(current[name].shape) != tuple(value.shape))]
     if missing:
         raise ValueError('common initialization state is incompatible: ' + ','.join(missing[:5]))
     with torch.no_grad():
         for name, value in state.items():
+            if name in skipped:
+                continue
             current[name].copy_(value)
     return {
         'path': str(artifact_path),
@@ -217,7 +227,8 @@ class RankMicrobatchStream(Dataset):
 
     def __init__(self, source, *, seed, world, rank, microbatch, accumulation,
                  start_step, max_steps, sigma, ratio, third_task='fp',
-                 fgr_mu=0.0, fgr_sigma=1.0, fgr_max_pairs=32):
+                 fgr_mu=0.0, fgr_sigma=1.0, fgr_max_pairs=32,
+                 atom_target='element', env_vocab=None, torsion_mode=None):
         from src.dataset.glt_dual_pretrain import (  # local: avoid import cycles
             prepare_pretrain_sample, pretrain_collate,
         )
@@ -240,6 +251,9 @@ class RankMicrobatchStream(Dataset):
         self.fgr_mu = float(fgr_mu)
         self.fgr_sigma = float(fgr_sigma)
         self.fgr_max_pairs = int(fgr_max_pairs)
+        self.atom_target = str(atom_target)
+        self.env_vocab = env_vocab
+        self.torsion_mode = torsion_mode
 
     def __len__(self):
         return self.steps * self.accumulation
@@ -261,6 +275,8 @@ class RankMicrobatchStream(Dataset):
                 target=(self.source.target_for(index) if self.third_task == 'fp' else None),
                 third_task=self.third_task, fgr_mu=self.fgr_mu,
                 fgr_sigma=self.fgr_sigma, fgr_max_pairs=self.fgr_max_pairs,
+                atom_target=self.atom_target, env_vocab=self.env_vocab,
+                torsion_mode=self.torsion_mode,
             ))
         return self._collate(rows)
 
@@ -388,11 +404,12 @@ class CleanLabeledDataset(Dataset):
     overrides and DataLoader collation cannot mutate a cached sample.
     """
 
-    def __init__(self, source, targets, *, cache_capacity_bytes=0):
+    def __init__(self, source, targets, *, cache_capacity_bytes=0, torsion_mode=None):
         self.source = source
         self.raw_targets = np.asarray(targets, dtype=np.float64)
         self.targets = self.raw_targets.copy()
         self.cache_capacity_bytes = max(0, int(cache_capacity_bytes))
+        self.torsion_mode = torsion_mode
         self._cache = OrderedDict()
         self._cache_bytes = 0
         self._cache_hits = 0
@@ -423,7 +440,8 @@ class CleanLabeledDataset(Dataset):
                 data = cached.clone()
             else:
                 self._cache_misses += 1
-                built = build_dual_sample(*self.source[index], static=self.source.static_for(index))
+                built = build_dual_sample(*self.source[index], static=self.source.static_for(index),
+                                          torsion_mode=self.torsion_mode)
                 payload_bytes = _tensor_payload_bytes(built.to_dict())
                 if payload_bytes > self.cache_capacity_bytes:
                     self._cache_skipped_bytes += payload_bytes
@@ -439,7 +457,8 @@ class CleanLabeledDataset(Dataset):
                     self._cache_bytes += payload_bytes
                     data = cached.clone()
         else:
-            built = build_dual_sample(*self.source[index], static=self.source.static_for(index))
+            built = build_dual_sample(*self.source[index], static=self.source.static_for(index),
+                                      torsion_mode=self.torsion_mode)
             data = built.clone()
         data.y = torch.tensor([float(self.targets[index])], dtype=torch.float32)
         return data

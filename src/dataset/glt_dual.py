@@ -166,7 +166,7 @@ def _validate_geometry_fallback_carrier(topology, trimer):
 
 
 def build_dual_sample(topology, trimer, smiles, *, identity=None,
-                      bond_path_features=None, static=None):
+                      bond_path_features=None, static=None, torsion_mode=None):
     """Build only model-required fields; never carry MD/coordinate tensors into a batch.
 
     ``identity`` and ``bond_path_features`` are pure functions of
@@ -271,6 +271,34 @@ def build_dual_sample(topology, trimer, smiles, *, identity=None,
         result.line_mask = torch.from_numpy(np.array(static['line_path_mask'], dtype=bool, copy=True))
         result.line_path_group = torch.from_numpy(np.array(static['line_path_group'], dtype=np.int64, copy=True))
         result.line_is_self = torch.from_numpy(np.array(static['line_is_self'], dtype=bool, copy=True))
+    if torsion_mode is not None:
+        # Deployment-side torsion fields: real values from the frozen clean
+        # geometry, via the same canonical bond table and physical-bond
+        # identity as the pretraining path.  A deployment that carries the
+        # torsion modules is never silently fed an empty field.
+        from .glt_dual_pretrain import _torsion_fields, _topology_z, periodic_bond_table
+        mode = str(torsion_mode).lower()
+        if mode not in {'on', 'off'}:
+            raise ValueError('torsion mode must be on or off')
+        normalized_text = getattr(topology, 'normalized_canonical_smiles', None)
+        if normalized_text is None:
+            raise ValueError('torsion fields require the frozen normalized SMILES')
+        bond_table = periodic_bond_table(
+            str(normalized_text), topology.canonical_to_trimer_base_atom_id)
+        mapping = torch.as_tensor(
+            getattr(trimer, 'mips_to_trimer_central_index', torch.empty(0)),
+            dtype=torch.long).reshape(-1)
+        if result.geometry_valid:
+            index, values, valid = _torsion_fields(
+                static, _topology_z(topology).tolist(), trimer.trimer_pos, mapping, 'on',
+                bond_table)
+        else:
+            index = torch.zeros(0, dtype=torch.long)
+            values = torch.zeros((0, 2), dtype=torch.float32)
+            valid = torch.zeros(0, dtype=torch.bool)
+        result.torsion_bond_index = index
+        result.torsion_values = values
+        result.torsion_mask = valid
     if getattr(topology, 'y', None) is not None:
         result.y = topology.y.clone()
     return result
@@ -378,6 +406,10 @@ def dual_glt_collate(samples):
     batch = Data()
     fields = {}
     atom_offset = bond_offset = relation_offset = 0
+    has_torsion = hasattr(samples[0], 'torsion_values')
+    if not all(hasattr(item, 'torsion_values') == has_torsion for item in samples):
+        raise ValueError('torsion fields must be present on every sample or none')
+    torsion_index, torsion_values, torsion_mask = [], [], []
     for graph, item in enumerate(samples):
         n, m = item.mips_x.size(0), item.bond_distance.numel()
         for name in ('mips_x', 'mips_backbone_mask', 'lga_spd', 'lga_path_mask',
@@ -396,11 +428,19 @@ def dual_glt_collate(samples):
         fields.setdefault('line_path_group', []).append(item.line_path_group + relation_offset)
         fields.setdefault('canonical_graph_index', []).append(torch.full((n,), graph, dtype=torch.long))
         fields.setdefault('bond_batch', []).append(torch.full((m,), graph, dtype=torch.long))
+        if has_torsion:
+            torsion_index.append(item.torsion_bond_index + bond_offset)
+            torsion_values.append(item.torsion_values)
+            torsion_mask.append(item.torsion_mask)
         atom_offset += n
         bond_offset += m
         relation_offset += item.line_source.numel()
     for name, values in fields.items():
         setattr(batch, name, torch.cat(values, dim=1 if name == 'lga_edge_index' else 0))
+    if has_torsion:
+        batch.torsion_bond_index = torch.cat(torsion_index, dim=0)
+        batch.torsion_values = torch.cat(torsion_values, dim=0)
+        batch.torsion_mask = torch.cat(torsion_mask, dim=0)
     batch.graph_available = torch.tensor([x.graph_available for x in samples], dtype=torch.bool)
     batch.geometry_valid = torch.tensor([x.geometry_valid for x in samples], dtype=torch.bool)
     batch.geometry_invalid_reason = [x.geometry_invalid_reason for x in samples]

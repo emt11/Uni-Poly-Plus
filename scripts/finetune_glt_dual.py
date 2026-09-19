@@ -279,6 +279,9 @@ def main():
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     package = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    # A deployment trained with the S4 torsion modules must keep them at
+    # inference; load_deployment refuses any silent module mismatch.
+    deployment_torsion = bool(package.get('torsion_modules', False))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     validation_only = bool(args.smoke or args.development)
     if adaptation == 'ridge' and not validation_only:
@@ -324,6 +327,7 @@ def main():
             dataset = CleanLabeledDataset(
                 source, targets,
                 cache_capacity_bytes=int(args.clean_cache_gib * (1024 ** 3)),
+                torsion_mode=('on' if deployment_torsion else None),
             )
             predictions = np.full(len(dataset), np.nan)
             visits = np.zeros(len(dataset), dtype=np.int64)
@@ -343,7 +347,8 @@ def main():
                         shuffle=training, num_workers=0, collate_fn=dual_glt_collate,
                         generator=torch.Generator().manual_seed(run_config['seed'] + fold_id))
                 train_loader, val_loader = loader(train, True), loader(validation)
-                encoder = build_dual_glt_model(run_config['fusion_mode']).to(device)
+                encoder = build_dual_glt_model(run_config['fusion_mode'],
+                                               torsion=deployment_torsion).to(device)
                 load_deployment(encoder, package, run_config['downstream_step'])
                 adaptation_meta = configure_adaptation(
                     encoder, adaptation, rank=args.lora_rank,

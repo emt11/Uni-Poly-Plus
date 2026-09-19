@@ -12,6 +12,7 @@ from rdkit import Chem
 from rdkit.Chem import BRICS, rdFingerprintGenerator
 
 from .graph_data import build_periodic_multimer_mol
+from .glt_bond_chemistry import bond_type_index
 from .glt_dual import bond_paths, build_dual_sample, dual_glt_collate
 from .canonical_periodic import resolve_normalized_identity
 
@@ -288,10 +289,180 @@ def _unpack_fingerprint(packed):
     return torch.from_numpy(bits[:2048].copy()).float()
 
 
+def _topology_z(topology):
+    """Canonical element table of one frozen topology record."""
+    z = getattr(topology, 'atomic_numbers', None)
+    if z is None:
+        z = getattr(topology, 'z', None)
+    if z is None:
+        raise ValueError('frozen topology is missing the canonical element table')
+    return torch.as_tensor(z, dtype=torch.long).reshape(-1)
+
+
+def periodic_bond_table(normalized_smiles, canonical_to_base):
+    """Canonical periodic chemical bonds of one sample.
+
+    One entry ``(a, b, bond_type, shift)`` per distinct periodic edge of the
+    quotient graph: center-internal bonds (shift 0) and both seam directions
+    (shift -1 / +1).  Endpoints are canonical atom indices; the table is built
+    from the frozen normalized SMILES only, never from atom array positions.
+    """
+    molecule, metadata = build_periodic_multimer_mol(
+        str(normalized_smiles), num_repeat_units=3, close_periodic=False
+    )
+    size = int(metadata['base_atom_count'])
+    mapping = torch.as_tensor(canonical_to_base, dtype=torch.long).reshape(-1)
+    if mapping.numel() != size or sorted(mapping.tolist()) != list(range(size)):
+        raise ValueError('canonical-to-base mapping is not a base permutation')
+    inverse = torch.full((size,), -1, dtype=torch.long)
+    inverse[mapping] = torch.arange(mapping.numel(), dtype=torch.long)
+    table = set()
+    for bond in molecule.GetBonds():
+        a, b = int(bond.GetBeginAtomIdx()), int(bond.GetEndAtomIdx())
+        qa, qb = a // size, b // size
+        if qa == qb and qa != 1:
+            continue
+        if qa == qb == 1:
+            shift = 0
+        elif {qa, qb} == {0, 1}:
+            shift = -1
+        elif {qa, qb} == {1, 2}:
+            shift = +1
+        else:
+            raise ValueError('periodic bond leaves the three-unit chain')
+        ca, cb = int(inverse[a % size]), int(inverse[b % size])
+        if ca > cb:
+            ca, cb, shift = cb, ca, -shift
+        table.add((ca, cb, int(bond_type_index(bond)), shift))
+    return sorted(table)
+
+
+def environment_atom_labels(bond_table, atomic_numbers, vocab):
+    """Periodic rooted radius-1 atom-environment class per canonical atom.
+
+    The environment of atom ``i`` is its element plus the unordered multiset of
+    ``(neighbor element, bond type)`` over every real periodic chemical bond of
+    ``i``.  Categories missing from the frozen P_train vocabulary map to UNK.
+    """
+    z = torch.as_tensor(atomic_numbers, dtype=torch.long).reshape(-1).tolist()
+    neighbors = {}
+    for ca, cb, bond_type, _ in bond_table:
+        neighbors.setdefault(ca, []).append((z[cb], bond_type))
+        neighbors.setdefault(cb, []).append((z[ca], bond_type))
+    unk = vocab.get('<unk>')
+    if unk is None:
+        raise ValueError('environment vocabulary is missing the <unk> entry')
+    labels = torch.full((len(z),), int(unk), dtype=torch.long)
+    for atom, pairs in neighbors.items():
+        category = f'{z[atom]}|' + ';'.join(f'{element}:{bond}'
+                                            for element, bond in sorted(pairs))
+        labels[atom] = int(vocab.get(category, unk))
+    return labels
+
+
+def torsion_quadruplets(bond_table, atomic_numbers):
+    """Every heavy-atom torsion a-b-c-d on center-RU internal bonds.
+
+    All four atoms are distinct center-RU heavy atoms and the three relations
+    are real chemical bonds; the middle bond is identified by its canonical
+    (a, b) pair.  A path and its reverse describe one physical torsion, so only
+    one orientation is recorded per (middle bond, endpoint pair).
+    """
+    z = torch.as_tensor(atomic_numbers, dtype=torch.long).reshape(-1).tolist()
+    adjacency = {}
+    for ca, cb, bond_type, shift in bond_table:
+        if shift != 0:
+            continue
+        adjacency.setdefault(ca, []).append((cb, bond_type))
+        adjacency.setdefault(cb, []).append((ca, bond_type))
+    quadruplets = []
+    for bond in sorted(key for key in bond_table if key[3] == 0):
+        b, c = bond[0], bond[1]
+        if z[b] <= 1 or z[c] <= 1:
+            continue
+        left = [a for a, _ in adjacency.get(b, []) if a != c and z[a] > 1]
+        right = [d for d, _ in adjacency.get(c, []) if d != b and z[d] > 1]
+        for a in left:
+            for d in right:
+                if a == d:
+                    continue
+                quadruplets.append((a, b, c, d, (b, c)))
+    return quadruplets
+
+
+def torsion_features(positions, mapping, quadruplets, *, zero=False):
+    """[cos(phi), cos(2*phi)] from the given (noisy or clean) coordinates.
+
+    Degenerate (near-collinear) quadruplets are masked instead of being forced
+    through an unstable inverse cosine.
+    """
+    positions = torch.as_tensor(positions, dtype=torch.float32)
+    mapping = torch.as_tensor(mapping, dtype=torch.long).reshape(-1)
+    values = torch.zeros((len(quadruplets), 2), dtype=torch.float32)
+    mask = torch.zeros((len(quadruplets),), dtype=torch.bool)
+    for index, (a, b, c, d, _) in enumerate(quadruplets):
+        p0, p1 = positions[mapping[a]], positions[mapping[b]]
+        p2, p3 = positions[mapping[c]], positions[mapping[d]]
+        b0 = p1 - p0
+        b1 = p2 - p1
+        b2 = p3 - p2
+        norm_b1 = torch.linalg.vector_norm(b1)
+        if not bool(torch.isfinite(norm_b1)) or float(norm_b1) <= 0:
+            continue
+        b1 = b1 / norm_b1
+        v = b0 - torch.dot(b0, b1) * b1
+        w = b2 - torch.dot(b2, b1) * b1
+        if (not bool(torch.isfinite(v).all()) or not bool(torch.isfinite(w).all())):
+            continue
+        if float(torch.linalg.vector_norm(v)) < 1e-3 or float(torch.linalg.vector_norm(w)) < 1e-3:
+            continue
+        y = torch.dot(torch.cross(b1, v, dim=0), w)
+        x = torch.dot(v, w)
+        phi = torch.atan2(y, x)
+        cos = torch.cos(phi)
+        values[index, 0] = cos
+        values[index, 1] = 2.0 * cos * cos - 1.0
+        mask[index] = True
+    if zero:
+        values = torch.zeros_like(values)
+    return values, mask
+
+
+def _torsion_fields(static, atomic_numbers, positions, mapping, mode, bond_table):
+    """Shared data path for S4_TOR_ON (real values) and S4_TOR_OFF (zeros).
+
+    Quadruplet identity comes from the canonical periodic bond table; middle
+    bonds are mapped to frozen 3D bond-token rows through the stored center
+    row index, with an element/bond-type cross-check against the static row.
+    """
+    center_table = sorted((key[0], key[1], key[2]) for key in bond_table
+                          if key[3] == 0 and atomic_numbers[key[0]] > 1
+                          and atomic_numbers[key[1]] > 1)
+    center_rows = np.asarray(static['distance_token_index'], dtype=np.int64)
+    if len(center_table) != len(center_rows):
+        raise ValueError('center bond table disagrees with frozen token rows')
+    lookup = {}
+    for position, (ca, cb, bond_type) in enumerate(center_table):
+        row = int(center_rows[position])
+        z = atomic_numbers
+        if z[ca] != int(static['token_z_a'][row]) or z[cb] != int(static['token_z_b'][row]) \
+                or bond_type != int(static['token_bond_type'][row]):
+            raise ValueError('torsion middle bond does not match the frozen token row')
+        lookup[(ca, cb)] = row
+    quadruplets = torsion_quadruplets(bond_table, atomic_numbers)
+    index = torch.as_tensor([lookup[middle] for _, _, _, _, middle in quadruplets],
+                            dtype=torch.long)
+    features = [(a, b, c, d, lookup[middle]) for a, b, c, d, middle in quadruplets]
+    values, mask = torsion_features(positions, mapping, features,
+                                    zero=bool(mode == 'off'))
+    return index, values, mask
+
+
 def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
                             sigma=0.03, ratio=0.3, static=None, target=None,
                             third_task='fp', fgr_mu=0.0, fgr_sigma=1.0,
-                            fgr_max_pairs=32):
+                            fgr_max_pairs=32, atom_target='element',
+                            env_vocab=None, torsion_mode=None):
     if not bool(topology.graph_available):
         raise ValueError('three-task training requires valid canonical 2D topology')
     if not math.isfinite(sigma) or sigma < 0 or not 0 < ratio < 1:
@@ -354,6 +525,19 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
         for field in ('line_source', 'line_target', 'line_path', 'line_path_group', 'bond_center'):
             if not torch.equal(getattr(clean, field), getattr(noisy, field)):
                 raise ValueError('coordinate perturbation changed physical topology')
+    needs_bond_table = (atom_target == 'environment') or (torsion_mode is not None)
+    bond_table = None
+    if needs_bond_table:
+        if identity is None:
+            raise ValueError('environment/torsion targets require the normalized identity')
+        bond_table = periodic_bond_table(
+            identity['normalized_smiles'], identity['canonical_to_normalized_base'])
+    if atom_target == 'environment':
+        targets_atom = environment_atom_labels(bond_table, _topology_z(topology), env_vocab)
+        if targets_atom.numel() != topology.mips_x.size(0):
+            raise ValueError('environment label count differs from canonical atoms')
+    else:
+        targets_atom = None
     # Use one path row for each genuine undirected one-hop center angle.  Keep
     # the original row order and directed relation multiplicity, but gather the
     # validity mask in one tensor operation instead of scanning Python rows.
@@ -380,7 +564,9 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
         mu=fgr_mu, sigma=fgr_sigma, max_pairs=fgr_max_pairs)
         if third_task == 'fgr' else
         (torch.empty((0, 2), dtype=torch.long), torch.empty(0), torch.empty(0, dtype=torch.long)))
-    targets = dict(atom_mask=mask, atom_label=topology.mips_x[:, :101].argmax(-1),
+    targets = dict(atom_mask=mask,
+        atom_label=(targets_atom if targets_atom is not None
+                    else topology.mips_x[:, :101].argmax(-1)),
         distance=clean.bond_distance[clean.bond_center].clone(),
         angle_pairs=pairs.reshape(-1, 2),
         angle_cos=cosines if cosines.numel() else torch.empty(0),
@@ -390,6 +576,26 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
         align_identity=str(key),
         align_valid=bool(clean.geometry_valid and clean.bond_center.any()),
         third_task=third_task)
+    if torsion_mode is not None:
+        mode = str(torsion_mode).lower()
+        if mode not in {'on', 'off'}:
+            raise ValueError('torsion mode must be on or off')
+        if static is None:
+            raise ValueError('torsion fields require the frozen static rows')
+        if clean.geometry_valid:
+            mapping = torch.as_tensor(
+                getattr(trimer, 'mips_to_trimer_central_index', torch.empty(0)),
+                dtype=torch.long).reshape(-1)
+            index, values, valid = _torsion_fields(
+                static, _topology_z(topology).tolist(), changed.trimer_pos, mapping, mode,
+                bond_table)
+        else:
+            index = torch.zeros(0, dtype=torch.long)
+            values = torch.zeros((0, 2), dtype=torch.float32)
+            valid = torch.zeros(0, dtype=torch.bool)
+        noisy.torsion_bond_index = index
+        noisy.torsion_values = values
+        noisy.torsion_mask = valid
     return noisy, targets
 
 

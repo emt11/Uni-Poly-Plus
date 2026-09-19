@@ -165,7 +165,7 @@ class PathAngleBias(nn.Module):
 
 
 class GalformerTrimer3D(nn.Module):
-    def __init__(self, dropout=0.1):
+    def __init__(self, dropout=0.1, *, torsion=False):
         super().__init__()
         self.endpoint = nn.Linear(101, 512)
         self.distance_basis = TypeGaussian(256, 104)
@@ -173,11 +173,28 @@ class GalformerTrimer3D(nn.Module):
         self.triplet = nn.Sequential(nn.Linear(1024, 512), nn.GELU(), nn.Linear(512, 512))
         self.angle_bias = PathAngleBias()
         self.layers = nn.ModuleList([TransformerBlock(dropout) for _ in range(6)])
+        # S4 torsion head: real Trimer heavy-atom quadruplets feed
+        # [cos(phi), cos(2*phi)] through a small MLP, pooled per physical
+        # center bond and added to the initial 3D bond token through one
+        # scalar gate initialized at zero (strictly zero initial increment).
+        self.torsion_mlp = (nn.Sequential(nn.Linear(2, 64), nn.GELU(), nn.Linear(64, 512))
+                            if torsion else None)
+        self.torsion_gate = nn.Parameter(torch.zeros(1)) if torsion else None
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+
+    def _torsion_increment(self, data, bond_count):
+        index = data.torsion_bond_index.long()
+        valid = data.torsion_mask.bool()
+        features = self.torsion_mlp(data.torsion_values.float())
+        pooled = features.new_zeros((bond_count, features.size(-1)))
+        counts = features.new_zeros((bond_count,))
+        pooled.index_add_(0, index[valid], features[valid])
+        counts.index_add_(0, index[valid], torch.ones_like(index[valid], dtype=features.dtype))
+        return pooled / counts.clamp_min(1.0).unsqueeze(-1)
 
     def forward(self, data):
         za, zb = element_index(data.bond_z_a), element_index(data.bond_z_b)
@@ -189,6 +206,8 @@ class GalformerTrimer3D(nn.Module):
         endpoints = self.endpoint(a) + self.endpoint(b)
         radial = self.distance_projection(self.distance_basis(distance, torch.stack([za, zb], -1)))
         states = self.triplet(torch.cat([endpoints, radial], -1))
+        if self.torsion_mlp is not None:
+            states = states + self.torsion_gate * self._torsion_increment(data, states.size(0))
         types = triplet_type(data.bond_z_a, data.bond_z_b, data.bond_type)
         path_bias = self.angle_bias(types, data.line_path, data.line_angle, data.line_mask)
         # Equal shortest paths contribute symmetrically to ONE attention edge.
@@ -209,13 +228,13 @@ class GalformerTrimer3D(nn.Module):
 class DualGLTModel(nn.Module):
     architecture_name = 'O8-BondPath-GalformerTrimer-Hop2'
 
-    def __init__(self, fusion_mode='concat', dropout=0.1):
+    def __init__(self, fusion_mode='concat', dropout=0.1, *, torsion=False):
         super().__init__()
         if fusion_mode not in {'concat', 'kfuse'}:
             raise ValueError('fusion_mode must be concat or kfuse')
         self.fusion_mode = fusion_mode
         self.o8 = BondPathO8(dropout)
-        self.glt = GalformerTrimer3D(dropout)
+        self.glt = GalformerTrimer3D(dropout, torsion=torsion)
         if fusion_mode == 'concat':
             self.norm2, self.norm3 = nn.LayerNorm(512), nn.LayerNorm(512)
         else:
@@ -251,5 +270,5 @@ class DualGLTModel(nn.Module):
         return self.predictor(self.fuse(self.encode(data, atom_mask=atom_mask)))
 
 
-def build_dual_glt_model(fusion_mode='concat', *, dropout=0.1):
-    return DualGLTModel(fusion_mode=fusion_mode, dropout=dropout)
+def build_dual_glt_model(fusion_mode='concat', *, dropout=0.1, torsion=False):
+    return DualGLTModel(fusion_mode=fusion_mode, dropout=dropout, torsion=torsion)
