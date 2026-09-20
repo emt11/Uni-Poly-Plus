@@ -247,3 +247,14 @@
 * 配对验证：新增`L_NEAR_GEO`保留完全相同物理关系但关闭跨度2距离，以及`L_OFF`关闭全部距离。L−NEAR检验跨度2显式几何，L−OFF检验整体几何，L−S只作多锚点/范围整体增量，L−P只作共享折叠/独立物理状态比较。保留全部r1组，不静默将L替换进P4/P5。
 * 新预算均待授权：M0三组各2updates及XC fold0各2epochs，合计6updates/6epochs；M1三条5k及18个30epoch开发单元，合计15000updates/540epochs。新增方向不依赖S已晋级，但替换判断需要已获授权且身份匹配的S/R参考。L相对NEAR/OFF均需XC mean增量≥0.01且两fold均正、EPS/EAT各退化不超过0.01，再验证参考保护条件；未通过停止，通过只列开发候选。与r1最大预算相加为75000研究updates+26correctness、2700开发epochs+18smoke，原P5最多120单元不增加。
 * 验证与下一步：文档逻辑、计数公式、预算与git diff --check自检；没有运行单测、GPU、训练、微调、缓存构建或清理。接手端先读取r2，原r1可在既有授权内继续，新M0/M1须单独授权；不干扰原P0脚本，不把新规划当成实施完成。Git同步结果见本轮交付。
+
+## 2026-09-20｜GLT-CANON3D-20260920-01 / r1–r2 规划归档：被用户新任务替换，未完成事项未获验收
+
+* 归档原因与状态：`Plan.md` 中原有的 `GLT-CANON3D-20260920-01 / r1`（基线 dev@79e3d2d）及其 `/ r2` 多-RU 修订（基线 dev@b61876d）在本日被用户新任务 `GLT-GALPH-PHRETENTION-20260920-01 / r1` 替换。CANON3D 周期**只完成规划**，没有任何阶段通过验收；本条目按用户要求保存其计划与未完成状态，**不标记为已完成，也不推翻其科学问题**（负结果/未执行 ≠ 被否决）。
+* 完整文本的稳定位置：CANON3D r1 的 `Plan.md` 原文保存在 git 提交 `b61876d`（`git show b61876d:Plan.md`），r2 修订保存在 `a231c05` 及其后到 `f991f84` 的 `Plan.md` blob（`git show a231c05:Plan.md`），可随时检索；本条只记录实质与状态，不重复粘贴全文。
+* 方案实质（r1）：以单个 RU 的 M 个 persistent canonical 原子状态承载 3D 表示，替换"全 Trimer 物理键更新后读中心键"的旧 GLT 分支；中心 query 访问全部真实 image（R=M(3M−1)，删 exact self、保留左右独立关系、不平均距离），固定完整关系集合以避免 geometry-OFF 的近邻 membership 泄漏；512 维/6 层/8 头，新独立 target-query/source-key 模块与 relation-conditioned bias/value；O8、Concat 与 chem/geo/FP 目标保持。对照：R_GLT、R_2D、G_OFF、S_SHARED；条件组 E_STATIC（侧 source 固定为 h0）与 P_PHYSICAL（真实 3M 动态状态）。开放 Trimer 上的状态共享为近似，不宣称严格周期性，不生成/优化构象。
+* 方案实质（r2）：保留 r1 全部组，新增 `L_MULTI2`（枚举冻结 Trimer 内全部物理有向原子对，每个 canonical 目标的三个物理锚点内独立 softmax，跨度 0/1/2 关系数分别为 3M(M−1)、4M²、2M²）及两个匹配控制 `L_NEAR_GEO`（只关闭跨度 2 距离）与 `L_OFF`（关闭全部距离）；新增 M0/M1 为独立待授权分支，不自动并入 P0–P1。
+* 拟议预算（均未使用）：P0 最多 1024 条数据审计；P1 六路径各 2 步 = 12 updates + 恢复验证 8 updates，另 12 个 smoke epochs；P2–P4 最多 12 条 5k = 60000 研究 updates、72 开发单元/2160 epochs，逐段授权；P5 另行授权（最多 3 组 × 8 任务 × 5 折 = 120 单元/12000 epochs，不新增预训练）。r2 的 M0/M1 另计（6 updates/6 epochs 与 15000 updates/540 epochs）。
+* 实际执行与回滚（执行者记录，供审查）：用户曾明确授权 `GLT-CANON3D-20260920-01 / r1` 的 P0–P1；执行者实现了拟新增文件 `src/dataset/canonical_geometry.py`、`src/modules/canonical_geometry.py`、`tests/test_canonical_geometry.py`、`scripts/audit_canon3d_p0.py`、`configs/mts/canon3d_*.json`，并运行 P0 只读审计写出 `results/glt_canon3d_20260920/p0/p0_audit.json`。用户随后指示停止该任务并要求回滚这些代码改动；执行者已删除上述 5 类新文件（**当前工作树中确认不存在**），仅保留未跟踪的只读产物 `results/glt_canon3d_20260920/p0/p0_audit.json`。该产物不参与后续任何判断，也未进入本日 GALPH 周期。
+* 未完成事项（逐项列出，全部未获验收）：P0 审计无独立审查；P1 的身份/关系数/不变性/G_OFF 回退/部署 strict-load 测试随代码删除而消失；P2 主比较（R_GLT/R_2D/G/S 各 5k）与 24 个开发单元从未运行；P3 条件归因（E_STATIC/P_PHYSICAL）、P4 多 seed 确认、P5 固定协议复评从未运行；r2 的 `L_MULTI2`/`L_NEAR_GEO`/`L_OFF` 与 M0/M1 从未实现或运行。以上内容不因本条归档而关闭或通过；若要重启，必须按当时的合同重新授权并重新建立验证，不得引用本条作为已完成证据。
+* 交接边界：CANON3D 的旧 Python 脚本若在别处残留，不构成本项目活跃计划；旧周期中提到的 S5 launcher/aggregator 源码缺口与本归档无关，仍未关闭，也不由本条修复。

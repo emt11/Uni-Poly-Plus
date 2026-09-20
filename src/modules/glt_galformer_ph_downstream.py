@@ -65,6 +65,10 @@ class GalformerDownstream(nn.Module):
         batch.ph_valid = torch.zeros((graphs,), dtype=torch.bool, device=device)
         return batch
 
+    def adjust_r3(self, batch, r3, out):
+        """Retention hook: the base path keeps r3 exactly as computed."""
+        return r3
+
     def summarize(self, batch):
         """Return (fused, aux) for the downstream readout."""
         out = self.encoder(batch)
@@ -76,6 +80,9 @@ class GalformerDownstream(nn.Module):
             r3 = self.readout3(torch.cat([out['cls3'], mean3], -1))
         else:
             r2, r3 = out['g2'], out['g3']
+        # Any retention residual is applied here, on the r3 that actually feeds
+        # the gate, the fusion and therefore the property head.
+        r3 = self.adjust_r3(batch, r3, out)
         gate = torch.sigmoid(self.gate(torch.cat([r2, r3], -1)))
         if self.readout == '2D_ONLY':
             fused = self.norm(r2)
