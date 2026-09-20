@@ -288,6 +288,7 @@ def _unit(group, task, fold, identity, **overrides):
            'pretrain_summary_mode': identity['summary_mode'],
            'pretrain_ph_mode': identity['ph_mode'],
            'readout': 'DUAL', 'adaptation': 'full',
+           'complete': True, 'stage_completed': 'diagnostics',
            'coverage': {'samples': 10, 'valid': 10, 'invalid': 0, 'missing': 0},
            'diagnostics': {'batches': 4, 'retention_gate_tanh': 0.01,
                            'residual_relative_norm': 1e-3, 'ph_valid_fraction': 1.0},

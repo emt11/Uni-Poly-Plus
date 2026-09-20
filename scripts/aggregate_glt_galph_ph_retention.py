@@ -67,6 +67,12 @@ def load_units(root, checkpoint_sha256, identity):
                         raise ValueError(f'unit {field}={row.get(field)!r} is not {expected!r}: {path}')
                 if row.get('updates_incomplete'):
                     raise ValueError(f'unit is an incomplete bounded run: {path}')
+                if row.get('complete') is not True:
+                    raise ValueError(
+                        f'unit is not a completed development unit '
+                        f"(complete={row.get('complete')!r}, "
+                        f"stage_completed={row.get('stage_completed')!r}, "
+                        f"failure={row.get('failure')!r}): {path}")
                 coverage = row.get('coverage')
                 if not isinstance(coverage, dict) or int(coverage.get('missing', 1)) != 0 \
                         or int(coverage.get('samples', 0)) <= 0 \

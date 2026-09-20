@@ -47,6 +47,9 @@ SMOKE_EPOCH_CAP = 2
 DEVELOPMENT_EPOCH_CAP = 30
 PROTOCOLS = ('ph_retention_bounded_updates', 'ph_retention_smoke',
              'ph_retention_development')
+# Filled in by main() as it walks groups/tasks/folds; the failure path in
+# __main__ reads it to say which unit died and at which stage.
+RUN_CONTEXT = {}
 
 
 def sha256_file(path):
@@ -273,6 +276,9 @@ def main():
         ph_encoder_version=package.get('ph_encoder_version'),
         ph_downstream='retention_residual_into_r3', outer_test='NOT_RUN'))
     all_folds = []
+    context = RUN_CONTEXT
+    context.update(group=args.group, protocol=protocol, output=str(output),
+                   started=time.perf_counter())
     for task in selected_tasks:
         csv_path = Path(args.raw_root) / f'smi_{task}.csv'
         manifest_path = Path(args.split_root) / f'{task}.json'
@@ -300,6 +306,7 @@ def main():
                 fold_started = time.perf_counter()
                 folder = output / task / f'fold{fold_id}'
                 folder.mkdir(parents=True, exist_ok=False)
+                context.update(task=task, fold=fold_id)
                 set_global_seed(int(run_config['seed']) + fold_id)
                 train, validation = (fold['train_indices'], fold['validation_indices'])
 
@@ -363,20 +370,25 @@ def main():
                         float(record['validation_r2']) for record in validation_summary.history]
                     unit['best_validation_r2'] = float(best_r2)
                     unit['best_epoch'] = int(best_epoch)
-                    unit['diagnostics'] = ph_diagnostics(model, val_loader, device,
-                                                         const_profile)
-                    save_checkpoint(folder / 'best.pt', dict(
+                    unit['wall_seconds'] = float(time.perf_counter() - fold_started)
+                    # Selection is done and the best weights are in memory: they are
+                    # written down before anything optional can fail, so a later
+                    # failure cannot cost the fold's checkpoint or its core metrics.
+                    complete_unit(folder, unit, dict(
                         state_dict=best, architecture=model.architecture_name,
                         group=args.group, task=task, fold=fold_id, protocol=protocol,
                         split=fold, config=run_config, best_validation_r2=best_r2,
                         best_epoch=best_epoch,
                         epochs_run=int(unit.get('epochs_run', -1)),
+                        validation_r2_history=unit['validation_r2_history'],
                         checkpoint_sha256=checkpoint_sha,
                         checkpoint_identity=verified,
                         scaler_mean=scaler.scaler.mean_.tolist(),
-                        scaler_scale=scaler.scaler.scale_.tolist()))
+                        scaler_scale=scaler.scaler.scale_.tolist()),
+                        model, val_loader, device, const_profile)
                 unit['wall_seconds'] = float(time.perf_counter() - fold_started)
-                write_json(folder / 'metrics.json', unit)
+                if protocol == PROTOCOLS[0]:
+                    write_json(folder / 'metrics.json', unit)
                 all_folds.append(unit)
                 del model, encoder, optimizer, scheduler
         finally:
@@ -389,6 +401,7 @@ def main():
         protocol=protocol, group=args.group, ph_residual=GROUPS_TO_MODE[args.group],
         units=all_folds, outer_test='NOT_RUN', validation_only=True,
         updates_incomplete=incomplete,
+        checkpoint_identity=verified,
         interpretation=('bounded trainability check' if protocol == PROTOCOLS[0] else
                         'development-fold validation-only evaluation; not OOF and not '
                         'independent blind evidence')))
@@ -397,11 +410,70 @@ def main():
         protocol=protocol, group=args.group, selected_tasks=selected_tasks,
         selected_folds=selected_folds, updates=requested_updates,
         updates_incomplete=incomplete, outer_test='NOT_RUN',
+        checkpoint_identity=verified,
         process_wall_seconds=float(time.perf_counter() - process_started)))
     if incomplete:
         raise RuntimeError('fewer optimizer updates ran than requested: '
                            + ', '.join(incomplete))
 
 
+def complete_unit(folder, unit, payload, model, val_loader, device, const_profile):
+    """Selection artefacts first, then the optional PH diagnostics.
+
+    The checkpoint and the core metrics are on disk before the diagnostic runs, so
+    a diagnostic failure cannot cost the fold its best weights; such a unit is left
+    with ``complete=False`` and a recorded failure stage, and the exception
+    propagates so the process exits non-zero.  The aggregator refuses units that
+    are not ``complete``.
+    """
+    save_checkpoint(folder / 'best.pt', payload)
+    unit['stage_completed'] = 'selection'
+    unit['complete'] = False
+    write_json(folder / 'metrics.json', unit)
+    try:
+        unit['diagnostics'] = ph_diagnostics(model, val_loader, device, const_profile)
+    except Exception as error:
+        unit['failure'] = dict(stage='ph_diagnostics',
+                               error=f'{type(error).__name__}: {error}',
+                               checkpoint_kept=True)
+        write_json(folder / 'metrics.json', unit)
+        raise
+    unit['stage_completed'] = 'diagnostics'
+    unit['complete'] = True
+    write_json(folder / 'metrics.json', unit)
+    return unit
+
+
+def write_failure(context, error):
+    """A unit that died mid-way is written as FAIL, never as a missing runtime.
+
+    ``context`` is updated by ``main`` as it walks groups/tasks/folds, so the
+    failure record names the unit and the stage that actually failed.
+    """
+    output = context.get('output')
+    if not output:
+        return None
+    folder = Path(output) / str(context.get('task', '')) / f"fold{context.get('fold', '')}"
+    kept = (folder / 'best.pt').is_file()
+    write_json(Path(output) / 'runtime.json', dict(
+        status='FAIL', protocol=context.get('protocol'), group=context.get('group'),
+        task=context.get('task'), fold=context.get('fold'),
+        failure=dict(error=f'{type(error).__name__}: {error}',
+                     stage=('selection_or_training' if not kept else 'ph_diagnostics'),
+                     checkpoint_kept=kept,
+                     metrics_written=(folder / 'metrics.json').is_file()),
+        outer_test='NOT_RUN',
+        process_wall_seconds=float(time.perf_counter() - context.get('started',
+                                                                     time.perf_counter()))))
+    return Path(output) / 'runtime.json'
+
+
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as failure:
+        # main() has already written the partial artefacts and kept the checkpoint;
+        # this records the failing unit as FAIL and keeps the non-zero exit visible.
+        write_failure(RUN_CONTEXT, failure)
+        print(f'RETENTION_RUN_FAILED {type(failure).__name__}: {failure}', file=sys.stderr)
+        raise

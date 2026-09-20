@@ -437,6 +437,7 @@ def _write_development_units(root, values, checkpoint_sha):
                     'pretrain_summary_mode': identity['summary_mode'],
                     'pretrain_ph_mode': identity['ph_mode'],
                     'readout': 'DUAL', 'adaptation': 'full',
+                    'complete': True, 'stage_completed': 'diagnostics',
                     'coverage': {'samples': 4, 'valid': 4, 'invalid': 0, 'missing': 0},
                     'diagnostics': {'batches': 2, 'retention_gate_tanh': 0.0,
                                     'residual_relative_norm': 0.0,

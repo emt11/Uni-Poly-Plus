@@ -4,14 +4,14 @@
 
 | 字段 | 内容 |
 | --- | --- |
-| 计划 ID | GLT-GALPH-PHRETENTION-20260920-01 / r5 |
-| 日期／状态 | 2026-09-20；**阻断**：r5 的身份接线、局部测试与只读接线诊断已完成；**三组 smoke 的 6/6 epoch 预算已全部消耗**（三组各训练 2 epochs 后在新增报告代码中崩溃，无 metrics 落盘），按 r5 合同"失败前消耗和重跑消耗都计入预算；若需要超预算重跑，停止并报告"**未自行重跑**，18 units 未启动（见 §9.7、§14）。原 18-unit 研究问题仍未回答 |
-| 用户要求 | ① 原始：同一 C1 主干下，下游**保留样本特异 PH**是否优于**关闭 PH**与**同容量固定 PH 分支**；② r5：在**修复版** C1 step5000 主干上做该匹配开发实验，先 3 组 × XC/fold0 ≤2 epochs smoke，通过后跑 18 个 development units（每单元 ≤30 epochs） |
-| 授权范围 | 本轮：必要的 checkpoint 身份接线与局部测试；3 组独立 smoke（合计 ≤6 epochs）；**smoke 通过后** 18 units（合计 ≤540 epochs）；新增预训练预算 0 updates |
-| 明确禁止 | 新预训练 / 有界 optimizer-update 实验；额外 seed、任务、fold、训练时长或结构；outer-test、OOF、train+validation refit；超预算重跑；用旧 C1 指标或旧 smoke 替代本轮控制；覆盖 r1–r4 产物 |
-| 角色 | Codex 规划与独立审查；ZCode 执行接线、smoke、development、汇总与文档；执行者不宣布最终验收通过 |
-| 基线 | dev@778ad6d（`git status` 干净、`HEAD...origin/dev = 0/0`）+ 本轮 commit（见 §9.7） |
-| 产物根目录 | `results/glt_galph_ph_retention_20260920/p3/`（本轮独立目录，不覆盖 p0/p1）、`logs/glt_galph_ph_retention_20260920/p3/` |
+| 计划 ID | GLT-GALPH-PHRETENTION-20260920-01 / r6 |
+| 日期／状态 | 2026-09-20；**执行中 → 待审查**：报告保存顺序与 launcher 已返修；3 组 × 1 epoch 恢复 smoke 已通过（3/3 epochs）；18 development units 执行中（授权 ≤540 epochs）。r5 的 6-epoch 消耗与失败记录**保留不抵销**（§14.2） |
+| 用户要求 | ① 原始：同一 C1 主干下，下游**保留样本特异 PH**是否优于**关闭 PH**与**同容量固定 PH 分支**；② r6：返修报告保存顺序与 launcher，做最小端到端恢复验证（3 epochs），通过后继续既有条件授权的 18 development units |
+| 授权范围 | 恢复 smoke 3 组 × XC/fold0 × 1 epoch（合计 ≤3 epochs）+ 既有授权的 18 units（≤30 epochs/单元、合计 ≤540 epochs）；不新增预训练、optimizer-update smoke、seed、任务或 fold |
+| 明确禁止 | outer-test、OOF、train+validation refit；改变模型/损失/门控初始化/晋级判据；超预算重跑；把失败 smoke 补写为 PASS；删除或覆盖 r5 失败目录与退出码更正记录 |
+| 角色 | Codex 规划与独立审查；ZCode 执行返修、验证、development、汇总与文档；执行者不宣布最终验收通过 |
+| 基线 | dev@5d0ca89（工作树干净、`HEAD...origin/dev = 0/0`）+ 本轮 commit |
+| 产物根目录 | `results/glt_galph_ph_retention_20260920/p4/`（r5 的 p3 保留不动）、`logs/glt_galph_ph_retention_20260920/p4/` |
 
 本文件是拟实施合同，不是既有 CLI。执行端在阶段结束时回填 §9；状态只在有证据时推进。
 
@@ -57,6 +57,13 @@ Codex 对 r2 交付提出两项诊断缺陷；r3 的修复与替代范围见 **�
 * **唯一初始化**：`pretrain_C1_REPAIR_5K/deploy_05000.pt`（sha256 `3063cf8b…`，step 5000、cls/global、`scale-interaction-v2`、204 张量 strict-load 逐位一致）。旧 GALPH `summary.json` **不被覆盖**，也不再作为本轮的版本闸门。
 * **本轮不做**：不比较"修复预训练 vs 旧预训练"孰优，不验证 PH-XATTN，不做正式泛化评测，不新增预训练 budget。
 * **r4 表述更正**：见 §13.2 第 4 条的 r5 更正（诊断 step 0 属 common-init/LEGACY 参考；REPAIR 实际起点 `tanh(α)=0.02`），旧证据保留、不重跑。
+
+### 0.6 r6 修订说明（保存顺序、launcher 与最小恢复验证）
+
+* **保留 r5 全部失败痕迹**：`p3/smoke_*`（仅 `run.json`）、各组 traceback 日志、`p3/chain_status.log` 与更正 `p3/chain_status_correction.txt` 一律不删、不改写；r5 消耗的 6 epochs **不抵销**。
+* **本轮返修**（见 §9.8 与 §15）：训练结果先落盘（`best.pt` + 核心指标在可选 PH 诊断之前），诊断失败保留 checkpoint 与核心指标并写 `complete=false` + 失败阶段，进程非零退出且写 FAIL `runtime.json`；aggregator 拒绝 `complete!=true` 的单元；launcher 立即捕获真实退出码、失败即停、错误路径不写 `ALL_DONE`。
+* **恢复 smoke 明确配置 1 epoch**（`configs/mts/glt_galph_downstream_dual_epoch1.json`），三组各一次，共 3 epochs。
+* **不改变**科学定义：同一部署包、同初始化、冻结 PH encoder、`gamma=0`、FULL adaptation、outer5_inner20、seed 42、≤30 epochs、patience 10、train-only scaler、validation 选优、无 refit、不因预算末端最佳值延长。
 
 ## 1. 科学问题与可证伪假设
 
@@ -265,6 +272,25 @@ GPU、worker 或超过一分钟的任务在 tmux `Uni-Poly` 独立 window 执行
 | 预算 | smoke 6 epochs（全部为失败消耗）；dev 0；预训练 0 updates | r2 的 1026/超 514 与 r4 的 5000/5000 各自独立保留 |
 | Git（r5） | 完成 | commit `1a60fbc`（身份记录、共享校验模块、runner/aggregator 接线、r5 测试、只读诊断脚本、`Plan.md` r5 记录）+ 其后的登记提交，推送 `origin/dev`；fetch 后 `HEAD...origin/dev = 0/0`、远端指向本轮 commit、工作树干净 |
 
+### 9.8 r6 记录（保存顺序与 launcher 返修；恢复 smoke 3/3；18/18 units 完成）
+
+| 项目 | 状态 | 证据／限制 |
+| --- | --- | --- |
+| 执行前核对与 pull | 完成 | `HEAD=5d0ca89`、工作树干净、`HEAD...origin/dev = 0/0`、GPU 空闲、无活动训练进程 |
+| 保存顺序返修 | 完成 | `scripts/finetune_glt_galformer_ph_retention.py`：新增 `complete_unit()`（先 `best.pt` + 核心 `metrics.json`，再可选 PH 诊断；失败保留产物、记 `complete=false`/`failure.stage`、重新抛出）与 `write_failure()`（写 FAIL `runtime.json`，含 `stage`/`checkpoint_kept`/`metrics_written`）；`__main__` 捕获后打印 `RETENTION_RUN_FAILED …` 并保持非零退出 |
+| aggregator 返修 | 完成 | `scripts/aggregate_glt_galph_ph_retention.py`：新增 `complete is True` 硬校验（其余身份/覆盖率/预算校验沿用），错误信息含 `complete`/`stage_completed`/`failure` |
+| launcher 返修 | 完成 | 新增 `scripts/run_glt_galph_retention.sh`：命令后立即取 `code=$?`；失败即停并原样退出；错误路径不写 `ALL_DONE`；修复 `GROUPS` 与 bash 内建变量冲突（曾使组名变成 `0`） |
+| 1-epoch smoke 配置 | 完成 | `configs/mts/glt_galph_downstream_dual_epoch1.json`（仅 `epochs: 1`，其余沿用既有开发配置） |
+| 零训练局部回归 | 完成 | `tests/test_glt_galph_ph_retention_r6.py` 新增 6 项；全套 **44 passed, EXIT=0**（`logs/glt_galph_ph_retention_20260920/r6_tests.log`）；不启动训练、不占 epoch 预算 |
+| 报告路径先行检查 | 完成（0 updates） | `scripts/check_glt_galph_retention_diagnostics.py` → `p4/diagnostics_path_check.json`（`DIAGPATH_EXIT=0`，tmux `galph_r6_diagpath`）：真实 xc/fold0 的 8 个 validation 样本上直接调用修复后的 `ph_diagnostics`，三组均返回有限值；未消耗 smoke 预算 |
+| 恢复 smoke | 完成（3/3 epochs） | launcher 顺序执行三组 × XC/fold0 × 1 epoch：`F_OFF` 15:48:09→15:48:29、`F_CONST` →15:48:48、`F_REAL` →15:49:07，均 **exit=0**，`p4/smoke_r6_status.log` 以 `ALL_DONE` 结束；产物 `p4/smoke_r6/<GROUP>/{best.pt,xc/fold0/metrics.json,runtime.json}` |
+| smoke 校验 | 完成 | `scripts/verify_glt_galph_retention_smoke.py` → `p4/smoke_r6_verification.json`（`VERIFY_EXIT=0`）：**每组 26 项 + 5 项分离性全部通过**（退出码、`epochs_run=1`、三件产物、身份、validation-only、`outer_test=NOT_RUN`、指标有限、`best.pt` strict-load、PH encoder 冻结且 eval、覆盖率；F_OFF 残差恰为 0、F_CONST 输入样本无关、F_REAL 非样本无关） |
+| 18 development units | 完成 | launcher `--protocol development`：`F_OFF` 15:50:41→15:59:57、`F_CONST` →16:09:19、`F_REAL` →16:18:46，均 **exit=0**；18/18 单元 `complete=true`、`validation_only=true`、`outer_test=NOT_RUN`；结果见 §15.4 |
+| 汇总 | 完成 | `scripts/aggregate_glt_galph_ph_retention.py` → `p4/development_aggregate.json`（`AGG_EXIT=0`）：身份、覆盖率、预算、有限性校验全部通过；`VERDICT=STOP`、`risk_flags=[]` |
+| 失败与重试 | 无（训练） | 本轮 0 次训练失败、0 次重试；两次**非训练**脚本修复：报告路径检查脚本缺 `import numpy`（0 updates）、launcher 组名变量缺陷（由单元测试与验证发现并修复） |
+| 预算 | 未超出 | 恢复 smoke 3/3 epochs；development 411/540 epochs；预训练与 optimizer-update smoke 0；r5 的 6 epochs 失败消耗保留记录、不抵销（§14.2） |
+| Git（r6） | 完成 | 本轮 commit（保存顺序/launcher/aggregator 返修、r6 测试、smoke 校验与报告路径脚本、1-epoch 配置、`Plan.md` r6 记录）+ 登记提交，推送 `origin/dev` 并核验 `HEAD...origin/dev = 0/0` |
+
 ## 10. 下一步
 
 本轮交付后交 Codex 审查（§3 四处返修的实际 diff、§4 诊断与 §5/§6 预检证据、§9.2 的预算偏差）。审查通过前不启动任何扩展：
@@ -273,6 +299,8 @@ GPU、worker 或超过一分钟的任务在 tmux `Uni-Poly` 独立 window 执行
 * 不自动重跑 N1/C1 的 5k，不自动进入 XATTN、multiscale、额外 seed 或正式评测，不自动重跑旧四臂；
 * 若审查接受 R_REPAIR 作为修复配方，缺的是**新的单条 C1 长程确认授权**（5k 约 82 min）与随后的 18 units 授权。**256 步预检不构成"5k 不会再次退化"的证据，更不构成 PH 提升属性预测的证据**；其唯一结论是"该配方在 256 步内可训练、无衰减、输入敏感性不降"；
 * 若审查选择选项 B（改科学问题：下游 PH encoder 新初始化并训练）或选项 C（归档为负结果），§11.3–§11.4 的证据可直接支撑，无需新增运行。
+
+**r5/r6 补充（2026-09-20，执行端注记，不改写上文）**：r5 完成身份接线后因 smoke 预算耗尽阻断（§14）；r6 返修保存顺序与 launcher、跑通 3-epoch 恢复 smoke 并在**同一新主干**上完成 18 个 development units（§9.8、§15）。**本轮结论为负结果**：F_REAL 相对 F_OFF/F_CONST 的三任务均值增益为 +5.0e-6 / +1.1e-7，远低于预登记 +0.005，`VERDICT=STOP`、无 risk flag；实测门控极小（|tanh γ| ≤ 3.8e-4）。是否继续、以及是否改变科学问题，由 Codex 规划。
 
 **r3/r4 补充（2026-09-20，执行端注记，不改写上文）**：上段"缺新的单条 C1 长程确认授权"已在 r4 获批并执行完毕——单条 `C1_REPAIR_5K`（5000/5000 updates）与只读诊断的结果见 **§9.6 / §13**；r3 的诊断返修见 **§12**。18 development units 仍**未授权、未执行**；本文件 §1–§8 仍为暂停中的登记合同，是否恢复由 Codex 规划。
 
@@ -538,3 +566,75 @@ GPU、worker 或超过一分钟的任务在 tmux `Uni-Poly` 独立 window 执行
 1. **补跑 smoke**：3 组 × XC/fold0 × ≤2 epochs = ≤6 epochs（修复已落地并有回归测试）；产物写 `p3/smoke_*`（现有目录保留为预算消耗证据，不覆盖）。
 2. smoke 通过后启动 **18 development units**（≤30 epochs/单元、patience 10、outer5_inner20、seed 42、FULL adaptation、PH encoder 冻结、validation-only、outer_test=NOT_RUN），产物写 `p3/development/{F_OFF,F_CONST,F_REAL}/`，再由 aggregator 按已预登记的 §7 判据汇总。
 3. 若审查认为可用 §14.3 的只读证据替代 smoke 门，请明确说明——执行端不自行替代。
+
+## 15. r6 结果与验收（保存顺序返修、恢复 smoke 与 18 development units）
+
+### 15.1 本轮返修（见 §9.8 的 diff 清单）
+
+1. **结果先落盘**：`best.pt`（含 `best_validation_r2`/`best_epoch`/`epochs_run`/validation history/split/身份）与核心 `metrics.json` 在可选 PH 诊断**之前**写出；诊断失败保留二者，`metrics.json` 记 `complete=false` + `stage_completed='selection'` + `failure.stage='ph_diagnostics'`，进程非零退出并写 **FAIL** `runtime.json`（`stage`、`checkpoint_kept`、`metrics_written`）。全部必需步骤成功才写 `complete=true` 与 PASS runtime。
+2. **aggregator 拒绝部分产物**：单元必须 `complete is True`，否则 `ValueError: unit is not a completed development unit`。
+3. **launcher**（`scripts/run_glt_galph_retention.sh`）：命令后**立即** `code=$?`，先记 `EXIT group=… code=…` 再记状态；非零立即 `STOPPED_AFTER_FAILURE` 并以该退出码退出，**不启动后续组**；只有全部成功才写 `ALL_DONE`。（修掉了 r5 里 `$(date)` 覆盖 `$?` 的缺陷；另修掉 `GROUPS` 与 bash 内建特殊变量冲突导致组名变成 `0` 的问题。）
+4. 保留 r5 的 const-profile 设备修复（`.to(device=profiles.device)`）与其回归测试。
+
+### 15.2 零训练预算局部回归（`logs/glt_galph_ph_retention_20260920/r6_tests.log`）
+
+**44 passed，EXIT=0**（r1/r2 retention 15 + r5 wiring 13 + r6 新 6 + diagnostic 10）。r6 新增（`tests/test_glt_galph_ph_retention_r6.py`，全部使用 fixture 与假进程，不启动训练）：诊断抛异常时 `best.pt` 与核心指标仍在且 `complete=false`、FAIL runtime 记录失败阶段；成功路径交付完整单元；aggregator 拒绝部分单元；launcher 保留退出码 1、只跑第一组、不写 `ALL_DONE`；成功时跑满三组并写 `ALL_DONE`；非法 protocol 退出码 2。
+
+### 15.3 恢复 smoke（3 组 × XC/fold0 × 1 epoch，合计 3 epochs）
+
+`configs/mts/glt_galph_downstream_dual_epoch1.json`（`epochs=1`），经 launcher 顺序执行：`F_OFF` 15:48:09→15:48:29、`F_CONST` →15:48:48、`F_REAL` →15:49:07，三组 **exit=0**，状态日志以 `ALL_DONE` 结束。逐组 26 项校验（真实退出码、`epochs_run=1`、`best.pt`/`metrics.json`/`runtime.json` 齐全、身份与 encoder 版本、validation-only、`outer_test=NOT_RUN`、指标有限、`best.pt` strict-load、PH encoder 冻结且 eval、覆盖率完整）+ 5 项分离性检查全部通过：`p4/smoke_r6_verification.json`，`VERIFY_EXIT=0`。
+
+分离性（smoke 的 8 样本批次）：F_OFF `residual_norm=0`（源 zero_placeholder）；F_CONST 输入跨样本 spread **0.0**、`encoder_summary_own_vs_const=0.0`（源 p_train_mean_fixed）；F_REAL spread **0.71**、`encoder_summary_own_vs_const=0.29`（源 sample_own_frozen）。三组 R² 均为 0.2093（1 epoch，仅证明流程可跑，**不可解释为预测性能**）。
+
+### 15.4 18 development units（F_OFF/F_CONST/F_REAL × XC/EPS/EAT × fold0/1）
+
+同一部署包（sha256 `3063cf8b…`）、同初始化、冻结 PH encoder、`gamma=0` 起步、FULL adaptation、outer5_inner20、seed42、`epochs≤30`、patience10、train-only scaler、validation 选优、无 refit。**F_OFF 为本轮重训控制**，未使用旧 C1 指标或任何 smoke 结果替代。三组均 `exit=0`、`ALL_DONE`，18/18 单元 `complete=true`。
+
+| 任务 | 组 | fold0 R² | fold1 R² | 任务均值 | epochs (f0/f1) | best_epoch (f0/f1) |
+| --- | --- | --- | --- | --- | --- | --- |
+| xc | F_OFF | 0.327180 | 0.385436 | 0.356308 | 16/19 | 6/9 |
+| xc | F_CONST | 0.327186 | 0.385435 | 0.356310 | 16/19 | 6/9 |
+| xc | F_REAL | 0.327186 | 0.385435 | 0.356310 | 16/19 | 6/9 |
+| eps | F_OFF | 0.773621 | 0.876573 | 0.825097 | 20/22 | 10/12 |
+| eps | F_CONST | 0.773622 | 0.876596 | 0.825109 | 20/22 | 10/12 |
+| eps | F_REAL | 0.773620 | 0.876598 | 0.825109 | 20/22 | 10/12 |
+| eat | F_OFF | 0.991276 | 0.989242 | 0.990259 | 30/30 | 24/24 |
+| eat | F_CONST | 0.991276 | 0.989242 | 0.990259 | 30/30 | 24/24 |
+| eat | F_REAL | 0.991276 | 0.989242 | 0.990259 | 30/30 | 24/24 |
+
+整体（三任务均值）：F_OFF 0.723888、F_CONST 0.723893、F_REAL 0.723893。
+
+| 差值 | 三任务均值 | xc | eps | eat |
+| --- | --- | --- | --- | --- |
+| F_REAL − F_OFF | **+0.0000050** | +0.0000029 | +0.0000122 | −0.00000002 |
+| F_REAL − F_CONST | **+0.0000001** | +0.0000005 | −0.0000001 | −0.0000000 |
+| F_CONST − F_OFF | +0.0000049 | +0.0000025 | +0.0000123 | −0.00000002 |
+
+门控与残差（6 单元均值）：`tanh(γ)` F_OFF 0.0 / F_CONST 1.62e-4 / F_REAL 1.65e-4；残差/参考 F_OFF 0 / CONST 1.21e-4 / REAL 1.21e-4；PH 有效率 F_OFF 0 / CONST 1.0 / REAL 1.0。覆盖率（每折 train+validation，`valid/invalid/missing`）：xc 345/0/0、eps 305/0/0、eat 312/0/0。成本：F_OFF 544 s、F_CONST 550 s、F_REAL 555 s，合计 27.5 min；可训练参数 40,992,145，冻结训练专用头 8 个；无失败、无重试。
+
+**接线有效性（不是"三组相同"）**：F_CONST 与 F_REAL 的输入与表示明确不同（前者跨样本 spread 恰为 0、summary 与 const 完全相同；后者 spread 0.71–0.96、summary 与 const 相差 0.29–0.35，源标记分别为 `p_train_mean_fixed` 与 `sample_own_frozen`），`best.pt` 权重也不同（如 `ph_proj.weight` 相差 0.015–0.042，243 个张量中约 203–206 个逐位不同），γ 在两组都被训练到非零。**因此三组的接近不是接线失效所致。**
+
+### 15.5 预登记判据与结论（阈值未因结果改动）
+
+* 三任务均值相对两个控制均需 ≥ **+0.005**：实测 +0.0000050 与 +0.0000001 → **未达到**。
+* XC 声称需两折均不退化且均值 ≥ **+0.01**：xc 均值 +2.9e-6 / +4.8e-7 → **不成立**。
+* 任一任务均值相对任一控制退化超过 **0.01**：无（最大退化 2e-8）→ `risk_flags` 为空。
+* **VERDICT：`STOP: F_REAL does not reach the three-task gain threshold against both controls`**（aggregator 原文），`EPS_ONLY_CANDIDATE=false`，无 `best_epoch` 触及 30 上限的单元。
+
+**结论（仅限本轮开发比较）**：在本轮修复版 C1_REPAIR_5K 主干与既定配方下，**下游保留样本特异 PH 没有带来可检出的属性预测增益**；三组差异在 1e-5 量级，比预登记阈值低约三个数量级。这是**负结果**，本轮据此完成，不追加实验。
+
+**限制与不得声称**：
+1. 训练得到的门控极小（`|tanh γ| ≤ 3.8e-4`），残差仅占参考的 ~1.2e-4：本轮实际比较的是"几乎关闭的 PH 残差"。这既是结果本身（模型没有学会打开它），也**限制**了结论——本轮**不能**回答"若门控更大/更强条件化时 PH 是否有用"。按要求未调整门控、未加开门正则、未改融合结构。
+2. 两折、单一 seed、共享 validation 折的开发比较**不是**独立盲测，也不是显著性检验；不访问 outer-test，不做 OOF。
+3. eat 上三组几乎完全相同（0.991276/0.989242），该任务对 PH 条件化不敏感（也可能是该任务接近可分上限）。
+4. 不得据此宣布 PH retention 方向整体失败或成功；不得与旧 C1 结果做受控比较（不同主干/初始化）。
+
+### 15.6 预算
+
+| 项目 | 授权 | 实际 |
+| --- | --- | --- |
+| 恢复 smoke | 3 组 × 1 epoch = ≤3 epochs | **3**（三组各 1，全部成功） |
+| development units | 18 单元 × ≤30 epochs = ≤540 epochs | **411**（均 ≤30：16/19/20/22/30/30 ×3 组） |
+| 预训练 / optimizer-update smoke | 0 | **0** |
+| 只读诊断与 CPU 测试 | 不计入 | 报告路径检查 1 次（0 updates）、CPU 测试 44 项 |
+| r5 历史消耗 | 保留 | **6 epochs 失败消耗，记录不抵销**（§14.2、`p3/chain_status_correction.txt`） |
