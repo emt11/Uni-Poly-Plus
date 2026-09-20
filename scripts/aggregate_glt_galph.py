@@ -66,13 +66,42 @@ def summarize_pretrain(root):
             'schedule_total_steps': run['identity']['config']['schedule_total_steps'],
         }
         if deploy.is_file():
+            import hashlib
             import torch
             package = torch.load(deploy, map_location='cpu', weights_only=False)
             report[arm]['deployment_step'] = int(package['step'])
             report[arm]['deployment_summary_mode'] = package['summary_mode']
             report[arm]['deployment_ph_mode'] = package['ph_mode']
+            report[arm]['deployment_ph_encoder_version'] = package.get('ph_encoder_version')
             report[arm]['deployment_tensors'] = len(package['state_dict'])
+            report[arm]['deployment_bytes'] = deploy.stat().st_size
+            report[arm]['deployment_sha256'] = hashlib.sha256(
+                deploy.read_bytes()).hexdigest()
     return report
+
+
+def version_freeze(pretrain, attribution_path):
+    """The r3 freeze record: SHAs, PH encoder version and training commits."""
+    import hashlib
+    attribution = {}
+    path = Path(attribution_path)
+    if path.is_file():
+        attribution = json.loads(path.read_text(encoding='utf-8'))
+    return {
+        'common_init': {
+            'path': 'results/glt_galph_20260920/p1/common_init_galph_v1.pt',
+            'sha256': hashlib.sha256(Path(
+                'results/glt_galph_20260920/p1/common_init_galph_v1.pt').read_bytes()).hexdigest(),
+        },
+        'ph_encoder_version': 'scale-interaction-v2',
+        'deployments': {arm: {'path': row.get('deployment'),
+                              'step': row.get('deployment_step'),
+                              'sha256': row.get('deployment_sha256'),
+                              'ph_encoder_version': row.get('deployment_ph_encoder_version')}
+                        for arm, row in pretrain.items()},
+        'training_commits': attribution.get('training_commits', {}),
+        'training_commit_evidence': attribution.get('evidence', {}),
+    }
 
 
 def summarize_development(root):
@@ -90,9 +119,11 @@ def summarize_development(root):
                 units[f'{arm}/{task}/fold{fold}'] = {
                     'best_validation_r2': float(row['best_validation_r2']),
                     'best_epoch': int(row['best_epoch']),
-                    'epochs_configured': int(row['config']['epochs']),
+                    'validation_r2_final_epoch': float(row['validation_r2']),
                     'wall_seconds': float(row.get('wall_seconds', float('nan'))),
                     'readout': row['readout'],
+                    'pretrain_step': int(row['pretrain_step']),
+                    'pretrain_ph_mode': str(row['pretrain_ph_mode']),
                     'trainable_parameter_count': int(row['trainable_parameter_count']),
                 }
     if missing:
@@ -134,11 +165,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--pretrain')
     parser.add_argument('--development')
+    parser.add_argument('--commit-attribution',
+                        default='results/glt_galph_20260920/commit_attribution.json')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     payload = {}
     if args.pretrain:
         payload['pretrain'] = summarize_pretrain(args.pretrain)
+        payload['versions'] = version_freeze(payload['pretrain'], args.commit_attribution)
     if args.development:
         payload['development'] = summarize_development(args.development)
     Path(args.output).write_text(json.dumps(payload, indent=2), encoding='utf-8')
