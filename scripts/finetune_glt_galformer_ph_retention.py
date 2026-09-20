@@ -4,9 +4,9 @@
 All three groups load the same frozen C1 ``deploy_05000.pt`` (verified by
 sha256 against the previous cycle's version record), build the identical module
 tree and therefore the identical initial tensors; only the PH input differs.
-Development and smoke modes are validation-only: no outer-test loader exists in
-this file.  ``--updates N`` bounds the optimizer steps for the bounded
-trainability check.
+Exactly one of ``--updates``/``--smoke``/``--development`` must be selected:
+the first runs a bounded trainability check, the other two are validation-only
+over xc/eps/eat folds 0/1 and no outer-test loader exists in this file.
 """
 import argparse
 import hashlib
@@ -40,6 +40,12 @@ from src.utils import set_global_seed, scale_targets, train_epoch, _cosine_sched
 GROUPS_TO_MODE = {'F_OFF': 'off', 'F_CONST': 'const', 'F_REAL': 'real'}
 VERSION_RECORD = 'results/glt_galph_20260920/summary.json'
 DIAGNOSTIC_BATCHES = 8
+ALLOWED_TASKS = ('xc', 'eps', 'eat')
+ALLOWED_FOLDS = (0, 1)
+SMOKE_EPOCH_CAP = 2
+DEVELOPMENT_EPOCH_CAP = 30
+PROTOCOLS = ('ph_retention_bounded_updates', 'ph_retention_smoke',
+             'ph_retention_development')
 
 
 def sha256_file(path):
@@ -52,24 +58,45 @@ def frozen_arm_deployment(group_arm, record_path=VERSION_RECORD):
     return record['versions']['deployments'][group_arm]['sha256']
 
 
+def resolve_protocol(updates, smoke, development):
+    """Exactly one of updates/smoke/development must be requested explicitly."""
+    if updates is not None and int(updates) <= 0:
+        raise ValueError('--updates must be a positive integer')
+    chosen = [name for name, active in (('updates', updates is not None),
+                                        ('smoke', bool(smoke)),
+                                        ('development', bool(development))) if active]
+    if len(chosen) != 1:
+        raise ValueError('select exactly one of --updates, --smoke and --development')
+    return {'updates': PROTOCOLS[0], 'smoke': PROTOCOLS[1],
+            'development': PROTOCOLS[2]}[chosen[0]]
+
+
+def epoch_budget(protocol, configured):
+    """Smoke/bounded runs cap at two epochs, development at thirty."""
+    cap = DEVELOPMENT_EPOCH_CAP if protocol == PROTOCOLS[2] else SMOKE_EPOCH_CAP
+    return min(int(configured), cap)
+
+
+def runtime_status(units):
+    """A unit that ran fewer optimizer steps than requested can never be a PASS."""
+    incomplete = sorted(f'{unit["group"]}/{unit["task"]}/fold{unit["fold"]}'
+                        for unit in units if unit.get('updates_incomplete'))
+    return ('FAIL' if incomplete else 'PASS'), incomplete
+
+
 def resolve_selection(tasks, folds, *, smoke=False, development=False, updates=0):
-    """Only development/smoke selections exist; there is no outer-test mode."""
-    selected_tasks = list(tasks) if tasks else list(TASKS)
-    selected_folds = [int(value) for value in folds] if folds else list(range(5))
-    if development and not tasks:
-        selected_tasks = ['xc', 'eps', 'eat']
-    if development and not folds:
-        selected_folds = [0, 1]
+    """Only the retention scope (xc/eps/eat, folds 0/1) exists; no outer-test mode."""
+    selected_tasks = list(tasks) if tasks else list(ALLOWED_TASKS)
+    selected_folds = [int(value) for value in folds] if folds else list(ALLOWED_FOLDS)
     if sorted(set(selected_tasks) - set(TASKS)) or any(v < 0 or v >= 5 for v in selected_folds):
         raise ValueError('task/fold selection is outside TASKS or outer5_inner20')
     if smoke or updates:
         if len(selected_tasks) != 1 or len(selected_folds) != 1:
             raise ValueError('a bounded run requires exactly one --task and one --fold')
-    elif development:
-        if not set(selected_tasks).issubset({'xc', 'eps', 'eat'}):
-            raise ValueError('--development only permits xc, eps and eat')
-        if any(value not in (0, 1) for value in selected_folds):
-            raise ValueError('--development only permits folds 0 and 1')
+    if not set(selected_tasks).issubset(set(ALLOWED_TASKS)):
+        raise ValueError('this round only runs xc, eps and eat')
+    if any(value not in ALLOWED_FOLDS for value in selected_folds):
+        raise ValueError('this round only runs folds 0 and 1')
     return selected_tasks, selected_folds
 
 
@@ -109,7 +136,11 @@ def bounded_updates(model, loader, optimizer, scheduler, device, updates, summar
                            'ph_valid_fraction': model.last_ph_stats.get('ph_valid_fraction')})
         if seen >= updates:
             break
-    summary.update(optimizer_updates=seen, training_losses=losses, gate_gradients=gate_grads)
+    summary.update(optimizer_updates=seen, updates_requested=int(updates),
+                   training_losses=losses, gate_gradients=gate_grads)
+    if seen < int(updates):
+        # A loader that ends early must never be reported as a completed check.
+        summary['updates_incomplete'] = int(updates) - seen
     return summary
 
 
@@ -151,23 +182,21 @@ def main():
                         help='single task/fold, at most two epochs, validation-only')
     parser.add_argument('--development', action='store_true',
                         help='xc/eps/eat folds 0/1, validation-only')
-    parser.add_argument('--updates', type=int, default=0,
+    parser.add_argument('--updates', type=int, default=None,
                         help='bounded trainability check: exactly this many optimizer steps')
     parser.add_argument('--clean-cache-gib', type=float, default=0.0)
     args = parser.parse_args()
     process_started = time.perf_counter()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
-    if args.smoke and args.development:
-        raise ValueError('--smoke and --development are mutually exclusive')
-    if args.updates and (args.smoke or args.development):
-        raise ValueError('--updates is a separate bounded mode')
+    protocol = resolve_protocol(args.updates, args.smoke, args.development)
+    requested_updates = int(args.updates) if args.updates is not None else 0
     selected_tasks, selected_folds = resolve_selection(
         args.tasks, args.folds, smoke=args.smoke, development=args.development,
-        updates=args.updates)
+        updates=requested_updates)
+    epoch_cap = (DEVELOPMENT_EPOCH_CAP if protocol == PROTOCOLS[2] else SMOKE_EPOCH_CAP)
     run_config = dict(config)
-    run_config['epochs'] = (min(int(config.get('epochs', 30)), 2)
-                            if (args.smoke or args.updates) else int(config.get('epochs', 30)))
+    run_config['epochs'] = epoch_budget(protocol, config.get('epochs', DEVELOPMENT_EPOCH_CAP))
     run_config['readout'] = args.readout
     run_config['adaptation'] = 'full'
     if args.development and args.readout != 'DUAL':
@@ -191,14 +220,12 @@ def main():
     const_profile = load_const_profile(args.const_profile)
     sidecar_meta = json.loads((Path(args.ph_sidecar) / 'metadata.json')
                               .read_text(encoding='utf-8'))
-    protocol = ('ph_retention_bounded_updates' if args.updates else
-                'ph_retention_smoke' if args.smoke else
-                'ph_retention_development')
     write_json(output / 'run.json', dict(
         config=run_config, command=sys.argv, protocol=protocol, group=args.group,
         ph_residual=GROUPS_TO_MODE[args.group], readout=args.readout,
         adaptation='full', selected_tasks=selected_tasks,
-        selected_folds=selected_folds, updates=int(args.updates),
+        selected_folds=selected_folds, updates=requested_updates,
+        epochs_cap=int(epoch_cap),
         checkpoint=str(args.checkpoint), checkpoint_sha256=checkpoint_sha,
         ph_sidecar=str(args.ph_sidecar), ph_sidecar_records=len(reader),
         const_profile=str(args.const_profile),
@@ -270,6 +297,7 @@ def main():
                                                       if p.requires_grad)),
                     total_parameter_count=int(sum(p.numel() for p in model.parameters())),
                     epochs_configured=int(run_config['epochs']),
+                    epochs_cap=int(epoch_cap),
                     train_sample_count=int(len(train)),
                     validation_sample_count=int(len(validation)),
                     outer_test='NOT_RUN', validation_only=True,
@@ -277,9 +305,9 @@ def main():
                     coverage=fold_coverage(reader, [dataset.source.samples[int(i)][0].hex()
                                                     for i in list(train) + list(validation)],
                                            key_rows))
-                if args.updates:
+                if protocol == PROTOCOLS[0]:
                     unit = bounded_updates(model, train_loader, optimizer, scheduler,
-                                           device, int(args.updates), unit)
+                                           device, requested_updates, unit)
                     unit['best_validation_r2'] = None
                     unit['best_epoch'] = None
                 else:
@@ -308,17 +336,23 @@ def main():
                 dataset.cache_stats()
             source.close()
     pd.DataFrame(all_folds).to_csv(output / 'all_fold_metrics.csv', index=False)
+    status, incomplete = runtime_status(all_folds)
     write_json(output / 'summary.json', dict(
         protocol=protocol, group=args.group, ph_residual=GROUPS_TO_MODE[args.group],
         units=all_folds, outer_test='NOT_RUN', validation_only=True,
-        interpretation=('bounded trainability check' if args.updates else
+        updates_incomplete=incomplete,
+        interpretation=('bounded trainability check' if protocol == PROTOCOLS[0] else
                         'development-fold validation-only evaluation; not OOF and not '
                         'independent blind evidence')))
     write_json(output / 'runtime.json', dict(
-        status='PASS', pid=os.getpid(), command=sys.argv, protocol=protocol,
-        group=args.group, selected_tasks=selected_tasks, selected_folds=selected_folds,
-        updates=int(args.updates), outer_test='NOT_RUN',
+        status=status, pid=os.getpid(), command=sys.argv,
+        protocol=protocol, group=args.group, selected_tasks=selected_tasks,
+        selected_folds=selected_folds, updates=requested_updates,
+        updates_incomplete=incomplete, outer_test='NOT_RUN',
         process_wall_seconds=float(time.perf_counter() - process_started)))
+    if incomplete:
+        raise RuntimeError('fewer optimizer updates ran than requested: '
+                           + ', '.join(incomplete))
 
 
 if __name__ == '__main__':

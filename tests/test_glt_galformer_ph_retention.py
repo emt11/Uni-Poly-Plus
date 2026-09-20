@@ -77,6 +77,39 @@ def _with_ph(batch, profiles, valid):
     return batch
 
 
+# Downstream batches carry no 2D/3D mask rows, so these two embeddings are
+# legitimately outside the prediction graph (``grad is None``) without being
+# frozen.  Every other parameter without a gradient must be frozen on purpose.
+INACTIVE_DOWNSTREAM = ('encoder.mask_2d_embedding', 'encoder.mask_3d_embedding')
+
+
+def _gradient_parity(base, retention):
+    """Compare gradients on the real shared ``named_parameters`` objects.
+
+    Returns the shared parameter names that actually carry a nonzero gradient.
+    ``None`` is accepted only when both sides agree *and* the parameter is either
+    frozen or explicitly inactive downstream, so an all-``None`` comparison can
+    no longer pass as parity.
+    """
+    left, right = dict(base.named_parameters()), dict(retention.named_parameters())
+    assert set(left) & set(right), 'the two paths must share parameters'
+    frozen = {name for name, value in retention.named_parameters()
+              if not value.requires_grad}
+    graded = []
+    for name in sorted(set(left) & set(right)):
+        left_grad, right_grad = left[name].grad, right[name].grad
+        if left_grad is None or right_grad is None:
+            assert left_grad is None and right_grad is None, \
+                f'{name}: only one path has a gradient'
+            assert name in frozen or name in INACTIVE_DOWNSTREAM, \
+                f'{name}: an unfrozen, active parameter lost its gradient'
+            continue
+        torch.testing.assert_close(left_grad, right_grad, atol=0, rtol=0, msg=name)
+        if float(left_grad.abs().max()) > 0.0:
+            graded.append(name)
+    return graded
+
+
 # ① profile shape / collate / key alignment
 def test_profile_shape_and_collate():
     batch = _toy_batch()
@@ -166,9 +199,10 @@ def test_f_off_matches_the_original_c1_downstream_path():
     base = GalformerDownstream(_encoder(seed=3), readout='DUAL')
     set_global_seed(7)
     retention = GalformerPHDownstream(_encoder(seed=3), readout='DUAL', ph_residual='off')
-    common = set(base.state_dict()) & set(retention.state_dict())
+    common = sorted(set(dict(base.named_parameters())) & set(dict(retention.named_parameters())))
     for name in common:
-        assert torch.equal(base.state_dict()[name], retention.state_dict()[name]), name
+        assert torch.equal(dict(base.named_parameters())[name],
+                           dict(retention.named_parameters())[name]), name
     base.eval(), retention.eval()
     with torch.no_grad():
         left, _ = base(batch)
@@ -191,16 +225,19 @@ def test_f_off_matches_the_original_c1_downstream_path():
         criterion(output, batch.y).backward()
         outputs.append(output.detach().clone())
     torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
-    for name in common:
-        left_grad = base.state_dict()[name].grad
-        right_grad = retention.state_dict()[name].grad
-        assert (left_grad is None) == (right_grad is None), name
-        if left_grad is not None:
-            torch.testing.assert_close(left_grad, right_grad, atol=0, rtol=0, msg=name)
+    graded = _gradient_parity(base, retention)
+    trunk = [name for name in graded if name.startswith(('encoder.o8.', 'encoder.glt.'))]
+    head = [name for name in graded if name.startswith('head.')]
+    assert trunk, 'no trunk parameter carried a nonzero gradient'
+    assert head, 'no property-head parameter carried a nonzero gradient'
+    parameters = dict(retention.named_parameters())
+    for name in trunk + head:
+        assert bool(torch.isfinite(parameters[name].grad).all()), name
     for _, optimizer in optimizers:
         optimizer.step()
+    left_params, right_params = dict(base.named_parameters()), dict(retention.named_parameters())
     for name in common:
-        torch.testing.assert_close(base.state_dict()[name], retention.state_dict()[name],
+        torch.testing.assert_close(left_params[name], right_params[name],
                                    atol=0, rtol=0, msg=name)
     # the PH module receives no gradient in F_OFF, only the zeroed branch
     assert retention.ph_proj.weight.grad is None or \
@@ -334,3 +371,109 @@ def test_runner_has_no_outer_test_path():
     assert runner.resolve_selection(None, None, development=True) == (
         ['xc', 'eps', 'eat'], [0, 1])
     assert runner.resolve_selection(['xc'], [0], updates=2) == (['xc'], [0])
+
+
+# ⑫ r2: exactly one protocol, this round's scope, budget caps and status rule
+def test_protocol_selection_scope_budget_and_status():
+    import scripts.finetune_glt_galformer_ph_retention as runner
+    assert runner.resolve_protocol(2, False, False) == 'ph_retention_bounded_updates'
+    assert runner.resolve_protocol(None, True, False) == 'ph_retention_smoke'
+    assert runner.resolve_protocol(None, False, True) == 'ph_retention_development'
+    for call in ((None, False, False), (2, True, False), (2, False, True), (None, True, True)):
+        with pytest.raises(ValueError):
+            runner.resolve_protocol(*call)
+    for updates in (0, -3):
+        with pytest.raises(ValueError):
+            runner.resolve_protocol(updates, False, False)
+    for tasks, folds in ((['hm'], [0]), (['xc'], [2]), (['xc'], [0, 1]), (None, None)):
+        with pytest.raises(ValueError):
+            runner.resolve_selection(tasks, folds, updates=256)
+    assert runner.epoch_budget('ph_retention_smoke', 30) == 2
+    assert runner.epoch_budget('ph_retention_bounded_updates', 30) == 2
+    assert runner.epoch_budget('ph_retention_development', 40) == 30
+    assert runner.epoch_budget('ph_retention_development', 12) == 12
+    assert runner.runtime_status([{'group': 'F_OFF', 'task': 'eps', 'fold': 1}]) == ('PASS', [])
+    assert runner.runtime_status([{'group': 'F_REAL', 'task': 'xc', 'fold': 0,
+                                   'updates_incomplete': 4}]) == ('FAIL', ['F_REAL/xc/fold0'])
+
+
+# ⑬ r2: the sidecar builder refuses to overwrite a completed artifact
+def test_sidecar_builder_refuses_to_overwrite():
+    if not (SIDECAR / '.done').is_file():
+        pytest.skip('downstream PH sidecar not built yet')
+    import subprocess
+    completed = subprocess.run(
+        [sys.executable, 'scripts/build_glt_ph_downstream_sidecar.py',
+         '--cohort-root', 'data/processed/glt_dual_v2/downstream/cohort_1545eda5a8f6a1',
+         '--cache-root', 'data/processed/mips_trimer_scage_downstream',
+         '--dual-static-root', 'data/processed/glt_dual_v2/downstream/dual_static_v1',
+         '--output-root', str(SIDECAR), '--p-train-sidecar', str(PH_ROOT)],
+        capture_output=True, text=True)
+    assert completed.returncode != 0, 'the builder must not overwrite a finished sidecar'
+    assert 'refusing to overwrite' in completed.stderr
+
+
+def _write_development_units(root, values, checkpoint_sha):
+    for group in ('F_OFF', 'F_CONST', 'F_REAL'):
+        for task in ('xc', 'eps', 'eat'):
+            for fold in (0, 1):
+                folder = Path(root) / group / task / f'fold{fold}'
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / 'metrics.json').write_text(json.dumps({
+                    'group': group, 'task': task, 'fold': fold,
+                    'protocol': 'ph_retention_development', 'outer_test': 'NOT_RUN',
+                    'best_validation_r2': values[group][task][fold], 'best_epoch': 5,
+                    'epochs_configured': 30, 'checkpoint_sha256': checkpoint_sha,
+                    'wall_seconds': 1.0}), encoding='utf-8')
+
+
+# ⑭ r2: the aggregator checks identity, finiteness, budget and holds on risk
+def test_aggregator_checks_identity_finiteness_budget_and_risk(tmp_path):
+    import scripts.aggregate_glt_galph_ph_retention as aggregator
+    sha = aggregator.frozen_c1_sha256()
+    values = {group: {task: [0.70, 0.71] for task in ('xc', 'eps', 'eat')}
+              for group in ('F_OFF', 'F_CONST', 'F_REAL')}
+    _write_development_units(tmp_path, values, sha)
+    tied = aggregator.summarize(tmp_path)
+    assert tied['risk_flags'] == []
+    assert tied['VERDICT'].startswith('STOP')
+
+    values['F_REAL']['xc'] = [0.65, 0.71]
+    _write_development_units(tmp_path, values, sha)
+    risky = aggregator.summarize(tmp_path)
+    assert set(risky['risk_flags']) == {'xc vs F_OFF', 'xc vs F_CONST'}
+    assert risky['VERDICT'] == 'NEEDS_REVIEW', 'a risk flag must never promote a verdict'
+    assert 'risk_flags is not empty' in risky['verdict_note']
+
+    values['F_REAL']['xc'] = [0.70, 0.71]
+    values['F_OFF']['eps'] = [float('inf'), 0.71]
+    _write_development_units(tmp_path, values, sha)
+    with pytest.raises(ValueError, match='non-finite'):
+        aggregator.summarize(tmp_path)
+
+    values['F_OFF']['eps'] = [0.70, 0.71]
+    values['F_OFF']['eps'] = [None, 0.71]
+    _write_development_units(tmp_path, values, sha)
+    with pytest.raises(ValueError, match='non-finite'):
+        aggregator.summarize(tmp_path)
+
+    values['F_OFF']['eps'] = [0.70, 0.71]
+    _write_development_units(tmp_path, values, sha)
+    path = Path(tmp_path) / 'F_REAL' / 'eat' / 'fold1' / 'metrics.json'
+    row = json.loads(path.read_text(encoding='utf-8'))
+    row['checkpoint_sha256'] = '0' * 64
+    path.write_text(json.dumps(row), encoding='utf-8')
+    with pytest.raises(ValueError, match='frozen C1 deployment'):
+        aggregator.summarize(tmp_path)
+
+    row['checkpoint_sha256'] = sha
+    row['group'] = 'F_CONST'
+    path.write_text(json.dumps(row), encoding='utf-8')
+    with pytest.raises(ValueError, match='identity'):
+        aggregator.summarize(tmp_path)
+
+    row['group'] = 'F_REAL'
+    row['best_epoch'] = 31
+    path.write_text(json.dumps(row), encoding='utf-8')
+    with pytest.raises(ValueError, match='budget'):
+        aggregator.summarize(tmp_path)

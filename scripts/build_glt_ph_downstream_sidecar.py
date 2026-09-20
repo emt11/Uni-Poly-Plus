@@ -57,6 +57,8 @@ def main():
     args = parser.parse_args()
     started = time.perf_counter()
     output = Path(args.output_root)
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError(f'refusing to overwrite an existing sidecar: {output}')
     output.mkdir(parents=True, exist_ok=True)
 
     keys, profiles, valids = [], [], []
@@ -76,11 +78,18 @@ def main():
             reused, fresh_invalid = 0, 0
             for index in sorted(needed):
                 key = source.samples[int(index)][0]
+                if len(key) != 32:
+                    raise ValueError(f'sample key must be 32 bytes, got {len(key)}')
                 hex_key = key.hex()
                 if hex_key in row_of:
                     reused += 1
                     continue
                 _, trimer, _ = source[int(index)]
+                if trimer is None:
+                    raise ValueError(f'no frozen Trimer geometry for key {hex_key}')
+                # A degenerate but legitimately present geometry stays on the
+                # invalid contract (zeros + valid=False); only a mapping or
+                # identity failure raises.
                 profile, ok = ph_profile(
                     np.asarray(trimer.trimer_pos, dtype=np.float64),
                     np.asarray(trimer.trimer_atomic_number, dtype=np.int64))

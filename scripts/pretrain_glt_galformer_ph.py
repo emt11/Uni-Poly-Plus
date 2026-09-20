@@ -15,6 +15,7 @@ import argparse
 import hashlib
 from contextlib import nullcontext
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -31,7 +32,7 @@ from src.modules.glt_dual_pretrain import (alignment_local_anchor_count,
                                            global_objective)
 from src.modules.glt_galformer_ph_pretrain import (GalformerPretrainer,
                                                    galformer_deployment_package)
-from src.modules.glt_galformer_ph import PH_ENCODER_VERSION
+from src.modules.glt_galformer_ph import PH_ENCODER_VERSION, PH_PATCHES
 from src.training.glt_dual_runtime import (IndexedFrozenDualSource,
                                            OrderedSampleStream,
                                            apply_common_initialization,
@@ -47,6 +48,88 @@ ARMS = {'N0': ('mean', None), 'N1': ('mean', 'global'),
         'C0': ('cls', None), 'C1': ('cls', 'global')}
 MASK_GROUPS = ('mask2d_rows', 'mask2d_policy', 'mask2d_donor_atoms',
                'mask3d_rows', 'mask3d_policy', 'mask3d_donor_atoms')
+# The PH path the residual gate multiplies: encoder and projection, not ph_head.
+PH_PATH_PREFIXES = ('ph_encoder.', 'ph_to_summary.', 'alpha_ph')
+
+
+def is_ph_path_parameter(name):
+    return name.startswith(PH_PATH_PREFIXES)
+
+
+def ph_parameter_state(model, weight_decay):
+    """Per-tensor norms, task gradients and the coupled decay term of the PH path."""
+    per_tensor, gradient_square, decay_square = {}, 0.0, 0.0
+    for name, parameter in model.named_parameters():
+        if not is_ph_path_parameter(name):
+            continue
+        parameter_norm = float(parameter.detach().float().norm())
+        gradient_norm = (float(parameter.grad.detach().float().norm())
+                         if parameter.grad is not None else 0.0)
+        decay_norm = float(weight_decay) * parameter_norm
+        per_tensor[name] = {'parameter_norm': parameter_norm,
+                            'gradient_norm': gradient_norm,
+                            'decay_term_norm': decay_norm}
+        gradient_square += gradient_norm ** 2
+        decay_square += decay_norm ** 2
+    return {'per_tensor': per_tensor, 'gradient_norm_total': gradient_square ** 0.5,
+            'decay_term_norm_total': decay_square ** 0.5}
+
+
+def ph_monitor_row(model, data, probe, const, step, *, weight_decay, loss_terms,
+                   pre_clip=None, post_clip=None, before=None):
+    """One monitoring row: gate, norms, gradients, decay, update size, sensitivity.
+
+    The probe forward runs under ``eval`` + ``no_grad``: it consumes no dropout RNG,
+    leaves no gradient, and cannot move the sample position or the scheduler.
+    """
+    row = {'step': int(step), 'weight_decay': float(weight_decay),
+           'alpha_ph': float(model.alpha_ph.detach()),
+           'tanh_alpha': float(torch.tanh(model.alpha_ph.detach())),
+           'losses': loss_terms,
+           'ph_parameter_norms': {name: float(parameter.detach().float().norm())
+                                  for name, parameter in model.named_parameters()
+                                  if is_ph_path_parameter(name)}}
+    if pre_clip is not None:
+        row['pre_clip'] = pre_clip
+    if post_clip is not None:
+        row['post_clip'] = post_clip
+    if before is not None:
+        row['parameter_update'] = {
+            name: float((parameter.detach().float() - before[name]).norm())
+            for name, parameter in model.named_parameters()
+            if is_ph_path_parameter(name) and name in before}
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            probe_mask = torch.zeros((probe.size(0), PH_PATCHES), dtype=torch.bool,
+                                     device=probe.device)
+            summary = model.ph_encoder.summarize(model.ph_encoder(probe, probe_mask)).float()
+            average = model.ph_encoder.summarize(model.ph_encoder(
+                const.unsqueeze(0).expand_as(probe).contiguous(), probe_mask)).float()
+            out = model(data)
+            residual = torch.tanh(model.alpha_ph.float()) * model.ph_to_summary(
+                out['ph_summary'].float())
+            valid = data.ph_valid.bool().unsqueeze(-1)
+            masked = torch.where(valid, residual, torch.zeros_like(residual))
+            reference = torch.where(valid, out['g3'].float() - residual,
+                                    out['g3'].float())
+            reference_norm = float(reference.norm())
+            row['probe_sensitivity'] = {
+                'probe_count': int(probe.size(0)),
+                'profile_spread': float((probe.max(0).values - probe.min(0).values).max()),
+                'summary_norm_mean': float(summary.norm(dim=-1).mean()),
+                'summary_spread': float((summary.max(0).values - summary.min(0).values).max()),
+                'real_vs_const_max_abs': float((summary - average).abs().max())}
+            row['residual_relative_norm'] = (float(masked.norm()) / reference_norm
+                                             if reference_norm else 0.0)
+            row['graph_count'] = int(data.graph_available.numel())
+            row['all_finite'] = bool(torch.isfinite(masked).all()
+                                     and torch.isfinite(summary).all())
+    finally:
+        if was_training:
+            model.train()
+    return row
 
 
 class _MicrobatchStream(torch.utils.data.Dataset):
@@ -173,6 +256,17 @@ def main():
                         help='absolute steps at which to force a deployment export')
     parser.add_argument('--prep-workers', type=int, default=0,
                         help='DataLoader workers per rank for input prefetch')
+    parser.add_argument('--ph-no-weight-decay', action='store_true',
+                        help='trainability pre-check: PH path in its own Adam group with '
+                             'weight_decay=0; every other parameter keeps the configured '
+                             'settings')
+    parser.add_argument('--alpha-ph-tanh-init', type=float,
+                        help='trainability pre-check: start tanh(alpha_ph) at this value')
+    parser.add_argument('--ph-monitor', help='JSONL path for the PH monitor rows')
+    parser.add_argument('--ph-monitor-steps', type=int, nargs='*',
+                        default=[0, 1, 2, 16, 64, 128, 256])
+    parser.add_argument('--ph-probe', help='fixed probe profiles [N,3,32] for monitoring')
+    parser.add_argument('--ph-const-profile', help='P_train mean profile for monitoring')
     parser.add_argument('--log-every', type=int, default=10)
     parser.add_argument('--write-common-init',
                         help='evaluation-only: write the seeded step-0 shared state and exit')
@@ -276,8 +370,32 @@ def main():
         if common_init_path:
             # The artifact holds the shared step-0 state in the encoder key space.
             common_init = apply_common_initialization(trainer.model, common_init_path)
-        optimizer = torch.optim.Adam(trainer.parameters(), lr=float(config['lr']),
-                                     weight_decay=float(config.get('weight_decay', 0.0)))
+        if args.alpha_ph_tanh_init is not None:
+            if ph_mode != 'global':
+                raise ValueError('--alpha-ph-tanh-init requires a PH arm')
+            if not -1.0 < float(args.alpha_ph_tanh_init) < 1.0:
+                raise ValueError('--alpha-ph-tanh-init must lie strictly inside (-1, 1)')
+            with torch.no_grad():
+                # Zero-initializing the gate starves every parameter behind it;
+                # this pre-check opens it by a fixed, recorded amount instead.
+                trainer.model.alpha_ph.fill_(math.atanh(float(args.alpha_ph_tanh_init)))
+        weight_decay = float(config.get('weight_decay', 0.0))
+        if args.ph_no_weight_decay:
+            if ph_mode != 'global':
+                raise ValueError('--ph-no-weight-decay requires a PH arm')
+            decayed, ph_params = [], []
+            for name, parameter in trainer.model.named_parameters():
+                (ph_params if is_ph_path_parameter(name) else decayed).append(parameter)
+            if not ph_params:
+                raise ValueError('the PH path has no parameters to separate')
+            optimizer = torch.optim.Adam(
+                [dict(params=decayed, weight_decay=weight_decay),
+                 dict(params=ph_params, weight_decay=0.0)], lr=float(config['lr']))
+        else:
+            optimizer = torch.optim.Adam(trainer.parameters(), lr=float(config['lr']),
+                                         weight_decay=weight_decay)
+        # Decay actually applied to the PH path, for the monitor's decay term.
+        effective_wd = 0.0 if args.ph_no_weight_decay else weight_decay
         module = (DistributedDataParallel(trainer,
                                           device_ids=[device.index] if device.type == 'cuda' else None,
                                           find_unused_parameters=True)
@@ -301,7 +419,10 @@ def main():
             ph_encoder_version=(PH_ENCODER_VERSION if ph_mode else None),
             mask_candidate_rate=0.40, mask_policy='80_10_10',
             contrastive_temperature=float(config.get('contrastive_temperature', 0.1)),
-            optimizer='adam', grad_clip=float(config.get('grad_clip', 1.0)))
+            optimizer='adam', grad_clip=float(config.get('grad_clip', 1.0)),
+            ph_path_weight_decay=('zero' if args.ph_no_weight_decay else 'coupled'),
+            alpha_ph_tanh_init=(float(args.alpha_ph_tanh_init)
+                                if args.alpha_ph_tanh_init is not None else None))
         ordered_keys_hash = ordered_text_hash(
             key.hex() for key, _ in source.samples)
         resume_rng = None
@@ -358,6 +479,16 @@ def main():
             restore_rng(resume_rng)
         weights = [float(value) for value in config['loss_weights']]
         records_path = output / f'records_rank{rank}.jsonl'
+        monitor_steps = {int(value) for value in args.ph_monitor_steps} if args.ph_monitor else set()
+        probe = const = None
+        if monitor_steps:
+            if not args.ph_probe or not args.ph_const_profile:
+                raise ValueError('--ph-monitor requires --ph-probe and --ph-const-profile')
+            import numpy as np
+            probe = torch.as_tensor(np.load(args.ph_probe), dtype=torch.float32).to(device)
+            const = torch.as_tensor(np.load(args.ph_const_profile),
+                                    dtype=torch.float32).to(device)
+            monitor_path = Path(args.ph_monitor)
         for step in range(start, stop):
             step_started = time.perf_counter()
             prepared_started = time.perf_counter()
@@ -377,6 +508,9 @@ def main():
                                        ('lr', 'warmup_steps', 'schedule_total_steps', 'end_lr')})
             for group in optimizer.param_groups:
                 group['lr'] = lr
+            # A row labelled k is the state after exactly k optimizer updates,
+            # so the requested steps are matched by the completed-update counter.
+            monitor_now = bool(monitor_steps) and (step + 1) in monitor_steps and rank == 0
             optimizer.zero_grad(set_to_none=True)
             totals = torch.zeros(4, device=device)
             for offset, (data, labels) in enumerate(prepared):
@@ -393,9 +527,13 @@ def main():
                         raise FloatingPointError('nonfinite pretraining loss')
                     loss.backward()
                 totals += result['sums'].detach()
+            pre_clip = (ph_parameter_state(trainer.model, effective_wd)
+                        if monitor_now else None)
             grad_norm = float(torch.nn.utils.clip_grad_norm_(
                 trainer.parameters(), float(config.get('grad_clip', 1.0)),
                 error_if_nonfinite=True))
+            post_clip = (ph_parameter_state(trainer.model, effective_wd)
+                         if monitor_now else None)
             ph_grad_norms = None
             if ph_mode == 'global':
                 def _grad_norm(module):
@@ -409,6 +547,21 @@ def main():
                     'scale_fuse': _grad_norm(trainer.model.ph_encoder.scale_fuse),
                     'ph_encoder': _grad_norm(trainer.model.ph_encoder),
                 }
+            before = ({name: parameter.detach().float().clone()
+                       for name, parameter in trainer.model.named_parameters()
+                       if is_ph_path_parameter(name)} if monitor_now else None)
+            if rank == 0 and 0 in monitor_steps and step == 0:
+                # Step 0 is the initial state: recorded before any optimizer update.
+                initial = ph_monitor_row(
+                    trainer.model, moved_data, probe, const, 0,
+                    weight_decay=effective_wd,
+                    loss_terms=(totals / counts.clamp_min(1)).tolist(),
+                    pre_clip=pre_clip, post_clip=post_clip)
+                initial.update(arm=arm, lr=float(lr), grad_norm_preclip=grad_norm,
+                               losses_scope='rank0_local_window_before_all_reduce',
+                               note='initial state, before the first optimizer update')
+                with monitor_path.open('a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(initial) + '\n')
             optimizer.step()
             if world > 1:
                 dist.all_reduce(totals)
@@ -430,6 +583,16 @@ def main():
                 print(json.dumps(record), flush=True)
             with records_path.open('a', encoding='utf-8') as handle:
                 handle.write(json.dumps(record, sort_keys=True) + '\n')
+            if monitor_now:
+                row = ph_monitor_row(
+                    trainer.model, moved_data, probe, const, step + 1,
+                    weight_decay=effective_wd, loss_terms=record['losses'],
+                    pre_clip=pre_clip, post_clip=post_clip, before=before)
+                row['arm'] = arm
+                row['lr'] = float(lr)
+                row['grad_norm_preclip'] = grad_norm
+                with monitor_path.open('a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(row) + '\n')
             if (step + 1) in save_steps or (step + 1) % config['save_every'] == 0 \
                     or step + 1 == config['max_optimizer_steps']:
                 states = [None] * world
