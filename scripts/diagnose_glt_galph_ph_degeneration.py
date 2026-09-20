@@ -19,9 +19,19 @@ Only valid P_train rows are used, the selection never looks at any downstream
 validation metric, and every value is compared against an explicit tolerance so
 that a numerically meaningless non-zero is not reported as signal.  The script
 writes one JSON (plus the probe tensors) and never modifies a checkpoint.
+
+r3 corrections (Codex review of the r2 diagnostic):
+
+* every condition runs on its own shallow batch view, so replacing the PH input
+  for one condition cannot leak into the next one;
+* the residual and the heads are taken *inside* the same autocast context as the
+  forward that produced ``g3`` (the residual is read back as ``g3`` minus the
+  pre-residual summary), so the bf16 and fp32 rows no longer mix precisions.
 """
 import argparse
 from contextlib import nullcontext
+import copy
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -159,66 +169,124 @@ def load_model(checkpoint, device):
     return model.to(device).eval(), int(package['step'])
 
 
-def _forward(model, data, profiles, device, precision):
-    if profiles is not None:
-        data.ph_profile = profiles
+def _forward(model, data, device, precision):
+    """Model outputs in one precision convention.
+
+    The residual is read back from the model's own tensors (``g3`` minus the
+    pre-residual summary it was added to) and the heads run *inside* the same
+    autocast context as the forward, so no quantity is recomputed in a different
+    precision than the pass that produced it.
+    """
     with torch.no_grad(), _autocast(device, precision):
         out = model(data)
-    summary = out['g3'].float()
-    ph_summary = out['ph_summary'].float()
-    valid = data.ph_valid.bool().unsqueeze(-1)
-    residual = (torch.tanh(model.alpha_ph.float()) * model.ph_to_summary(ph_summary))
-    return {'g3': summary, 'masked_residual': torch.where(valid, residual,
-                                                          torch.zeros_like(residual)),
-            'reference': torch.where(valid, summary - residual, summary),
-            'ph_head': model.ph_head(summary).float(),
-            'cl_proj3': model.cl_proj3(summary).float()}
+        if out.get('cls3') is None:
+            raise ValueError('the diagnostic requires the CLS summary route')
+        summary = torch.where(out['line3d_valid'].bool().unsqueeze(-1), out['cls3'],
+                              torch.zeros_like(out['cls3']))
+        # Two views of the same quantity, both inside the forward's own precision:
+        # the model's own tensors (exact convention, but a subtraction, so limited
+        # by cancellation at ~eps_T of the summary) and the model's own expression
+        # recomputed in the same context (cancellation-free).
+        direct = torch.tanh(model.alpha_ph) * model.ph_to_summary(out['ph_summary'])
+        direct = torch.where(data.ph_valid.bool().unsqueeze(-1), direct,
+                             torch.zeros_like(direct))
+        return {'g3': out['g3'], 'summary': summary, 'residual': out['g3'] - summary,
+                'residual_direct': direct,
+                'ph_head': model.ph_head(out['g3']), 'cl_proj3': model.cl_proj3(out['g3'])}
+
+
+def _with_profile(data, profile):
+    """A shallow batch view carrying a different PH profile.
+
+    The batch handed in is never modified: every condition gets its own view, so
+    one condition's input cannot leak into the next call.
+    """
+    if profile is None:
+        return data
+    view = copy.copy(data)
+    view.ph_profile = profile
+    return view
+
+
+def _relative_change(left, right, reference):
+    return float((left.float() - right.float()).norm()) / reference
 
 
 def model_stats(model, data, const, device, precision, forced_gate=0.02):
-    """Fixed-model effect of replacing the PH input, per gate value."""
+    """Fixed-model effect of replacing the PH input, per gate value.
+
+    Every condition runs on its own batch view and the model state is restored
+    (`alpha_ph` bit-exactly, training mode included) even if a pass raises.
+    """
     handle = data.to(device)
+    own = handle.ph_profile
+    inputs = {'own': None,
+              'const': const.unsqueeze(0).expand_as(own).contiguous(),
+              'shuffled': own.roll(1, 0)}
     checkpoint_gate = float(torch.tanh(model.alpha_ph.detach().float()))
-    profiles = handle.ph_profile.clone()
-    shuffled = profiles.roll(1, 0)
-    const_batch = const.unsqueeze(0).expand_as(profiles).contiguous()
+    original = model.alpha_ph.detach().clone()
+    was_training = model.training
     rows = []
-    for gate in sorted({round(checkpoint_gate, 12), forced_gate}):
+    try:
+        model.eval()
+        for gate in sorted({round(checkpoint_gate, 12), forced_gate}):
+            with torch.no_grad():
+                model.alpha_ph.fill_(math.atanh(gate))
+            outputs = {name: _forward(model, _with_profile(handle, profile),
+                                      device, precision)
+                       for name, profile in inputs.items()}
+            repeat = _forward(model, handle, device, precision)
+            reference = float(outputs['own']['summary'].float().norm().clamp_min(1e-30))
+            residual_norm = float(outputs['own']['residual'].float().norm())
+            direct_norm = float(outputs['own']['residual_direct'].float().norm())
+            floor = _relative_change(repeat['g3'], outputs['own']['g3'], reference)
+            row = {
+                'tanh_alpha': gate,
+                'checkpoint_gate': bool(abs(gate - round(checkpoint_gate, 12)) < 1e-15),
+                'precision': precision,
+                'g3_dtype': str(outputs['own']['g3'].dtype),
+                'residual_dtype': str(outputs['own']['residual'].dtype),
+                'residual_direct_dtype': str(outputs['own']['residual_direct'].dtype),
+                'head_dtype': str(outputs['own']['ph_head'].dtype),
+                'reference_profile': 'own',
+                'summary_norm': reference,
+                # g3 - summary: the model's exact convention, cancellation-limited.
+                'residual_norm': residual_norm,
+                'residual_relative_norm': residual_norm / reference,
+                # the model's own expression in the same context: cancellation-free.
+                'residual_norm_direct': direct_norm,
+                'residual_relative_norm_direct': direct_norm / reference,
+                # How far the cancellation-limited view is from the exact one; a
+                # number, not a verdict, because a degenerate checkpoint can put
+                # them orders of magnitude apart while both stay negligible.
+                'residual_views_ratio': (abs(residual_norm - direct_norm)
+                                         / max(direct_norm, 1e-30)),
+                'g3_real_norm': float(outputs['own']['g3'].float().norm()),
+                'g3_repeat_floor': floor,
+                'g3_relative_change_const': _relative_change(outputs['const']['g3'],
+                                                             outputs['own']['g3'], reference),
+                'g3_relative_change_shuffled': _relative_change(outputs['shuffled']['g3'],
+                                                                outputs['own']['g3'], reference),
+                'ph_head_relative_change_const': _relative_change(
+                    outputs['const']['ph_head'], outputs['own']['ph_head'],
+                    float(outputs['own']['ph_head'].float().norm().clamp_min(1e-30))),
+                'cl_proj3_relative_change_const': _relative_change(
+                    outputs['const']['cl_proj3'], outputs['own']['cl_proj3'],
+                    float(outputs['own']['cl_proj3'].float().norm().clamp_min(1e-30))),
+                'all_finite': bool(all(torch.isfinite(value).all() for value in
+                                       (outputs['own']['g3'], outputs['const']['g3'],
+                                        outputs['own']['ph_head']))),
+            }
+            floor_limit = max(TOLERANCE[precision], 10.0 * floor)
+            row['resolution_floor'] = floor_limit
+            row['observable_at_tolerance'] = bool(
+                row['residual_relative_norm_direct'] > floor_limit
+                and row['g3_relative_change_const'] > floor_limit)
+            rows.append(row)
+    finally:
         with torch.no_grad():
-            model.alpha_ph.fill_(math.atanh(gate))
-        real = _forward(model, handle, None, device, precision)
-        repeat = _forward(model, handle, None, device, precision)
-        other = _forward(model, handle, const_batch, device, precision)
-        moved = _forward(model, handle, shuffled, device, precision)
-        reference = real['reference'].norm().clamp_min(1e-30)
-        # Two identical forwards bound what a difference can mean in this precision.
-        repeat_floor = float((repeat['g3'] - real['g3']).norm() / reference)
-        row = {
-            'tanh_alpha': gate,
-            'checkpoint_gate': bool(abs(gate - round(checkpoint_gate, 12)) < 1e-15),
-            'residual_relative_norm': float(real['masked_residual'].norm() / reference),
-            'g3_real_norm': float(real['g3'].norm()),
-            'g3_repeat_floor': repeat_floor,
-            'g3_relative_change_const': float((other['g3'] - real['g3']).norm() / reference),
-            'g3_relative_change_shuffled': float((moved['g3'] - real['g3']).norm() / reference),
-            'ph_head_relative_change_const': float(
-                (other['ph_head'] - real['ph_head']).norm()
-                / real['ph_head'].norm().clamp_min(1e-30)),
-            'cl_proj3_relative_change_const': float(
-                (other['cl_proj3'] - real['cl_proj3']).norm()
-                / real['cl_proj3'].norm().clamp_min(1e-30)),
-            'all_finite': bool(all(torch.isfinite(value).all() for value in
-                                   (real['g3'], other['g3'], real['ph_head']))),
-        }
-        floor = max(TOLERANCE[precision], 10.0 * repeat_floor)
-        row['resolution_floor'] = floor
-        row['observable_at_tolerance'] = bool(
-            row['residual_relative_norm'] > floor
-            and row['g3_relative_change_const'] > floor)
-        rows.append(row)
-    with torch.no_grad():
-        model.alpha_ph.fill_(math.atanh(checkpoint_gate)
-                             if abs(checkpoint_gate) < 1 else checkpoint_gate)
+            model.alpha_ph.copy_(original)
+        model.train(was_training)
     return {'checkpoint_tanh_alpha': checkpoint_gate,
             'ph_valid_fraction': float(handle.ph_valid.float().mean()),
             'graph_count': int(handle.graph_available.numel()), 'rows': rows}
@@ -260,6 +328,11 @@ def main():
                                 'p_train_mean_profile.npy')
     parser.add_argument('--probe-dir', default='results/glt_galph_ph_retention_20260920/p1')
     parser.add_argument('--build-probe-only', action='store_true')
+    parser.add_argument('--supersedes',
+                        help='earlier diagnostic JSON this run replaces (recorded, never '
+                             'overwritten)')
+    parser.add_argument('--replacement-scope',
+                        help='which sections of the superseded file this run replaces')
     parser.add_argument('--window-steps', type=int, nargs='*', default=[0])
     parser.add_argument('--microbatch', type=int, default=84)
     parser.add_argument('--seed', type=int, default=42)
@@ -403,7 +476,24 @@ def main():
         'g3_relative_change_const are all at or below the reported tolerance no longer '
         'carries observable PH sample information in the checked precision; the '
         'forced-gate row (tanh=0.02) reports what an opened gate would see even when the '
-        'checkpoint gate itself is closed.')
+        'checkpoint gate itself is closed.  Each row resolves differences against '
+        'max(tolerance, 10x its own repeated-forward floor): a difference at or below '
+        'that floor is not read as signal here, which bounds what THIS measurement can '
+        'resolve in a given precision and is not a statement about the precision itself.  '
+        'The residual is the tensor the model actually added (g3 minus the pre-residual '
+        'summary) and the heads are evaluated inside the same autocast context, so the '
+        'reported dtypes and norms share one precision convention per row.')
+    if args.supersedes:
+        superseded = Path(args.supersedes)
+        payload['supersedes'] = {
+            'path': str(superseded),
+            'sha256': (hashlib.sha256(superseded.read_bytes()).hexdigest()
+                       if superseded.is_file() else None),
+            'kept': True,
+            'replacement_scope': args.replacement_scope or 'model sections only',
+            'reason': ('r3: the earlier model-level rows used a batch whose ph_profile was '
+                       'replaced in place (so one condition could leak into the next) and '
+                       'recomputed the residual and heads in fp32 after a bf16 forward')}
     Path(args.output).write_text(json.dumps(payload, indent=2), encoding='utf-8')
 
 
