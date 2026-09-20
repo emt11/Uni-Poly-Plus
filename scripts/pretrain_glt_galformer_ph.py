@@ -56,6 +56,25 @@ def is_ph_path_parameter(name):
     return name.startswith(PH_PATH_PREFIXES)
 
 
+def optimizer_group_record(optimizer, model, **extra):
+    """Which parameters each optimizer group holds, and with what decay.
+
+    Recorded so a run's parameter grouping can be audited from its own output
+    instead of from the command line alone.
+    """
+    names = {id(parameter): name for name, parameter in model.named_parameters()}
+    groups = []
+    for index, group in enumerate(optimizer.param_groups):
+        parameters = sorted(names[id(parameter)] for parameter in group['params'])
+        groups.append({
+            'index': index, 'weight_decay': float(group['weight_decay']),
+            'weight_decay_zero': bool(float(group['weight_decay']) == 0.0),
+            'learning_rate': float(group['lr']), 'parameter_count': len(parameters),
+            'ph_path_only': all(is_ph_path_parameter(name) for name in parameters),
+            'parameters': parameters})
+    return dict(optimizer=type(optimizer).__name__, groups=groups, **extra)
+
+
 def ph_parameter_state(model, weight_decay):
     """Per-tensor norms, task gradients and the coupled decay term of the PH path."""
     per_tensor, gradient_square, decay_square = {}, 0.0, 0.0
@@ -396,6 +415,17 @@ def main():
                                          weight_decay=weight_decay)
         # Decay actually applied to the PH path, for the monitor's decay term.
         effective_wd = 0.0 if args.ph_no_weight_decay else weight_decay
+        if rank == 0 and (args.ph_no_weight_decay or args.alpha_ph_tanh_init is not None):
+            write_json(output / 'optimizer_groups.json', optimizer_group_record(
+                optimizer, trainer.model,
+                arm=arm,
+                ph_path_weight_decay=('zero' if args.ph_no_weight_decay else 'coupled'),
+                alpha_ph_init_tanh=(float(args.alpha_ph_tanh_init)
+                                    if args.alpha_ph_tanh_init is not None else None),
+                alpha_ph_after_init=float(trainer.model.alpha_ph.detach())
+                if args.alpha_ph_tanh_init is not None else None,
+                common_init_artifact=str(common_init_path) if common_init_path else None,
+                common_init_artifact_sha256=(common_init['sha256'] if common_init else None)))
         module = (DistributedDataParallel(trainer,
                                           device_ids=[device.index] if device.type == 'cuda' else None,
                                           find_unused_parameters=True)

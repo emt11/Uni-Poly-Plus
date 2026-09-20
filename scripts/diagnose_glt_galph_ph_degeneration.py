@@ -44,6 +44,8 @@ import torch
 from src.dataset.glt_galformer_ph import PHBettiReader
 from src.dataset.glt_ph import PH_BINS, PH_CHANNELS
 from src.modules.glt_galformer_ph import PH_PATCHES, PH_RADII_PER_PATCH, GLTGalPH
+from src.modules.glt_galformer_ph_downstream import TRAINING_ONLY_HEADS
+from src.modules.glt_galformer_ph_pretrain import load_galformer_deployment
 from src.training.glt_dual_runtime import (IndexedFrozenDualSource,
                                            OrderedSampleStream,
                                            load_sample_index_artifact,
@@ -159,6 +161,24 @@ def build_step0_model(common_init, device, summary_mode='cls', ph_mode='global',
     return model.to(device).eval(), record
 
 
+def compare_deploy_state(resume_state, deploy_state):
+    """Deploy tensors must be exactly the resume tensors minus the training-only heads."""
+    resume = {name[len('model.'):]: value for name, value in resume_state.items()
+              if name.startswith('model.')}
+    excluded = sorted(name for name in resume if name.startswith(TRAINING_ONLY_HEADS))
+    expected = sorted(set(resume) - set(excluded))
+    actual = sorted(deploy_state)
+    identical = [name for name in set(expected) & set(actual)
+                 if torch.equal(resume[name], deploy_state[name])]
+    differing = sorted(set(expected) & set(actual) - set(identical))
+    return {'deploy_tensors': len(actual), 'expected_tensors': len(expected),
+            'expected_keys': expected, 'deploy_keys': actual,
+            'keys_match': expected == actual,
+            'excluded_training_only': excluded,
+            'identical_tensors': len(identical), 'differing_tensors': differing,
+            'all_identical': expected == actual and not differing}
+
+
 def load_model(checkpoint, device):
     package = torch.load(checkpoint, map_location='cpu', weights_only=False)
     state = package['model']
@@ -169,13 +189,14 @@ def load_model(checkpoint, device):
     return model.to(device).eval(), int(package['step'])
 
 
-def _forward(model, data, device, precision):
+def _forward(model, data, device, precision, include_heads=True):
     """Model outputs in one precision convention.
 
     The residual is read back from the model's own tensors (``g3`` minus the
     pre-residual summary it was added to) and the heads run *inside* the same
     autocast context as the forward, so no quantity is recomputed in a different
-    precision than the pass that produced it.
+    precision than the pass that produced it.  ``include_heads=False`` is for
+    deployments, which exclude the training-only heads by construction.
     """
     with torch.no_grad(), _autocast(device, precision):
         out = model(data)
@@ -190,9 +211,12 @@ def _forward(model, data, device, precision):
         direct = torch.tanh(model.alpha_ph) * model.ph_to_summary(out['ph_summary'])
         direct = torch.where(data.ph_valid.bool().unsqueeze(-1), direct,
                              torch.zeros_like(direct))
-        return {'g3': out['g3'], 'summary': summary, 'residual': out['g3'] - summary,
-                'residual_direct': direct,
-                'ph_head': model.ph_head(out['g3']), 'cl_proj3': model.cl_proj3(out['g3'])}
+        result = {'g3': out['g3'], 'summary': summary, 'residual': out['g3'] - summary,
+                  'residual_direct': direct}
+        if include_heads:
+            result['ph_head'] = model.ph_head(out['g3'])
+            result['cl_proj3'] = model.cl_proj3(out['g3'])
+        return result
 
 
 def _with_profile(data, profile):
@@ -212,11 +236,16 @@ def _relative_change(left, right, reference):
     return float((left.float() - right.float()).norm()) / reference
 
 
-def model_stats(model, data, const, device, precision, forced_gate=0.02):
-    """Fixed-model effect of replacing the PH input, per gate value.
+def model_stats(model, data, const, device, precision, forced_gate=0.02,
+                repeat_runs=3, include_heads=True):
+    """Fixed-model effect of replacing the PH input, per gate condition.
 
-    Every condition runs on its own batch view and the model state is restored
-    (`alpha_ph` bit-exactly, training mode included) even if a pass raises.
+    Two explicitly different conditions are reported: ``checkpoint``, which uses
+    the trained ``alpha_ph`` tensor as it is (never rounded and rebuilt through
+    ``atanh``), and ``forced``, a counterfactual that sets the gate to a stated
+    value.  Every condition runs on its own batch view, and the model state is
+    restored (``alpha_ph`` bit-exactly, training mode included) even if a pass
+    raises.
     """
     handle = data.to(device)
     own = handle.ph_profile
@@ -229,25 +258,37 @@ def model_stats(model, data, const, device, precision, forced_gate=0.02):
     rows = []
     try:
         model.eval()
-        for gate in sorted({round(checkpoint_gate, 12), forced_gate}):
+        for condition, gate in (('checkpoint', None), ('forced', float(forced_gate))):
             with torch.no_grad():
-                model.alpha_ph.fill_(math.atanh(gate))
+                if gate is not None:
+                    model.alpha_ph.fill_(math.atanh(gate))
             outputs = {name: _forward(model, _with_profile(handle, profile),
-                                      device, precision)
+                                      device, precision, include_heads)
                        for name, profile in inputs.items()}
-            repeat = _forward(model, handle, device, precision)
             reference = float(outputs['own']['summary'].float().norm().clamp_min(1e-30))
             residual_norm = float(outputs['own']['residual'].float().norm())
             direct_norm = float(outputs['own']['residual_direct'].float().norm())
-            floor = _relative_change(repeat['g3'], outputs['own']['g3'], reference)
+            # The same input three times: the spread reported is the largest
+            # difference actually observed, not a proven upper bound on noise.
+            repeats = [_forward(model, handle, device, precision, include_heads)
+                       for _ in range(int(repeat_runs))]
+            observed_spread = max(_relative_change(repeats[i]['g3'], repeats[j]['g3'],
+                                                   reference)
+                                  for i in range(len(repeats))
+                                  for j in range(i + 1, len(repeats)))
             row = {
-                'tanh_alpha': gate,
-                'checkpoint_gate': bool(abs(gate - round(checkpoint_gate, 12)) < 1e-15),
+                'condition': condition,
+                'gate_source': ('the trained alpha_ph tensor, unmodified'
+                                if gate is None else
+                                f'counterfactual: tanh(alpha_ph) set to {gate}'),
+                'forced_gate_requested': gate,
+                'tanh_alpha': float(torch.tanh(model.alpha_ph.detach().float())),
                 'precision': precision,
                 'g3_dtype': str(outputs['own']['g3'].dtype),
                 'residual_dtype': str(outputs['own']['residual'].dtype),
                 'residual_direct_dtype': str(outputs['own']['residual_direct'].dtype),
-                'head_dtype': str(outputs['own']['ph_head'].dtype),
+                'head_dtype': (str(outputs['own']['ph_head'].dtype) if include_heads
+                               else None),
                 'reference_profile': 'own',
                 'summary_norm': reference,
                 # g3 - summary: the model's exact convention, cancellation-limited.
@@ -262,26 +303,34 @@ def model_stats(model, data, const, device, precision, forced_gate=0.02):
                 'residual_views_ratio': (abs(residual_norm - direct_norm)
                                          / max(direct_norm, 1e-30)),
                 'g3_real_norm': float(outputs['own']['g3'].float().norm()),
-                'g3_repeat_floor': floor,
+                'repeat_runs': int(repeat_runs),
+                'repeat_max_observed_difference': observed_spread,
                 'g3_relative_change_const': _relative_change(outputs['const']['g3'],
                                                              outputs['own']['g3'], reference),
                 'g3_relative_change_shuffled': _relative_change(outputs['shuffled']['g3'],
                                                                 outputs['own']['g3'], reference),
-                'ph_head_relative_change_const': _relative_change(
+                'ph_head_relative_change_const': (_relative_change(
                     outputs['const']['ph_head'], outputs['own']['ph_head'],
-                    float(outputs['own']['ph_head'].float().norm().clamp_min(1e-30))),
-                'cl_proj3_relative_change_const': _relative_change(
+                    float(outputs['own']['ph_head'].float().norm().clamp_min(1e-30)))
+                    if include_heads else None),
+                'cl_proj3_relative_change_const': (_relative_change(
                     outputs['const']['cl_proj3'], outputs['own']['cl_proj3'],
-                    float(outputs['own']['cl_proj3'].float().norm().clamp_min(1e-30))),
+                    float(outputs['own']['cl_proj3'].float().norm().clamp_min(1e-30)))
+                    if include_heads else None),
                 'all_finite': bool(all(torch.isfinite(value).all() for value in
-                                       (outputs['own']['g3'], outputs['const']['g3'],
-                                        outputs['own']['ph_head']))),
+                                       ((outputs['own']['g3'], outputs['const']['g3'],
+                                         outputs['own']['ph_head']) if include_heads
+                                        else (outputs['own']['g3'], outputs['const']['g3'],
+                                              outputs['own']['residual_direct'])))),
             }
-            floor_limit = max(TOLERANCE[precision], 10.0 * floor)
-            row['resolution_floor'] = floor_limit
+            # A ten-fold margin over the observed repeat spread, or the stated
+            # tolerance, whichever is larger.  The margin is a convention for
+            # "not read as signal here", not a proven bound on the numerics.
+            threshold = max(TOLERANCE[precision], 10.0 * observed_spread)
+            row['resolution_threshold'] = threshold
             row['observable_at_tolerance'] = bool(
-                row['residual_relative_norm_direct'] > floor_limit
-                and row['g3_relative_change_const'] > floor_limit)
+                row['residual_relative_norm_direct'] > threshold
+                and row['g3_relative_change_const'] > threshold)
             rows.append(row)
     finally:
         with torch.no_grad():
@@ -331,6 +380,9 @@ def main():
     parser.add_argument('--supersedes',
                         help='earlier diagnostic JSON this run replaces (recorded, never '
                              'overwritten)')
+    parser.add_argument('--strict-load-pair', nargs=2, metavar=('RESUME', 'DEPLOY'),
+                        help='also verify that the deployment package reproduces the '
+                             'resume checkpoint state and diagnostics exactly')
     parser.add_argument('--replacement-scope',
                         help='which sections of the superseded file this run replaces')
     parser.add_argument('--window-steps', type=int, nargs='*', default=[0])
@@ -418,6 +470,71 @@ def main():
                               'encoder_fp32': entry['encoder']['fp32'],
                               'model_fp32': entry['model']['fp32']['rows']}), flush=True)
             del model
+        if args.strict_load_pair:
+            resume_path, deploy_path = args.strict_load_pair
+            package = torch.load(deploy_path, map_location='cpu', weights_only=False)
+            state_report = compare_deploy_state(
+                torch.load(resume_path, map_location='cpu',
+                           weights_only=False)['model'], package['state_dict'])
+            deploy_model = GLTGalPH(str(package['summary_mode']),
+                                    package.get('ph_mode')).to(device)
+            load_galformer_deployment(deploy_model, package, int(package['step']))
+            resume_model, resume_step = load_model(resume_path, device)
+            comparison = {}
+            for precision in PRECISIONS:
+                left_encoder = encoder_stats(resume_model.ph_encoder, profiles, const,
+                                             device, precision)
+                right_encoder = encoder_stats(deploy_model.ph_encoder, profiles, const,
+                                              device, precision)
+                encoder_fields = {
+                    key: {'resume': left_encoder[key], 'deploy': right_encoder[key],
+                          'identical': left_encoder[key] == right_encoder[key]}
+                    for key in ('profile_spread', 'ph_summary_norm_mean',
+                                'ph_summary_spread', 'real_vs_const_max_abs',
+                                'real_vs_shuffled_max_abs', 'real_vs_const_bit_identical')}
+                left = model_stats(resume_model, window_data, const, device, precision,
+                                   include_heads=False)
+                right = model_stats(deploy_model, window_data, const, device, precision,
+                                    include_heads=False)
+                rows = []
+                for left_row, right_row in zip(left['rows'], right['rows']):
+                    fields = {
+                        key: {'resume': left_row[key], 'deploy': right_row[key],
+                              'identical': left_row[key] == right_row[key]}
+                        for key in ('condition', 'tanh_alpha', 'summary_norm',
+                                    'residual_norm_direct',
+                                    'residual_relative_norm_direct',
+                                    'g3_relative_change_const',
+                                    'g3_relative_change_shuffled',
+                                    'repeat_max_observed_difference',
+                                    'resolution_threshold', 'observable_at_tolerance')}
+                    rows.append({'condition': left_row['condition'], 'fields': fields,
+                                 'bit_identical': all(value['identical']
+                                                      for value in fields.values())})
+                comparison[precision] = {
+                    'encoder': {'fields': encoder_fields,
+                                'bit_identical': all(value['identical']
+                                                     for value in encoder_fields.values())},
+                    'model_rows': rows,
+                    'bit_identical': all(row['bit_identical'] for row in rows)}
+            payload['strict_load'] = {
+                'resume': str(resume_path), 'deploy': str(deploy_path),
+                'resume_step': resume_step, 'deploy_step': int(package['step']),
+                'architecture': package.get('architecture'),
+                'ph_encoder_version': package.get('ph_encoder_version'),
+                'loaded_through': 'load_galformer_deployment (strict)',
+                'state': state_report, 'comparison': comparison,
+                'note': ('the deployment excludes the training-only heads by construction '
+                         '(they are listed in state.excluded_training_only and frozen '
+                         'downstream), so the head fields are not part of this check')}
+            print(json.dumps({'strict_load': {
+                'keys_match': state_report['keys_match'],
+                'state_all_identical': state_report['all_identical'],
+                'encoder_and_model_identical': {
+                    precision: (comparison[precision]['encoder']['bit_identical'],
+                                comparison[precision]['bit_identical'])
+                    for precision in PRECISIONS}}}), flush=True)
+            del deploy_model, resume_model
         if args.common_init and Path(args.common_init).is_file():
             model, record = build_step0_model(args.common_init, device)
             entry = {
@@ -474,15 +591,17 @@ def main():
     payload['interpretation'] = (
         'A checkpoint whose ph_summary_spread, real_vs_const_max_abs and '
         'g3_relative_change_const are all at or below the reported tolerance no longer '
-        'carries observable PH sample information in the checked precision; the '
-        'forced-gate row (tanh=0.02) reports what an opened gate would see even when the '
-        'checkpoint gate itself is closed.  Each row resolves differences against '
-        'max(tolerance, 10x its own repeated-forward floor): a difference at or below '
-        'that floor is not read as signal here, which bounds what THIS measurement can '
-        'resolve in a given precision and is not a statement about the precision itself.  '
-        'The residual is the tensor the model actually added (g3 minus the pre-residual '
-        'summary) and the heads are evaluated inside the same autocast context, so the '
-        'reported dtypes and norms share one precision convention per row.')
+        'carries observable PH sample information in the checked precision.  Each row '
+        'reports two explicitly different gate conditions: "checkpoint" uses the trained '
+        'alpha_ph tensor unmodified, "forced" is a stated counterfactual.  Differences '
+        'are resolved against max(tolerance, 10x the largest difference observed across '
+        'three identical forwards); that ten-fold margin is a convention for "not read as '
+        'signal here" and the observed spread is not a proven upper bound on the '
+        'numerics, so this bounds what THIS measurement resolves in a given precision and '
+        'says nothing about the precision itself.  The residual is the tensor the model '
+        'actually added (g3 minus the pre-residual summary) and the heads are evaluated '
+        'inside the same autocast context, so the reported dtypes and norms share one '
+        'precision convention per row.')
     if args.supersedes:
         superseded = Path(args.supersedes)
         payload['supersedes'] = {

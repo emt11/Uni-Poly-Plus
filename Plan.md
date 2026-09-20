@@ -4,13 +4,13 @@
 
 | 字段 | 内容 |
 | --- | --- |
-| 计划 ID | GLT-GALPH-PHRETENTION-20260920-01 / r3 |
-| 日期／状态 | 2026-09-20；**阻断/返修中**：r2 的返修与可训练性预检已交付，r3 针对 Codex 审查提出的两项诊断缺陷完成修复与重算；18 units 仍未执行，研究目标未完成、未获验收 |
-| 用户要求 | ① 原始：同一 C1 主干下，下游**保留样本特异 PH**是否优于**关闭 PH**与**同容量固定 PH 分支**；② r3：修复诊断的"batch 输入原地修改"与"bf16 前向后 fp32 重算"两项缺陷，补输入不变性／调用顺序独立性／状态恢复测试，仅重算受影响的前向诊断，保留旧证据并写明替代范围，修正 bf16 的过度结论 |
-| 授权范围 | 本轮允许：诊断脚本的两处修复与相关局部测试；**仅前向**重算已有 checkpoint 的诊断（optimizer updates = **0**）。预检的 256 步、5k、18 units 均未授权 |
-| 明确禁止 | 任何 optimizer update；重跑 256 步预检；启动 5k；18 units；N1 重跑；outer-test；XATTN；multiscale；额外 seed；正式性能评估；覆盖旧 checkpoint、sidecar、日志或旧证据文件 |
-| 角色 | Codex 规划与独立审查；ZCode 执行修复、测试、重算与文档并回填 §9；执行者不宣布 Codex 最终验收通过 |
-| 基线 | dev@4e48f47（pull 后 0/0、工作树干净）+ 本轮 commit（见 §9.2） |
+| 计划 ID | GLT-GALPH-PHRETENTION-20260920-01 / r4 |
+| 日期／状态 | 2026-09-20；**阻断/返修中**：r3 审查返修已交付；r4 的**单条 C1_REPAIR_5K 长程可训练性确认**已授权并已启动/完成（状态与结果见 §9.6、§13）。18 units 仍未执行，研究目标未完成、未获验收 |
+| 用户要求 | ① 原始：同一 C1 主干下，下游**保留样本特异 PH**是否优于**关闭 PH**与**同容量固定 PH 分支**；② r4：从原始 common initialization 出发、沿用已验证的 R_REPAIR 配方，跑**一条** ≤5000 optimizer updates 的 C1 轨迹，在指定监测点记录 PH 可训练性、固定 probe 输入区分性与残差占比，并做 strict-load 一致性检查 |
+| 授权范围 | 本轮**仅一条轨迹**，累计 ≤5000 optimizer updates（含失败前已执行的更新与任何重复步骤）；两个尾项修复（gate 条件、重复三次的可观测差异）与相关局部 CPU 测试；沿用 r2/r3 已交付的代码 |
+| 明确禁止 | 18 development units；重跑 N0/N1/C0；outer-test；额外 seed；XATTN；multiscale；覆盖旧 checkpoint/sidecar/日志/证据；以"最终轨迹仍是 5k"为理由超出累计预算 |
+| 角色 | Codex 规划与独立审查；ZCode 执行运行、监测、一致性检查与文档并回填 §9；执行者不宣布 Codex 最终验收通过 |
+| 基线 | dev@0e22534（`git status` 干净；pull 后 Already up to date，0/0）+ 本轮 commit（见 §9.6） |
 | 产物根目录 | `results/glt_galph_ph_retention_20260920/{p0,p1}`、`logs/glt_galph_ph_retention_20260920/` |
 
 本文件是拟实施合同，不是既有 CLI。执行端在阶段结束时回填 §9；状态只在有证据时推进。
@@ -41,6 +41,14 @@ Codex 对 r2 交付提出两项诊断缺陷；r3 的修复与替代范围见 **�
 * `scripts/diagnose_glt_galph_ph_degeneration.py` 的 model 段被**重算**：`results/glt_galph_ph_retention_20260920/p1/ph_degeneration_diagnostics_r3.json` 取代 `ph_degeneration_diagnostics.json` 的 **model 段**；旧文件保留不删，取代关系记录在新文件的 `supersedes` 字段（含旧文件 sha256）。
 * encoder 段与 step0 段**未受影响**，重算后逐字段相同（§12.1 证据），因此这两段以任一文件为准。
 * r3 **没有**任何 optimizer update，未重跑 256 步预检，未触碰 §11.4 的预检证据（其 `residual_relative_norm` 的口径说明见 §12.3）。
+
+### 0.4 r4 修订说明（长程确认；预算独立记录）
+
+* **r2 的 1026 updates 与超预算 514 的历史记录保留**（§9.2 "预算偏差"行），**不因本轮而抵销或改写**；r4 的 5000-update 预算**独立记录**（§9.6）。
+* **r3 的修复与替代范围保留**：`ph_degeneration_diagnostics_r3.json` 取代旧文件 **model 段**（encoder/step0/probe_set/fixed_window 段相同），旧文件保留；相关 CPU 测试保留。
+* **原 18-unit 研究问题仍未回答**：r4 只回答"修复配方在 5k 上是否仍可训练、输入区分性是否保持"，**不回答** PH 保留是否提升属性预测。
+* 本轮 tail 修复（记录见 §9.6）：诊断的 checkpoint 条件直接使用原始 `alpha_ph` 张量（不再 `round` 后经 `atanh` 重建）；同输入重复**三次**并报告**最大观察差异**（不再称为严格噪声上界）；§11.6/§12.1 中"step ≥1000 输入无关"的表述已改为"step 1000 仍有可观测区分性，step ≥3000 在已检查输入与精度下逐位一致"。
+* **不做**：不因 tail 修复重跑旧 256 步预检或整套历史诊断（按 r4 合同第二节）。
 
 ## 1. 科学问题与可证伪假设
 
@@ -318,7 +326,7 @@ GPU、worker 或超过一分钟的任务在 tmux `Uni-Poly` 独立 window 执行
 
 1. C1/N1 部署中 PH 路径参数被衰减到 1e-11 以下，`tanh(alpha_ph)` ≈ ±1e-7；`ph_encoder.norm.weight` 等个别张量仍为 O(1)。
 2. 真实训练记录显示 PH encoder 的任务梯度自第 2 步起就比衰减项小 2–5 个数量级，且**衰减项不被梯度裁剪**。
-3. 固定 64 条 P_train probe 上：step 1000 仍可分辨（6.24e-3）、step 2000 低于容差、step ≥3000 在 fp32/bf16 下逐位输入无关。
+3. 固定 64 条 P_train probe 上：**step 1000 仍有可观测的 encoder 区分性**（跨样本 spread 6.24e-3）、step 2000 已低于容差、**step ≥3000 在已检查输入与两种执行精度下逐位一致**（不写成"输入无关"这一更强的一般性表述）。
 4. step 0（重建并与实运行 step-0 逐项相等）在强制门控 0.02、fp32 下可观测（r3 重算：Δg3 = 1.938e-4、Δ`ph_head` = 1.942e-4、Δ`cl_proj3` = 1.871e-4，地板 7.67e-6）——通路本身能用，训练后的 checkpoint 不能用。
 5. bf16 的重复前向噪声地板约 4.4e-3，大于全部被测 PH 效应。
 6. mask 无目标泄漏（5 checkpoint × 2 精度全部通过）。
@@ -351,7 +359,7 @@ GPU、worker 或超过一分钟的任务在 tmux `Uni-Poly` 独立 window 执行
 ### 12.1 审查问题 1：诊断原地修改 `batch.ph_profile` 造成跨条件输入污染
 
 * **问题**：`_forward` 通过 `data.ph_profile = profiles` 直接改写共享 batch；`model_stats` 在同一 batch 上依次跑 own/const/shuffled，于是**后一个门控迭代的 "own" 基线读到的其实是上一次替换后的输入**。
-* **影响面（定量）**：只有每个 checkpoint×精度的**第二个门控行**（强制 0.02）受影响，第一行（checkpoint 自身门控）不受影响。step 0 强制门控行：Δg3 1.912e-4 → **1.938e-4**（+1.4%）、Δ`ph_head` 1.920e-4 → 1.942e-4、Δ`cl_proj3` 1.862e-4 → 1.871e-4；step ≥1000 因 encoder 已输入无关，差值只在小数末位（如 fp32 Δg3 2.739e-7 → 2.746e-7）。因此**结论未变，但 step 0 的数值已更正**。
+* **影响面（定量）**：只有每个 checkpoint×精度的**第二个门控行**（强制 0.02）受影响，第一行（checkpoint 自身门控）不受影响。step 0 强制门控行：Δg3 1.912e-4 → **1.938e-4**（+1.4%）、Δ`ph_head` 1.920e-4 → 1.942e-4、Δ`cl_proj3` 1.862e-4 → 1.871e-4；step ≥3000 的 encoder 在已检查输入下逐位一致（step 1000 仍有可观测区分性、step 2000 低于容差），故差值只在小数末位（如 fp32 Δg3 2.739e-7 → 2.746e-7）。因此**结论未变，但 step 0 的数值已更正**。
 * **修改**：新增 `_with_profile()`，每个条件拿到自己的浅拷贝视图（`copy.copy`，张量共享、属性独立），原 batch 永不被写；每行记录 `reference_profile: 'own'`。
 * **验证**：`test_forward_never_mutates_the_batch_and_is_input_pure`（调用前后 batch 的 `ph_profile` 逐位不变；穿插 const 调用后 own 结果不变）与 `test_model_stats_row_pairing_is_call_order_independent`（用测试内独立复现的公式断言强制门控行的基线确实是**样本自身**输入，逐位相等）。
 * **证据**：`p1/ph_degeneration_diagnostics_r3.json`；新旧比对见 §12.5。

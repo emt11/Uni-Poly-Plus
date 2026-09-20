@@ -118,27 +118,32 @@ def test_forward_never_mutates_the_batch_and_is_input_pure():
     assert torch.equal(batch.ph_profile, own), 'the view wrote through to the batch'
 
 
+def _expectation(model, batch, own, const, alpha):
+    """Independent recomputation of one condition's numbers at a given alpha."""
+    with torch.no_grad():
+        model.alpha_ph.fill_(alpha)
+        own_out = model(batch)
+        const_view = copy.copy(batch)
+        const_view.ph_profile = const.unsqueeze(0).expand_as(own).contiguous()
+        const_out = model(const_view)
+        reference = float((own_out['g3'] - model.residual(own, batch.ph_valid)).norm())
+        return (float((const_out['g3'] - own_out['g3']).norm()) / reference,
+                float(model.residual(own, batch.ph_valid).norm()) / reference)
+
+
 def test_model_stats_row_pairing_is_call_order_independent():
     own, const = _profiles()
     batch = _StubBatch(own)
     model = _StubModel()
     with torch.no_grad():
         model.alpha_ph.fill_(0.03)
-    checkpoint_gate = float(torch.tanh(model.alpha_ph.detach()))
+    raw_alpha = float(model.alpha_ph.detach())
     stats = diagnostic.model_stats(model, batch, const, torch.device('cpu'), 'fp32')
+    assert [row['condition'] for row in stats['rows']] == ['checkpoint', 'forced']
     for row in stats['rows']:
-        gate = row['tanh_alpha']
-        # Independent expectation: the baseline is the sample's own profile.
-        with torch.no_grad():
-            model.alpha_ph.fill_(math.atanh(gate))
-            own_out = model(batch)
-            const_view = copy.copy(batch)
-            const_view.ph_profile = const.unsqueeze(0).expand_as(own).contiguous()
-            const_out = model(const_view)
-            reference = float((own_out['g3'] - model.residual(own, batch.ph_valid)).norm())
-            expected = float((const_out['g3'] - own_out['g3']).norm()) / reference
-            expected_residual = float(
-                model.residual(own, batch.ph_valid).norm()) / reference
+        alpha = (raw_alpha if row['condition'] == 'checkpoint'
+                 else math.atanh(row['forced_gate_requested']))
+        expected, expected_residual = _expectation(model, batch, own, const, alpha)
         assert row['g3_relative_change_const'] == pytest.approx(expected, rel=0, abs=0), \
             'the compared baseline is not the sample own PH input'
         # The same-context view reproduces the model's own expression exactly; the
@@ -148,9 +153,64 @@ def test_model_stats_row_pairing_is_call_order_independent():
         assert row['residual_relative_norm'] == pytest.approx(
             expected_residual, rel=1e-4, abs=0)
         assert 0.0 <= row['residual_views_ratio'] < 1.0
-    assert stats['checkpoint_tanh_alpha'] == checkpoint_gate
-    assert sorted(row['tanh_alpha'] for row in stats['rows']) == \
-        sorted({round(checkpoint_gate, 12), 0.02})
+    assert stats['checkpoint_tanh_alpha'] == float(torch.tanh(torch.tensor(raw_alpha)))
+
+
+def test_checkpoint_condition_uses_the_raw_gate_tensor():
+    """The trained gate must not be rounded and rebuilt through ``atanh``."""
+    own, const = _profiles()
+    batch = _StubBatch(own)
+    model = _StubModel()
+    raw = 0.1234567890123456
+    with torch.no_grad():
+        model.alpha_ph.fill_(raw)
+    roundtripped = float(torch.atanh(torch.tensor(
+        round(float(torch.tanh(torch.tensor(raw))), 12))))
+    assert roundtripped != raw, 'pick an alpha where the old round trip is lossy'
+    stats = diagnostic.model_stats(model, batch, const, torch.device('cpu'), 'fp32')
+    checkpoint_row = stats['rows'][0]
+    assert checkpoint_row['condition'] == 'checkpoint'
+    assert checkpoint_row['gate_source'] == 'the trained alpha_ph tensor, unmodified'
+    assert checkpoint_row['forced_gate_requested'] is None
+    assert checkpoint_row['tanh_alpha'] == float(torch.tanh(torch.tensor(raw)))
+    _, expected_residual = _expectation(model, batch, own, const, raw)
+    assert checkpoint_row['residual_relative_norm_direct'] == expected_residual, \
+        'the checkpoint condition did not use the raw alpha_ph tensor'
+
+
+def test_forced_condition_is_labelled_as_a_counterfactual():
+    own, const = _profiles()
+    batch = _StubBatch(own)
+    model = _StubModel()
+    with torch.no_grad():
+        model.alpha_ph.fill_(0.01)
+    stats = diagnostic.model_stats(model, batch, const, torch.device('cpu'), 'fp32',
+                                   forced_gate=0.05)
+    forced = stats['rows'][1]
+    assert forced['condition'] == 'forced'
+    assert forced['forced_gate_requested'] == 0.05
+    # The forced gate is realized through an fp32 atanh, so the value in effect
+    # differs from the requested one at fp32 resolution; both are recorded.
+    assert forced['tanh_alpha'] == pytest.approx(0.05, rel=0, abs=1e-6)
+    assert forced['tanh_alpha'] != 0.05
+    assert 'counterfactual' in forced['gate_source']
+
+
+def test_repeat_spread_is_reported_as_an_observation_three_times():
+    own, const = _profiles()
+    batch = _StubBatch(own)
+    model = _StubModel()
+    with torch.no_grad():
+        model.alpha_ph.fill_(0.02)
+    stats = diagnostic.model_stats(model, batch, const, torch.device('cpu'), 'fp32')
+    for row in stats['rows']:
+        assert row['repeat_runs'] == 3
+        spread = row['repeat_max_observed_difference']
+        assert math.isfinite(spread) and spread >= 0.0
+        assert row['resolution_threshold'] == max(diagnostic.TOLERANCE['fp32'],
+                                                  10.0 * spread)
+        # Naming regression: the old fields claimed a floor that was never proven.
+        assert 'g3_repeat_floor' not in row and 'resolution_floor' not in row
 
 
 def test_model_stats_restores_gate_and_mode_exactly():
@@ -189,6 +249,49 @@ def test_residual_and_heads_share_the_forward_precision():
         assert forward['residual'].dtype == forward['g3'].dtype
         assert forward['residual_direct'].dtype == forward['g3'].dtype
         assert all(torch.isfinite(value).all() for value in forward.values())
+
+
+class _DeployStubModel(_StubModel):
+    """A deployment-like model: the training-only heads do not exist at all."""
+
+    def __init__(self):
+        super().__init__()
+        del self.ph_head, self.cl_proj3
+
+
+def test_forward_and_model_stats_run_without_the_training_only_heads():
+    own, const = _profiles()
+    batch = _StubBatch(own)
+    model = _DeployStubModel()
+    with torch.no_grad():
+        model.alpha_ph.fill_(0.02)
+    stats = diagnostic.model_stats(model, batch, const, torch.device('cpu'), 'fp32',
+                                   include_heads=False)
+    for row in stats['rows']:
+        assert row['ph_head_relative_change_const'] is None
+        assert row['cl_proj3_relative_change_const'] is None
+        assert row['all_finite']
+    forward = diagnostic._forward(model, batch, torch.device('cpu'), 'fp32',
+                                  include_heads=False)
+    assert 'ph_head' not in forward and 'residual_direct' in forward
+
+
+def test_compare_deploy_state_reports_keys_and_bit_equality():
+    resume = {f'model.{name}': torch.full((2,), float(index) + 1.0)
+              for index, name in enumerate(('o8.x', 'glt.y', 'head_2d.0.weight',
+                                            'ph_head.0.weight', 'alpha_ph'))}
+    deploy = {name[len('model.'):]: value.clone() for name, value in resume.items()
+              if not name.startswith(('model.head_2d', 'model.ph_head'))}
+    report = diagnostic.compare_deploy_state(resume, deploy)
+    assert report['keys_match'] and report['all_identical']
+    assert report['excluded_training_only'] == ['head_2d.0.weight', 'ph_head.0.weight']
+    assert report['differing_tensors'] == []
+    deploy['o8.x'] = torch.zeros(2)
+    broken = diagnostic.compare_deploy_state(resume, deploy)
+    assert not broken['all_identical'] and broken['differing_tensors'] == ['o8.x']
+    missing = diagnostic.compare_deploy_state(
+        resume, {name: value for name, value in deploy.items() if name != 'glt.y'})
+    assert not missing['keys_match'] and not missing['all_identical']
 
 
 def test_mask_leakage_check_is_input_pure():
