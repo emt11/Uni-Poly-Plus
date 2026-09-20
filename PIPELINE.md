@@ -1142,3 +1142,13 @@ finite。几何 flag 只在 collated Data 内存副本修改，active cache 未�
 
 上述结果属于 S0 审计、S1 接口 smoke 和 S2 目标/通信边界验证，不是预训练性能、下游性能或正式科学比较。
 S3–S5 仍须新的明确授权；没有访问 outer-test、修改 active cache、生成构象或启动正式训练。
+
+### GLT-GALPH-PHRETENTION-20260920-01：主干身份、完整产物判定与失败保留（2026-09-20 收口，ZCode 记录）
+
+**适用范围**：以下三条是本周期实际落地并被后续运行使用的机制，**不构成把 PH retention 晋级为默认生产方案**——该配方经 Codex 审查验收后结论为"未建立预测增量"（限定负结果），已随周期归档（`PROJECT_HISTORY.md`、`RESULTS.md`、`Plan.md` §16）。
+
+1. **新主干身份记录（唯一入口）**：`configs/mts/glt_galph_c1_repair_5k_identity.json` 描述修复配方部署包 `results/glt_galph_ph_retention_20260920/p1/pretrain_C1_REPAIR_5K/deploy_05000.pt`（sha256 `3063cf8bef341841b665c93f118a1eb251308d5d67dfa41b4179465570f302e2`、step 5000、`cls`/`global`、`scale-interaction-v2`、204 张量 strict-load 逐位一致），并写明其配方、common-init 来源（sha256 `637827e6…`）与**旧 C1 `b7093898…` 不是本轮控制**。下游 runner（`--checkpoint-identity`，默认该文件）与 aggregator（`--identity`）读同一记录，`verify_checkpoint()` 逐字段核对 sha256/step/architecture/summary_mode/ph_mode/ph_encoder_version；任意其他 checkpoint（含旧 C1）被拒绝，不接受绕过校验。旧 `results/glt_galph_20260920/summary.json` **不被覆盖**，也不再作为该下游流程的版本闸门。
+2. **完整产物判定**：一个 development 单元只有在 `metrics.json` 中 `complete is True`（`stage_completed='diagnostics'`）时才被 aggregator 接受；`complete!=true`、`updates_incomplete`、覆盖率不完整（`missing>0` 或 `valid+invalid≠samples`）、身份或 encoder 版本不符、`epochs_run` 超出预算、指标非有限、`outer_test≠NOT_RUN` 或 `validation_only≠true` 一律报错拒绝，不产生部分汇总。
+3. **失败保留机制**：runner 先写 `best.pt`（含 `best_validation_r2`/`best_epoch`/`epochs_run`/逐 epoch validation history/split/身份）与核心 `metrics.json`，**之后**才跑可选 PH 诊断；诊断失败时保留二者、记 `complete=false` 与 `failure.stage='ph_diagnostics'`、进程非零退出，并由 `write_failure()` 写 **FAIL** `runtime.json`（含 `stage`/`checkpoint_kept`/`metrics_written`）。launcher `scripts/run_glt_galph_retention.sh` 在命令后立即捕获真实退出码，非零即停、不再启动后续组、错误路径不写 `ALL_DONE`。历史失败现场（`results/glt_galph_ph_retention_20260920/p3/smoke_*`、各组 traceback、`chain_status.log` 及其更正记录）**保留不清理**，失败运行不得补写为 PASS。
+
+**边界**：这些机制只说明"如何约束主干身份、如何判定一个单元完成、失败时保留什么"；它们不宣告 PH retention 方向有效或无效，也不改变任何既有科学结论。除本文件、`Plan.md`、`RESULTS.md`、`PROJECT_HISTORY.md` 的文档更新外，收口轮未运行模型、测试、训练、诊断前向、缓存构建或清理。

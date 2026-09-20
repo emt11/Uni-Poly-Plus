@@ -477,3 +477,33 @@ pooled OOF macro7 = 0.782525。
 按同样 7 任务重算。聚合脚本对非 8 任务刻意不输出 macro 字段，该 macro 由已验证的逐任务均值派生。
 egc 新增 fold0/1（0.8927/0.8854）与旧 Concat 同 fold（0.8979/0.9010）仅供参考，2/5 fold 不足以判定。
 XC 在三条路线中均为最低（0.279/0.226/0.309），与既有记录一致，仍需单独诊断。
+
+## GLT-GALPH-PHRETENTION-20260920-01｜PH retention 三组开发比较（2026-09-20，限定负结果）
+
+**科学问题**：同一个修复版 C1 主干（`C1_REPAIR_5K`，`deploy_05000.pt`，sha256 `3063cf8bf…`）下，下游**保留样本特异 PH**（F_REAL）是否优于**关闭 PH**（F_OFF）与**同容量固定 PH 分支**（F_CONST，P_train 平均 profile）。三组共享同一部署包、公共与新投影/门控初始张量、数据顺序与公共随机流；结构 `r3_new = r3 + tanh(gamma)·W_ph(冻结 PH encoder(profile))`，`gamma` 从 0 起步、不复用预训练 `alpha_ph`、无开门正则、PH encoder 冻结且 eval、无效 PH 为零残差且不删样本；**F_OFF 为本轮重训控制**，未用旧 C1 指标或任何 smoke 结果替代。
+
+**协议**：xc/eps/eat × fold0/1（`outer5_inner20`）、seed 42、FULL adaptation、≤30 epochs、patience 10、train-only scaler、validation 选优、无 refit、`outer_test=NOT_RUN`、`validation_only=true`。18/18 单元完成，实际 **411/540 epochs**，失败 0 次。汇总 `results/glt_galph_ph_retention_20260920/p4/development_aggregate.json`。
+
+| 任务 | F_OFF | F_CONST | F_REAL |
+|-|-|-|-|
+|xc（fold0／fold1）|0.327180 / 0.385436|0.327186 / 0.385435|0.327186 / 0.385435|
+|eps（fold0／fold1）|0.773621 / 0.876573|0.773622 / 0.876596|0.773620 / 0.876598|
+|eat（fold0／fold1）|0.991276 / 0.989242|0.991276 / 0.989242|0.991276 / 0.989242|
+|**三任务均值**|**0.7238879309**|**0.7238928537**|**0.7238929676**|
+
+差值（validation R²，越高越好）：**F_REAL − F_OFF = 5.036685268300367e-6**、**F_REAL − F_CONST = 1.1396120269679955e-7**、F_CONST − F_OFF = 4.92272406571459e-6。预登记工程阈值为三任务均值相对两个控制均 ≥ **+0.005**（XC 另有 ≥ +0.01 且两折不退化的条件），**实际差低约三个数量级、未达到**；无任务均值相对任一控制退化超过 0.01（`risk_flags` 为空）。汇总判定 `VERDICT = STOP: F_REAL does not reach the three-task gain threshold against both controls`；`EPS_ONLY_CANDIDATE=false`；无单元 `best_epoch` 触及 30 上限。
+
+**接线有效性（排除"三组其实相同"）**：三组输入源分别为 `zero_placeholder` / `p_train_mean_fixed`（跨样本 spread 恰为 0）/ `sample_own_frozen`（spread 0.71–0.96），encoder summary 与 const 相差 0.29–0.35；`best.pt` 中约 203–206/243 个张量逐位不同（`ph_proj.weight` 相差 0.015–0.042）；γ 在 F_CONST/F_REAL 被训练到非零（`|tanh γ|` 1e-5–3.8e-4）而 F_OFF 恒为 0。成本：三组 544/550/555 s，合计 27.5 min；覆盖率完整（xc 345、eps 305、eat 312 个 train+validation 样本，invalid/missing 均为 0）。
+
+**解释边界（必须与数值同时引用）**
+
+* 这是**两个开发折上的 validation-R² 比较**：**不是 outer-test**、**不是 OOF**、**不是独立盲测**，也**不是显著性检验**；两折单 seed 的均值只用于对照预登记工程阈值。
+* **不作统计等价声明**：差异幅度小（~1e-5）且无重复 seed，**不能**据此断言三组"统计上等价"；只能说本项目按预登记阈值**未检出** F_REAL 的增量。
+* **不与旧 C1 作受控性能归因**：本轮主干为新初始化的修复配方 C1_REPAIR_5K，与旧 C1（`b7093898…`，PH 路径已退化）在主初始化与训练路径上均不同，两者差值不是受控比较。
+* **不宣布 PH 或 3D 整体无效**：本轮实际比较的是**几乎关闭的 PH 残差**（实测 `|tanh γ| ≤ 3.8e-4`，残差约占参考 1.2e-4）。这一门控限制与结果同时成立：结论仅覆盖"按当前配方训练后门控极小"的情形，未检验更强条件化、非零门控初始化或解冻 encoder 的配置（均未运行、未获授权）。
+* eat 上三组几乎完全相同（0.991276 / 0.989242），该任务对本轮 PH 条件化不敏感，可能接近该数据上的可分上限；不据此推断其他任务或其他 3D 表示。
+* 与 F_OFF 的一致性检查：F_OFF 的 PH 残差精确为 0（显式分支），其属性路径与基础 CLS+读出路径一致，已由逐位 parity 测试与 0-update 接线诊断分别验证。
+
+**上游背景（同周期）**：旧 C1 的 PH encoder 在下游失去可观测样本区分性（step 1000 仍可分辨、step 2000 低于容差、step ≥3000 逐位一致），机制为耦合 weight decay 压过被门控抑制的任务梯度（r2）；修复配方（PH 路径 `weight_decay=0` + `tanh(alpha)` 初值 0.02）在 5k 内不再退化，但门控自身收敛到 ≈2e-4（r4）。该背景不构成本轮下游结果的因果解释。
+
+**产物与提交**：`results/glt_galph_ph_retention_20260920/p4/{smoke_r6,development,development_aggregate.json,smoke_r6_verification.json,diagnostics_path_check.json}`；日志 `logs/glt_galph_ph_retention_20260920/{p3,p4}/`；提交链 `886623a`/`9c0bc7e`（r6），周期全链见 `PROJECT_HISTORY.md`。**本周期以该限定负结果结束，不再追加实验。**

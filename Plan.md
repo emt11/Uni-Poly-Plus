@@ -4,8 +4,8 @@
 
 | 字段 | 内容 |
 | --- | --- |
-| 计划 ID | GLT-GALPH-PHRETENTION-20260920-01 / r6 |
-| 日期／状态 | 2026-09-20；**执行中 → 待审查**：报告保存顺序与 launcher 已返修；3 组 × 1 epoch 恢复 smoke 已通过（3/3 epochs）；18 development units 执行中（授权 ≤540 epochs）。r5 的 6-epoch 消耗与失败记录**保留不抵销**（§14.2） |
+| 计划 ID | GLT-GALPH-PHRETENTION-20260920-01 / r6（**已由 Codex 验收通过；本周期以限定负结果结束**）|
+| 日期／状态 | 2026-09-20；**已完成**：r6 实现与 18-unit 开发比较**经 Codex 审查验收通过**；整个周期以**限定负结果**结束，**暂无后续执行**（审查结论见 §16，归档见 `PROJECT_HISTORY.md`）。r5 的 6-epoch 失败消耗与失败现场**保留不抵销**（§14.2） |
 | 用户要求 | ① 原始：同一 C1 主干下，下游**保留样本特异 PH**是否优于**关闭 PH**与**同容量固定 PH 分支**；② r6：返修报告保存顺序与 launcher，做最小端到端恢复验证（3 epochs），通过后继续既有条件授权的 18 development units |
 | 授权范围 | 恢复 smoke 3 组 × XC/fold0 × 1 epoch（合计 ≤3 epochs）+ 既有授权的 18 units（≤30 epochs/单元、合计 ≤540 epochs）；不新增预训练、optimizer-update smoke、seed、任务或 fold |
 | 明确禁止 | outer-test、OOF、train+validation refit；改变模型/损失/门控初始化/晋级判据；超预算重跑；把失败 smoke 补写为 PASS；删除或覆盖 r5 失败目录与退出码更正记录 |
@@ -638,3 +638,26 @@ GPU、worker 或超过一分钟的任务在 tmux `Uni-Poly` 独立 window 执行
 | 预训练 / optimizer-update smoke | 0 | **0** |
 | 只读诊断与 CPU 测试 | 不计入 | 报告路径检查 1 次（0 updates）、CPU 测试 44 项 |
 | r5 历史消耗 | 保留 | **6 epochs 失败消耗，记录不抵销**（§14.2、`p3/chain_status_correction.txt`） |
+
+## 16. Codex 审查结论与周期收口（2026-09-20）
+
+**审查结论（Codex，非执行者自检）**：r6 实现与 18-unit 开发比较**验收通过**；**当前 PH retention 配方未建立预测增量**；整个 `GLT-GALPH-PHRETENTION-20260920-01` 周期**以该限定负结果结束，不再追加实验**。
+
+确认事实：
+
+| 项目 | 数值／状态 |
+| --- | --- |
+| development units | **18/18 完成**（F_OFF/F_CONST/F_REAL × xc/eps/eat × fold0/1），三组 exit=0，无失败、无重试 |
+| development 实际预算 | **411 / 540 epochs**（各单元 16–30，无一因 `best_epoch=30` 需要延长） |
+| F_REAL − F_OFF | **5.036685268300367e-6**（Codex 独立复算；产物 `p4/development_aggregate.json` 为 `5.036685268411389e-6`，两者相对差约 2e-11，来自求均顺序） |
+| F_REAL − F_CONST | **1.1396120269679955e-7**（产物与复算一致） |
+| 预登记工程阈值 | 三任务均值需 ≥ +0.005（XC 声称另需两折不退化且均值 ≥ +0.01）→ **未达到**；无任务退化超过 0.01，`risk_flags` 为空 |
+| 汇总判定 | `VERDICT = STOP: F_REAL does not reach the three-task gain threshold against both controls` |
+| 门控限制 | 训练后 `|tanh γ| ≤ 3.8e-4`，残差约占参考 1.2e-4 → 本轮比较的是**几乎关闭的 PH 残差**，该限制与结果同时成立 |
+| 本轮进一步执行 | **无**；下一步：**暂无后续执行** |
+
+**归档与状态**：本周期（r1–r6）已完整归档至 `PROJECT_HISTORY.md`；结果与解释边界记录在 `RESULTS.md`，流程性说明（新 checkpoint 身份、完整产物判定、失败保留机制）记录在 `PIPELINE.md`。本轮为**纯文档收口**：未运行模型、测试、训练、诊断前向、缓存构建、清理或任何 optimizer update；未启动非零门控初始化实验、未解冻 encoder，未做 XATTN、多尺度、额外 seed、完整八任务五折或 outer-test。
+
+**保留（不清理、不覆盖）**：全部 checkpoint、sidecar、r5 失败现场（`p3/smoke_*` 残件、traceback、`chain_status.log` 与更正记录）、旧诊断产物与历史文档条目。
+
+**不得据本周期声称**：PH retention 或 3D 表示整体无效；F_REAL/F_CONST/F_OFF 统计等价；与旧 C1 的受控性能归因；任何 outer-test/OOF/独立盲测层面的结论。
