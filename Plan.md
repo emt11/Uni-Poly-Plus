@@ -172,6 +172,7 @@ GPU、worker 或超过一分钟的任务在 tmux `Uni-Poly` 独立 window 执行
 | §4 只读诊断 | 完成 | `scripts/diagnose_glt_galph_ph_degeneration.py` → `results/glt_galph_ph_retention_20260920/p1/ph_degeneration_diagnostics.json`（含 `ph_probe_profiles.npy` / `ph_probe_keys.json`：P_train sidecar 行 0–63，全部 valid）；step 0 由 common-init 重建并与 R_LEGACY 实测 step-0 逐项相等（`all_equal=true`）；5 个 resume checkpoint × {fp32, bf16} 结果见 §11.3 |
 | §5/§6 两臂预检 | 完成 | R_LEGACY / R_REPAIR 各 256 updates，exit=0，见 §11.4；监测行步号按"完成的 optimizer updates"对齐到 0/1/2/16/64/128/256（v2 修正后重跑） |
 | **预算偏差（据实报告）** | 超出授权 512 | 合同允许两臂合计 ≤512 updates。实际：`parity_two_updates` 2 + v1 两臂 512 + **v2 两臂 512 = 1026**。原因：v1 监测行步号与 §6 要求的 16/64/128 错位（落成 17/65/129），为满足合同重跑 v2。v1 未删除，保留为 parity 与确定性证据（v1 与 v2 训练记录须逐位一致）。未扩大任何训练视野（仍 ≤256）、未新增 arm、未改配置 |
+| **失败记录（已修复）** | 无科学影响 | 诊断脚本两次启动失败：① mask 张量建在 CPU 导致 device mismatch；② 误从 `identity` 顶层取 `sample_index_artifact`（实际在 `identity['config']`）。两次都在写出任何 JSON 之前报错退出，未产生半成品证据、未影响预检；修复后一次成功（`DIAG_EXIT=0`）。另：v1 监测行步号错位（§9.2 预算偏差行）是**合同符合性**问题而非运行失败 |
 | 18 development units | **仍未执行** | 本轮未授权，未启动 |
 | 汇总与门控 | 仍未执行 | 依赖上一行；且即使执行，也受 §11 的机制修正约束 |
 | Git（r2） | 完成 | commit `d372b08`，分支 `dev`，已推送 `origin/dev`；fetch 后 `HEAD...origin/dev` = 0/0，`origin/dev` 指向 `d372b08` 且与本地树一致；推送经代理 + HTTP/1.1（直连报 `GnuTLS recv error`）。未 force push、未改写历史 |
