@@ -289,7 +289,7 @@ GPU、worker 或超过一分钟的任务在 tmux `Uni-Poly` 独立 window 执行
 | 汇总 | 完成 | `scripts/aggregate_glt_galph_ph_retention.py` → `p4/development_aggregate.json`（`AGG_EXIT=0`）：身份、覆盖率、预算、有限性校验全部通过；`VERDICT=STOP`、`risk_flags=[]` |
 | 失败与重试 | 无（训练） | 本轮 0 次训练失败、0 次重试；两次**非训练**脚本修复：报告路径检查脚本缺 `import numpy`（0 updates）、launcher 组名变量缺陷（由单元测试与验证发现并修复） |
 | 预算 | 未超出 | 恢复 smoke 3/3 epochs；development 411/540 epochs；预训练与 optimizer-update smoke 0；r5 的 6 epochs 失败消耗保留记录、不抵销（§14.2） |
-| Git（r6） | 完成 | 本轮 commit（保存顺序/launcher/aggregator 返修、r6 测试、smoke 校验与报告路径脚本、1-epoch 配置、`Plan.md` r6 记录）+ 登记提交，推送 `origin/dev` 并核验 `HEAD...origin/dev = 0/0` |
+| Git（r6） | 完成 | commit `886623a`（保存顺序/launcher/aggregator 返修、r6 测试、smoke 校验与报告路径脚本、1-epoch 配置、`Plan.md` §0.6/§9.8/§15 r6 记录）+ 登记提交，推送 `origin/dev` 并核验 `HEAD...origin/dev = 0/0` |
 
 ## 10. 下一步
 
