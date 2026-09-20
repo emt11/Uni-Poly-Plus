@@ -500,7 +500,11 @@ def main():
                 for left_row, right_row in zip(left['rows'], right['rows']):
                     fields = {
                         key: {'resume': left_row[key], 'deploy': right_row[key],
-                              'identical': left_row[key] == right_row[key]}
+                              'identical': left_row[key] == right_row[key],
+                              'relative_difference': (
+                                  abs(left_row[key] - right_row[key])
+                                  / max(abs(left_row[key]), abs(right_row[key]), 1e-30)
+                                  if isinstance(left_row[key], (int, float)) else None)}
                         for key in ('condition', 'tanh_alpha', 'summary_norm',
                                     'residual_norm_direct',
                                     'residual_relative_norm_direct',
@@ -508,15 +512,37 @@ def main():
                                     'g3_relative_change_shuffled',
                                     'repeat_max_observed_difference',
                                     'resolution_threshold', 'observable_at_tolerance')}
-                    rows.append({'condition': left_row['condition'], 'fields': fields,
-                                 'bit_identical': all(value['identical']
-                                                      for value in fields.values())})
+                    # The two model objects hold identical tensors, so they can only
+                    # differ through the forward's own run-to-run behaviour.  The
+                    # effect fields are all "relative to |summary|", so they are
+                    # compared as absolute differences in those units against the
+                    # row's resolution threshold; a tiny effect divided by its own
+                    # value would overstate a disagreement that is orders of
+                    # magnitude below anything this diagnostic resolves.
+                    effects = ('residual_relative_norm_direct', 'g3_relative_change_const',
+                               'g3_relative_change_shuffled')
+                    worst = max(abs(left_row[key] - right_row[key]) for key in effects)
+                    threshold = min(left_row['resolution_threshold'],
+                                    right_row['resolution_threshold'])
+                    rows.append({
+                        'condition': left_row['condition'],
+                        'worst_effect_difference': worst,
+                        'resolution_threshold': threshold,
+                        'conclusions_identical': bool(
+                            left_row['condition'] == right_row['condition']
+                            and left_row['observable_at_tolerance']
+                            == right_row['observable_at_tolerance']),
+                        'within_resolution': bool(
+                            worst <= threshold
+                            and left_row['observable_at_tolerance']
+                            == right_row['observable_at_tolerance']),
+                        'fields': fields})
                 comparison[precision] = {
                     'encoder': {'fields': encoder_fields,
                                 'bit_identical': all(value['identical']
                                                      for value in encoder_fields.values())},
                     'model_rows': rows,
-                    'bit_identical': all(row['bit_identical'] for row in rows)}
+                    'within_resolution': all(row['within_resolution'] for row in rows)}
             payload['strict_load'] = {
                 'resume': str(resume_path), 'deploy': str(deploy_path),
                 'resume_step': resume_step, 'deploy_step': int(package['step']),
@@ -530,9 +556,13 @@ def main():
             print(json.dumps({'strict_load': {
                 'keys_match': state_report['keys_match'],
                 'state_all_identical': state_report['all_identical'],
-                'encoder_and_model_identical': {
-                    precision: (comparison[precision]['encoder']['bit_identical'],
-                                comparison[precision]['bit_identical'])
+                'encoder_bit_identical': {precision: comparison[precision]['encoder'][
+                    'bit_identical'] for precision in PRECISIONS},
+                'model_within_resolution': {precision: comparison[precision][
+                    'within_resolution'] for precision in PRECISIONS},
+                'worst_effect_difference': {
+                    precision: max(row['worst_effect_difference']
+                                   for row in comparison[precision]['model_rows'])
                     for precision in PRECISIONS}}}), flush=True)
             del deploy_model, resume_model
         if args.common_init and Path(args.common_init).is_file():
