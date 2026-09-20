@@ -263,7 +263,7 @@ GPU、worker 或超过一分钟的任务在 tmux `Uni-Poly` 独立 window 执行
 | 18 development units | **未启动** | 合同以"smoke 通过"为前提；开发预算 540 epochs 未使用 |
 | 汇总与判据 | 未执行 | 无 development 产物可汇总；aggregator 判据未改、已接线待用 |
 | 预算 | smoke 6 epochs（全部为失败消耗）；dev 0；预训练 0 updates | r2 的 1026/超 514 与 r4 的 5000/5000 各自独立保留 |
-| Git（r5） | 完成 | 本轮 commit（身份记录、共享校验模块、runner/aggregator 接线、r5 测试、只读诊断脚本、`Plan.md` r5 记录），推送 `origin/dev` 并核验远端包含本次 commit |
+| Git（r5） | 完成 | commit `1a60fbc`（身份记录、共享校验模块、runner/aggregator 接线、r5 测试、只读诊断脚本、`Plan.md` r5 记录）+ 其后的登记提交，推送 `origin/dev`；fetch 后 `HEAD...origin/dev = 0/0`、远端指向本轮 commit、工作树干净 |
 
 ## 10. 下一步
 
