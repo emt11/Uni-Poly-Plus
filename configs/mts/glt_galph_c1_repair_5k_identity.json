@@ -1,0 +1,49 @@
+{
+  "record": "glt_galph_c1_repair_5k_deployment",
+  "checkpoint": "results/glt_galph_ph_retention_20260920/p1/pretrain_C1_REPAIR_5K/deploy_05000.pt",
+  "sha256": "3063cf8bef341841b665c93f118a1eb251308d5d67dfa41b4179465570f302e2",
+  "bytes": 159594871,
+  "step": 5000,
+  "architecture": "O8-GalformerTrimer-GalPretrain-PHGlobal",
+  "summary_mode": "cls",
+  "ph_mode": "global",
+  "ph_encoder_version": "scale-interaction-v2",
+  "ph_schema": "glt-ph-betti-v2",
+  "ph_channels": 3,
+  "ph_bins": 32,
+  "pretrain": {
+    "run": "results/glt_galph_ph_retention_20260920/p1/pretrain_C1_REPAIR_5K",
+    "updates": 5000,
+    "status": "PASS",
+    "recipe": "original C1 recipe except: the PH path (ph_encoder.*, ph_to_summary.weight, alpha_ph) is its own Adam parameter group with weight_decay=0, and tanh(alpha_ph) is initialised to 0.02 (no keep-positive or away-from-zero regularisation, alpha free)",
+    "adam_weight_decay_ph_group": "zero",
+    "tanh_alpha_init": 0.02,
+    "seed": 42,
+    "world_size": 4,
+    "code_commit": "dbb1225",
+    "common_init_artifact": "results/glt_galph_20260920/p1/common_init_galph_v1.pt",
+    "common_init_sha256": "637827e62fc83ad991b59e5cad27dc0cb5239140ae9531cb5060ff243e2ef805",
+    "runtime_record": "results/glt_galph_ph_retention_20260920/p1/pretrain_C1_REPAIR_5K/runtime.json",
+    "monitor_record": "results/glt_galph_ph_retention_20260920/p1/pretrain_C1_REPAIR_5K/ph_monitor.jsonl",
+    "optimizer_group_record": "results/glt_galph_ph_retention_20260920/p1/pretrain_C1_REPAIR_5K/optimizer_groups.json",
+    "r4_evidence": "Plan.md sections 9.6 and 13"
+  },
+  "strict_load": {
+    "resume": "results/glt_galph_ph_retention_20260920/p1/pretrain_C1_REPAIR_5K/resume_05000.pt",
+    "tensors": 204,
+    "all_identical": true,
+    "encoder_bit_identical_precisions": ["fp32", "bf16"],
+    "verified_by": "results/glt_galph_ph_retention_20260920/p1/ph_diagnostics_C1_REPAIR_5K.json (section strict_load)"
+  },
+  "encoder_state": {
+    "probe_profiles": "results/glt_galph_ph_retention_20260920/p1/ph_probe_profiles.npy",
+    "probe_rows": 64,
+    "const_profile": "results/glt_galph_ph_retention_20260920/p0/ph_sidecar_downstream/p_train_mean_profile.npy",
+    "summary_spread": 0.5264357924461365,
+    "real_vs_const_max_abs": 0.29192277789115906,
+    "tolerance": {"fp32": 1e-06, "bf16": 0.001},
+    "note": "the frozen encoder still carries observable sample discrimination; the downstream retention arms must not be run if this check fails again"
+  },
+  "supersedes": "results/glt_galph_20260920/summary.json versions.deployments.C1 (sha256 b709389895554e924884df22bd98f2b7b51cb7b54c199ebc92b3e95417fc2817) is the previous cycle's degenerate deployment; it is a historical description only and is NOT this round's matched control",
+  "not_the_control": "results/glt_galph_20260920/p2/*/pretrain/deploy_05000.pt and any checkpoint whose sha256 is not listed above"
+}

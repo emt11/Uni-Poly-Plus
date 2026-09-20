@@ -33,12 +33,13 @@ from src.modules.glt_galformer_ph import GLTGalPH
 from src.modules.glt_galformer_ph_downstream import TRAINING_ONLY_HEADS
 from src.modules.glt_galformer_ph_pretrain import load_galformer_deployment
 from src.modules.glt_galformer_ph_retention import GalformerPHDownstream
+from src.modules.glt_galph_checkpoint_identity import (DEFAULT_IDENTITY, load_identity,
+                                                       verify_checkpoint)
 from src.training.glt_dual_runtime import (TASKS, open_source, require_tmux,
                                            save_checkpoint, write_json)
 from src.utils import set_global_seed, scale_targets, train_epoch, _cosine_scheduler
 
 GROUPS_TO_MODE = {'F_OFF': 'off', 'F_CONST': 'const', 'F_REAL': 'real'}
-VERSION_RECORD = 'results/glt_galph_20260920/summary.json'
 DIAGNOSTIC_BATCHES = 8
 ALLOWED_TASKS = ('xc', 'eps', 'eat')
 ALLOWED_FOLDS = (0, 1)
@@ -52,10 +53,21 @@ def sha256_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def frozen_arm_deployment(group_arm, record_path=VERSION_RECORD):
-    """The frozen sha256 of the C1 deployment from the previous cycle record."""
-    record = json.loads(Path(record_path).read_text(encoding='utf-8'))
-    return record['versions']['deployments'][group_arm]['sha256']
+class EpochHistory(dict):
+    """``validation_summary`` that also keeps every epoch's record.
+
+    ``fit_select_and_test`` updates its summary in place once per epoch, so
+    counting the updates is how the caller learns the epochs actually run and
+    the per-epoch validation R2 without touching the shared helper.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.history = []
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        self.history.append(dict(self))
 
 
 def resolve_protocol(updates, smoke, development):
@@ -144,10 +156,16 @@ def bounded_updates(model, loader, optimizer, scheduler, device, updates, summar
     return summary
 
 
-def ph_diagnostics(model, loader, device, limit=DIAGNOSTIC_BATCHES):
-    """Gate value, residual scale and PH validity over a few validation batches."""
+def ph_diagnostics(model, loader, device, const_profile, limit=DIAGNOSTIC_BATCHES):
+    """Gate value, residual scale, PH validity and the actual PH input seen.
+
+    The profile fingerprints answer the r5 smoke gate directly: they show whether
+    this arm fed the encoder the sample's own profile or one fixed profile, and
+    how far the frozen encoder's *summary* moves between the two inputs.
+    """
     model.eval()
-    gates, ratios, valids, norms = [], [], [], []
+    gates, ratios, valids, norms, retention_gates = [], [], [], [], []
+    profile_norms, profile_spreads, summary_deltas, const_deltas = [], [], [], []
     with torch.inference_mode():
         for index, batch in enumerate(loader):
             if index >= limit:
@@ -159,11 +177,31 @@ def ph_diagnostics(model, loader, device, limit=DIAGNOSTIC_BATCHES):
             ratios.append(float(stats.get('residual_relative_norm', 0.0)))
             valids.append(float(stats.get('ph_valid_fraction', 0.0)))
             norms.append(float(stats.get('residual_norm', 0.0)))
-    return {'gate_mean': float(np.mean(gates)) if gates else None,
-            'residual_relative_norm': float(np.mean(ratios)) if ratios else None,
-            'residual_norm': float(np.mean(norms)) if norms else None,
-            'ph_valid_fraction': float(np.mean(valids)) if valids else None,
-            'batches': len(gates)}
+            retention_gates.append(float(stats.get('gate_tanh', 0.0)))
+            profiles = batch.ph_profile.float()
+            profile_norms.append(float(profiles.norm(dim=(1, 2)).mean()))
+            profile_spreads.append(float((profiles.max(0).values
+                                          - profiles.min(0).values).max()))
+            const = const_profile.to(device=profiles.device, dtype=torch.float32)
+            const = const.unsqueeze(0).expand_as(profiles).contiguous()
+            const_deltas.append(float((profiles - const).abs().max()))
+            mask = batch.ph_mask.bool()
+            own = model.encoder.ph_encoder.summarize(
+                model.encoder.ph_encoder(profiles, mask)).float()
+            fixed = model.encoder.ph_encoder.summarize(
+                model.encoder.ph_encoder(const, mask)).float()
+            summary_deltas.append(float((own - fixed).abs().max()))
+    mean = lambda values: (float(np.mean(values)) if values else None)
+    return {'gate_mean': mean(gates), 'retention_gate_tanh': mean(retention_gates),
+            'residual_relative_norm': mean(ratios), 'residual_norm': mean(norms),
+            'ph_valid_fraction': mean(valids), 'batches': len(gates),
+            'profile_norm_mean': mean(profile_norms),
+            'profile_cross_sample_spread': mean(profile_spreads),
+            'profile_vs_const_max_abs': mean(const_deltas),
+            'encoder_summary_own_vs_const_max_abs': mean(summary_deltas),
+            'profile_source': ('zero_placeholder' if model.ph_residual == 'off' else
+                               'p_train_mean_fixed' if model.ph_residual == 'const' else
+                               'sample_own_frozen')}
 
 
 def main():
@@ -184,6 +222,8 @@ def main():
                         help='xc/eps/eat folds 0/1, validation-only')
     parser.add_argument('--updates', type=int, default=None,
                         help='bounded trainability check: exactly this many optimizer steps')
+    parser.add_argument('--checkpoint-identity', default=DEFAULT_IDENTITY,
+                        help='the committed identity record this round runs against')
     parser.add_argument('--clean-cache-gib', type=float, default=0.0)
     args = parser.parse_args()
     process_started = time.perf_counter()
@@ -206,10 +246,9 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     checkpoint_sha = sha256_file(args.checkpoint)
-    expected_sha = frozen_arm_deployment('C1')
-    if checkpoint_sha != expected_sha:
-        raise ValueError('C1 deployment sha256 does not match the frozen record')
+    identity = load_identity(args.checkpoint_identity)
     package = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    verified = verify_checkpoint(identity, args.checkpoint, package, sha256=checkpoint_sha)
     if int(package.get('step', -1)) != int(run_config['downstream_step']):
         raise ValueError('deployment step does not match downstream_step')
     if package.get('ph_mode') != 'global' or package.get('summary_mode') != 'cls':
@@ -227,6 +266,7 @@ def main():
         selected_folds=selected_folds, updates=requested_updates,
         epochs_cap=int(epoch_cap),
         checkpoint=str(args.checkpoint), checkpoint_sha256=checkpoint_sha,
+        checkpoint_identity=verified,
         ph_sidecar=str(args.ph_sidecar), ph_sidecar_records=len(reader),
         const_profile=str(args.const_profile),
         const_profile_source=sidecar_meta.get('const_profile_source'),
@@ -292,6 +332,7 @@ def main():
                     pretrain_ph_mode=str(package.get('ph_mode')),
                     ph_encoder_version=package.get('ph_encoder_version'),
                     checkpoint_sha256=checkpoint_sha,
+                    checkpoint_identity=verified,
                     frozen_training_only_heads=frozen_heads,
                     trainable_parameter_count=int(sum(p.numel() for p in model.parameters()
                                                       if p.requires_grad)),
@@ -311,20 +352,27 @@ def main():
                     unit['best_validation_r2'] = None
                     unit['best_epoch'] = None
                 else:
-                    validation_summary = {}
+                    validation_summary = EpochHistory()
                     best, best_r2, best_epoch, _ = fit_select_and_test(
                         model, scaler, train_loader, val_loader, None, device, optimizer,
                         scheduler, run_config, task=task, fold_id=fold_id,
                         validation_only=True, validation_summary=validation_summary)
                     unit.update(validation_summary)
+                    unit['epochs_run'] = len(validation_summary.history)
+                    unit['validation_r2_history'] = [
+                        float(record['validation_r2']) for record in validation_summary.history]
                     unit['best_validation_r2'] = float(best_r2)
                     unit['best_epoch'] = int(best_epoch)
-                    unit['diagnostics'] = ph_diagnostics(model, val_loader, device)
+                    unit['diagnostics'] = ph_diagnostics(model, val_loader, device,
+                                                         const_profile)
                     save_checkpoint(folder / 'best.pt', dict(
                         state_dict=best, architecture=model.architecture_name,
                         group=args.group, task=task, fold=fold_id, protocol=protocol,
                         split=fold, config=run_config, best_validation_r2=best_r2,
-                        best_epoch=best_epoch, checkpoint_sha256=checkpoint_sha,
+                        best_epoch=best_epoch,
+                        epochs_run=int(unit.get('epochs_run', -1)),
+                        checkpoint_sha256=checkpoint_sha,
+                        checkpoint_identity=verified,
                         scaler_mean=scaler.scaler.mean_.tolist(),
                         scaler_scale=scaler.scaler.scale_.tolist()))
                 unit['wall_seconds'] = float(time.perf_counter() - fold_started)

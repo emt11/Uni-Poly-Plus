@@ -414,6 +414,12 @@ def test_sidecar_builder_refuses_to_overwrite():
 
 
 def _write_development_units(root, values, checkpoint_sha):
+    """Schema-complete development units, as the r5 runner writes them."""
+    from src.modules.glt_galph_checkpoint_identity import load_identity
+    identity = load_identity()
+    recorded = {key: identity[key] for key in
+                ('record', 'record_path', 'checkpoint', 'sha256', 'step',
+                 'summary_mode', 'ph_mode', 'ph_encoder_version')}
     for group in ('F_OFF', 'F_CONST', 'F_REAL'):
         for task in ('xc', 'eps', 'eat'):
             for fold in (0, 1):
@@ -422,8 +428,19 @@ def _write_development_units(root, values, checkpoint_sha):
                 (folder / 'metrics.json').write_text(json.dumps({
                     'group': group, 'task': task, 'fold': fold,
                     'protocol': 'ph_retention_development', 'outer_test': 'NOT_RUN',
+                    'validation_only': True,
                     'best_validation_r2': values[group][task][fold], 'best_epoch': 5,
-                    'epochs_configured': 30, 'checkpoint_sha256': checkpoint_sha,
+                    'epochs_configured': 30, 'epochs_run': 5,
+                    'checkpoint_sha256': checkpoint_sha,
+                    'checkpoint_identity': recorded,
+                    'ph_encoder_version': identity['ph_encoder_version'],
+                    'pretrain_summary_mode': identity['summary_mode'],
+                    'pretrain_ph_mode': identity['ph_mode'],
+                    'readout': 'DUAL', 'adaptation': 'full',
+                    'coverage': {'samples': 4, 'valid': 4, 'invalid': 0, 'missing': 0},
+                    'diagnostics': {'batches': 2, 'retention_gate_tanh': 0.0,
+                                    'residual_relative_norm': 0.0,
+                                    'ph_valid_fraction': 1.0},
                     'wall_seconds': 1.0}), encoding='utf-8')
 
 
@@ -463,7 +480,7 @@ def test_aggregator_checks_identity_finiteness_budget_and_risk(tmp_path):
     row = json.loads(path.read_text(encoding='utf-8'))
     row['checkpoint_sha256'] = '0' * 64
     path.write_text(json.dumps(row), encoding='utf-8')
-    with pytest.raises(ValueError, match='frozen C1 deployment'):
+    with pytest.raises(ValueError, match='recorded deployment'):
         aggregator.summarize(tmp_path)
 
     row['checkpoint_sha256'] = sha
