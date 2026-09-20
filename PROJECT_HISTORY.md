@@ -225,3 +225,15 @@
 * 未执行与限制：ANCHOR（无信号，跳过）、matched O8 预训练（S5 仅两组 80 单元）、FP+FGR/组合目标、多构象/多任务/ensemble、预训练吞吐正式 benchmark 之外的调度研究、cache 生产切换；S3b 之前的 3GPU 数据仅作历史记录。无正式 5k 之外的超额训练，无 test 结果驱动的重跑/加 seed/换 checkpoint。
 * 归档操作：仅追加本条到 `PROJECT_HISTORY.md`；不修改 `Plan.md`（用户明确禁止）、代码、config、cache、results 或 checkpoint；`git diff --check` 自检。commit/push 见本轮 Git 历史与交付回复。
 * 下一步：交 Codex 对 S0–S5 全链路（源码、configs、tests、正式产物与 commit 链 `d105ee2→ebed2c6→187a0e7→a89267e→ec005d2→8fe5c58→018f8a0`）做最终独立审查并归档审查结论；审查后的生产路线整理、RESULTS/PIPELINE 更新或任何新实验均须另行授权，本归档不产生新授权。
+
+## 2026-09-20｜旧 GLT-PRED 审查补记与 CANON3D r1 规划交付
+
+* 旧周期状态更正：此前 Codex 对 S5 的80个已有预测单元进行了只读独立复算，R²/MAE/RMSE与保存值最大差异约2.22e-16，逐折test行序与固定manifest一致，OOF各样本一次，B_NONE晋级gate失败、保留B_FP的数值判断成立。此为有限范围验收，不是对S0–S5所有训练过程的重放或完整独立审查。
+* 旧周期仍需收尾：2026-09-20源码复核确认launcher完成判定路径仍与实际嵌套产物不一致，aggregator仍直接采用保存的逐折指标；上文执行者所述COMPLETED/OOF唯一性不独立证明所有历史运行绝无重复test访问。此前Plan与执行脱节的情况现由执行者归档解释为用户阶段性禁止修改Plan；不据旧Plan文字反推未授权。保留历史记录，旧周期不因新计划而标为CLOSED。
+* 本轮用户要求与角色：用户要求给出借鉴2D的3D输入优化方案及完整价值验证计划。Codex编写`GLT-CANON3D-20260920-01/r1`并做文档自检；没有执行模型实现或实验，也不是该方案的独立科学验收。
+* 基线与已有改动：dev@79e3d2d；Plan.md已由用户清空，为唯一已跟踪修改。检查远端仓库后`git pull --ff-only origin dev`成功且Already up to date，在空Plan填入新合同，不恢复旧活动计划；历史科学周期未完成项保留在新Plan的衔接节。
+* 最终方案：M个canonical重原子状态，中心query访问全部真实Trimer images，删exact self、保留独立左右物理关系，不平均距离；固定完整M(3M−1)关系避免geometry-OFF的近邻membership泄漏。512维/6层/8头，新3D独立target-query/source-key模块，relation-conditioned bias和value；原O8、Concat与chem/geo/FP目标不变。新atom经对称atom→bond适配沿用中心键监督，N=0不伪造目标。开放Trimer状态共享为近似，不宣称严格周期性。
+* 验证计划实质：R_GLT、R_2D、G_OFF、S_SHARED四组先做matched 5k和XC/EPS/EAT×fold0/1开发筛查；只有几何和替换双重gate通过，才增加固定侧source的E_STATIC及3M动态状态P_PHYSICAL；再用S/G/锁定参考做seed43/44确认。相同数据、公共初始张量、随机流和原20k scheduler前5k；不复活FGR/ALIGN/ENV/TOR，不生成构象，不改变旧缓存。
+* 拟议预算：P0最多1024条数据审计；P1六路径两步共12updates加恢复8updates=20，另12微调smoke epochs；P2–P4最多12条5k=60000研究updates、72开发单元/2160epochs，按条件逐段授权、不为用满预算补跑。P5另行授权且须通过开发确认，最多三组八任务五折120单元/12000epochs，不新增预训练；既有outer-test已见过，只能称固定协议复评。
+* 交付变化：本轮仅Plan.md及本条历史衔接/规划记录；查阅当前源码、配置、报告和GRIN/SpaceFormer/Matformer原始页面，检查预算、引用与Markdown格式。未运行测试、GPU、模型、缓存构建、预训练、微调或清理；未更新PIPELINE/RESULTS以免将拟议路线写成生产事实。
+* 下一步：新科学周期待授权，建议只先授权P0–P1；旧S5工程缺口在复用前做最小修复与CPU测试，不重跑旧outer-test。负结果可以结束新周期，未满足gate不得机械扩展。Git提交/推送结果见本轮交付，不以Git同步代替方案价值验收。
