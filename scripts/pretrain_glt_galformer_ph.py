@@ -31,6 +31,7 @@ from src.modules.glt_dual_pretrain import (alignment_local_anchor_count,
                                            global_objective)
 from src.modules.glt_galformer_ph_pretrain import (GalformerPretrainer,
                                                    galformer_deployment_package)
+from src.modules.glt_galformer_ph import PH_ENCODER_VERSION
 from src.training.glt_dual_runtime import (IndexedFrozenDualSource,
                                            OrderedSampleStream,
                                            apply_common_initialization,
@@ -185,6 +186,10 @@ def main():
     if config.get('summary_mode', summary_mode) != summary_mode \
             or config.get('ph_mode', ph_mode) != ph_mode:
         raise ValueError('config summary/ph mode does not match the selected arm')
+    configured_ph_version = config.get('ph_encoder_version')
+    expected_ph_version = PH_ENCODER_VERSION if ph_mode == 'global' else None
+    if configured_ph_version != expected_ph_version:
+        raise ValueError('config PH encoder version does not match implementation')
     for key in ('microbatch', 'global_batch', 'max_optimizer_steps', 'save_every'):
         if int(config[key]) <= 0:
             raise ValueError(f'config {key} must be positive')
@@ -293,6 +298,7 @@ def main():
             sample_index_split=(sample_index['split'] if sample_index else None),
             common_init_artifact_sha256=(common_init['sha256'] if common_init else None),
             objective='galformer_mask2d_mask3d_cl' + ('_ph' if ph_mode else ''),
+            ph_encoder_version=(PH_ENCODER_VERSION if ph_mode else None),
             mask_candidate_rate=0.40, mask_policy='80_10_10',
             contrastive_temperature=float(config.get('contrastive_temperature', 0.1)),
             optimizer='adam', grad_clip=float(config.get('grad_clip', 1.0)))
@@ -390,6 +396,19 @@ def main():
             grad_norm = float(torch.nn.utils.clip_grad_norm_(
                 trainer.parameters(), float(config.get('grad_clip', 1.0)),
                 error_if_nonfinite=True))
+            ph_grad_norms = None
+            if ph_mode == 'global':
+                def _grad_norm(module):
+                    values = [parameter.grad.detach().float().reshape(-1)
+                              for parameter in module.parameters()
+                              if parameter.grad is not None]
+                    return float(torch.cat(values).norm()) if values else 0.0
+                ph_grad_norms = {
+                    'alpha_ph': (float(trainer.model.alpha_ph.grad.detach().float().abs().max())
+                                 if trainer.model.alpha_ph.grad is not None else 0.0),
+                    'scale_fuse': _grad_norm(trainer.model.ph_encoder.scale_fuse),
+                    'ph_encoder': _grad_norm(trainer.model.ph_encoder),
+                }
             optimizer.step()
             if world > 1:
                 dist.all_reduce(totals)
@@ -403,6 +422,8 @@ def main():
                 stream_digest=_stream_digest(prepared, bool(ph_mode)),
                 preparation_seconds=preparation_seconds,
                 step_seconds=time.perf_counter() - step_started)
+            if ph_grad_norms is not None:
+                record['ph_grad_norms'] = ph_grad_norms
             if rank == 0 and device.type == 'cuda':
                 record['peak_gpu_memory_gib'] = torch.cuda.max_memory_allocated(device) / 2 ** 30
             if (step + 1) % max(1, int(args.log_every)) == 0 or step + 1 == stop:

@@ -20,7 +20,8 @@ from src.dataset.canonical_periodic import build_canonical_periodic_topology
 from src.dataset.glt_dual_static import build_dual_static
 from src.dataset.glt_galformer_ph import (PHBettiReader, galformer_collate,
                                           prepare_galformer_sample, mask_3d)
-from src.modules.glt_galformer_ph import MASK_TYPE, GLTGalPH, PHProfileEncoder
+from src.modules.glt_galformer_ph import (MASK_TYPE, GLTGalPH, PHProfileEncoder,
+                                           PH_ENCODER_VERSION)
 from src.modules.glt_galformer_ph_pretrain import (GalformerPretrainer,
                                                    galformer_deployment_package,
                                                    galformer_objective,
@@ -194,12 +195,54 @@ def test_ph_masked_patch_hides_raw_values():
     mask = torch.zeros(1, 8, dtype=torch.bool)
     mask[0, :2] = True
     tokens = encoder(profile, mask)
-    masked = encoder.mask_token + encoder.scale_embedding
-    torch.testing.assert_close(tokens[0, :2], masked[:2])
+    masked = encoder.scale_fuse(encoder.mask_token.view(1, 1, -1)
+                                + encoder.scale_embedding[:2].view(1, 2, -1))
+    torch.testing.assert_close(tokens[0, :2], masked[0], atol=0, rtol=0)
     altered = profile.clone()
     altered[0, :, :8] = 123.0                      # patches 0 and 1 live here
     tokens_alt = encoder(altered, mask)
     torch.testing.assert_close(tokens_alt[0, :2], tokens[0, :2], atol=0, rtol=0)
+
+
+def test_ph_scale_position_sensitivity():
+    """Visible patch content must interact with its filtration scale."""
+    torch.manual_seed(123)
+    encoder = PHProfileEncoder()
+    profile = torch.randn(1, 3, 32)
+    mask = torch.zeros(1, 8, dtype=torch.bool)
+    swapped = profile.clone()
+    first, second = profile[:, :, :4].clone(), profile[:, :, 4:8].clone()
+    swapped[:, :, :4], swapped[:, :, 4:8] = second, first
+    left = encoder.summarize(encoder(profile, mask))
+    right = encoder.summarize(encoder(swapped, mask))
+    assert float((left - right).abs().max()) > 1e-8
+
+
+def test_ph_masked_raw_values_do_not_change_summary():
+    torch.manual_seed(123)
+    encoder = PHProfileEncoder()
+    profile = torch.randn(1, 3, 32)
+    mask = torch.zeros(1, 8, dtype=torch.bool)
+    mask[0, :2] = True
+    altered = profile.clone()
+    altered[:, :, :8] = altered[:, :, :8] + 12345.0
+    left = encoder.summarize(encoder(profile, mask))
+    right = encoder.summarize(encoder(altered, mask))
+    torch.testing.assert_close(left, right, atol=0, rtol=0)
+
+
+def test_ph_n1_c1_common_block_initialization_exact():
+    torch.manual_seed(42)
+    n1 = GLTGalPH('mean', 'global')
+    torch.manual_seed(42)
+    c1 = GLTGalPH('cls', 'global')
+    n1_state, c1_state = n1.state_dict(), c1.state_dict()
+    common = sorted(set(n1_state) & set(c1_state))
+    ph_common = [name for name in common if name.startswith(('ph_encoder.', 'ph_to_summary.',
+                                                              'alpha_ph', 'ph_head.'))]
+    assert ph_common
+    assert all(torch.equal(n1_state[name], c1_state[name]) for name in ph_common)
+    assert n1.ph_encoder_version == c1.ph_encoder_version == PH_ENCODER_VERSION
 
 
 # ⑨b PH batch stacking: per-graph [3,32] profiles, [8] masks and scalar flags
@@ -309,6 +352,7 @@ def test_bf16_autocast_masked_forward():
     objective.backward()
     assert float(trainer.model.mask_2d_embedding.grad.abs().sum()) > 0
     assert float(trainer.model.mask_3d_embedding.grad.abs().sum()) > 0
+    assert trainer.model.alpha_ph.grad is not None
 
 
 def test_objective_and_gradients_are_finite():

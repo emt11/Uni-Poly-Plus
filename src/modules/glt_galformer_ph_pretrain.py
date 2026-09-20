@@ -10,7 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .glt_dual_pretrain import alignment_loss
-from .glt_galformer_ph import PH_PATCH_DIM, PH_PATCHES, PH_PROFILE_DIM
+from .glt_galformer_ph import PH_ENCODER_VERSION, PH_PATCH_DIM, PH_PATCHES, PH_PROFILE_DIM
 
 CONTRASTIVE_TEMPERATURE = 0.1
 PH_HUBER_DELTA = 0.1
@@ -114,6 +114,7 @@ def galformer_deployment_package(pretrainer, step):
                 pretrain_objective='galformer_native_mask_cl',
                 mask_candidate_rate=0.40, mask_policy='80_10_10',
                 contrastive_temperature=pretrainer.temperature,
+                ph_encoder_version=(PH_ENCODER_VERSION if model.ph_mode else None),
                 ph_schema='glt-ph-betti-v2' if model.ph_mode else None,
                 ph_channels=3 if model.ph_mode else None,
                 ph_bins=32 if model.ph_mode else None,
@@ -126,6 +127,9 @@ def load_galformer_deployment(model, package, expected_step=5000):
             or package.get('ph_mode') != model.ph_mode
             or int(package.get('step', -1)) != int(expected_step)):
         raise ValueError('galformer checkpoint identity mismatch')
+    expected_ph_version = PH_ENCODER_VERSION if model.ph_mode else None
+    if package.get('ph_encoder_version') != expected_ph_version:
+        raise ValueError('galformer PH encoder version mismatch')
     current = model.state_dict()
     expected = {name for name in current
                 if not name.startswith(('head_2d.', 'head_3d.', 'cl_proj2.',

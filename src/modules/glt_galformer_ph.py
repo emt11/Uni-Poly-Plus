@@ -32,6 +32,7 @@ MASK_TYPE = 25857
 LINE_CLASSES = 25755
 CLS_SEED = 20260920
 PH_SEED = 20260921
+PH_ENCODER_VERSION = 'scale-interaction-v2'
 KEEP, MASK, REPLACE = 0, 1, 2
 
 
@@ -45,9 +46,16 @@ class PHProfileEncoder(nn.Module):
     def __init__(self, hidden=512):
         super().__init__()
         self.patch = _head(PH_PATCH_DIM, 128, hidden)
+        # Scale positions must interact nonlinearly with patch content.  A
+        # linear add followed by mean pooling would make the summary invariant
+        # to swapping visible patches between filtration scales.
+        self.scale_fuse = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, hidden)
+        )
         self.scale_embedding = nn.Parameter(torch.zeros(PH_PATCHES, hidden))
         self.mask_token = nn.Parameter(torch.zeros(hidden))
         self.norm = nn.LayerNorm(hidden)
+        nn.init.normal_(self.scale_embedding, std=0.02)
 
     def patchify(self, profile):
         """[3,32] or [B,3,32] -> [B,8,12]: 8 radius patches, 3 channels x 4 radii."""
@@ -61,11 +69,14 @@ class PHProfileEncoder(nn.Module):
         if patch_mask.dim() == 1:
             patch_mask = patch_mask.unsqueeze(0)
         patches = self.patchify(profile)
-        tokens = self.patch(patches) + self.scale_embedding.unsqueeze(0)
-        # A masked patch contributes no raw value: only the learned mask token
-        # and its filtration-scale embedding.
-        masked_token = (self.mask_token + self.scale_embedding).unsqueeze(0)
-        return torch.where(patch_mask.unsqueeze(-1), masked_token, tokens)
+        content = self.patch(patches)
+        # A masked patch contributes no raw value: replace its content before
+        # the scale interaction, then apply the same nonlinear fusion used by
+        # visible patches.
+        content = torch.where(
+            patch_mask.unsqueeze(-1), self.mask_token.view(1, 1, -1), content
+        )
+        return self.scale_fuse(content + self.scale_embedding.unsqueeze(0))
 
     def summarize(self, tokens):
         return self.norm(tokens.mean(1))
@@ -82,6 +93,7 @@ class GLTGalPH(nn.Module):
             raise ValueError('ph_mode must be none or global')
         self.summary_mode = summary_mode
         self.ph_mode = ph_mode
+        self.ph_encoder_version = PH_ENCODER_VERSION if ph_mode == 'global' else None
         if ph_mode == 'global':
             self.architecture_name = 'O8-GalformerTrimer-GalPretrain-PHGlobal'
         self.o8 = BondPathO8(dropout)

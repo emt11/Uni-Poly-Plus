@@ -2,6 +2,7 @@
   "arm": "C1",
   "summary_mode": "cls",
   "ph_mode": "global",
+  "ph_encoder_version": "scale-interaction-v2",
   "dataset_name": "PI1M_v2",
   "seed": 42,
   "microbatch": 84,
