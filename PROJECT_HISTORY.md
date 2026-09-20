@@ -284,3 +284,13 @@
 * **执行者自检与独立审查的区分**：周期内所有运行、监测、一致性检查、测试与文档均属 **ZCode 执行者自检**，执行者从未宣布验收通过；**Codex 独立审查**的范围为 r6 实现与 18-unit 开发比较（其结论为"验收通过、未建立预测增量、以限定负结果结束"）。r4 的 5000-update 轨迹、r2 的 1026-update 预检与 r5 的失败 smoke 均**未**经 Codex 逐条重放；执行者自检不得当作独立审查。
 * **未完成／未验证（不因归档而关闭）**：① 早期（<1000 步）PH 路径的实际贡献；② 非零门控（更强条件化）下 PH 是否带来增益——本轮明确未做该干预；③ N1 是否与 C1 同构退化（只复核部署权重与旧记录）；④ 8 任务 5 折与 outer-test 层面的任何结论（本轮未运行，且共享 validation 折不是独立盲测）；⑤ 旧 S5 launcher 完成判定路径与 aggregator 逐折校验缺口（与本周期无关，仍未关闭）。
 * **归档操作**：仅追加本条到 `PROJECT_HISTORY.md`，并同步更新 `Plan.md`（审查结论与收口）、`RESULTS.md`（本轮开发结果与解释边界）、`PIPELINE.md`（新 checkpoint 身份、完整产物判定、失败保留机制）；**未**运行模型、测试、训练、诊断前向、缓存构建或清理，**未**改动代码与配置，**未**删除或覆盖任何 checkpoint、sidecar、失败现场与旧诊断。
+## GLT-PH-END2END-20260920-01 / r1 文档规划交付（2026-09-20）
+
+- **角色、授权与状态**：用户要求Codex在PH.md制定可由ZCode执行的多个端到端PH融合方案，目标为提升微调预测表现；本轮仅完成规划文档，实验仍待授权。Codex完成文档自检，不称独立实现审查；ZCode本轮未执行。
+- **基线与保护**：dev@fd6378f，ff-only pull成功；原工作树有Plan.md删除、.zcodeignore未跟踪及空PH.md。本轮不恢复Plan.md、不提交这两项用户改动，仅新增PH.md并追加本归档。
+- **完整规划摘要**：A在原6层512维GLT第2/4层后加入PH-token cross-attention；B在第3/5层后按真实原子—键incidence引入2.5/4/6Å空间消息，用PH路由共享小模块（推荐先做）；C用6层256维原子空间Transformer替换line主干，局部元素选择PH进入第2/4层，输出投影512。保留O8，冻结现有Trimer来源，不生成构象。每family CONST/STAT/PH三臂分别控制新容量、普通空间统计及真实PH，三臂同初始化与预算。先复用当前global PH，C单独核算local PH成本，不将其称完整PiPE或MCP复现。
+- **训练与微调**：主轮共同2D/3D masked-token CE＋InfoNCE，无默认PH重建或FP；新配方AdamW lr2e-4、global1008、warmup2000、20k schedule、5k截断，PH参数wd0。新训练R0/R2D用于比较，现有修复C1 5k作为CURRENT部署锚点只重新微调，不重训。微调outer5_inner20、train-only scaler、Huber0.5、encoder lr1e-5/head1e-4，探索30epochs、后续100epochs、patience10；PH在预训练和微调均可训练，无late-residual新门控。
+- **阶段与上限**：首次建议仅授权P0＋P1-B。每新增arm P1≤10updates及1epoch，CURRENT另1epoch；P2-B五条各5k共25k；P3-B含CURRENT六臂36units/1080epochs。A/C各需单独授权，各增加15k及18units/540epochs。最多11条新轨迹55k、含CURRENT72探索units/2160epochs，非一次性授权。最多一个family晋级；四个新部署从5k续至20k新增≤60k；加CURRENT共五臂，确认90units/9000epochs，正式200units/20000epochs，均另需授权。全量离线特征构建先测算和授权，不隐藏为Dataset前处理。
+- **验收／停止**：候选对CONST和R0的macro3≥+0.005、XC≥+0.01且XC两折为正，对STAT macro3/XC为正，对CURRENT探索为正、确认达到相同增量阈值；跨任务退化保护0.01。仅开发阈值非显著性保证。正式前不访问outer-test，不使用历史不匹配分数做PH归因；可训练性、smoke、开发、正式层级分开。无收益接受限定负结果，不追加无边界sweep。
+- **工程与证据**：复用现有mask/DDP/split/保存恢复；专门覆盖空几何rank、N=0、NUL key、物理mapping、PH/STAT区别、置换和欧氏不变性、报告先保存再诊断及真实退出码。文档检查为相关引用、公式/代码围栏、预算算术、git diff --check；无模型、测试、GPU、训练、缓存或构象生成。
+- **交付与后续**：详细接口、方程、拟新增路径、预算和执行边界保存在本次提交的PH.md。文档交付已完成；新实验未执行，未宣布性能提升。下一步由用户授权P0/P1-B，再由ZCode执行、Codex审查；不自动恢复或替换Plan.md。
