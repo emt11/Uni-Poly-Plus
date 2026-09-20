@@ -233,6 +233,8 @@ GPU、worker 或超过一分钟的任务在 tmux `Uni-Poly` 独立 window 执行
 * **三方互相抑制**：`alpha_ph` 自身梯度最初健康（3.6e-3），但其因子 `ph_to_summary` 同样被衰减（4.89 → 4.3e-4），于是 α 的梯度在 3500 步后也塌到 4.8e-8；反过来 encoder 的梯度被 tanh(α) 压制。分支里只有 `ph_encoder.norm.weight` 存活（7.99），其余张量全部 →0，与"输出为常量但范数非零"的实测自洽。
 * `loss_ph` 0.0149 → 0.0029 由 `ph_head` 读主干 `g3` 完成（§11.5）。
 
+**机制支持证据（**不是**完整训练轨迹的复现）**：`results/glt_galph_ph_retention_20260920/p1/blocker_evidence.json` 的 `adam_decay_check` 记录了一个受控小实验——`torch.optim.Adam(lr=2e-4, weight_decay=1e-6)` 在 4096 维参数上、**损失梯度恒为 0** 的情况下，5000 步把范数 1.2714 压到 0.0（`max|p| ≈ 4.6e-24`）；同等条件下 decoupled 的 AdamW 保持 1.2714。它说明"耦合衰减在不被任务梯度抵住时会吃掉参数"，只与上表的真实轨迹**结论一致**，不能被当作轨迹复现，也不能单独用来归因真实运行；真实的梯度—衰减竞争以上表为准。
+
 ### 11.3 只读诊断（§4，`scripts/diagnose_glt_galph_ph_degeneration.py`）
 
 * **probe 集**：P_train sidecar 的**行 0–63**（冻结文件里固定行序、全部 valid），键值写入 `p1/ph_probe_keys.json`，张量写入 `p1/ph_probe_profiles.npy`；**不涉及任何下游 validation/test 指标**，样本选择只看行序。
