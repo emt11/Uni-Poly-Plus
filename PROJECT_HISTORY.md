@@ -258,3 +258,10 @@
 * 实际执行与回滚（执行者记录，供审查）：用户曾明确授权 `GLT-CANON3D-20260920-01 / r1` 的 P0–P1；执行者实现了拟新增文件 `src/dataset/canonical_geometry.py`、`src/modules/canonical_geometry.py`、`tests/test_canonical_geometry.py`、`scripts/audit_canon3d_p0.py`、`configs/mts/canon3d_*.json`，并运行 P0 只读审计写出 `results/glt_canon3d_20260920/p0/p0_audit.json`。用户随后指示停止该任务并要求回滚这些代码改动；执行者已删除上述 5 类新文件（**当前工作树中确认不存在**），仅保留未跟踪的只读产物 `results/glt_canon3d_20260920/p0/p0_audit.json`。该产物不参与后续任何判断，也未进入本日 GALPH 周期。
 * 未完成事项（逐项列出，全部未获验收）：P0 审计无独立审查；P1 的身份/关系数/不变性/G_OFF 回退/部署 strict-load 测试随代码删除而消失；P2 主比较（R_GLT/R_2D/G/S 各 5k）与 24 个开发单元从未运行；P3 条件归因（E_STATIC/P_PHYSICAL）、P4 多 seed 确认、P5 固定协议复评从未运行；r2 的 `L_MULTI2`/`L_NEAR_GEO`/`L_OFF` 与 M0/M1 从未实现或运行。以上内容不因本条归档而关闭或通过；若要重启，必须按当时的合同重新授权并重新建立验证，不得引用本条作为已完成证据。
 * 交接边界：CANON3D 的旧 Python 脚本若在别处残留，不构成本项目活跃计划；旧周期中提到的 S5 launcher/aggregator 源码缺口与本归档无关，仍未关闭，也不由本条修复。
+
+## 2026-09-20｜COLLAB-20260920-01 / r1：明确 Codex 规划审查、ZCode 执行闭环
+
+* 授权与角色：用户明确要求更新 `AGENTS.md`；Codex 执行本次文档修改，基线 `dev@41d33b0`，修改前工作树干净，安全 pull 成功。
+* 最终规则与实际修改：在 `AGENTS.md` §4 明确用户将 Codex 规划转交 ZCode，并返回执行结果；Codex 核对实际 diff、日志和产物后给出审查结论，制定下一步或返修计划及一致的执行提示词。接收结果不等于接管执行，保留用户明确要求 Codex 执行时的例外。
+* 验证与结论：仅文档逻辑与 `git diff --check` 自检，无独立审查；未运行测试、模型、训练或缓存任务。本次规则更新完成，提交与远端核验见本轮交付。
+* 边界与下一步：未修改当前 `Plan.md`，不改变 PH retention 周期的阻断状态或实验授权；本次规则修改暂无后续执行。
