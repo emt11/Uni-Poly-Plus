@@ -171,6 +171,25 @@ def test_ph_sidecar_key_alignment():
         reader.get(0, '00' * 32)
 
 
+@pytest.mark.skipif(not (PH_ROOT / '.done').is_file(),
+                    reason='PH Betti sidecar not present in this checkout')
+def test_ph_reader_follows_the_sample_key_across_epochs():
+    """Stream positions wrap every epoch; the profile must follow the sample."""
+    reader = PHBettiReader(PH_ROOT)
+    size = len(reader)
+    key = _key_at(7)
+    profile, valid = reader.get(7, key)
+    # The same sample reached again in a later epoch: the position is far past
+    # the sidecar length, so only the sample key identifies the row.  Reading by
+    # position alone raised IndexError here and stopped the N1 run at step 904.
+    for position in (7 + size, 7 + 3 * size):
+        wrapped, wrapped_valid = reader.get(position, key)
+        torch.testing.assert_close(torch.from_numpy(wrapped), torch.from_numpy(profile))
+        assert wrapped_valid == valid
+    with pytest.raises(ValueError):
+        reader.get(size + 7, '11' * 32)
+
+
 def _key_at(position):
     """The P_train key at a *training-stream* position (the sidecar's order)."""
     from src.training.glt_dual_runtime import (IndexedFrozenDualSource,

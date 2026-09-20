@@ -23,7 +23,14 @@ PH_PATCHES_MASKED = 2
 
 
 class PHBettiReader:
-    """Read-only mmap access to the PH Betti sidecar, key-validated."""
+    """Read-only mmap access to the PH Betti sidecar, addressed by sample key.
+
+    Rows follow the epoch-0 training-stream order, so a raw stream position is
+    only a fast path: training positions grow monotonically and wrap every
+    epoch, while the sidecar holds exactly one row per sample.  Every lookup
+    therefore falls back to the sample key, which is what the profile belongs
+    to.
+    """
 
     def __init__(self, root, verify_keys=True):
         from pathlib import Path
@@ -34,20 +41,55 @@ class PHBettiReader:
         self.valid = np.load(root / 'ph_valid.npy', mmap_mode='r')
         self.keys = np.load(root / 'sample_keys.npy', mmap_mode='r')
         self.verify_keys = bool(verify_keys)
+        self._sorted_head = None
+        self._sorted_rows = None
 
     def __len__(self):
         return int(self.profiles.shape[0])
 
+    def _key_table(self):
+        """Sorted uint64 head of every key; the row list follows that order."""
+        if self._sorted_head is None:
+            raw = np.ascontiguousarray(self.keys)
+            head = raw[:, :8].copy().view(np.uint64).reshape(-1)
+            order = np.argsort(head, kind='stable')
+            self._sorted_head, self._sorted_rows = head[order], order
+        return self._sorted_head, self._sorted_rows
+
+    def _row_for_key(self, expected):
+        """Row whose key equals ``expected``.
+
+        A byte-string comparison would be wrong here: sample keys are raw
+        32-byte hashes and numpy's ``'S'`` dtype compares them as C strings, so
+        a key containing a NUL byte never matches.  The table is sorted on the
+        first eight bytes and every hit is verified against all 32 bytes, with a
+        full scan as the rare fallback.
+        """
+        if expected.size >= 8:
+            head, rows = self._key_table()
+            target = int(np.frombuffer(expected.tobytes()[:8], dtype=np.uint64)[0])
+            slot = int(np.searchsorted(head, target))
+            if slot < head.size and int(head[slot]) == target:
+                row = int(rows[slot])
+                if np.array_equal(np.asarray(self.keys[row]), expected):
+                    return row
+        matches = np.flatnonzero((np.asarray(self.keys) == expected).all(axis=1))
+        return int(matches[0]) if matches.size else None
+
+    def _row(self, row):
+        return (np.asarray(self.profiles[row], dtype=np.float32), bool(self.valid[row]))
+
     def get(self, position, key):
+        expected = np.frombuffer(bytes.fromhex(str(key)), dtype=np.uint8)[:32]
         position = int(position)
-        if position >= len(self):
-            raise IndexError('PH sidecar is shorter than the manifest')
-        if self.verify_keys:
-            expected = np.frombuffer(bytes.fromhex(key), dtype=np.uint8)[:32]
-            if not np.array_equal(np.asarray(self.keys[position]), expected):
-                raise ValueError('PH sidecar sample key does not match the manifest order')
-        return (np.asarray(self.profiles[position], dtype=np.float32),
-                bool(self.valid[position]))
+        if (self.verify_keys and 0 <= position < len(self)
+                and expected.size == 32
+                and np.array_equal(np.asarray(self.keys[position]), expected)):
+            return self._row(position)
+        row = self._row_for_key(expected)
+        if row is None:
+            raise ValueError('PH sidecar does not contain this sample key')
+        return self._row(row)
 
 
 def _choose(candidates, generator, rate=CANDIDATE_RATE):

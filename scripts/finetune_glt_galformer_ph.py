@@ -69,9 +69,8 @@ def optimizer_for(model, config):
 
 def fit_select_and_test(model, scaler, train_loader, val_loader, test_loader, device,
                         optimizer, scheduler, config, *, task, fold_id,
-                        validation_only=False, validation_summary=None,
-                        outer_test_guard=None):
-    encoder, criterion = model, nn.MSELoss()
+                        validation_only=False, validation_summary=None):
+    criterion = nn.MSELoss()
     best, best_r2, best_epoch, stalled = None, -float('inf'), -1, 0
     for epoch in range(config['epochs']):
         train_epoch(model, train_loader, criterion, optimizer, scheduler, device,
@@ -130,6 +129,8 @@ def main():
         raise ValueError('--clean-cache-gib must be finite and non-negative')
     if args.smoke and args.development:
         raise ValueError('--smoke and --development are mutually exclusive')
+    if args.formal_shard:
+        raise ValueError('round 1 is development-only: this runner has no outer-test path')
     selected_tasks = list(args.tasks) if args.tasks else list(TASKS)
     selected_folds = [int(value) for value in args.folds] if args.folds else list(range(5))
     if args.development and not args.tasks:
@@ -274,9 +275,7 @@ def main():
                 write_json(folder / 'metrics.json', result)
                 results.append(result)
                 all_folds.append(result)
-                del model, encoder, optimizer, scheduler
-            if not validation_only:
-                raise ValueError('round 1 must not read outer-test')
+                del model, optimizer, scheduler
         finally:
             if dataset is not None:
                 dataset.cache_stats()
