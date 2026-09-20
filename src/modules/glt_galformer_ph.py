@@ -30,6 +30,8 @@ PH_PATCH_DIM = PH_CHANNELS * PH_RADII_PER_PATCH  # 12
 PH_PROFILE_DIM = PH_CHANNELS * PH_BINS           # 96
 MASK_TYPE = 25857
 LINE_CLASSES = 25755
+CLS_SEED = 20260920
+PH_SEED = 20260921
 KEEP, MASK, REPLACE = 0, 1, 2
 
 
@@ -92,7 +94,18 @@ class GLTGalPH(nn.Module):
         self.cl_proj3 = _head(512, 256, 128)
         nn.init.normal_(self.mask_2d_embedding, std=0.02)
         nn.init.normal_(self.mask_3d_embedding, std=0.02)
-        if summary_mode == 'cls':
+        # Arm-specific blocks are built under their own fixed seed, and every
+        # arm forks both blocks (empty when absent) so the shared step-0 tensors,
+        # the CLS block (C0/C1), the PH block (N1/C1) and the RNG state left for
+        # the training streams are identical across the four arms.
+        self._build_cls_block(summary_mode == 'cls')
+        self._build_ph_block(ph_mode == 'global')
+
+    def _build_cls_block(self, present):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(CLS_SEED)
+            if not present:
+                return
             self.cls_2d = nn.Parameter(torch.zeros(512))
             self.cls_3d = nn.Parameter(torch.zeros(512))
             self.virtual_to_real_bias = nn.Parameter(torch.zeros(8))
@@ -100,7 +113,12 @@ class GLTGalPH(nn.Module):
             self.virtual_self_bias = nn.Parameter(torch.zeros(8))
             nn.init.normal_(self.cls_2d, std=0.02)
             nn.init.normal_(self.cls_3d, std=0.02)
-        if ph_mode == 'global':
+
+    def _build_ph_block(self, present):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(PH_SEED)
+            if not present:
+                return
             self.ph_encoder = PHProfileEncoder()
             self.ph_to_summary = nn.Linear(512, 512, bias=False)
             self.alpha_ph = nn.Parameter(torch.zeros(1))
@@ -117,9 +135,9 @@ class GLTGalPH(nn.Module):
             mask_rows = rows[policy == MASK]
             replace_rows = rows[policy == REPLACE]
             if mask_rows.numel():
-                initial[mask_rows] = self.mask_2d_embedding
+                initial[mask_rows] = self.mask_2d_embedding.to(initial.dtype)
             if replace_rows.numel():
-                initial[replace_rows] = self._donor_embeddings(data)
+                initial[replace_rows] = self._donor_embeddings(data).to(initial.dtype)
         # PathNode and bond-path biases read the masked/replaced states, so no
         # original atom feature can leak through the attention bias.
         bias = (self.o8.spd_embedding(data.lga_spd.long())
@@ -186,7 +204,7 @@ class GLTGalPH(nn.Module):
             mask_rows = rows[data.mask3d_policy.long() == MASK]
             if mask_rows.numel():
                 states = states.clone()
-                states[mask_rows] = self.mask_3d_embedding
+                states[mask_rows] = self.mask_3d_embedding.to(states.dtype)
                 types = types.clone()
                 types[mask_rows] = MASK_TYPE
         path_bias = self.glt.angle_bias(types, data.line_path, data.line_angle,

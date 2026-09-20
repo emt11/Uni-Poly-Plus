@@ -190,9 +190,9 @@ def galformer_collate(records):
     batch.mask3d_policy = torch.cat(policy3) if policy3 else torch.zeros(0, dtype=torch.long)
     batch.mask3d_donor_atoms = torch.cat(donors3) if donors3 else torch.zeros(0, dtype=torch.long)
     if ph_profiles:
-        batch.ph_profile = torch.cat(ph_profiles, 0)
-        batch.ph_mask = torch.cat(ph_masks, 0)
-        batch.ph_valid = torch.stack(ph_valids, 0)
+        batch.ph_profile = torch.stack(ph_profiles, 0)   # [B,3,32]
+        batch.ph_mask = torch.stack(ph_masks, 0)         # [B,8]
+        batch.ph_valid = torch.stack(ph_valids, 0)       # [B]
     labels = {'label_2d': torch.cat(labels_2d), 'label_3d': torch.cat(labels_3d),
               'identity': identities}
     if labels_ph:

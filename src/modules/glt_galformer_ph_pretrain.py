@@ -10,7 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .glt_dual_pretrain import alignment_loss
-from .glt_galformer_ph import PH_PROFILE_DIM
+from .glt_galformer_ph import PH_PATCH_DIM, PH_PATCHES, PH_PROFILE_DIM
 
 CONTRASTIVE_TEMPERATURE = 0.1
 PH_HUBER_DELTA = 0.1
@@ -60,11 +60,14 @@ class GalformerPretrainer(nn.Module):
         ph_sum = out['g3'].sum() * 0.0
         ph_count = torch.zeros((), dtype=torch.long, device=out['g2'].device)
         if self.ph_mode == 'global':
-            summary = out['g3']
-            prediction = self.model.ph_head(summary).float()
             patch_mask = labels['ph_patch_mask'].bool()
-            target = labels['label_ph'].float().reshape(-1, 2, 12)
-            predicted = prediction.reshape(-1, 8, 12)[:, patch_mask[0], :]
+            graphs, masked_per_graph = patch_mask.size(0), int(patch_mask.sum(-1).max())
+            if not bool((patch_mask.sum(-1) == masked_per_graph).all()):
+                raise ValueError('every graph must mask the same number of PH patches')
+            prediction = self.model.ph_head(out['g3']).float().reshape(
+                graphs, PH_PATCHES, PH_PATCH_DIM)
+            predicted = prediction[patch_mask].reshape(graphs, masked_per_graph, PH_PATCH_DIM)
+            target = labels['label_ph'].float().reshape(graphs, masked_per_graph, PH_PATCH_DIM)
             valid_ph = data.ph_valid.bool() & data.graph_available.bool()
             per_graph = F.huber_loss(predicted, target, reduction='none',
                                      delta=PH_HUBER_DELTA).mean(-1).mean(-1)

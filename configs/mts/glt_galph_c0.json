@@ -1,0 +1,31 @@
+{
+  "arm": "C0",
+  "summary_mode": "cls",
+  "ph_mode": null,
+  "dataset_name": "PI1M_v2",
+  "seed": 42,
+  "microbatch": 84,
+  "global_batch": 1008,
+  "max_optimizer_steps": 5000,
+  "save_every": 1000,
+  "lr": 0.0002,
+  "weight_decay": 1e-06,
+  "warmup_steps": 2000,
+  "schedule_total_steps": 20000,
+  "end_lr": 1e-09,
+  "amp_dtype": "bf16",
+  "grad_clip": 1.0,
+  "contrastive_temperature": 0.1,
+  "loss_weights": [
+    1,
+    1,
+    1,
+    1
+  ],
+  "deployment_step": 5000,
+  "sample_index_artifact": "results/glt_pred_20260918/s3b_prep/pretrain_split_v1.json",
+  "sample_index_split": "train",
+  "common_init_artifact": "results/glt_galph_20260920/p1/common_init_galph_v1.pt",
+  "ph_sidecar_root": "results/glt_galph_20260920/p0/ph_sidecar_betti_v2",
+  "expected_world_size": 4
+}
