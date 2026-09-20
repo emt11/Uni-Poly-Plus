@@ -237,3 +237,13 @@
 * 拟议预算：P0最多1024条数据审计；P1六路径两步共12updates加恢复8updates=20，另12微调smoke epochs；P2–P4最多12条5k=60000研究updates、72开发单元/2160epochs，按条件逐段授权、不为用满预算补跑。P5另行授权且须通过开发确认，最多三组八任务五折120单元/12000epochs，不新增预训练；既有outer-test已见过，只能称固定协议复评。
 * 交付变化：本轮仅Plan.md及本条历史衔接/规划记录；查阅当前源码、配置、报告和GRIN/SpaceFormer/Matformer原始页面，检查预算、引用与Markdown格式。未运行测试、GPU、模型、缓存构建、预训练、微调或清理；未更新PIPELINE/RESULTS以免将拟议路线写成生产事实。
 * 下一步：新科学周期待授权，建议只先授权P0–P1；旧S5工程缺口在复用前做最小修复与CPU测试，不重跑旧outer-test。负结果可以结束新周期，未满足gate不得机械扩展。Git提交/推送结果见本轮交付，不以Git同步代替方案价值验收。
+
+## 2026-09-20｜GLT-CANON3D-20260920-01 / r2 多RU关系规划修订
+
+* 用户要求：在Plan.md基础上新增考虑跨两个RU、借鉴2D和旧N+1/N+2思想的实现方案。Codex本轮只修订Plan.md与本条；未实现、未运行模型或测试，不改变已有执行授权。基线dev@b61876d，安全pull成功。未跟踪`.zcodeignore`与`scripts/audit_canon3d_p0.py`完整保留且不暂存，不能仅因脚本存在宣称P0完成。
+* 源码依据：2D使用canonical状态和带shift的lifted关系；旧revision-2 N+1/N+2先枚举共享中心原子的物理键对，再映射状态，N+1合并左右跨键且平均长度，N+2保留真实两侧。新的r2继承物理身份/多重性，不重复长度平均；旧N+2不等于已观测中心RU±2。
+* 最终新增合同：`L_MULTI2`维护M个canonical状态，枚举冻结Trimer全部物理有向原子对，保留source/target原始image与target anchor及delta=q_source−q_target。共3M(3M−1)关系，其中跨度0/1/2分别为3M(M−1)、4M²、2M²。只删physical exact self，不按canonical/相对shift去重。每个canonical目标的三个物理锚点内独立softmax，以中心1/2、左右各1/4合并消息后更新M状态。侧锚点只有临时message，不递归维护独立隐藏状态。输出是多局部观测估计的代表性RU，不再宣称纯中心几何状态。
+* 几何边界：实际RU−1到RU+1距离可用，但不等于中心到RU+2距离；重新定锚不是坐标平移。所有距离用同一次noisy实际坐标重算，目标保持原中心键/角度与chem/FP。无新增角度、torsion或loss。接口容纳更长真实观测集合，当前只允许K=3；无RU±2坐标不伪造，扩真实K需另立数据与预算合同。
+* 配对验证：新增`L_NEAR_GEO`保留完全相同物理关系但关闭跨度2距离，以及`L_OFF`关闭全部距离。L−NEAR检验跨度2显式几何，L−OFF检验整体几何，L−S只作多锚点/范围整体增量，L−P只作共享折叠/独立物理状态比较。保留全部r1组，不静默将L替换进P4/P5。
+* 新预算均待授权：M0三组各2updates及XC fold0各2epochs，合计6updates/6epochs；M1三条5k及18个30epoch开发单元，合计15000updates/540epochs。新增方向不依赖S已晋级，但替换判断需要已获授权且身份匹配的S/R参考。L相对NEAR/OFF均需XC mean增量≥0.01且两fold均正、EPS/EAT各退化不超过0.01，再验证参考保护条件；未通过停止，通过只列开发候选。与r1最大预算相加为75000研究updates+26correctness、2700开发epochs+18smoke，原P5最多120单元不增加。
+* 验证与下一步：文档逻辑、计数公式、预算与git diff --check自检；没有运行单测、GPU、训练、微调、缓存构建或清理。接手端先读取r2，原r1可在既有授权内继续，新M0/M1须单独授权；不干扰原P0脚本，不把新规划当成实施完成。Git同步结果见本轮交付。
