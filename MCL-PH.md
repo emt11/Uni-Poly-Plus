@@ -4,8 +4,8 @@
 
 ## 0. 状态、角色与授权
 
-- **状态：受阻 / 待审查（r5 部分交付）**。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**），**根因仍未定位**；同时补齐 Router 诊断开关与内存记录（§13.4）。r5 完成四项收尾状态修正与针对性验证（14 passed），但**唯一一次** cat 两步真实运行因我方预建输出目录触发防覆盖守卫而在预备阶段中止（0 update、未重试），故「真实两步复现」目标未完成，详见 §13.5。
-- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（cat 完成 2/6 授权 update 但无 r3 自己的 `deploy_00002.pt`，M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4，r5 见 §13.5。
+- **状态：受阻 / 待审查（r6 执行后交回）**。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**）。r5 完成四项收尾状态修正与针对性验证（14 passed），但唯一一次真实运行因预建输出目录触发防覆盖守卫而中止（0 update）。r6 的唯一一次 cat 两步运行**完成了 2 个 update**（`resume_00002.pt` 与 r3b 逐字节相同），随后在导出窗口抛出 `IndexError` 并进入收尾死锁——**r3 挂起由此复现并定位到具体缺陷**（`shared` 变量遮蔽），另有看门狗 180 s 自动停止不可达的缺陷；按指令未改代码、未重试，详见 §13.5/§13.6。
+- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（cat 在 r3 与 r6 各完成 2/6 授权 update、均无 deploy 包；M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4，r5 见 §13.5，r6 见 §13.6。
 - r1 状态（历史，已被 r2 取代）：**待授权执行**。
 - Codex 规划和审查；ZCode 在用户授权后执行。推荐第一次仅授权 P0＋P1，后续阶段必须分别交回审查。
 - 文档基准：`dev@0d633d8`，已安全 pull、无远端更新。原 `MCL-PH.md` 为空；用户未跟踪 `.zcodeignore` 不修改、不提交。
@@ -931,4 +931,130 @@ B. **四 rank GPU 收尾复现**（`tests/_mcl_ph_r4_epilogue_replay.py`，`torc
 - 未改动：模型数学/初始化/数据语义/超参/batch/worker 数；冻结缓存；r3 现场（`pretrain_r3b/cat/runtime.json` 仍 `RUNNING`，文件清单与 sha 未变）；r4 恢复导出候选；`.zcodeignore`（未跟踪、未提交）。
 - 未取得任何性能或收敛结论；本轮不写「挂起已修复」，也不宣称任何 PASS。
 - 提交与同步：本轮改动提交为 `c9fcb50`，推送 `cf2199c..c9fcb50 dev -> dev`（非 force），`git ls-remote origin dev` 核对远端 = `c9fcb50c9708e9aaad525fa6246c5ef36bb1190f`，与本地 HEAD 一致；`.zcodeignore`（用户未跟踪文件）未修改、未提交；`logs/`、`results/` 下的运行产物按仓库 `.gitignore` 不提交，只按路径引用。远端在本轮开始与提交前均为 `cf2199c`，无他人未合并的提交。
+
+### 13.6 r6 执行记录（执行者 ZCode，2026-09-21 UTC，基准 `dev@7fc7779`）
+
+**计划头（执行前登记）**
+
+| 项目 | 内容 |
+| --- | --- |
+| 计划 ID / 修订 | `MCL-PH-20260921-01` / **r6「修正操作流程后，一次 CAT 两步运行」** |
+| 状态 | **受阻（执行后交回审查）**：唯一一次运行完成 2 个 update 后在导出窗口因 `shared` 遮蔽缺陷抛 `IndexError` 并进入收尾死锁（挂起被复现且定位），按指令未重试、未改代码 |
+| 授权来源 | 用户 2026-09-21 的 r6 指令：新增授权「最多 1 次训练启动、CAT 最多 2 optimizer updates」；旧预算不抵扣、不追认；失败即停止、不自动重试 |
+| 角色 | Codex 规划与审查；ZCode 执行 |
+| 基准 commit | `dev@7fc7779`（含 r5 提交 `8e67680`；`git merge-base --is-ancestor 8e67680 HEAD` = 是） |
+| 同步 | `git pull --ff-only origin dev` → **Already up to date**；`git ls-remote origin dev` = `7fc7779c6fa6575125b721d7c02dc81c867b3b7b`，与本地 HEAD 一致 |
+| 远端新增 | `7fc7779`（作者 emt11，内容仅把 `.zcodeignore` 纳入版本管理，81 行；由用户本人提交，本轮不修改、不碰该文件） |
+| 工作区 | `git status` 干净（无未提交改动）；无 `pretrain_mcl_ph`/`finetune_mcl_ph`/`torch.distributed.run`/看门狗进程；无遗留的 `mcl_ph_r*` tmux window；4 张 GPU 空闲（GPU3 490 MiB 常驻非本轮进程） |
+
+**一、r6 范围**
+
+- 仅做一次 cat 两步真实运行（不修改模型或训练代码、不重跑测试套件、不新增框架）。
+- 新增授权：训练启动 **≤1**、CAT optimizer updates **≤2**；额外 forward/backward **0**、微调 epochs **0**。
+- 不启动 GATE/XATTN、GLT_REF、O8_ONLY、P2/P3、正式 5k、outer-test 或缓存构建；不使用恢复导出候选或旧 checkpoint 续训；不重新随机生成初始化。
+- 本轮只允许必要的计划/执行记录文档修改；若发现需要改代码，**停止并交回**，不边修边重试。
+- 旧预算不抵扣、不追认：r5 的 1 次启动（0 update，预备守卫中止）不用于抵扣本轮。
+
+**二、执行前静态核对（只读；结果如下）**
+
+| 检查 | 方法（只读） | 结果 |
+| --- | --- | --- |
+| 基准含 8e67680 | `git merge-base --is-ancestor` | 是；HEAD = `7fc7779` |
+| arm 路径不存在 | `test -e results/mcl_ph_20260921/p1/pretrain_r6/cat` | `EXISTS=no`（创建完输出根目录后复检仍为 `no`） |
+| arm 路径非符号链接 | `test -L` | `SYMLINK=no` |
+| 仅创建输出根与日志目录 | `mkdir -p results/mcl_ph_20260921/p1/pretrain_r6 logs/mcl_ph_20260921` | 已建；**未创建** `.../pretrain_r6/cat`（留给生产 runner） |
+| v2 初态逐字节身份 | `cmp` + `sha256sum`（r3b / r5 / r6 三份副本） | 三份**逐字节相同**，sha256 均 `499309392d578daf7a7baf1d102d7a7f5c652e5a9b42ca2904ac9d83d1fab85a`（schema `mcl-ph-shared-new-init-v2`） |
+| 写权限 | 仅在**父目录**探测（`touch`/`rm` 临时文件），未对 arm 路径做 mkdir 或试写 | `PARENT_WRITABLE` |
+| 配置与 r3 一致 | 当前 `configs/mts/mcl_ph_cat.json` 与 r3 `runtime.json` 内嵌 `config` 逐键对比（38 键） | **零差异**；`fusion_mode=cat`、microbatch 84、accumulation 3、global_batch 1008、lr 2e-4、wd 0、warmup 2000、schedule_total_steps 20000、end_lr 1e-9、seed 42、cutoffs [2,3,4]、dropout 0.1、balance_weight 1e-3、router_dense_updates 500、top_k 2、noise_sigma 0.03、atom_mask_ratio 0.3、max_optimizer_steps 5000；配置文件自 `3d66198` 起未改动 |
+| 数据/缓存路径 | 与 r3 相同的 launcher 默认值 | cohort `cohort_30f17b59bc5862a1`、cache `mips_trimer_scage`、static `dual_static_v1`、statistics `results/mcl_ph_20260921/p0/statistics.npz`（sha256 `67a77db02822e24b600daaf2a5e141cc69eebb04a354ae5af38f3e9ad873b9c7`） |
+| 命令 | 显式 `ARMS='cat'`（不使用默认 `glt_ref cat gate xattn`）、`UPDATES=2`、`NPROC=4`、`PREP_WORKERS=12` | 见「三」 |
+| 看门狗 | 沿用已提交的 `tests/_mcl_ph_r5_stall_supervisor.py`（r5 已验证；对尚不存在的 stages 目录 glob 返回空、不报错） | 复用，不新增脚本 |
+
+**三、最终命令（只读核对后原样执行）**
+
+```
+ARMS='cat' UPDATES=2 NPROC=4 PREP_WORKERS=12 \
+OUTPUT=results/mcl_ph_20260921/p1/pretrain_r6 \
+LOG=logs/mcl_ph_20260921/r6_pretrain_cat.log \
+MCL_PH_STALL_SECONDS=120 \
+timeout -k 30 900 bash scripts/run_mcl_ph_pretrain_smoke.sh
+# 同 window 内另起（已验证的）看门狗：
+python tests/_mcl_ph_r5_stall_supervisor.py --root-pid <launcher pid> \
+  --stages-dir results/mcl_ph_20260921/p1/pretrain_r6/cat \
+  --log logs/mcl_ph_20260921/r6_pretrain_cat.log \
+  --report results/mcl_ph_20260921/p1/pretrain_r6/stall_supervisor.json
+```
+
+- tmux：`Uni-Poly: mcl_ph_r6_cat`（独立 window）。
+- 外部总时限 ≤15 min；收尾 120 s 无进展出栈（进程内 faulthandler 立即 flush）、180 s 无进展由看门狗终止**本次进程树**并保存现场；只终止本轮明确 PID 及其后代。
+- 保持 r4/r5 既有机制：每 rank 阶段日志与逐张量导出进度、faulthandler 停滞栈、Router/全局分母/梯度/内存记录、真实退出码、清理状态与 launcher 的 `verify_mcl_ph_arm.py` 验收。
+
+**四、停止条件（执行前登记）**
+
+- 任何失败、超时或人工终止：**本轮立即停止**，不自动重试、不启动其他臂或微调；即使失败发生在 0 update，也消耗本轮唯一启动额度。
+- 如实保存：实际 updates、最后完成阶段、各 rank 栈、真实退出码、看门狗介入记录。
+- 成功结论只能是：「本次完整训练条件下 CAT 两步 smoke 成功；旧 r3 挂起根因仍未确定，未证明问题永久消失。」
+- 若失败，明确区分**预备守卫/训练错误**与**导出挂起**，不混为同一故障。
+
+（实际运行、验收与预算核算见下。）
+
+**五、实际运行（唯一一次启动，14:29:0xZ → 14:33:04Z，约 3.5 min）**
+
+| 时间（UTC） | 事件 |
+| --- | --- |
+| 14:29:0x | `torchrun --nproc_per_node=4` 启动（完整训练条件：world 4、microbatch 84、accumulation 3、BF16、dense 路由、effective_graphs 1008、分母 `update_level`） |
+| — | **step 1、step 2 两个 optimizer update 均真实完成**（`steps.jsonl` 2 行；loss atom 5.193→5.163、geometry 0.252、balance 1.18e-4、`grad_total_preclip` 63.7/63.6，全部有限；`router_mode=dense`；新监控字段在真实记录中出现：`router_statistics='population_std_correction_0'`、`memory.cuda.window='step_since_last_reset'`、`memory.cpu.window='rank_process_lifetime'`） |
+| 14:28:53 | `resume_00002.pt` 落盘完成，rank1–3 到达 `barrier` 并**阻塞**（stage log 最后一条：`barrier: enter`） |
+| 14:29:04.27 | rank0：`deployment_package: enter` → `IndexError` → `failure: enter` → `cleanup: enter` → `cleanup: source_closed`（14:29:04.42）后**无** `process_group_destroyed`；rank0 阻塞在进程组销毁 |
+| 14:31:0x | 进程内看门狗（120 s 无进展）输出四份**真实 Python 栈**（见「六」） |
+| 14:32:5x | 看门狗的 180 s 自动停止**未生效**（原因见「七.2」），由操作者调用模块内既有 `stop_tree` 逻辑定向终止本次进程树：54 个后代全部 SIGTERM、**0 个需要 SIGKILL**、无幸存进程、GPU 显存释放；记录写入 `results/mcl_ph_20260921/p1/pretrain_r6/stall_supervisor_manual_stop.json` |
+| 14:33:04 | launcher 退出码 **143**（SIGTERM，来自窗口日志 `R6_CAT_LAUNCHER_EXIT=143 SUPERVISOR_EXIT=0`）；supervisor 报告 `status='ROOT_EXITED'`、`intervened=false`、`silent_seconds=90.0` |
+
+产物（`results/mcl_ph_20260921/p1/pretrain_r6/cat/`）：
+
+- `resume_00002.pt` 315,570,711 B，sha256 `e91bda10bfb0db5a6da5f0a05c6bd0c22458ef48bb8a1053c2ef9e13f8818af2` —— 与 r3b 的 `resume_00002.pt` **逐字节相同**（`cmp` 通过），即两轮两步计算完全一致。
+- **无 `deploy_00002.pt`**；无 `PASS`、无 `ALL_ARMS_OK`；`runtime.json` = `FAILED`/`exit_code=1`/`phase='before_cleanup'`；`failure_rank0.log`、`runtime_failure_rank0.json` 各一份（rank1–3 未抛异常，故无失败记录）。
+- 阶段日志 `stages_rank{0..3}.log`、停滞栈 `stall_stack_rank{0..3}.txt`（各 3.1–3.3 KB）。
+
+**六、根因：r3 导出挂起本轮被复现并定位**
+
+1. **触发**：`shared` 变量遮蔽。`scripts/pretrain_mcl_ph.py:592`（denominator 循环内，`91626cb` r2 引入）把 `shared` 从 `apply_shared_init()` 的 dict（第 466 行）重绑为 `global_sum` 返回的 1-D tensor；导出窗口的 `source={'shared_new_init_sha256': shared['sha256']}`（`3d66198` 引入，现第 692 行）于是对 1-D tensor 做字符串索引 → `IndexError: too many indices for tensor of dimension 1`。**无模型最小复现**（CPU、1 元素张量）：`torch.tensor([1008.0])['sha256']` → 同一 UserWarning + 同一 IndexError。
+2. **为什么表现为静默挂起且无 traceback**：rank0 抛错后进入 `finally` → `destroy_process_group()`，而 rank1–3 已在 `dist.barrier()` 等待 rank0 永不抵达的 barrier，形成死锁；异常被 `finally` 拖住，stderr 的 traceback 永不打印。看门狗 120 s 输出的真实栈：
+   - rank0：`torch/distributed/distributed_c10d.py:2186 destroy_process_group` ← `scripts/pretrain_mcl_ph.py:727 main` ← `:774 <module>`
+   - rank1–3：`torch/distributed/distributed_c10d.py:4811 barrier` ← `scripts/pretrain_mcl_ph.py:700 main` ← `:774 <module>`
+3. **与 r3 的关系（不混为同一故障，但同源）**：r3b 的 launcher 日志在**同一表达式**（当时的 `pretrain_mcl_ph.py:535`）输出了**同一个 UserWarning**，随后静默 5.4 分钟直至人工 SIGTERM；两轮 `resume_00002.pt` 逐字节相同。故 r3 phase-2 的导出挂起**由本轮复现并定位到该缺陷**（此前状态为「未定位」）。r3 phase-1（10:53 那次，`exitcode: -15`、`balance≈96`）是另一次失败，与本缺陷无关，不并入。
+4. **分类**：本次失败**不是**预备守卫失败，**不是**训练错误，而是**导出窗口缺陷 + 收尾死锁**；训练部分（两个 update）在完整条件下完成且与 r3 逐字节一致。
+
+**七、本轮新发现的两个待修缺陷（按指令本轮不修改代码，交回 Codex）**
+
+1. **`shared` 遮蔽导致导出必失败**（第 592 行重绑 / 第 692 行使用）：任何跑到 deploy 的 cat/gate/xattn 两步运行都会在导出元数据处抛 `IndexError`，随后进入收尾死锁。修法方向：把循环内 `shared` 改名为 `denominator_total`（或把初始化 dict 改名为 `shared_init`），保持数值与文件语义不变。
+2. **看门狗的 180 s 自动停止不可达**：进程内看门狗每 120 s（`repeat=True`）向 `stall_stack_rank*.txt` 追加栈，这些写入被 `signature()` 计入 progress，静默时间永远不会超过 120 s（实测手工停止时 `silent_seconds=90.0`，`intervened=false`，报告文件只有在 root 退出后才生成）。修法方向：`signature()` 排除 `stall_stack_*`（只认 `stages_rank*` 的 mark）或改为只读最后一条 mark 的时间；r5 的 fixture 用静态目录，未能暴露该交互，需补一条「栈转储不得重置停滞计时」的 fixture。
+
+**八、验收结论**
+
+- **不满足「成功」**：launcher 未以 0 退出（143，操作者定向终止），`verify_mcl_ph_arm.py` 未进入；无部署包。故 §三 的只读验收**不适用**；仅存在训练侧记录（见「五」），**不宣称本轮 smoke 成功**。
+- 训练侧事实（仅作记录）：2/2 updates、分母 1008/1008、loss/梯度/Router 统计有限、`resume` 与 r3 逐字节一致。
+- 结论表述（按 §四 要求）：本次**复现了导出/收尾挂起**，且**定位到具体缺陷**；但该缺陷的修复与「挂起是否永久消失」需要下一轮在修好后重新验证。
+
+**九、预算核算**
+
+| 项目 | 上限 | 实际 |
+| --- | --- | --- |
+| 训练启动 | ≤1 | **1**（唯一一次，用满） |
+| CAT optimizer updates | ≤2 | **2**（两个 update 均真实完成） |
+| 额外模型 forward/backward | 0 | **0**（未运行任何预测/训练前向或反向） |
+| 微调 epochs | 0 | 0 |
+| 重跑测试套件 | 0 | 0 |
+| GATE/XATTN/GLT_REF/O8_ONLY/P2/P3/5k/outer-test/缓存构建 | 0 | 0 |
+| 代码修改 | 仅文档 | 仅 `MCL-PH.md`（本轮未改代码） |
+| 外部总时限 | ≤15 min | 未触发（运行 ≈3.5 min，其中收尾挂起 ≈3.8 min 由定向终止结束） |
+
+**十、交付状态**
+
+- 状态：**受阻（执行后交回）**——唯一一次运行完成 2 个 update 后在导出窗口失败并挂起，根因定位；按指令未重试、未改代码、未启动其他臂。
+- 产物与证据：`results/mcl_ph_20260921/p1/pretrain_r6/`（`cat/` 阶段日志、栈、FAILED 记录、resume；`stall_supervisor.json`、`stall_supervisor_manual_stop.json`、`shared_new_init.pt`）；日志 `logs/mcl_ph_20260921/r6_pretrain_cat.log`、`logs/mcl_ph_20260921/r6_tmux_window.log`。
+- 未改动：模型数学/初始化/数据语义/超参/batch/worker 数；r3 现场（`pretrain_r3b/cat/runtime.json` 仍 `RUNNING`）；r4 恢复导出候选；`.zcodeignore`（`7fc7779` 由用户提交，本轮未碰）。
+- 未取得：部署包与 §三 的 CPU/strict-load 核验；gate/xattn 与微调线索；任何性能结论。
+
+
 
