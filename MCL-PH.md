@@ -1140,7 +1140,7 @@ python -m pytest tests/test_mcl_ph_r5_completion.py -q -k supervisor  # 2 passed
 - 未读取或改写 r3–r6 运行产物作为「修复」材料；r3 现场保持原状（`pretrain_r3b/cat/runtime.json` 仍 `RUNNING`）；未恢复根目录 `Plan.md`；未修改 `.zcodeignore`、`PH.md`、`3D.md`。
 - 结论层级：本记录属于**实现 + 无模型测试**，不是 smoke、不是消融、不是正式实验。
 
-**七、提交与同步**：本轮 commit 短哈希与远端核对结果见下方补记。下一步（不在本轮执行）：在用户授权下做修好后的真实 CAT 两步运行，以验证导出写出与 launcher 验收，并在真实运行中确认修正后的定向停止生效。
+**七、提交与同步**：本轮 4 个文件（`scripts/pretrain_mcl_ph.py`、`tests/_mcl_ph_r5_stall_supervisor.py`、`tests/test_mcl_ph_r7a_repair.py`、`MCL-PH.md`）创建**单独 commit `8b44361`**，非 force push 成功 `8108dc3..8b44361 dev -> dev`；`git ls-remote origin dev` = `8b443610c7a459d09c60e4b404d002c22e2af189`，与本地 HEAD 一致。运行产物位于 `results/`、`logs/`（按 `.gitignore` 不提交，只按路径引用）；未提交 checkpoint、缓存或临时目录。下一步（不在本轮执行）：在用户授权下做修好后的真实 CAT 两步运行，以验证导出写出与 launcher 验收，并在真实运行中确认修正后的定向停止生效。
 
 
 
