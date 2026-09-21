@@ -4,8 +4,8 @@
 
 ## 0. 状态、角色与授权
 
-- **状态：受阻 / 待审查（r6 执行后交回）**。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**）。r5 完成四项收尾状态修正与针对性验证（14 passed），但唯一一次真实运行因预建输出目录触发防覆盖守卫而中止（0 update）。r6 的唯一一次 cat 两步运行**完成了 2 个 update**（`resume_00002.pt` 与 r3b 逐字节相同），随后在导出窗口抛出 `IndexError` 并进入收尾死锁——**r3 挂起由此复现并定位到具体缺陷**（`shared` 变量遮蔽），另有看门狗 180 s 自动停止不可达的缺陷；按指令未改代码、未重试，详见 §13.5/§13.6。
-- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（cat 在 r3 与 r6 各完成 2/6 授权 update、均无 deploy 包；M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4，r5 见 §13.5，r6 见 §13.6。
+- **状态：r7A 工程返修完成，待 Codex 审查**（本轮无任何真实训练，不代表 CAT 两步成功，也不代表 P1 完成）。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**）。r5 完成四项收尾状态修正与针对性验证（14 passed），但唯一一次真实运行因预建输出目录触发防覆盖守卫而中止（0 update）。r6 的唯一一次 cat 两步运行**完成了 2 个 update**（`resume_00002.pt` 与 r3b 逐字节相同），随后在导出窗口抛出 `IndexError` 并进入收尾死锁——**r3 挂起由此复现并定位到具体缺陷**（`shared` 变量遮蔽），另有看门狗 180 s 自动停止不可达的缺陷；按指令未改代码、未重试，详见 §13.5/§13.6。r7A 按授权**只**修这两个已定位缺陷（导出身份变量改名 + 停滞进度只认 `stages_rank*.log` 真实 mark）并做无模型回归（8 passed；GPU/forward/backward/update/训练启动均为 0），**未运行 CAT**，详见 §13.7。
+- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（cat 在 r3 与 r6 各完成 2/6 授权 update、均无 deploy 包；M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4，r5 见 §13.5，r6 见 §13.6，r7A 见 §13.7。
 - r1 状态（历史，已被 r2 取代）：**待授权执行**。
 - Codex 规划和审查；ZCode 在用户授权后执行。推荐第一次仅授权 P0＋P1，后续阶段必须分别交回审查。
 - 文档基准：`dev@0d633d8`，已安全 pull、无远端更新。原 `MCL-PH.md` 为空；用户未跟踪 `.zcodeignore` 不修改、不提交。
@@ -1056,6 +1056,91 @@ python tests/_mcl_ph_r5_stall_supervisor.py --root-pid <launcher pid> \
 - 未改动：模型数学/初始化/数据语义/超参/batch/worker 数；r3 现场（`pretrain_r3b/cat/runtime.json` 仍 `RUNNING`）；r4 恢复导出候选；`.zcodeignore`（`7fc7779` 由用户提交，本轮未碰）。
 - 未取得：部署包与 §三 的 CPU/strict-load 核验；gate/xattn 与微调线索；任何性能结论。
 - 提交与同步：本轮改动（仅 `MCL-PH.md`）提交为 `f7f42f2`；首次 `git push` 因 `gnutls_handshake() failed: The TLS connection was non-properly terminated.` 失败（本地提交已完成），随即重试成功 `7fc7779..f7f42f2 dev -> dev`（非 force），`git ls-remote origin dev` = `f7f42f279a794e2b3adab4e86863004e8bbec84d`，与本地 HEAD 一致。运行产物位于 `results/`、`logs/`（按 `.gitignore` 不提交，只按路径引用）；`.zcodeignore` 未修改。
+
+---
+
+### 13.7 r7A 执行记录（ZCode 执行；2026-09-21 UTC；基准 `dev@8108dc3`）
+
+**计划头**
+
+| 项目 | 内容 |
+| --- | --- |
+| 计划 ID / 修订 | `MCL-PH-20260921-01` / **r7A「已定位导出故障与 stall supervisor 最小返修」** |
+| 状态 | **r7A 工程返修完成，待 Codex 审查**（本轮无任何真实训练；不代表 CAT 两步成功，也不代表 P1 完成） |
+| 授权来源 | 用户 2026-09-21 的 r7A 指令：只修两个已定位缺陷 + 无模型针对性回归；**禁止启动 CAT/GATE/XATTN/微调，禁止模型 forward/backward** |
+| 角色 | Codex/ChatGPT 规划与审查；ZCode 执行 |
+| 开始时 HEAD / pull | `dev@8108dc3`（= 本轮审查基线）；`git pull --ff-only origin dev` → **Already up to date**；`git ls-remote origin dev` = `8108dc36d9bc8ed40fbf65d803b073774c406685`，远端无更新提交，无冲突实现，未触发停止条件 |
+
+**一、修改文件（仅 3 个）**
+
+- `scripts/pretrain_mcl_ph.py` —— 修复 A（`shared` 遮蔽）。
+- `tests/_mcl_ph_r5_stall_supervisor.py` —— 修复 B（停滞计时把假进展当真实进展）。
+- `tests/test_mcl_ph_r7a_repair.py` —— 新增，无模型回归（8 项）。
+
+**二、修复 A：初始化身份的遮蔽**
+
+- 身份变量改名：`shared = apply_shared_init(...)` → **`shared_init`**，并同步全部引用点——训练启动 `run.json` 的 `identity.shared_new_init_sha256`、`step_0000.json` 的 `shared_new_initialization`、deploy `source.shared_new_init_sha256`，共 3 处，全部读取同一个 `shared_init`；导出窗口不再出现 `shared[...]`。
+- denominator 归约抽成具名纯函数 `reduce_update_denominators(update_counts, global_sum, device)`（原循环逐行搬移），训练入口改为一行调用；循环内临时量改名 `denominator_total`。**本文件中不再存在名为 `shared` 的变量绑定**（含 helper 内部，AST 断言）。
+- **未改**：`effective_graph_counts` 的语义与取值、global reduction 的调用与输入张量、denominator 数值、objective（`L_atom + L_geo + 1e-3·L_bal`）、accumulation 缩放、loss 权重、DDP 行为、checkpoint identity、deployment metadata 字段名。
+- **未采用**任何掩盖式修法：没有重新打开 `shared_new_init.pt`、没有重算 SHA、没有在 deploy 时新加 fallback。
+- 训练入口的其余部分未顺手重构。
+
+**三、修复 B：supervisor 的进度定义**
+
+- 进度判定由 `signature()`（stages 日志 + `stall_stack_rank*.txt` + 普通 log 的 size/mtime）改为 `progress_marker()` + `_stage_log_marker()`：**只读 `stages_rank*.log`**，且只认**真实追加**（同时记录字节长度与最后一行内容，故单纯的 `mtime` 刷新不算）。
+- 明确不计入进度：`stall_stack_rank*.txt` 增长、普通 runtime 日志增长、supervisor 自身输出与报告、对任意文件的 `os.utime`。
+- `--log` 仍保留在 CLI 与报告中（取证用途），但**不再参与计时**；报告字段由 `signature_at_stop` 改为 `progress_at_stop`。
+- `StageLogger.tensor_progress()` 的写入本就落在 `stages_rank*.log`，因此**真实导出进度仍被识别**（Test C 验证）。
+- **未改**：默认阈值 120 s / 180 s、`EXIT_*` 返回码、`stop_tree`/`alive`/`descendants`/`stage_tail` 交互面、`StageLogger` 语义；**未新增通用 watchdog 框架**。
+
+**四、实际运行的精确命令与结果（无模型回归）**
+
+```
+python -m pytest tests/test_mcl_ph_r7a_repair.py -q                   # 8 passed, 10.24s → exit 0
+python -m pytest tests/test_mcl_ph_r5_completion.py -q -k supervisor  # 2 passed, 12 deselected, 10.95s → exit 0
+```
+
+日志：`logs/mcl_ph_20260921/r7a_regression_final.log`（首次尝试 `r7a_regression.log`；重跑 `r7a_regression_retry.log`）。
+
+| 测试 | 覆盖内容 | 结果 |
+| --- | --- | --- |
+| Test A-1 `test_update_denominators_are_the_globally_summed_effective_graph_counts` | 走生产 helper：world=4 的假 collective 下得 `{'atom': 1008.0, 'geometry': 1008.0}`，collective 收到的正是本 rank 的 252；不等计数（1008/1004）第二组同样正确 | PASS |
+| Test A-2 `test_the_initialization_identity_cannot_be_shadowed_again` | AST：模块内不存在名为 `shared` 的绑定；`shared_init` 恰好绑定一次且来自 `apply_shared_init(...)` | PASS |
+| Test A-3 `test_the_deploy_metadata_reads_that_same_identity` | AST：deploy `source` 的 `shared_new_init_sha256` 读的是 `shared_init['sha256']`（同一身份变量） | PASS |
+| Test A-4 `test_the_denominator_reduction_touches_no_identity` | helper 内部绑定集合恰为 `{update_counts, global_sum, device, denominators, name, value, denominator_total}`，不读写身份名；且 `main()` 确实调用该 helper | PASS |
+| Test A-5 `test_progress_marker_counts_only_appended_stage_marks` | 追加 `stall_stack_rank0.txt` 或 `os.utime` 均不改变 marker，真实追加 `stages_rank*.log` 才改变 | PASS |
+| Test B `test_growing_stack_dumps_and_logs_cannot_postpone_the_stop` | 隔离 fixture：stages 日志不再产生真实 mark，同时线程持续（数十次）向 `stall_stack_rank*.txt` 与普通 log 追加；supervisor 仍按缩短阈值介入（`stop_seconds=0.8`，`silent_seconds_at_stop < 1.5`），退出码 9，`intervened=true`，`progress_at_stop` 仍等于停止前的真实 mark 长度；**旁观进程未被误伤** | PASS |
+| Test C `test_a_real_stage_mark_resets_the_silence_timer` | 以 0.4 s 间隔写入 5 条真实 stage mark（阈值 0.8 s）：最后一条 mark 之后进程仍存活（`alive_after_last_mark=[True]`），停止发生在最后一条 mark 之后一个阈值（`silent_seconds_at_stop ≥ stop_seconds−0.05`），无提前终止 | PASS |
+| Test D `test_a_normal_exit_is_not_reported_as_a_stall` | 子进程自行退出（rc 0）→ supervisor 退出码 0、`status='ROOT_EXITED'`、`intervened=false`、报告无 `tree` 键、stdout 无 `STOPPED_BY_SUPERVISOR`、子进程自身 returncode 0 | PASS |
+| 既有契约回归 | r5 的两条 supervisor 测试（静态 stages 日志下按阈值停止；正常运行不动手）在新进度定义下仍通过 | PASS |
+
+**失败与修复（如实记录）**：首轮 7 passed / 1 failed——Test B 的 `assert bystander.poll() is None` 得到 `-15`，原因是**我的夹具**在 `finally` 中先终止了旁观进程，才执行该断言；把存活判定移到 `run_supervisor` 返回后、清理之前后通过。这是**测试夹具缺陷**，不是产品缺陷；产品代码的「只终止本次进程树」行为未改。
+
+**五、预算核算（无模型回归）**
+
+| 项目 | 上限 | 实际 |
+| --- | --- | --- |
+| 训练启动（CAT / GATE / XATTN / 任何 arm） | 0 | **0** |
+| 模型 forward / backward | 0 / 0 | **0 / 0** |
+| optimizer update | 0 | **0** |
+| 微调 epoch | 0 | **0** |
+| GPU | 0 | **0**（`nvidia-smi --query-compute-apps` 为空；fixture 全为 CPU 子进程） |
+| 全仓 pytest 套件 | 0 | **0**（仅上述两个文件/选择器） |
+| 回归墙钟 | ≤5 min | **≈42 s**（首轮 10.40 s + 10.85 s；最终确认 10.24 s + 10.95 s） |
+| 修改范围 | 仅必要代码 | 2 个源文件 + 1 个新测试文件 + 本执行记录 |
+| 遗留进程 | 0 | **0**（`pgrep` 无残留） |
+
+**六、明确未声称 / 未验证**
+
+- 本轮**未运行 CAT**，因此**不声称**「导出故障已在真实训练中修复」、**不声称**「CAT 两步 smoke 成功」、**不声称**「所有 DDP 异常退出已修复」。`rank0` 在 collective 中抛异常后 `destroy_process_group()` 与其余 rank 的 `barrier` 仍可能互相等待——该**收尾死锁本轮未处理**，`destroy_process_group`/barrier 异常协议未改；外部 supervisor 只保证「真实阶段停滞超过阈值时定向终止本次进程树」。
+- 修复 A 的证据是**静态契约 + 纯函数/身份变量回归**；它在真实两步运行中能否写出 `deploy_00002.pt` 并通过 launcher 验收，**仍未验证**（需下一轮单独授权）。
+- 修复 B 的证据是**缩短阈值的隔离 fixture**；120 s/180 s 默认值**在真实运行中未再验证**。
+- P1 **仍未完成**（cat 仍停在 2/6 update、无 deploy 包；M_GATE/M_XATTN 与三条微调未运行）；**无任何 MCL-PH 性能、收敛或泛化结论**。
+- 未改动：模型数学/Router/PH 与拓扑定义/Randić-Wiener-Betti/fusion/loss/balance/shared-init schema/optimizer/scheduler/config/dataset/collate/DDP objective/launcher 训练预算/P2/P3/outer-test/checkpoint 与历史结果。
+- 未读取或改写 r3–r6 运行产物作为「修复」材料；r3 现场保持原状（`pretrain_r3b/cat/runtime.json` 仍 `RUNNING`）；未恢复根目录 `Plan.md`；未修改 `.zcodeignore`、`PH.md`、`3D.md`。
+- 结论层级：本记录属于**实现 + 无模型测试**，不是 smoke、不是消融、不是正式实验。
+
+**七、提交与同步**：本轮 commit 短哈希与远端核对结果见下方补记。下一步（不在本轮执行）：在用户授权下做修好后的真实 CAT 两步运行，以验证导出写出与 launcher 验收，并在真实运行中确认修正后的定向停止生效。
 
 
 

@@ -278,6 +278,23 @@ def apply_shared_init(model, path):
             'tensor_count': len(state)}
 
 
+def reduce_update_denominators(update_counts, global_sum, device):
+    """The exact denominator of one optimizer update, one entry per task.
+
+    ``update_counts`` are this rank's own effective graph counts for the update
+    and ``global_sum`` is the collective the objective already uses, so both the
+    value and the collective behaviour are unchanged by this call.  It is a named
+    helper because the total belongs to the update rather than to the loop that
+    computes it: a local name that only ever holds this reduction cannot be
+    mistaken for the initialization identity the export metadata reads.
+    """
+    denominators = {}
+    for name, value in update_counts.items():
+        denominator_total = global_sum(torch.tensor([float(value)], device=device))
+        denominators[name] = float(denominator_total.detach().reshape(-1)[0])
+    return denominators
+
+
 def _step_diagnostics(model, report, batch, labels, world):
     """Observation only: read from tensors the objective already computed."""
     atom_states = report['atom_states']
@@ -463,7 +480,7 @@ def main():
             common['o8_tensor_count'] = len(covered)
             common['artifact_tensors_not_used'] = len(excluded) - (
                 len(base.state_dict()) - len(covered))
-        shared = apply_shared_init(base, args.shared_new_init)
+        shared_init = apply_shared_init(base, args.shared_new_init)
         optimizer = torch.optim.AdamW(base.parameters(), lr=float(config['lr']),
                                       weight_decay=float(config['weight_decay']))
         module = (DistributedDataParallel(base, device_ids=[device.index] if device.type == 'cuda'
@@ -482,7 +499,7 @@ def main():
             statistics_sha256=sha256_file(args.statistics),
             statistics_samples=statistics['samples'],
             common_init_artifact_sha256=(common['sha256'] if common else None),
-            shared_new_init_sha256=shared['sha256'],
+            shared_new_init_sha256=shared_init['sha256'],
             fusion_mode=fusion_mode, cutoffs=list(cutoffs),
             router_dense_updates=dense_updates, router_top_k=top_k,
             route='mcl_ph', third_task='none', use_md200=False)
@@ -524,7 +541,7 @@ def main():
                 step=0, note='initial values only; no optimizer update has run',
                 parameter_digest=digest, parameters=summary,
                 router_mode=base.encoder.branch.router.mode,
-                common_initialization=common, shared_new_initialization=shared))
+                common_initialization=common, shared_new_initialization=shared_init))
         stream = OrderedSampleStream(len(source), int(config['seed']))
         # Per-rank stage log and stall watchdog: the export epilogue is the last
         # thing a run does, so it is exactly the part that has to be observable
@@ -587,10 +604,7 @@ def main():
                     int(host_batch.graph_available.numel()))['counts']
                 update_counts['atom'] += local_counts['atom']
                 update_counts['geometry'] += local_counts['geometry']
-            denominators = {}
-            for name, value in update_counts.items():
-                shared = global_sum(torch.tensor([float(value)], device=device))
-                denominators[name] = float(shared.detach().reshape(-1)[0])
+            denominators = reduce_update_denominators(update_counts, global_sum, device)
             totals = torch.zeros(3, device=device)
             counts = torch.zeros(2, device=device)
             target_counts = torch.zeros(5, device=device)
@@ -689,7 +703,7 @@ def main():
                             router_dense_updates=dense_updates, router_top_k=top_k,
                             source={'cohort_hash': source.cohort['manifest_hash'],
                                     'statistics_sha256': sha256_file(args.statistics),
-                                    'shared_new_init_sha256': shared['sha256']},
+                                    'shared_new_init_sha256': shared_init['sha256']},
                             progress=stages.tensor_progress)
                         stages.mark('deployment_package', 'complete', step=step_number)
                         stages.mark('deploy_save', 'enter', step=step_number)

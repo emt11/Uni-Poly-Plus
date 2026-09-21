@@ -12,6 +12,13 @@ nothing else on the machine can be affected by it.  It kills nothing on a run
 that keeps making progress, and it exits on its own as soon as the root process
 is gone.
 
+Progress means a new StageLogger mark in ``stages_rank*.log``, and nothing else.
+That restriction is the point: the in-process watchdog appends a stack dump
+every ``stack_seconds`` for as long as a rank stays stuck, so a supervisor that
+counted those appends (or the run log, or an mtime) as progress would never see
+the silence it exists to detect.  ``--log`` is therefore kept for the report and
+for forensics only; it does not participate in the timer.
+
 Usage (in the tmux window that owns the run):
 
     bash scripts/run_mcl_ph_pretrain_smoke.sh ... &
@@ -72,22 +79,37 @@ def descendants(root):
     return order
 
 
-def signature(stages_dir, log_path):
-    """A change in any of these numbers means the run made observable progress."""
-    total, newest = 0, 0.0
-    for pattern in ('stages_rank*.log', 'stall_stack_rank*.txt'):
-        for path in Path(stages_dir).glob(pattern):
-            try:
-                info = path.stat()
-            except OSError:
-                continue
-            total += info.st_size
-            newest = max(newest, info.st_mtime)
-    if log_path is not None and Path(log_path).is_file():
-        info = Path(log_path).stat()
-        total += info.st_size
-        newest = max(newest, info.st_mtime)
-    return (total, round(newest, 3))
+def _stage_log_marker(path, window=8192):
+    """Byte length plus the newest line: an append changes both, a touch neither."""
+    try:
+        with open(path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            length = handle.tell()
+            handle.seek(max(0, length - window))
+            text = handle.read().decode('utf-8', 'replace')
+    except OSError:
+        return None
+    lines = text.splitlines()
+    return (length, lines[-1] if lines else '')
+
+
+def progress_marker(stages_dir):
+    """Real progress is a new StageLogger mark in a stage log, and nothing else.
+
+    The in-process watchdog keeps appending stack dumps to
+    ``stall_stack_rank*.txt`` for as long as a rank stays stuck, and the run log
+    keeps whatever the ranks last printed, so counting either of them would keep
+    resetting the silence timer and make the stop threshold unreachable.  Only
+    ``stages_rank*.log`` counts here, and only a real append: a bare mtime
+    refresh changes nothing.  A ``tensor_progress`` mark is a StageLogger mark
+    like any other, so real export progress is still recognised.
+    """
+    markers = []
+    for path in sorted(Path(stages_dir).glob('stages_rank*.log')):
+        marker = _stage_log_marker(path)
+        if marker is not None:
+            markers.append((path.name, marker[0], marker[1]))
+    return tuple(markers)
 
 
 def stage_tail(stages_dir, lines=3):
@@ -153,7 +175,7 @@ def main():
               'log': args.log, 'stack_seconds': args.stack_seconds,
               'stop_seconds': args.stop_seconds, 'poll_seconds': args.poll_seconds,
               'intervened': False}
-    last = signature(args.stages_dir, args.log)
+    last = progress_marker(args.stages_dir)
     last_change = time.monotonic()
     stack_at = None
     while True:
@@ -161,7 +183,7 @@ def main():
             report['status'] = 'ROOT_EXITED'
             report['silent_seconds'] = round(time.monotonic() - last_change, 3)
             break
-        current = signature(args.stages_dir, args.log)
+        current = progress_marker(args.stages_dir)
         now = time.monotonic()
         if current != last:
             last, last_change = current, now
@@ -178,7 +200,7 @@ def main():
             report['silent_seconds_at_stop'] = round(silent, 3)
             report['stopped_at_monotonic'] = time.perf_counter()
             report['stage_tail'] = stage_tail(args.stages_dir)
-            report['signature_at_stop'] = list(current)
+            report['progress_at_stop'] = [list(marker) for marker in current]
             report['tree'] = stop_tree(args.root_pid, args.grace_seconds)
             Path(args.report).parent.mkdir(parents=True, exist_ok=True)
             Path(args.report).write_text(json.dumps(report, indent=2, sort_keys=True),
