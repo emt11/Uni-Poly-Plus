@@ -26,6 +26,29 @@ def sha256_bytes(payload):
     return hashlib.sha256(payload).hexdigest()
 
 
+def assert_zero_z3_rows(z3, center_counts, geometry_valid):
+    """Both degenerate row kinds must carry an exact zero z3.
+
+    The trained representation defines ``z3 = norm3(graph_3d)`` re-zeroed at
+    every row where ``geometry_valid & (center_bond_count > 0)`` fails.  That
+    covers **two** disjoint populations: rows with no centre bond and rows whose
+    geometry is invalid.  Checking only their intersection would silently accept
+    a corrupt geometry-invalid row, so both are asserted separately here.
+    """
+    z3 = np.asarray(z3, dtype=np.float64)
+    counts = np.asarray(center_counts, dtype=np.int64)
+    valid = np.asarray(geometry_valid, dtype=bool)
+    if not (z3.shape[0] == counts.shape[0] == valid.shape[0]):
+        raise ValueError('z3 / centre-count / validity rows disagree')
+    zero_centre = counts == 0
+    invalid = ~valid
+    for mask, label in ((zero_centre, 'zero-centre'), (invalid, 'geometry-invalid')):
+        if bool(mask.any()) and not bool((np.abs(z3[mask]).sum(axis=1) == 0).all()):
+            raise ValueError(f'{label} rows do not carry an exact zero z3')
+    return {'zero_centre': int(zero_centre.sum()), 'geometry_invalid': int(invalid.sum()),
+            'union': int((zero_centre | invalid).sum())}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cohort-root', required=True)
@@ -78,9 +101,7 @@ def main():
                                          f'({len(indices)}, {EXPECTED_DIMS[name]})')
                 valid = data['geometry_valid'].astype(bool)
                 counts = data['center_bond_count'].astype(np.int64)
-                if bool(((counts == 0) & valid).any()) and not bool(
-                        (np.abs(data['z3'][counts == 0]).sum(1) == 0).all()):
-                    raise ValueError(f'{path}: a zero-centre row does not carry an exact zero z3')
+                degenerate = assert_zero_z3_rows(data['z3'], counts, valid)
                 unit[split] = {
                     'rows': int(len(indices)),
                     'dtypes': {name: str(data[name].dtype) for name in
@@ -88,6 +109,7 @@ def main():
                     'finite': finite,
                     'geometry_valid': int(valid.sum()),
                     'center_bond_zero': int((counts == 0).sum()),
+                    'zero_z3_rows': degenerate,
                     'sample_key_sha256': sha256_bytes(data['sample_key'].tobytes()),
                     'row_index_sha256': sha256_bytes(data['row_index'].astype('<i8').tobytes()),
                     'path': str(path),

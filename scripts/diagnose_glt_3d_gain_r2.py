@@ -80,6 +80,30 @@ def fit_ridge(x_train, y_train, x_validation, alpha, budget, category):
     return label_scaler.inverse_transform(scaled).reshape(-1)
 
 
+def cross_fitted_oof(x_train, y_train, alpha, budget, category, *, folds=3, seed=42):
+    """Out-of-fold predictions from an inner K-fold split.
+
+    Each inner fold fits only on its own training part, so no row's label ever
+    enters the model that predicts it.  Every row must be filled exactly once;
+    a partial or repeated fill is a hard error rather than a silently accepted
+    prediction.
+    """
+    from sklearn.model_selection import KFold
+
+    x_train = np.asarray(x_train)
+    y_train = np.asarray(y_train, dtype=np.float64).reshape(-1)
+    oof = np.zeros(len(y_train), dtype=np.float64)
+    filled = np.zeros(len(y_train), dtype=np.int64)
+    for inner_train, inner_test in KFold(folds, shuffle=True,
+                                         random_state=seed).split(x_train):
+        oof[inner_test] = fit_ridge(x_train[inner_train], y_train[inner_train],
+                                    x_train[inner_test], alpha, budget, category)
+        filled[inner_test] += 1
+    if not bool((filled == 1).all()):
+        raise ValueError('OOF rows were not filled exactly once per inner fold')
+    return oof, filled
+
+
 def r2_original(predicted, actual):
     from sklearn.metrics import r2_score
     return float(r2_score(np.asarray(actual, dtype=np.float64).reshape(-1, 1),
@@ -169,17 +193,8 @@ def main():
                                   'alpha': unit[name]['selected_alpha'],
                                   'boundary': unit[name]['boundary']}), flush=True)
 
-            from sklearn.model_selection import KFold
-            oof = np.zeros(len(y_train), dtype=np.float64)
-            filled = np.zeros(len(y_train), dtype=np.int64)
-            for inner_train, inner_test in KFold(3, shuffle=True,
-                                                 random_state=42 + fold).split(train['z2']):
-                predicted = fit_ridge(train['z2'][inner_train], y_train[inner_train],
-                                      train['z2'][inner_test], 1.0, budget, 'oof_baseline')
-                oof[inner_test] = predicted
-                filled[inner_test] += 1
-            if not bool((filled == 1).all()):
-                raise ValueError('OOF rows were not filled exactly once per inner fold')
+            oof, filled = cross_fitted_oof(train['z2'], y_train, 1.0, budget,
+                                           'oof_baseline', folds=3, seed=42 + fold)
             residual = y_train - oof
             baseline_prediction = fit_ridge(train['z2'], y_train, validation['z2'],
                                             1.0, budget, 'full_baseline')

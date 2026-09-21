@@ -17,8 +17,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.diagnose_glt_3d_gain_r2 import (  # noqa: E402
-    FitBudget, fit_ridge, r2_original, select,
+    FitBudget, cross_fitted_oof, fit_ridge, r2_original, select,
 )
+from scripts.verify_glt_3d_gain_d1_features import assert_zero_z3_rows  # noqa: E402
 
 
 def _manual_svd_ridge(x_train, y_train, x_validation, alpha):
@@ -148,3 +149,68 @@ def test_r2_original_is_in_label_units():
     actual = np.array([1.0, 2.0, 3.0, 4.0])
     assert r2_original(actual, actual) == pytest.approx(1.0)
     assert r2_original(np.full(4, actual.mean()), actual) == pytest.approx(0.0)
+
+
+def test_zero_z3_assertion_covers_both_degenerate_populations():
+    """r3 repair: the check must cover zero-centre and geometry-invalid rows
+    separately, not only their intersection."""
+    n = 4
+    z3 = np.zeros((n, 3))
+    z3[1] = [1.0, 0.0, 0.0]        # a row with a centre bond may be non-zero
+    counts = np.asarray([0, 5, 0, 5])            # rows 0,2 have no centre bond
+    valid = np.asarray([True, True, False, False])  # rows 2,3 have invalid geometry
+    assert assert_zero_z3_rows(z3, counts, valid) == {
+        'zero_centre': 2, 'geometry_invalid': 2, 'union': 3}
+
+    # A non-zero z3 on a geometry-invalid row whose centre count is positive:
+    # this is exactly the case the previous intersection-only test missed.
+    bad_invalid = z3.copy()
+    bad_invalid[3] = [0.5, 0.0, 0.0]
+    with pytest.raises(ValueError, match='geometry-invalid'):
+        assert_zero_z3_rows(bad_invalid, counts, valid)
+
+    bad_centre = z3.copy()
+    bad_centre[0] = [0.0, 2.0, 0.0]
+    with pytest.raises(ValueError, match='zero-centre'):
+        assert_zero_z3_rows(bad_centre, counts, valid)
+
+    with pytest.raises(ValueError, match='rows disagree'):
+        assert_zero_z3_rows(z3, counts[:3], valid)
+
+
+def test_cross_fitted_oof_fills_once_and_excludes_inner_test_labels():
+    """r3 repair: exercise the production OOF fill directly, not just KFold."""
+    from sklearn.model_selection import KFold
+
+    rng = np.random.default_rng(7)
+    n, d = 45, 6
+    x = rng.normal(size=(n, d))
+    y = rng.normal(size=n)
+    budget = FitBudget(20)
+    oof, filled = cross_fitted_oof(x, y, 1.0, budget, 'oof', folds=3, seed=99)
+    assert bool((filled == 1).all())
+    assert int(filled.sum()) == n
+    assert budget.count == 3
+
+    # Independent replay with the same splitter: identical fill positions, and
+    # an explicit assertion that no inner test index enters its own fit.
+    replay = np.zeros(n)
+    for inner_train, inner_test in KFold(3, shuffle=True, random_state=99).split(x):
+        assert not (set(inner_train.tolist()) & set(inner_test.tolist()))
+        replay[inner_test] = fit_ridge(x[inner_train], y[inner_train], x[inner_test],
+                                       1.0, budget, 'oof')
+    assert np.allclose(oof, replay, rtol=0, atol=0)
+    assert budget.count == 6
+
+
+def test_cross_fitted_oof_cannot_predict_labels_independent_of_features():
+    from sklearn.metrics import r2_score
+
+    rng = np.random.default_rng(13)
+    n = 60
+    x = rng.normal(size=(n, 8))
+    y = rng.normal(size=n)          # independent of x by construction
+    budget = FitBudget(10)
+    oof, _ = cross_fitted_oof(x, y, 1.0, budget, 'oof', folds=3, seed=42)
+    # A model that never saw a row's own label cannot predict pure noise.
+    assert r2_score(y, oof) < 0.2
