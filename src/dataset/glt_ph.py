@@ -47,6 +47,11 @@ def _diagram_deaths(points, dimension, max_edge=PH_RADIUS_MAX):
 _GRID = np.linspace(PH_RADIUS_MIN, PH_RADIUS_MAX, PH_BINS)
 
 
+def radius_grid():
+    """The 32 sampling radii actually used by this schema (read, never re-derived)."""
+    return _GRID.copy()
+
+
 def _histogram(values, count):
     """Legacy death-value histogram (schema v1); kept for audit comparison."""
     if count <= 0:

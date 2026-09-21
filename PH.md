@@ -11,7 +11,6 @@
 | 目标 | 提升真实下游微调泛化表现，重点观察 XC；不以 PH loss、门控幅度、重建精度代替属性评估 |
 | 编写基线 | `dev@fd6378f`；已 `git pull --ff-only origin dev`，Already up to date |
 | 已有用户改动 | `Plan.md` 删除、`.zcodeignore` 未跟踪、`PH.md` 空文件未跟踪；本轮只编辑／提交 `PH.md`，不恢复或提交用户删除 |
-| 与 Plan.md 的关系 | 本文是用户明确指定的候选设计文档，不自动成为已授权活动计划；实施前须由 Codex 将获授权阶段登记到 `Plan.md`，或由用户明确指定本文件作为本周期入口。不能擅自恢复被删除的文件 |
 | 历史边界 | PHRETENTION r6 已以限定负结果结束；不重跑其零初始化 late-residual 实验，不覆盖旧缓存、checkpoint 和报告 |
 
 所有路径中的拟新增文件、stage 和参数均为**待实现接口合同**，不能把本文命令名当作现有 CLI。本文给出三条可独立实施的端到端路线，不要求一次全部运行。默认推荐顺序 **B → A → C**；每个阶段结束交回审查，不自动消耗后续预算。
@@ -395,3 +394,77 @@ runner拟支持 `audit / preflight / pretrain / finetune / aggregate`，明确 `
 **文档自检，不是独立审查**：检查三臂输入语义、维度、参数组、损失与预算闭合；检查Markdown与git diff。按AGENTS在PROJECT_HISTORY.md追加本轮文档交付归档，不关闭尚未授权的新实验周期。后续执行记录应进入经用户指定的活动入口；本文件不伪造实验结果。
 
 **建议下一次用户授权仅覆盖 P0＋P1-B（含R0/R2D接口），暂不覆盖5k训练。** 执行端先提供空间关系成本、公共mask／初始化一致性、真实forward/backward与报告保存结果。通过审查后，再单独授权P2-B/P3-B。A/C作为完整备选保留，不因文档齐全自动实施。
+
+## 14. r1 P0＋P1-B 执行记录（ZCode，2026-09-21，待 Codex 审查）
+
+**状态**：`P0/P1-B执行完成，待Codex审查`。本记录只覆盖用户授权的 P0＋P1-B（含 R0/R2D/CURRENT 接口）；**未启动 P2-B/P3-B**，未训练 5k，未做开发比较，未访问 outer-test，未实现 A/C。所有数值为自己的执行结果，不是独立审查；性能结论仍是空白。
+
+### 14.1 执行前核对
+
+* `git status` 显示用户改动 `M PH.md`（删除"与 Plan.md 的关系"一行）、`D Plan.md`、未跟踪 `.zcodeignore`；`git pull --ff-only origin dev` 成功且 Already up to date（0/0，基线 `bc21d05`）。tmux `Uni-Poly` 无活动训练进程，4 张 4090 空闲。用户改动全部保护，未暂存未提交。
+
+### 14.2 P0 来源／身份／接口／成本审计（`results/glt_ph_end2end_20260920/p0/p0_audit.json`，`P0_EXIT=0`）
+
+* **状态 PASS**（首轮两次因真实接口问题报 BLOCKED，见 14.5）。抽样 256 条 P_train（split 工件 `results/glt_pred_20260918/s3b_prep/pretrain_split_v1.json`，sha256 `c51345e6…`，train 911391 / validation 47968 / fixed validation 1024）。
+* **冻结来源**：cohort `data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1`，`manifest_hash b03f96a1…`（与 split 工件一致）、records 959588、`main_bundle_hash 30f17b59…`、dual-static manifest `9ff122cc…`；PH sidecar `results/glt_galph_20260920/p0/ph_sidecar_betti_v2`，`glt-ph-betti-v2`、3 通道 × 32 bins、rows 911391 = P_train，`sidecar_covers_p_train=true`。
+* **半径数组**：直接读取 `src/dataset/glt_ph.radius_grid()`（`linspace(0.8, 6.0, 32)`，sha256 `9e1d3a1b…` 记录在报告里），未另用端点约定重算。
+* **32-byte key**：256 条全部 32 字节，其中 **33 条含 NUL 字节** → 任何字符串语义比较都会截断，本实现一律按 bytes 处理（reader 与审计均已覆盖）。
+* **CURRENT 身份**：`configs/mts/glt_galph_c1_repair_5k_identity.json` 的 sha256 `3063cf8b…` 实测一致；common-init `637827e6…` 一致（201 张量；**不含 cls/ph 块**，与 r1 源码一致）。
+* **原子／键／映射**：抽样样本 geometry_valid **256/256**；重原子投影与 GLT bond 行**逐行**核对（元素 + 坐标距离，容差 1e-3 Å）**0 失败**；`bond_row_count` 全部一致。真实键表按 GLT 自己的排序规则重建：`(not center, atom_a, atom_b, q_a, q_b, local_a, local_b)`，端点按 `(atom_a,q_a,local_a)` 定向。
+* **三空间图规模**（全原子、双向、含所有非 self 对）：2.5Å 均值 **744**（min 14 / max 2644）、4Å **1954**（20 / 8066）、6Å **4376**（20 / 22304）；样本原子数均值 121.3（min 5 / max 395），重原子 59.3，Trimer 键 61.2。嵌套包含、无 self、双向对称、无跨图在 256 条上 0 违例；`spatial_edge_index` 与逐图重建的集合逐条相同。
+* **成本**：每样本边张量（index/distance/bonded/scale，22 B/边）在 6Å 下约 96 KB → 投影到完整 P_train 约 **86.0 GiB**（2.5/4Å 分别为 14.6/38.4 GiB）；RBF 特征（33×fp32）只在消息 MLP 内按 16384 条边分块计算，未整体物化。数据构建 25.9 ms/样本、STAT 2.4 ms/样本 → 单进程为整个 P_train 生成 STAT 约 **0.63 h**（P2 前须单独授权离线构建，本轮**未**构建全量 STAT 缓存）。
+* **下游无标签几何**：xc/eps/eat 各 16 条，全部取自对应 fold0 的 train∪validation 索引，**未读 test 索引、未读标签**；PH 有效率 16/16，6Å 边数均值 2283 / 1092 / 1167。限制：下游审计只统计了最大半径的边数（2.5/4Å 未逐条记录）。
+* **SMOKE_ONLY 统计**：用这 256 条 P_train 的有效 PH 记录拟合 `[3,32]` 均值/标准差（std 下限 1e-3）→ `results/glt_ph_end2end_20260920/p0/ph_stats_smoke_256.npz`（sha256 `f4868b1e…`，文件内写死 `scope=SMOKE_ONLY_256_P_TRAIN_NOT_FOR_P2`）；P1 只在这份统计上训练，P2 必须另行拟合并新起初始化。
+
+### 14.3 P1-B 实现
+
+新增（全部只读既有缓存，未写旧缓存、未改历史 checkpoint）：
+
+| 文件 | 作用 |
+| --- | --- |
+| `src/dataset/glt_ph_fusion_inputs.py` | 全原子 Trimer 读数、重原子投影、物理键表（GLT 行序）、三嵌套空间图、32-RBF+bonded、STAT 三通道、条件输入（CONST/STAT/PH）、标准化、融合样本与 collate、下游 adapter |
+| `src/modules/glt_ph_fusion_candidates.py` | 条件 profile encoder（§3.2）、空间消息块（§5.2）、`GLTFusionB`（三臂）、`R2DModel`、`FusionPretrainer`、`FusionDownstream`（§7.1 读出）、部署包与 strict 加载 |
+| `scripts/pretrain_glt_ph_fusion.py` | 预训练 runner：`--arm R0/R2D/CONST/STAT/PH`、`--mode smoke/pretrain`、AdamW 分组（矩阵 wd 1e-6，bias/norm/PH侧 0）、20k schedule 截断、resume、结果先落盘、FAIL runtime |
+| `scripts/finetune_glt_ph_fusion.py` | 微调 runner：6 臂、Huber(0.5)、trunk 1e-5 / readout-head 1e-4、train-only scaler、validation-only、`complete/stage_completed` 语义 |
+| `scripts/aggregate_glt_ph_fusion.py` | 单元校验（complete/outer_test/validation_only/有限性/预算）＋ §8 预登记阈值判定 |
+| `scripts/audit_glt_ph_fusion_p0.py`、`scripts/check_glt_ph_fusion_paths.py`、`scripts/check_glt_ph_fusion_ddp.py`、`scripts/verify_glt_ph_fusion_smoke.py`、`scripts/run_glt_ph_fusion.sh` | P0 审计、零 update 报告路径检查、DDP 空几何检查、smoke 核验、launcher |
+| `configs/mts/ph_fusion/{common,b,smoke_b,smoke_reference,downstream,downstream_smoke_step4,downstream_smoke_step16}.json` | §6.3/§7.1 锁定数值；smoke 配置显式标 `smoke_only` 并缩小 batch |
+| `src/dataset/glt_ph.py` | 只加 `radius_grid()` 只读访问器（+5 行），不改历史数学 |
+
+**合同落点**：O8 与 GLT 原类原样复用（`BondPathO8`/`GalformerTrimer3D`，GLTFusionB 继承 `GLTGalPH` 并重写 forward 以在第 3、5 层后插入块）；三尺度共享同一 message MLP 与无 affine LN；端点对称回写 `M_a+M_b → Linear128→512 ×0.1`；router 最后一层零初始化 → 初始 softmax **恰为 1/3**；**无** PH 总开关、无开门正则、不加载旧 C1 PH encoder（新模块在家族种子 20260924 下构建）；R0 = 原 `GLTGalPH('cls', None)` + `galformer_collate` 原数据路径；R2D = O8/CLS2 单路、无 GLT/CL，微调用 `2D_ONLY` 分支；CURRENT = 原 r6 F_OFF 架构（`GLTGalPH('cls','global')` + 无效 PH 占位 → 零残差），checkpoint 经身份记录 sha256 与 `load_galformer_deployment` 双重校验。
+
+### 14.4 验证（零训练部分）
+
+* **fixture 测试 34 项全通过**（CPU，无 GPU/数据依赖）：`tests/test_glt_ph_fusion_inputs.py` 12、`tests/test_glt_ph_fusion_models.py` 13、`tests/test_glt_ph_fusion_protocol.py` 9。覆盖：RBF 网格与 bonded bit、三图嵌套/无 self/双向、**临界半径 d=r 属于内图**、刚体不变（旋转+反射+平移）、STAT 与暴力参考一致及退化点集、重原子投影的双索引空间、GLT 行序复现、条件输入三臂与 PH 失效回退 CONST、router 零初始化与结构化反事实（逐位还原）、置换等变、空邻域恒等、**bf16 autocast 不混 dtype**、三臂共同初始化、部署 strict 加载（错 step/架构/缺键均拒绝）、优化器 wd 合同、launcher 真实退出码与失败即停、失败现场保留、汇总器拒绝部分产物。
+* **既有套件 44 项仍全通过**（retention r5/r6 与诊断套件），确认 `radius_grid()` 未影响历史行为。
+* **零 update 真实报告路径检查**（`p1/path_check.json`，`PATHCHK_EXIT=0`）：真实 4 样本 batch，GPU，bf16；预训练与下游两条路径各跑 forward/backward，**0 optimizer updates**；预训练 loss 17.573 有限、`spatial.*` 30 个张量梯度非零有限、`conditional.*` 首步为 0（零初始化 router 的声明行为）、22756 条空间边；下游 xc/fold0 4 样本 DUAL 预测有限，`metrics.json`+`best.pt` 写盘并复读成功。
+* **DDP 空几何检查**（`ddp_control.json` / `ddp_partial.json` / `ddp_all-empty.json`，各 `EXIT=0`）：真实 4 rank backward，**0 optimizer updates**。control：4 rank 全有限、梯度非零；partial：rank0 无几何（3D 目标 0、空间边 0），rank1-3 正常（3D 目标 21/50/76）；all-empty：4 rank 全无几何，2D 目标 23/7/16/24 仍参与、loss/梯度全有限非零 → 通信正常、无 NaN、2D 任务不被空几何带走。
+* **一个反例说明**：P_train 抽样 256 条中**没有** geometry-invalid 结构，因此 DDP 的"空几何"是**按声明空分支合成**（清空 3D 键/线/掩码/空间关系与 3D 目标，保留 O8/2D 字段与原子表），不是真实无效样本；该限制写在检查脚本与结果 JSON 里。
+
+### 14.5 缺陷、修复与失败现场（据实报告）
+
+| # | 现象 | 根因 | 修复与验证 |
+| --- | --- | --- | --- |
+| 1 | P0 首轮 BLOCKED：`bond_row_distance`（元素正确） | 我最初假设 GLT bond 行按 `(local_a, local_b)` 排序，实际是 `(not center, atom_a, atom_b, q_a, q_b, local_a, local_b)` 且端点按 canonical 序定向 | 按真实规则重建键表；256 条 0 失败（`physical_bond_table` 内注释记录该事实） |
+| 2 | P0 次轮 BLOCKED：2/256 仍失败 | `bond_atom_index` 用了重原子枚举下标，却被拿去索引**全原子**坐标/空间表；H 交错时 off-by-one | 键表同时返回 `index`（重原子空间，与 GLT 行对齐）与 `atom_index`（全原子空间，供消息回写）；两个原失败样本与 13 个其他样本全部通过 |
+| 3 | 零 update 路径检查 EXIT=1 | `edge_rbf` 的 RBF 中心建在 CPU，边距离在 CUDA | 基函数跟随输入 device；新增 CUDA 条件回归测试 |
+| 4 | 零 update 路径检查第二次 EXIT=1 | bf16 autocast 下消息输出 bf16、累加器 fp32 → `index_add_` 报错 | 显式 `.to(pooled.dtype)`／回写 `.to(root.dtype)`；新增 CPU bf16-autocast 回归测试 |
+| 5 | DDP 首次运行"卡住"（rank0 空闲、其余 3 rank 满负荷） | **不是** DDP 语义问题：rank0 在前向崩溃，其余 rank 停在 NCCL 集合通信 | 单进程复现拿到真实栈；根因是我 DDP 检查脚本的"空几何"合成错误清掉了属于 2D/拓扑的 `bond_path_fields` 且未同步清空 `label_3d`；改为**按样本**应用声明空分支后再 collate |
+| 6 | 预训练 smoke 第一步失败（launcher 正确报 code=1、立即停止、未写 ALL_DONE） | runner 把参考臂名（R0/R2D）传进只声明 CONST/STAT/PH 的 family-B 数据层 | 参考臂改走原 `galformer_collate` 数据路径，B 臂走融合路径；失败现场保留为 `p1/smoke_R0_2_failed_arm_wiring/`（含 FAIL `runtime.json` 与 `FAILURE_NOTE.md`，**消耗 0 updates**：无 records、无 checkpoint、`metrics_written=false`） |
+| 7 | 汇总器在单折输入下写出 NaN 被拒 | 缺失折被当作 NaN 参与比较 | 缺失折显式跳过并记入 `xc_folds`，`xc_ok` 要求两折齐全 |
+
+### 14.6 运行、日志与预算
+
+* 全部 GPU/长任务在 tmux `Uni-Poly` 独立 window；日志根 `logs/glt_ph_end2end_20260920/`，产物根 `results/glt_ph_end2end_20260920/`（p0/p1），未覆盖任何历史产物。
+* **预训练 smoke：5 路径 × 10 updates = 50/50 updates 用满**（每条 = 独立 2 + 连续 4 + 分段 2 + 恢复 2）。launcher `chain_status.log`：**20/20 步 `code=0`、以 `ALL_DONE` 结束、`LAUNCHER_EXIT=0`**；外加 1 次 0-update 失败尝试（14.5 #6）。
+* **CURRENT 新增预训练 updates = 0**（复用 r6 部署包，仅做 1 epoch 接口 smoke）。
+* **微调 smoke：6 臂 × xc/fold0 × 1 epoch = 6/6 epochs**；`finetune_status.log` **6/6 `code=0`、`ALL_DONE`、`FT_LAUNCHER_EXIT=0`**；6 个单元 `complete=true`、`stage_completed=diagnostics`、`validation_only=true`、`outer_test=NOT_RUN`、`best.pt` 与 `metrics.json` 齐全，root `runtime.json` 全部 PASS。
+* **smoke 核验**（`p1/smoke_verification.json`，`status=PASS`）：预训练 **64/64** 项通过，含**恢复逐位一致**（连续第 3-4 步与"2 步后恢复再 2 步"在 4 个 rank 上的 losses/grad_norm/stream_digest/position/lr 完全相同）、独立 2 步与前两步一致、部署 strict 加载、优化器分组合同；微调 6/6 单元通过。
+* 零训练检查不计入训练预算：P0 审计、路径检查、DDP 三项合计 **0 optimizer updates**。
+* **微调 smoke 的 R² 仅证明流程可跑，不是性能证据**（1 epoch、预训练 checkpoint 只有 4 updates）：R0 0.042678、R2D 0.080607、CURRENT 0.097700、CONST 0.014634、STAT 0.047213、PH −0.114820（xc/fold0）。**不得**据此比较路线优劣，也不得与 r6 的历史分数对照。
+
+### 14.7 未执行项与限制
+
+* **未执行**：P2-B 5k 预训练、P3-B 开发比较、方案 A/C 的任何实现或运行、全量 STAT 缓存构建、局部 PH 全量构建、正式微调、outer-test、OOF、train+validation refit、构象生成；CURRENT 未重训。
+* **限制**：P1 的 smoke 用缩减 batch（micro 4 / global 16，配置显式标 `smoke_only`）与 SMOKE_ONLY 统计；P2 必须用 `configs/mts/ph_fusion/{common,b}.json` 与另行拟合的 P_train 统计并从共同初始状态开始，**不能续训 P1 模型**。三臂在初始 uniform 路由下输出相同（已声明并测试），因此"输入不同"不等于"当前已产生功能差异"；可训练性/接线通过不构成属性预测增益。P0 的下游边数只记录了 6Å；DDP 空几何为合成案例；R0/R2D 的 P1 验证基于 4-update 部署。
+* **待 Codex 审查的问题**：(1) 三空间图的边规模（6Å 均值 4376/样本，投影 86 GiB 输入）是否要求 P2 前先做按 query 分块以外的结构削减；(2) 我自行决定的两项工程选择——参考臂走原 `galformer_collate` 数据路径、smoke 使用缩减 batch——是否符合计划意图；(3) P2 的离线特征构建（全量 STAT + P_train 统计）需单独授权与预算，本轮未启动；(4) 零初始化 router 使 conditional encoder 首步无梯度（已声明），是否需要在 P2 首 256 步检查中单独记录其解冻时点。
