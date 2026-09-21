@@ -1469,7 +1469,7 @@ summary = dict(status='PASS', command=sys.argv, config=config,
 - 未访问 outer-test（各 unit `outer_test = NOT_RUN`）；未启动任何 5k 正式训练或 P2 内容。
 - 未改写 r3–r7C 历史记录（仅按指令更正 §13.9 中 shared-init artifact 与 `step_0000.json` 完整快照的混写，结论不变）；未恢复 `Plan.md`；未修改 `.zcodeignore`、`PH.md`、`3D.md`。
 
-**九、提交与同步**：本轮只改 `MCL-PH.md`（追加本记录 + §13.9 措辞更正），提交与远端核对见下条补记。
+**九、提交与同步**：本轮只改 `MCL-PH.md`，提交为 **`d07cd92`**，非 force push 成功 `a47a910..d07cd92 dev -> dev`；`git ls-remote origin dev` = `d07cd92c8a1b9c0b2fa1c3042f77ebd8d0d8aca3`，与本地 HEAD 一致。产物与日志：`results/mcl_ph_20260921/p1/pretrain_r7b/{gate,xattn,deployment_check_r8.json,stall_supervisor_gate.json,stall_supervisor_xattn.json}`、`results/mcl_ph_20260921/p1/finetune_r8/glt_ref/xc/fold0/`（失败现场）、`logs/mcl_ph_20260921/{r8_pretrain_gate.log,r8_pretrain_xattn.log,r8_finetune_smoke.log,r8_tmux_*.log}`，按 `.gitignore` 不提交，只按路径引用。**未自动启动其它 downstream 臂、aggregator、GATE/XATTN 微调或任何 5k 训练**；交回 ChatGPT/Codex 审查。
 
 
 
