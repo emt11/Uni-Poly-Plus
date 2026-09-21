@@ -499,4 +499,4 @@ Test C 逐次明细（每次 4 rank）：`r2_objective_check.log` 在 DDP 模型
 - P1 仍未完成：CAT 预训练无成功 unit，`m_cat` 微调 unit 缺失，五臂验收只有 4/5（PARTIAL）。
 - `results/mcl_ph_20260921/p1/pretrain/cat_failed_rng_collective/runtime.json` 仍为 `RUNNING`（进程被用户停止请求中止，未写终态），保留现场不追溯修改。
 - 修复后是否补跑三条既有预训练 arm 与相应微调、以及新增预算，**待本轮审查后由用户与 Codex 决定**；本轮未启动任何训练。
-- 同步：r1 提交 `3d66198` 与 r2 提交（见下）推送 `origin/dev`；r1 期间 HTTPS 推送因 TLS 中断失败，r2 复核时 `git fetch` 已恢复，推送结果以最终回复为准。
+- 同步：r1 提交 `3d66198` 与 r2 提交 `91626cb` 已推送 `origin/dev`（`cca9bd3..91626cb`，非 force），并以 `git ls-remote origin dev` 核对远端确为 `91626cb`。r1 期间 HTTPS 推送因 `GnuTLS recv error (-110)` 失败属暂时性网络故障，r2 复核时同一凭据与代理配置下 fetch/push 均恢复；r1 的未推送事实保留在 §13.1，不追改。
