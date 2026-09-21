@@ -315,6 +315,19 @@ def mcl_ph_downstream_collate(records):
     return batch
 
 
+def build_summary(common, *, config, device, command):
+    """The successful unit summary, built from the run's own ``common`` record.
+
+    ``common`` already carries ``optimizer_groups``, so it must arrive here by
+    expansion and never as an explicit keyword: passing it both ways raises
+    ``TypeError: dict() got multiple values for keyword argument`` at the end of
+    an otherwise successful unit.
+    """
+    return dict(status='PASS', command=command, config=config, device=str(device), **{
+        key: value for key, value in common.items()
+        if key not in ('history', 'load_state_dict_result')})
+
+
 def run_unit(args, folder, started, statistics, config, manifest):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     package = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
@@ -412,10 +425,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
             optimizer_groups=group_evidence, split=split_evidence))
     finally:
         source.close()
-    summary = dict(status='PASS', command=sys.argv, config=config,
-                   optimizer_groups=group_evidence, device=str(device), **{
-                       key: value for key, value in common.items()
-                       if key not in ('history', 'load_state_dict_result')})
+    summary = build_summary(common, config=config, device=device, command=sys.argv)
     write_json(folder / 'run.json', dict(summary, history=common['history']))
     write_json(folder / 'runtime.json', dict(
         status='PASS', arm=args.arm, task=args.task, fold=int(args.fold), stage=args.stage,
