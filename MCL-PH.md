@@ -1572,5 +1572,7 @@ python scripts/aggregate_mcl_ph.py --root results/mcl_ph_20260921/p1/finetune_r9
 - **不写 `P1 PASS`/「正式验收通过」**；ZCode 只报告执行证据完整，最终验收由 ChatGPT 审查远端 commit 后给出。
 - 未改写 r3–r8 历史记录（含 r8 的 FAILED 记录）；未恢复 `Plan.md`；未修改 `.zcodeignore`、`PH.md`、`3D.md`。未回滚其它执行者的改动。
 
+**八、提交与同步**：本轮 3 个文件（`scripts/finetune_mcl_ph.py`、`tests/test_mcl_ph_r9_summary.py`、`MCL-PH.md`）提交为 **`eee5583`**，非 force push 成功 `73bd4cc..eee5583 dev -> dev`；`git ls-remote origin dev` = `eee55832ec160519e8625965d258bed5ad278511`，与本地 HEAD 一致。产物与日志：`results/mcl_ph_20260921/p1/finetune_r9/{<arm>/xc/fold0/,aggregate.json}`、`logs/mcl_ph_20260921/{r9_regression.log,r9_finetune_smoke.log,r9_tmux_finetune.log}`，按 `.gitignore` 不提交，只按路径引用。**未自动启动 P2 或任何后续实验**；交回 ChatGPT/Codex 审查。
+
 
 
