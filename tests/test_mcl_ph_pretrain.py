@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pytest
 import torch
+from torch import nn
 
 from test_mcl_ph_modules import build_batch, build_labels, make_pretrainer
 from src.modules.mcl_ph_pretrain import (ATOM_CLASSES, BALANCE_WEIGHT, HUBER_BETA,
@@ -248,3 +249,72 @@ def test_step_diagnostics_reports_finite_observation_fields():
     assert baseline['nonbond_abs_log1p_error_max'] == 0.0
     assert baseline['nonbond_abs_log1p_error_mean'] == 0.0
     assert baseline['length_abs_log1p_error_mean'] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Section 5.2/8: the declared initialisation must survive the full construction
+# ---------------------------------------------------------------------------
+
+def _declared_router_std():
+    return 0.02
+
+
+def test_router_and_gate_keep_their_declared_init_after_full_construction():
+    """Checked on the finished model, not on an isolated module.
+
+    The router is declared Normal(0,0.02) with zero bias and the gate weight
+    Normal(0,0.001): a recursive ``apply`` at the pre-trainer level replaces both
+    with Xavier (std ~0.084 and ~0.056 for these fan-ins), which is what this
+    test would catch.
+    """
+    model = MCLPHPretrainer('gate', dropout=0.1, cutoffs=(2.0, 3.0, 4.0),
+                            router_dense_updates=500)
+    first = model.encoder.branch.router.net[0]
+    last = model.encoder.branch.router.net[2]
+    with torch.no_grad():
+        assert float(first.weight.std()) == pytest.approx(_declared_router_std(), rel=0.15)
+        assert torch.equal(first.bias, torch.zeros_like(first.bias))
+        assert torch.equal(last.bias, torch.zeros_like(last.bias))
+        assert float(last.weight.abs().sum()) > 0, 'an all-zero last layer ties every sample'
+        gate = model.encoder.fusion.gate
+        assert float(gate.weight.std()) == pytest.approx(0.001, rel=0.15)
+        assert torch.equal(gate.bias, torch.zeros_like(gate.bias))
+        centre = torch.sigmoid(gate(torch.zeros(4, gate.in_features)))
+        left = torch.sigmoid(gate(torch.full((1, gate.in_features), 0.5)))
+        right = torch.sigmoid(gate(torch.full((1, gate.in_features), -0.5)))
+        assert float(centre.mean()) == pytest.approx(0.5, abs=1e-6), 'initial g is about 0.5'
+        assert float(left.mean()) == pytest.approx(0.5, abs=0.02)
+        assert not torch.allclose(left, right), 'g is not a hard-wired constant'
+        # Fusion projections stay Xavier (non-zero), and no bias is introduced.
+        for name, layer in (('to_reduced', model.encoder.fusion.to_reduced),
+                            ('out', model.encoder.fusion.out)):
+            assert layer.bias is None, name
+            assert float(layer.weight.abs().sum()) > 0, name
+        # Expert embeddings are Normal(0,0.02) and the interaction filters keep zero bias.
+        for expert in model.encoder.branch.experts:
+            assert float(expert.element.weight.std()) == pytest.approx(0.02, rel=0.15)
+            for interaction in expert.interactions:
+                for layer in interaction.filter:
+                    if isinstance(layer, nn.Linear):
+                        assert torch.equal(layer.bias, torch.zeros_like(layer.bias))
+
+
+def test_the_shared_new_state_is_built_from_a_correctly_initialised_model(tmp_path):
+    """The artifact published for the arms must itself carry the declared init."""
+    from scripts.pretrain_mcl_ph import SHARED_INIT_SCHEMA, build_shared_init
+
+    path = tmp_path / 'shared.pt'
+    payload = build_shared_init(str(path), dropout=0.1, cutoffs=(2.0, 3.0, 4.0),
+                                dense_updates=500)
+    assert payload['schema'] == SHARED_INIT_SCHEMA
+    state = payload['state_dict']
+    router = [value for name, value in state.items()
+              if name.startswith('encoder.branch.router.net.0.weight')]
+    assert len(router) == 1
+    assert float(router[0].std()) == pytest.approx(0.02, rel=0.15)
+    with pytest.raises(ValueError, match='unsupported schema'):
+        from scripts.pretrain_mcl_ph import apply_shared_init
+
+        stale = tmp_path / 'stale.pt'
+        torch.save({'schema': 'mcl-ph-shared-new-init-v1', 'seed': 1, 'state_dict': state}, stale)
+        apply_shared_init(MCLPHPretrainer('gate'), stale)

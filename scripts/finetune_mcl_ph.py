@@ -395,6 +395,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
             split=split_evidence, learning_rate_table={'backbone': BACKBONE_LR, 'head': HEAD_LR},
             weight_decay=WEIGHT_DECAY, adaptation='full',
             pretrain_step=expected, pretrain_package_sha256=sha256_file(args.checkpoint),
+            optimizer_groups=group_evidence,
             copied_o8_tensors=(len(copied) if copied else None),
             load_state_dict_result={'missing_keys': list(reload_check.missing_keys),
                                     'unexpected_keys': list(reload_check.unexpected_keys)},

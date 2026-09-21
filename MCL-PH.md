@@ -1,10 +1,11 @@
 # MCL-PH：多尺度距离专家与 PH 路由替换 GLT 3D 通道
 
-计划 ID：`MCL-PH-20260921-01` ｜ 修订：r1 ｜ 日期：2026-09-21 UTC
+计划 ID：`MCL-PH-20260921-01` ｜ 修订：r2 ｜ 日期：2026-09-21 UTC
 
 ## 0. 状态、角色与授权
 
-- **状态：待授权执行**。本轮只获授权制定本文件；实现、模型验证、数据派生和训练尚未启动。
+- **状态：需返修（r2 修复已完成、待 Codex 审查）**。r1 审查发现 5 项缺陷（Randić 归一化、初始化作用域、主任务全局分母与 balance 缩放、metrics.json 的 `optimizer_groups`、验收臂数），r2 已完成最小修复与针对性验证；**P1 仍未完成**（CAT 预训练无成功 unit、`m_cat` 微调 unit 缺失），P2/P3 仍未授权。r2 的修改、证据与预算见 §13.2。
+- r1 状态（历史，已被 r2 取代）：**待授权执行**。
 - Codex 规划和审查；ZCode 在用户授权后执行。推荐第一次仅授权 P0＋P1，后续阶段必须分别交回审查。
 - 文档基准：`dev@0d633d8`，已安全 pull、无远端更新。原 `MCL-PH.md` 为空；用户未跟踪 `.zcodeignore` 不修改、不提交。
 - 本文件是用户指定的新方案合同。此前 `3D.md` 的空间 adapter 和 `PH.md` 的候选不是本轮执行任务，不能叠加其预算或自动启动。旧 GLT/PH 产物保留，只作来源明确的参考。
@@ -391,3 +392,111 @@ GPU/worker/超过一分钟的命令只能在tmux session `Uni-Poly` 独立window
 ## 13. 执行记录与审查区
 
 ZCode在每阶段后追加：实际基准/变更、命令和tmux window、结果与失败、预算消耗、产物/日志、未完成项、待审查问题。不得擦除失败或以新跑覆盖旧跑。Codex追加逐项验收与下一步；当前均为空，尚无新模型验证或预测结果。
+
+### 13.1 r1 执行记录（执行者 ZCode，2026-09-21 UTC，基准 `dev@cca9bd3`）
+
+**授权与范围**：用户仅授权 P0＋P1。GPU 未使用；预训练 smoke 的 optimizer updates 与微调 smoke 的 epoch 在计划 P1 硬预算表内。
+
+**P0：数据/泄漏/拓扑成本审计**
+
+- 命令：`python scripts/audit_mcl_ph_p0.py --mapping-samples 512 --statistics-samples 4096 --output results/mcl_ph_20260921/p0`；tmux session `Uni-Poly` window `mcl_ph_p0`。
+- 前 4 次运行部分完成或已被取代，全部保留：`logs/mcl_ph_20260921/p0_audit.log`、`p0_audit_r2.log`、`p0_audit_r3.log`、`p0_audit_r4_superseded.log`、`p0_audit_final.log`，以及 `results/mcl_ph_20260921/p0/audit_superseded_prepatch_conncheck.json`。
+- 最终结果：`logs/mcl_ph_20260921/p0_audit_definitive.log`，`status=PASS`，499.8 s（上限 60 min，未超），产物 `results/mcl_ph_20260921/p0/audit.json`、`statistics.npz`。
+- 关键量：`connectivity_mismatch=0`、`geometry_invalid=0`、`canonical_atoms=13484`、`canonical_without_heavy=5`（5 个轻氢同位素副本全数计入，未静默丢弃）、`stereo_atoms=0`、`readout_invalid=4`、`bond_category` 无缺失；`length/nonbond` 归一化统计与内存投影见 audit.json。真实 N=0（"无中心内部键"）在审计集合内未出现，声明保留在 audit.json。
+- 已知缺陷（r2 修复，见 §13.2）：`statistics.router_mean/router_std` 由未归一化 Randić 求出，列 0 均值 63.6–80.1，违反 §5.1 声明的 [0,1] 区间。
+- 未核实项：`p0_audit_final.log` 之前各次的失败原因未逐条归档（仅保留日志原文）。
+
+**P1：实现与有限验证**
+
+- 预训练 smoke：launcher `scripts/run_mcl_ph_pretrain_smoke.sh`，world_size=4，`--stop-after-step 2`，tmux window `mcl_ph_p1_pretrain-`，日志 `logs/mcl_ph_20260921/p1_pretrain_smoke*.log`；driver 日志 `p1_pretrain_driver*.log`。
+  - `glt_ref`、`gate`、`xattn`：`EXIT=0`，各 2 updates，`run.json`/`runtime.json`/`deploy_00002.pt`/`resume_00002.pt` 齐全（`results/mcl_ph_20260921/p1/pretrain/<arm>`）。
+  - `cat`：3 次失败，均保留失败现场。`cat_failed_common_init`（`ValueError: common initialization state is incompatible: angle_head...`，真实 exit 1）、`cat_failed_diagnostics_device`（`RuntimeError: Expected all tensors to be on the same device... cuda:0 and cpu`，真实 exit 1）、`cat_failed_rng_collective`（rank0 在 checkpoint collective 处等待，被用户停止请求中止；`runtime.json` 无终态，仍为 `RUNNING`，`steps.jsonl` 记录 2 steps）。
+  - 结论：**4 臂中 3 臂可用，CAT 不可用**，因此没有 `m_cat` 的微调包。
+- 微调 smoke：launcher `scripts/run_mcl_ph_finetune_smoke.sh`，XC/fold0，各 1 epoch（9 optimizer updates），tmux window `mcl_ph_p1_finetune`，日志 `p1_finetune_smoke*.log`。
+  - `glt_ref`、`o8_only`、`m_gate`、`m_xattn`：`status=PASS`，`exit_code=0`，`metrics.json` 含 history/val R²。
+  - 第 2 次尝试的 `m_gate_failed_collate_interface` 失败现场保留；`m_cat` **未运行**（无预训练包）。计划 5 臂，实际 4 臂。
+- `results/mcl_ph_20260921/p1/finetune/aggregate.json` 为 r1 语义产物：因 `metrics.json` 缺 `optimizer_groups` 判 `units_accepted=0`、`status=INCOMPLETE`。**该文件不追溯修改**；r2 以只读补充审计替代（§13.2 修复 4）。
+- 无模型/模型测试脚本：`tests/test_mcl_ph_ph.py`、`tests/test_mcl_ph_protocol.py`、`tests/test_mcl_ph_pretrain.py`（含 4-rank DDP 检查）、`tests/test_mcl_ph_view.py`。
+
+**r1 实际预算账目（含超支，未自我追认）**
+
+| 项目 | 计划上限 | 实际（r1） | 结论 |
+| --- | --- | --- | --- |
+| CPU 模型 forwards | 96 | ≈110 | **超支 ≈14** |
+| CPU backward | 48 | ≈70 | **超支 ≈22** |
+| optimizer steps（预训练 smoke） | 8 updates | 8（glt_ref/gate/xattn 各 2，cat 2） | 未超（失败重试计入后正好用满） |
+| 微调 smoke | 5 epochs | 4（m_cat 未运行） | 未超 |
+| 额外 DDP 检查 | 4 rank × 8 次调用 | 4-rank DDP 测试 + 多次失败重跑 | **超支（未逐次计数）** |
+| P0 墙钟 | 60 min | 499.8 s | 未超 |
+| GPU / 正式实验 | 0 | 0 | 符合 |
+
+超支主因：CAT 3 次失败后的定位与重跑、以及 4-rank DDP 检查的调试；数字来自本轮日志统计，其中"额外 DDP 检查"未逐次计数，标为**未核实**。
+
+**平台与同步状态**
+
+- 提交 `3d66198`（r1 改动）**仅存在于本地**：`git push` 经 HTTPS 连续失败（`GnuTLS recv error (-110): The TLS connection was non-properly terminated.`，含 `-c http.proxy= -c https.proxy=` 与 HTTP/1.1），`origin/dev` 仍为 `cca9bd3`。未使用 force push，未重写历史。
+- 用户未跟踪文件 `.zcodeignore` 全程未修改、未提交。
+
+**未完成项**：CAT 预训练；`m_cat` 微调；五臂完整验收；由审查判定修复后是否补跑。
+
+### 13.2 r2 执行记录（执行者 ZCode，2026-09-21 UTC，基准 `dev@3d66198`）
+
+**授权与范围**：用户对 r2 仅授权"最小返修"——5 项修复与针对性验证（A 无模型、B 初始化终态、C 数学一致性）以及受限的 P0 修订。硬约束 GPU=0、`optimizer.step=0`、预训练 updates=0、微调 epochs=0；未启动 CAT，未启动任何正式轨迹。**本轮不宣称 P1 完成。**
+
+**问题 → 修改（逐项文件级）**
+
+| # | r1 审查问题 | r2 修改 | 文件 |
+| --- | --- | --- | --- |
+| 1 | Randić 少 `2/n` 因子，列 0 可达 ~185，违反已声明 [0,1] | `_randic` 恢复 `2/n * Σ 1/sqrt(deg(u)deg(v))`，docstring 指向 §5.1 | `src/dataset/mcl_ph_view.py` |
+| 2 | Pretrainer 级 `self.apply` 递归覆盖 Router/Gate 专用初值 | 只对 `atom_head`/`local_decoder`/`nonbond_decoder` 施加 `_initialise_new_heads`；共享初始状态 schema 升 `mcl-ph-shared-new-init-v2`，v1 直接拒绝并注明原因 | `src/modules/mcl_ph_pretrain.py`、`scripts/pretrain_mcl_ph.py` |
+| 3 | 主任务用局部有效图数、balance 未按 accumulation 平均、数学 loss／反向缩放／日志混在一起 | 新增 `effective_graph_counts`（整个 update 的有效图掩码与计数）与 `effective_term`（分离 `math_loss`／`backward_scale`／`loss`）；`objective(report, weights, world_size, denominators, accumulation)` 使用 update 级全局分母；`balance_term` 只返回数学量，`world/accumulation` 缩放改由 objective 施加；空分母为可反传的有限零 | `src/modules/mcl_ph_pretrain.py`、`src/modules/mcl_ph.py`、`scripts/pretrain_mcl_ph.py`（update 前用 AllReduce 汇总各 rank 有效图数） |
+| 4 | `metrics.json` 未写 `optimizer_groups`，旧 4 个微调 unit 被判 INCOMPLETE | 后续运行写入 `optimizer_groups=group_evidence`；旧 unit 由新增**只读**审计核验 | `scripts/finetune_mcl_ph.py`、`scripts/audit_mcl_ph_optimizer_groups.py`（新增） |
+| 5 | 验收未固定五臂，子集可能被当成通过 | `ACCEPTANCE_ARMS` 固定 5 臂（`xc`/fold0 → 5 units）；全范围无拒绝才 PASS，子集 PARTIAL(exit 5)，缺臂或字段冲突 INCOMPLETE(exit 4)；payload 增加 `acceptance`/`requested_*`/`partial_reason` | `scripts/aggregate_mcl_ph.py` |
+
+**A. 无模型验证**：`tests/test_mcl_ph_ph.py`（新增 `randic_reference` 手算参考：单边 1.0、三角形 1.0、三角形+孤立点 0.75、四点路径、两条不相交边、四星、无边；五列区间与列序检查；断言 Randić 不再是未归一化度数和）与 `tests/test_mcl_ph_protocol.py`（五臂接受、子集 PARTIAL exit 5、缺臂/字段冲突拒绝）。结果：`test_mcl_ph_ph.py` 63 passed；`test_mcl_ph_protocol.py` 24 passed / 2 skipped。
+
+**B. 初始化终态**：`tests/test_mcl_ph_pretrain.py` 新增两项——完整 `MCLPHPretrainer` 构造后 Router/Gate 仍保持声明初值（Router `Normal(0,0.02)` 相对偏差 ≤0.15、bias 全零、末层非零；Gate 权重 `Normal(0,0.001)`、bias 零、`centre.mean()≈0.5`、左右输入可区分），以及 v2 共享初始状态确实由正确初始化的模型生成、v1 产物被拒绝。仅实例化 Router 的做法无法通过（构造顺序覆盖会被该检查捕获）。结果：通过。
+
+**C. 数学一致性**：`tests/test_mcl_ph_objective_math.py`（新增 pytest 入口）以 torchrun 4 rank 驱动 `tests/_mcl_ph_objective_check.py`。**7 passed**，覆盖并给出证据：
+
+- update 级分母 = 各 rank×microstep 有效图数之和（`atom=30`、`geometry=17`，accumulation=3），四 rank 一致；旧"局部分母"公式给出 0.6/0.214/0.5/0.3，与闭式真值 0.4333 可区分。
+- 主任务梯度 vs 解析闭式：偏差 3.4e-8；`math_loss`×`world`=`loss`、`backward_scale`=`world/有效图数`（分离检查）。
+- 全局无几何：分母 0，梯度恰为 0.0（可反传的有限零），统计 `effective_graphs=0`、`numerator=0`、`loss=0`。
+- balance（生产 `balance_term`，accumulation=3）：对照全局闭式梯度偏差 1.5e-8。
+- 真实模型（rank 0 两原子/两几何图、rank 1 一原子/无几何、rank≥2 空监督）：update 级分母 `{atom:3, geometry:2}` ≠ 任何 rank 的局部计数；**rank 平均梯度与单进程全局计算逐元素相等（偏差 0.0，范数 15.935277 相同）**。该阶段关闭随机干扰（`eval()`）——`BondPathO8` 的 dropout 在 train 模式下会使两次前向不可比。
+- 说明：真实模型阶段 accumulation=1 以控制本轮 CPU 预算；accumulation=3 的累积语义由驱动生产 `objective` 的合成阶段覆盖。rank 平均用一次显式 AllReduce 模拟 DDP 的平均语义：rank 参数使用顺序不同时真实 DDP 不是合法配置（集合通信顺序须在各 rank 一致），该事实写在该阶段的 docstring 中。
+
+**P0 修订（仅 Randić 影响面）**：`scripts/audit_mcl_ph_p0_randic.py`（新增，模型无关，CPU）→ `results/mcl_ph_20260921/p0/statistics_randic_revision.json` 与 `.npz`。4096 样本、315.4 s（≤30 min）、`matches_frozen_sample_set=true`（与冻结审计同一 `ordered_key_sha256=c0402dca…`）。修正后五列全在 [0,1]：
+
+| 列 | min | max | mean | std |
+| --- | --- | --- | --- | --- |
+| randic | 0.0 | 0.998914 | 0.968945 | 0.055405 |
+| wiener | 0.0 | 1.0 | 0.345343 | 0.233511 |
+| efficiency | 0.0 | 0.837691 | 0.252635 | 0.130668 |
+| betti0_per_atom | 0.004444 | 1.0 | 0.030754 | 0.073456 |
+| betti1_per_edge | 0.0 | 1.0 | 0.217646 | 0.281827 |
+
+新报告替换的字段（写在 JSON 的 `supersedes` 中）：`statistics.router_mean`、`statistics.router_std`（旧值同时抄录在报告中：列 0 均值 63.6–80.1），以及 `statistics.npz` 的同名字段；**不替换** `length`/`nonbond` 归一化、`target_counts`、`nonbond_bin_histogram`、`mapping`、`memory`、`ph_definition`、`identity_source`、`cost_projection`（这些由原始距离与图结构导出，不受 Randić 影响）。冻结产物未被修改（`audit.json`、`statistics.npz` 的 mtime 仍为 10:27）。模型与数据路径都不读取 `router_mean/router_std`（`load_geometric_statistics` 只把它们放进统计记录），因此旧的列 0 未污染任何训练归一化；它影响的是 Router 的输入特征与报告统计。
+
+事实观察（供审查，不构成结论）：修正后 Randić 列接近饱和（mean 0.969、std 0.055），Router 直接消费未归一化的 155 维描述符，其余四列承担主要方差。
+
+**补充审计（修复 4 的只读证据）**：`results/mcl_ph_20260921/p1/finetune/optimizer_groups_audit.json`，4/4 `COMPLETE_FROM_OWN_RECORDS`（`run.json` 与 `best.pt` 的 `optimizer_groups` 一致、组名合法、共享字段一致），`acceptance=PARTIAL`（4/5 unit，缺 `m_cat`），`metrics_json_modified=false`、`training_rerun=false`；未重训、未改写旧预测。r1 的 `p1/finetune/aggregate.json` 保持原样。
+
+**r2 实际预算账目（未自我追认超支）**
+
+| 项目 | r2 上限 | 实际 | 结论 |
+| --- | --- | --- | --- |
+| CPU 模型 forwards | 48 | 48–56（含首次挂起运行 ≤8 次**未核实**） | **超支 0–8** |
+| CPU 模型 backwards | 32 | 48–56 | **超支 16–24** |
+| CPU 模型验证墙钟 | 30 min | ≈12.9 min | 未超 |
+| P0 修订墙钟（模型无关） | 30 min | 316.7 s（smoke 1.3 s + 正式 315.4 s） | 未超 |
+| `optimizer.step` / 预训练 updates / 微调 epochs / GPU | 0 | 0 / 0 / 0 / 0 | 符合 |
+
+Test C 逐次明细（每次 4 rank）：`r2_objective_check.log` 在 DDP 模型阶段挂起被终止（用满 653 s 墙钟，模型调用数未核实，因此记为"≤8"）；`check2`、`check3` 各 12 forwards + 12 backwards；`check4`、pytest 入口（首次断言容差失败、复跑、以及最终三套件联合运行各一次）各 6 + 6，合计 48 次已核实。超支集中在**测试工具本身**的调试（DDP 集合通信配置、dropout 随机性、fixture 计数一致性），生产代码的修复未因此改动。r2 的消耗不冲抵 r1 的 P1 预算（r1 自身已超支，见 §13.1）；r2 早期运行的 `tests/test_mcl_ph_pretrain.py`（含 4-rank DDP）与初始化测试的逐次模型调用未登记，标为**未核实**。
+
+**未完成 / 待审查**
+
+- P1 仍未完成：CAT 预训练无成功 unit，`m_cat` 微调 unit 缺失，五臂验收只有 4/5（PARTIAL）。
+- `results/mcl_ph_20260921/p1/pretrain/cat_failed_rng_collective/runtime.json` 仍为 `RUNNING`（进程被用户停止请求中止，未写终态），保留现场不追溯修改。
+- 修复后是否补跑三条既有预训练 arm 与相应微调、以及新增预算，**待本轮审查后由用户与 Codex 决定**；本轮未启动任何训练。
+- 同步：r1 提交 `3d66198` 与 r2 提交（见下）推送 `origin/dev`；r1 期间 HTTPS 推送因 TLS 中断失败，r2 复核时 `git fetch` 已恢复，推送结果以最终回复为准。

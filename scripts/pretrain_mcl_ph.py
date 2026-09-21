@@ -26,7 +26,9 @@ from torch.nn.parallel import DistributedDataParallel
 
 from src.dataset.mcl_ph_view import (MCLPHMicrobatchStream, load_geometric_statistics,
                                      mcl_ph_collate, prepare_mcl_ph_sample)
-from src.modules.mcl_ph_pretrain import BALANCE_WEIGHT, MCLPHPretrainer
+from src.modules.mcl_ph import global_sum
+from src.modules.mcl_ph_pretrain import (BALANCE_WEIGHT, MCLPHPretrainer,
+                                         effective_graph_counts)
 from src.training.glt_dual_runtime import (IndexedFrozenDualSource, OrderedSampleStream,
                                            apply_common_initialization, load_sample_index_artifact,
                                            move_labels, open_source, require_tmux,
@@ -88,6 +90,9 @@ def shared_new_state(model):
             if name.startswith(prefixes)}
 
 
+SHARED_INIT_SCHEMA = 'mcl-ph-shared-new-init-v2'
+
+
 def build_shared_init(path, *, dropout, cutoffs, dense_updates):
     """Create the one shared initial state for the new route, once."""
     previous = torch.get_rng_state()
@@ -95,7 +100,10 @@ def build_shared_init(path, *, dropout, cutoffs, dense_updates):
     reference = MCLPHPretrainer('gate', dropout=dropout, cutoffs=cutoffs,
                                 router_dense_updates=dense_updates)
     state = shared_new_state(reference)
-    payload = {'schema': 'mcl-ph-shared-new-init-v1', 'seed': SHARED_INIT_SEED,
+    # v2: the pre-r2 artifact was built while a recursive ``apply`` still
+    # overwrote the router and gate initialisation, so it must never be
+    # reused as the initial state of the fixed route.
+    payload = {'schema': SHARED_INIT_SCHEMA, 'seed': SHARED_INIT_SEED,
                'source': 'MCLPHPretrainer(fusion=gate)', 'state_dict': state}
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,8 +128,10 @@ def SHARED_INIT_EXCLUDE_NAMES(model, artifact_state):
 
 def apply_shared_init(model, path):
     payload = torch.load(Path(path), map_location='cpu', weights_only=False)
-    if payload.get('schema') != 'mcl-ph-shared-new-init-v1':
-        raise ValueError('shared initialization artifact has an unsupported schema')
+    if payload.get('schema') != SHARED_INIT_SCHEMA:
+        raise ValueError('shared initialization artifact has an unsupported schema: '
+                         f"{payload.get('schema')!r}; the v1 artifact predates the "
+                         'r2 initialization fix and may not be reused')
     state = payload['state_dict']
     current = model.state_dict()
     expected = set(shared_new_state(model))
@@ -417,10 +427,27 @@ def main():
             for group in optimizer.param_groups:
                 group['lr'] = lr
             optimizer.zero_grad(set_to_none=True)
+            # The exact denominator of one optimizer update: the effective graph
+            # count of each main task, summed over every microstep of this update
+            # and every rank.  It is known before the backward passes, so the
+            # gradient of the update is the gradient of
+            # ``sum numerator / sum count`` over the whole update.
+            update_counts = {'atom': 0, 'geometry': 0}
+            for host_batch, host_labels in prepared:
+                local_counts = effective_graph_counts(
+                    host_batch.canonical_graph_index, host_labels,
+                    int(host_batch.graph_available.numel()))['counts']
+                update_counts['atom'] += local_counts['atom']
+                update_counts['geometry'] += local_counts['geometry']
+            denominators = {}
+            for name, value in update_counts.items():
+                shared = global_sum(torch.tensor([float(value)], device=device))
+                denominators[name] = float(shared.detach().reshape(-1)[0])
             totals = torch.zeros(3, device=device)
             counts = torch.zeros(2, device=device)
             target_counts = torch.zeros(5, device=device)
             diagnostics = None
+            objective_statistics = None
             forward_started = time.perf_counter()
             for offset, (batch, labels) in enumerate(prepared):
                 sync = module.no_sync() if world > 1 and offset + 1 < accumulation else nullcontext()
@@ -431,10 +458,13 @@ def main():
                                         enabled=config['amp_dtype'] == 'bf16'):
                         report = module(moved_data, moved_labels)
                         loss = base.objective(report, weights=(1.0, 1.0, BALANCE_WEIGHT),
-                                              world_size=world)
+                                              world_size=world, denominators=denominators,
+                                              accumulation=len(prepared))
                     if not torch.isfinite(loss):
                         raise FloatingPointError('nonfinite MCL-PH pretraining loss')
                     loss.backward()
+                if objective_statistics is None and offset == len(prepared) - 1:
+                    objective_statistics = report.get('objective_statistics')
                 if diagnostics is None and offset == len(prepared) - 1:
                     # The diagnostics describe the tensors the model consumed.
                     # ``batch.to(device)`` mutates the PyG store in place while
@@ -457,7 +487,14 @@ def main():
             record = dict(step=step_number, rank=rank, lr=float(lr),
                           losses={'atom': float(totals[0] / counts[0].clamp_min(1)),
                                   'geometry': float(totals[1] / counts[1].clamp_min(1)),
-                                  'balance': float(totals[2])},
+                                  # The balance is defined per distributed
+                                  # microstep and averaged over the accumulation;
+                                  # the rank sum is divided out here because its
+                                  # value is identical on every rank.
+                                  'balance': float(totals[2] / (len(prepared)
+                                                                * max(1, world)))},
+                          objective_statistics=objective_statistics,
+                          update_denominators=denominators,
                           valid_graphs={'atom': float(counts[0]), 'geometry': float(counts[1])},
                           target_counts=[float(value) for value in target_counts],
                           grad_total_preclip=grad_total,

@@ -25,6 +25,10 @@ from scripts.finetune_mcl_ph import (ARMS, FOLDS, MCL_FUSION, SCHEDULE_TOTAL_EPO
 REQUIRED_FILES = ('run.json', 'runtime.json', 'metrics.json', 'best.pt',
                   'validation_predictions.npz')
 STAGE_EPOCH_LIMIT = {'smoke': 1, 'development': SCHEDULE_TOTAL_EPOCHS}
+# The declared P1 smoke scope; anything smaller can be verified but is PARTIAL.
+ACCEPTANCE_ARMS = tuple(ARMS)
+ACCEPTANCE_TASKS = ('xc',)
+ACCEPTANCE_FOLDS = (0,)
 
 
 def _finite(value):
@@ -155,8 +159,8 @@ def main():
     parser.add_argument('--stage', default='smoke', choices=tuple(STAGE_EPOCH_LIMIT))
     parser.add_argument('--expected-pretrain-step', type=int, required=True)
     parser.add_argument('--arms', nargs='+', default=list(ARMS))
-    parser.add_argument('--tasks', nargs='+', default=['xc'])
-    parser.add_argument('--folds', nargs='+', type=int, default=[0])
+    parser.add_argument('--tasks', nargs='+', default=list(ACCEPTANCE_TASKS))
+    parser.add_argument('--folds', nargs='+', type=int, default=list(ACCEPTANCE_FOLDS))
     parser.add_argument('--output')
     args = parser.parse_args()
     if args.stage == 'development':
@@ -170,21 +174,38 @@ def main():
             rejected.append({'arm': arm, 'task': task, 'fold': int(fold), 'problems': problems})
         else:
             accepted.append(record)
-    status = 'PASS' if not rejected and len(accepted) == len(units) else 'INCOMPLETE'
-    payload = {'plan': 'MCL-PH-20260921-01/r1', 'phase': 'P1', 'stage': args.stage,
-               'status': status, 'root': str(Path(args.root).resolve()),
+    # P1 acceptance is fixed at every declared arm: a subset can be verified, but
+    # it is reported as PARTIAL and never as acceptance, whatever it contains.
+    scope = (list(args.arms) == list(ARMS) and list(args.tasks) == list(ACCEPTANCE_TASKS)
+             and list(args.folds) == list(ACCEPTANCE_FOLDS))
+    if rejected:
+        status = 'INCOMPLETE'
+    elif scope and len(accepted) == len(units):
+        status = 'PASS'
+    else:
+        status = 'PARTIAL'
+    payload = {'plan': 'MCL-PH-20260921-01/r2', 'phase': 'P1', 'stage': args.stage,
+               'status': status, 'acceptance': status, 'root': str(Path(args.root).resolve()),
+               'acceptance_arms': list(ARMS), 'requested_arms': list(args.arms),
+               'acceptance_tasks': list(ACCEPTANCE_TASKS), 'requested_tasks': list(args.tasks),
+               'acceptance_folds': list(ACCEPTANCE_FOLDS), 'requested_folds': list(args.folds),
                'units_expected': len(units), 'units_accepted': len(accepted),
                'units_rejected': len(rejected), 'accepted': accepted, 'rejected': rejected,
                'outer_test': 'NOT_RUN',
                'note': 'implementation availability only; these units do not rank the arms '
                        'and are not a performance comparison'}
+    if status == 'PARTIAL':
+        payload['partial_reason'] = ('the requested arm/task/fold set is smaller than the '
+                                     'declared P1 acceptance scope')
     text = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + '\n'
     destination = Path(args.output) if args.output else Path(args.root) / 'aggregate.json'
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(text, encoding='utf-8')
     print(text, end='')
-    if status != 'PASS':
+    if status == 'INCOMPLETE':
         raise SystemExit(4)
+    if status == 'PARTIAL':
+        raise SystemExit(5)
 
 
 if __name__ == '__main__':

@@ -204,12 +204,16 @@ class TopologyRouter(nn.Module):
                 'order': order}
 
 
-def balance_term(dense_probabilities, valid, world_size=1):
+def balance_term(dense_probabilities, valid):
     """``3 * sum_k (mean_b over V p_bk)^2 - 1`` on the globally valid graph set.
 
     ``dense_probabilities`` are the pre-Top-2 soft probabilities of this rank's
     graphs.  With no valid graph anywhere the term is a finite, differentiable
-    zero (and carries no coefficient), instead of an empty-mean NaN.
+    zero instead of an empty-mean NaN.
+
+    This returns the *mathematical* term of section 5.2 only.  The distributed
+    backward scale is applied by the objective, which keeps the mathematics, the
+    scaling and the logged statistics separate.
     """
     if dense_probabilities.ndim != 2 or dense_probabilities.size(1) != 3:
         raise ValueError('router probabilities must be [B,3]')
@@ -222,9 +226,7 @@ def balance_term(dense_probabilities, valid, world_size=1):
     if float(count.detach()) <= 0:
         return dense_probabilities.sum() * 0.0, True
     mean = total / count.clamp_min(1.0)
-    # DDP averages gradients across ranks, exactly as ``global_objective``
-    # assumes; the factor restores the single global balance gradient.
-    return float(max(1, int(world_size))) * (3.0 * (mean ** 2).sum() - 1.0), False
+    return 3.0 * (mean ** 2).sum() - 1.0, False
 
 
 class MCLPHBranch(nn.Module):
@@ -243,7 +245,6 @@ class MCLPHBranch(nn.Module):
         return self.router.routing_mode_for_step(update)
 
     def forward(self, data):
-        world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
         count = int(data.mcl_z.numel())
         element, charge, aromatic = data.mcl_z.long(), data.mcl_charge.long(), data.mcl_aromatic.long()
         edge_index = data.mcl_edge_index.long()
@@ -275,7 +276,7 @@ class MCLPHBranch(nn.Module):
         for slot, value in enumerate(states):
             mixed = mixed + alpha[:, slot][atom_graph].unsqueeze(-1).to(mixed.dtype) * value
         valid = data.mcl_readout_valid.bool()
-        balance, balance_empty = balance_term(routed['dense'], valid, world_size=world)
+        balance, balance_empty = balance_term(routed['dense'], valid)
         result = {'expert_states': states, 'mixed': mixed, 'alpha': alpha,
                   'router_logits': routed['logits'], 'router_dense': routed['dense'],
                   'router_top_k': routed['top_k'], 'balance': balance,

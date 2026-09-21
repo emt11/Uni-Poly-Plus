@@ -34,6 +34,63 @@ def per_graph(loss, index, graphs):
     return means, counts > 0
 
 
+def effective_graph_counts(canonical_graph_index, labels, graphs):
+    """Per-graph validity of every declared task denominator, from the batch alone.
+
+    The runner needs the exact update-level denominators *before* the backward
+    passes, so the three predicates live here once: the forward derives its
+    denominators from this same call and cannot drift from the runner.
+    """
+    graphs = int(graphs)
+    atom_index = torch.as_tensor(canonical_graph_index).long()
+    device = atom_index.device
+    mask = labels['atom_mask'].bool()
+    atom = torch.zeros(graphs, dtype=torch.bool, device=device)
+    if bool(mask.any()):
+        atom[torch.unique(atom_index[mask])] = True
+    local = torch.zeros(graphs, dtype=torch.bool, device=device)
+    for name in ('mcl_length_graph', 'mcl_angle_graph'):
+        values = labels[name].long()
+        if int(values.numel()):
+            local[values] = True
+    nonbond = torch.zeros(graphs, dtype=torch.bool, device=device)
+    values = labels['mcl_nonbond_graph'].long()
+    if int(values.numel()):
+        nonbond[values] = True
+    return {'atom': atom, 'local': local, 'nonbond': nonbond, 'geometry': local | nonbond,
+            'counts': {'atom': int(atom.sum()), 'geometry': int((local | nonbond).sum())}}
+
+
+def effective_term(numerator, fallback_count, world, global_count=None):
+    """Scale one task term for DDP and report its mathematics separately.
+
+    Returns ``(scaled_term, statistics)`` where ``scaled_term`` is the tensor a
+    ``backward`` may use.  With ``global_count`` given (the exact update-level
+    denominator from ``effective_graph_counts`` over the whole optimizer
+    update) no collective runs here; otherwise the per-microstep global count is
+    taken through the autograd-aware ``global_sum``.  An empty denominator is a
+    finite, differentiable zero: the numerator of an empty selection is already
+    a zero tensor that keeps its ``grad_fn``.
+    """
+    world = float(max(1, int(world)))
+    if global_count is None:
+        count = float(global_sum(torch.as_tensor(
+            fallback_count, dtype=torch.float32).reshape(1)).detach())
+    else:
+        count = float(global_count)
+    denominator = max(1.0, count)
+    scale = world / denominator
+    scaled = torch.as_tensor(numerator, dtype=torch.float32) * scale
+    statistics = {
+        'numerator': float(numerator.detach()),
+        'effective_graphs': count,
+        'backward_scale': scale,
+        'math_loss': float(numerator.detach()) / denominator,
+        'loss': float(scaled.detach()),
+    }
+    return scaled, statistics
+
+
 class LocalGeometryDecoder(nn.Module):
     """One decoder shared by the three experts (section 7.2)."""
 
@@ -86,7 +143,12 @@ class MCLPHPretrainer(nn.Module):
         self.nonbond_decoder = NonBondDecoder()
         self.collect_diagnostics = bool(collect_diagnostics)
         self.last_diagnostics = None
-        self.apply(_initialise_new_heads)
+        # Only the heads this class owns are initialised here.  The encoder
+        # carries its own declared initialisation per section 4/5.2/8 -- the
+        # router uses Normal(0,0.02) and the gate weight Normal(0,0.001) -- and a
+        # recursive ``self.apply`` would overwrite both with Xavier.
+        for module in (self.atom_head, self.local_decoder, self.nonbond_decoder):
+            module.apply(_initialise_new_heads)
 
     @property
     def fusion_mode(self):
@@ -113,12 +175,11 @@ class MCLPHPretrainer(nn.Module):
             data.canonical_graph_index[mask], graphs)
         geometric = data.mcl_geometry_valid.bool()
         per_graph_atom = torch.where(geometric, 0.5 * loss_two + 0.5 * loss_fused, loss_two)
-        masked_graph = torch.zeros(graphs, dtype=torch.bool, device=per_graph_atom.device)
-        if bool(mask.any()):
-            masked_graph[data.canonical_graph_index[mask]] = True
-        atom_valid = masked_graph & (torch.bincount(data.canonical_graph_index[mask],
-                                                    minlength=graphs) > 0)
+        counts = effective_graph_counts(data.canonical_graph_index, labels, graphs)
+        atom_valid = counts['atom']
         local, nonbond, geo_valid = self._geometry_terms(data, labels, encoded, graphs)
+        if not torch.equal(geo_valid, counts['geometry']):
+            raise ValueError('the geometry denominator disagrees with the label-derived set')
         geometry = torch.where(local['valid'] & nonbond['valid'],
                                0.5 * local['value'] + 0.5 * nonbond['value'],
                                torch.where(local['valid'], local['value'],
@@ -238,15 +299,51 @@ class MCLPHPretrainer(nn.Module):
         valid = non_empty > 0
         return value, valid
 
-    def objective(self, report, weights=(1.0, 1.0, BALANCE_WEIGHT), world_size=1):
-        """DDP-correct global objective: each task keeps its own denominator."""
+    def objective(self, report, weights=(1.0, 1.0, BALANCE_WEIGHT), world_size=1,
+                  denominators=None, accumulation=1):
+        """The declared objective, with mathematics and DDP scaling separated.
+
+        ``denominators`` carries the exact update-level effective graph count of
+        each main task -- summed over every rank *and* every microstep of one
+        optimizer update -- so that one update's gradient is the gradient of
+        ``sum numerator / sum count`` over that whole update, whatever the
+        per-rank and per-microstep valid counts are.  Without it the per
+        microstep global count is used instead, which is the same value only
+        when the counts do not vary.
+
+        The balance term is specified differently (section 5.2): it is computed
+        per distributed microstep and averaged over the accumulation, so its
+        scale is ``world / accumulation`` and this is *not* claimed to equal one
+        computation over the whole global batch.
+
+        ``report['objective_statistics']`` keeps the mathematical loss, the
+        backward scale and the effective denominators apart for logging; the
+        returned tensor is the backward quantity only.
+        """
         world = float(max(1, int(world_size)))
-        weight = torch.as_tensor(weights, dtype=torch.float32,
-                                 device=report['atom_sum'].device)
-        atom = report['atom_sum'] * world / report['atom_count'].to(torch.float32).clamp_min(1.0)
-        geometry = (report['geo_sum'] * world
-                    / report['geo_count'].to(torch.float32).clamp_min(1.0))
-        return atom * weight[0] + geometry * weight[1] + report['balance'] * weight[2]
+        steps = float(max(1, int(accumulation)))
+        denominators = denominators or {}
+        atom, atom_statistics = effective_term(
+            report['atom_sum'], report['atom_count'], world,
+            global_count=denominators.get('atom'))
+        geometry, geometry_statistics = effective_term(
+            report['geo_sum'], report['geo_count'], world,
+            global_count=denominators.get('geometry'))
+        balance_scale = world / steps
+        balance = report['balance'] * balance_scale
+        weight = [float(value) for value in weights]
+        total = (atom * weight[0] + geometry * weight[1] + balance * weight[2])
+        report['objective_statistics'] = {
+            'atom': atom_statistics, 'geometry': geometry_statistics,
+            'balance': {'math_loss': float(report['balance'].detach()),
+                        'backward_scale': balance_scale,
+                        'loss': float(balance.detach()),
+                        'empty_valid_set': bool(report.get('balance_empty_valid', False))},
+            'weights': weight, 'world_size': int(max(1, int(world_size))),
+            'accumulation': int(max(1, int(accumulation))),
+            'denominators_source': ('update_level' if denominators else 'microstep_level'),
+        }
+        return total
 
 
 def _initialise_new_heads(module):

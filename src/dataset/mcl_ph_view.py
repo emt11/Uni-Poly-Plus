@@ -170,11 +170,20 @@ def _hop_distances(adjacency):
 
 
 def _randic(adjacency):
+    """Section 5.1 column 0: ``2/n * sum_edges 1/sqrt(deg(u) deg(v))``.
+
+    The ``2/n`` factor is part of the declared definition; without it the column
+    is an unnormalised degree sum, which contradicts the declared column range
+    and the descriptor scaling the router relies on.  A graph with no edge is 0.
+    """
+    count = int(adjacency.shape[0])
+    if count <= 0:
+        return 0.0
     degree = adjacency.sum(axis=1).astype(np.float64)
     left, right = np.nonzero(np.triu(adjacency, 1))
     if left.size == 0:
         return 0.0
-    return float(2.0 * np.sum(1.0 / np.sqrt(degree[left] * degree[right])))
+    return float(2.0 * np.sum(1.0 / np.sqrt(degree[left] * degree[right])) / float(count))
 
 
 def _normalized_wiener(adjacency, distance, members):

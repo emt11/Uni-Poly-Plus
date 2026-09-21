@@ -22,7 +22,7 @@ import numpy as np  # noqa: E402
 
 from scripts.aggregate_mcl_ph import STAGE_EPOCH_LIMIT, check_unit  # noqa: E402
 from scripts.finetune_glt_3d_gain_d2 import resolve_fold  # noqa: E402
-from scripts.finetune_mcl_ph import SPLIT_PROTOCOL, unit_directory  # noqa: E402
+from scripts.finetune_mcl_ph import ARMS, SPLIT_PROTOCOL, unit_directory  # noqa: E402
 
 PRETRAIN_LAUNCHER = ROOT / 'scripts' / 'run_mcl_ph_pretrain_smoke.sh'
 FINETUNE_LAUNCHER = ROOT / 'scripts' / 'run_mcl_ph_finetune_smoke.sh'
@@ -201,7 +201,7 @@ def _write_unit(root, arm='m_gate', task='xc', fold=0, stage='smoke', mutate=Non
     return directory
 
 
-def _aggregate(root, *, stage='smoke', step=2, arms=('m_gate',), output=None):
+def _aggregate(root, *, stage='smoke', step=2, arms=tuple(ARMS), output=None):
     destination = output or (Path(root) / 'aggregate.json')
     completed = subprocess.run(
         [sys.executable, str(ROOT / 'scripts' / 'aggregate_mcl_ph.py'), '--root', str(root),
@@ -213,12 +213,55 @@ def _aggregate(root, *, stage='smoke', step=2, arms=('m_gate',), output=None):
     return completed, payload
 
 
-def test_aggregator_accepts_a_complete_unit(tmp_path):
-    _write_unit(tmp_path)
+def _write_all_arms(root, stage='smoke'):
+    for arm in ARMS:
+        _write_unit(root, arm=arm, stage=stage)
+
+
+def test_aggregator_accepts_only_the_full_five_arm_scope(tmp_path):
+    _write_all_arms(tmp_path)
     completed, payload = _aggregate(tmp_path)
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert payload['status'] == 'PASS' and payload['units_accepted'] == 1
+    assert payload['status'] == 'PASS' and payload['acceptance'] == 'PASS'
+    assert payload['units_accepted'] == len(ARMS) == payload['units_expected']
     assert payload['rejected'] == [] and payload['outer_test'] == 'NOT_RUN'
+    assert payload['acceptance_arms'] == list(ARMS)
+
+
+def test_aggregator_marks_a_subset_scope_as_partial(tmp_path):
+    'A verified subset is never reported as acceptance (section 10 P1).'
+    _write_all_arms(tmp_path)
+    completed, payload = _aggregate(tmp_path, arms=tuple(ARMS)[:4])
+    assert completed.returncode == 5, completed.stdout + completed.stderr
+    assert payload['status'] == 'PARTIAL' and payload['acceptance'] == 'PARTIAL'
+    assert payload['units_accepted'] == 4 and payload['rejected'] == []
+    assert payload['requested_arms'] == list(ARMS)[:4]
+    assert payload['acceptance_arms'] == list(ARMS)
+    assert 'smaller than' in payload['partial_reason']
+
+
+def test_aggregator_rejects_a_conflicting_unit_inside_the_full_scope(tmp_path):
+    _write_all_arms(tmp_path)
+    unit = unit_directory(tmp_path, 'm_xattn', 'xc', 0)
+    metrics = json.loads((unit / 'metrics.json').read_text(encoding='utf-8'))
+    metrics['pretrain_step'] = 7
+    (unit / 'metrics.json').write_text(json.dumps(metrics), encoding='utf-8')
+    completed, payload = _aggregate(tmp_path)
+    assert completed.returncode == 4
+    assert payload['status'] == 'INCOMPLETE' and payload['units_accepted'] == len(ARMS) - 1
+    assert payload['rejected'][0]['arm'] == 'm_xattn'
+    assert 'pretrain_step' in ' '.join(payload['rejected'][0]['problems'])
+
+
+def test_aggregator_rejects_a_missing_arm_inside_the_full_scope(tmp_path):
+    _write_all_arms(tmp_path)
+    import shutil
+
+    shutil.rmtree(unit_directory(tmp_path, 'm_cat', 'xc', 0))
+    completed, payload = _aggregate(tmp_path)
+    assert completed.returncode == 4
+    assert payload['status'] == 'INCOMPLETE'
+    assert 'missing artifacts' in ' '.join(payload['rejected'][0]['problems'])
 
 
 def test_aggregator_rejects_an_empty_unit_directory(tmp_path):
@@ -232,7 +275,7 @@ def test_aggregator_rejects_an_empty_unit_directory(tmp_path):
 def test_aggregator_rejects_a_failed_run_that_kept_its_directory(tmp_path):
     _write_unit(tmp_path, mutate=lambda metrics, run, runtime: runtime.update(
         status='FAILED', exit_code=1, error='RuntimeError: nonfinite validation metrics'))
-    completed, payload = _aggregate(tmp_path)
+    completed, payload = _aggregate(tmp_path, arms=('m_gate',))
     assert completed.returncode == 4
     problems = ' '.join(payload['rejected'][0]['problems'])
     assert 'runtime status' in problems and 'exit_code' in problems
@@ -298,7 +341,7 @@ def test_aggregator_rejects_partial_and_inconsistent_products(tmp_path):
         _write_unit(root, mutate=mutate)
         if drop is not None:
             (unit_directory(root, 'm_gate', 'xc', 0) / drop).unlink()
-        completed, payload = _aggregate(root)
+        completed, payload = _aggregate(root, arms=('m_gate',))
         assert payload is not None, f'{name}: no aggregate written\n{completed.stderr}'
         problems = ' '.join(payload['rejected'][0]['problems'])
         assert completed.returncode == 4, f'{name}: {completed.stdout}{completed.stderr}'
@@ -312,7 +355,7 @@ def test_aggregator_rejects_nan_validation_predictions(tmp_path):
              sample_keys=np.asarray(['aa', 'bb']), y_true=np.asarray([1.0, 2.0]),
              y_pred=np.asarray([1.1, float('nan')]), best_epoch=np.asarray(1, dtype=np.int64),
              split_protocol=np.asarray(SPLIT_PROTOCOL), outer_test=np.asarray('NOT_RUN'))
-    completed, payload = _aggregate(tmp_path)
+    completed, payload = _aggregate(tmp_path, arms=('m_gate',))
     assert completed.returncode == 4
     assert 'NaN/Inf' in ' '.join(payload['rejected'][0]['problems'])
 
@@ -323,7 +366,7 @@ def test_aggregator_rejects_predictions_from_another_epoch(tmp_path):
              sample_keys=np.asarray(['aa', 'bb']), y_true=np.asarray([1.0, 2.0]),
              y_pred=np.asarray([1.1, 1.9]), best_epoch=np.asarray(7, dtype=np.int64),
              split_protocol=np.asarray(SPLIT_PROTOCOL), outer_test=np.asarray('NOT_RUN'))
-    completed, payload = _aggregate(tmp_path)
+    completed, payload = _aggregate(tmp_path, arms=('m_gate',))
     assert completed.returncode == 4
     assert 'not from the selected epoch' in ' '.join(payload['rejected'][0]['problems'])
 
