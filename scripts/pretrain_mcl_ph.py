@@ -15,6 +15,9 @@ import json
 import os
 from pathlib import Path
 import sys
+import faulthandler
+import os
+import resource
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -80,6 +83,127 @@ def _parameter_snapshot(model):
                              'rms': float(tensor.pow(2).mean().sqrt()),
                              'mean': float(tensor.mean())}
     return digest.hexdigest(), summary
+
+
+class StageLogger:
+    """Per-rank stage log plus a stall watchdog for the export epilogue.
+
+    A run that hangs after its last step leaves nothing behind: no record, no
+    stack, and a ``runtime.json`` that still says RUNNING.  Every mark here is
+    written and flushed immediately so an externally stopped process still shows
+    its last completed stage, and the ``faulthandler`` timer is re-armed at every
+    mark so that a stage which stops making progress dumps the stacks of *this*
+    rank to its own file.
+
+    Neither the marks nor the watchdog add synchronization, collectives or RNG
+    use: the log is a file write on the marking process, and the watchdog is a
+    timer thread that only reads stacks.
+    """
+
+    DEFAULT_STALL_SECONDS = 120.0
+
+    def __init__(self, directory, rank, stall_seconds=None):
+        self.rank = int(rank)
+        self.pid = os.getpid()
+        self.stall_seconds = (self.DEFAULT_STALL_SECONDS if stall_seconds is None
+                              else float(stall_seconds))
+        directory = Path(directory)
+        self.handle = (directory / f'stages_rank{self.rank}.log').open('a', encoding='utf-8')
+        self.stack_handle = (directory / f'stall_stack_rank{self.rank}.txt').open(
+            'a', encoding='utf-8')
+
+    def mark(self, stage, event, **extra):
+        self.handle.write(json.dumps({'monotonic': time.perf_counter(), 'rank': self.rank,
+                                      'pid': self.pid, 'stage': str(stage),
+                                      'event': str(event), **extra}, sort_keys=True) + '\n')
+        self.handle.flush()
+        self._arm()
+
+    def tensor_progress(self, event, name):
+        self.mark(f'tensor:{name}', event)
+
+    def _arm(self):
+        if self.stall_seconds <= 0:
+            return
+        faulthandler.cancel_dump_traceback_later()
+        faulthandler.dump_traceback_later(self.stall_seconds, repeat=True,
+                                         file=self.stack_handle)
+
+    def close(self):
+        faulthandler.cancel_dump_traceback_later()
+        try:
+            self.handle.close()
+            self.stack_handle.close()
+        except OSError:
+            pass
+
+
+class _NullStages:
+    """Stand-in for the stage log before the output directory exists.
+
+    Failures can happen before there is anywhere to log them; every mark call
+    has to stay valid so that the original error is what the caller sees.
+    """
+
+    def mark(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        return None
+
+
+def memory_record():
+    """Per-rank memory observation for one step window.
+
+    CUDA peaks are read as ``bytes`` over a window that starts at the previous
+    ``reset_peak_memory_stats`` call, so ``window`` travels with the numbers.
+    The CPU figure is this rank process's peak RSS: the dataloader workers are
+    separate processes and are *not* included, which the ``cpu_scope`` field
+    states rather than leaving the number to be misread as a whole-node figure.
+    """
+    record = {'window': 'step', 'units': 'bytes'}
+    if torch.cuda.is_available():
+        record['cuda_peak_allocated_bytes'] = int(torch.cuda.max_memory_allocated())
+        record['cuda_peak_reserved_bytes'] = int(torch.cuda.max_memory_reserved())
+        record['cuda_statistics_available'] = True
+    else:
+        record['cuda_peak_allocated_bytes'] = 'NOT_MEASURED'
+        record['cuda_peak_reserved_bytes'] = 'NOT_MEASURED'
+        record['cuda_statistics_available'] = False
+    try:
+        record['cpu_peak_rss_bytes'] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+        record['cpu_scope'] = 'rank_process_peak_rss_dataloader_workers_excluded'
+    except (ValueError, OSError):  # pragma: no cover - platform dependent
+        record['cpu_peak_rss_bytes'] = 'NOT_MEASURED'
+        record['cpu_scope'] = 'NOT_MEASURED'
+    return record
+
+
+def write_failure_record(error, rank, phase):
+    """Write a failure where it can be read, before any cleanup can block.
+
+    The record is a per-rank append-only log *and* the per-rank JSON the earlier
+    rounds already used; rank 0 owns ``runtime.json``.  ``phase`` distinguishes
+    the record written on the way out of the training body from the one written
+    by the outermost handler, so a duplicate is recognisable instead of looking
+    like two independent failures.  Nothing here is collective.
+    """
+    code = _failure_exit_code(error)
+    record = dict(status='FAILED', rank=int(rank), exit_code=code, command=sys.argv,
+                  phase=str(phase), error=f'{type(error).__name__}: {error}')
+    output = _OUTPUT[0]
+    if output is not None and Path(output).is_dir():
+        try:
+            with (Path(output) / f'failure_rank{rank}.log').open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps({'monotonic': time.perf_counter(), **record},
+                                        sort_keys=True) + '\n')
+            write_json(Path(output) / f'runtime_failure_rank{rank}.json', record)
+            if int(rank) == 0:
+                write_json(Path(output) / 'runtime.json', record)
+        except OSError as write_error:
+            record['record_error'] = f'{type(write_error).__name__}: {write_error}'
+    print(json.dumps(record, sort_keys=True), flush=True)
+    return record
 
 
 def shared_new_state(model):
@@ -286,6 +410,7 @@ def main():
     statistics = load_geometric_statistics(args.statistics)
     source, frame = open_source(args.cohort_root, args.cache_root,
                                dual_static_root=args.dual_static_root)
+    stages = _NullStages()
     try:
         sample_index = load_sample_index_artifact(
             args.sample_index_artifact or config.get('sample_index_artifact'),
@@ -387,6 +512,14 @@ def main():
                 router_mode=base.encoder.branch.router.mode,
                 common_initialization=common, shared_new_initialization=shared))
         stream = OrderedSampleStream(len(source), int(config['seed']))
+        # Per-rank stage log and stall watchdog: the export epilogue is the last
+        # thing a run does, so it is exactly the part that has to be observable
+        # from outside when the process is killed.
+        stages = StageLogger(output, rank, stall_seconds=float(
+            os.environ.get('MCL_PH_STALL_SECONDS', StageLogger.DEFAULT_STALL_SECONDS)))
+        stages.mark('loop', 'enter', steps=stop - start, start=start, stop=stop)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         prefetch = None
         if int(args.prep_workers) > 0:
             dataset = MCLPHMicrobatchStream(
@@ -402,6 +535,7 @@ def main():
         for step in range(start, stop):
             step_number = step + 1
             step_started = time.perf_counter()
+            stages.mark('step', 'enter', step=step_number)
             base.encoder.branch.router.configure(
                 base.encoder.branch.routing_mode_for_step(step_number), step_number)
             prep_started = time.perf_counter()
@@ -507,6 +641,10 @@ def main():
                 record['diagnostics'] = diagnostics
             if base.last_diagnostics is not None:
                 record['monitoring'] = base.last_diagnostics
+            record['memory'] = memory_record()
+            if torch.cuda.is_available():
+                # The window above ends here; the next step's window starts now.
+                torch.cuda.reset_peak_memory_stats()
             print(json.dumps(record, default=str), flush=True)
             if rank == 0 and (step_number in SAVED_STEPS or step_number in (start + 1, stop)):
                 with (output / 'steps.jsonl').open('a', encoding='utf-8') as handle:
@@ -514,36 +652,62 @@ def main():
             if step_number == stop:
                 # The RNG gather is a collective: every rank must reach it, so it
                 # stays outside the rank-0 guard that owns the file writes.
+                stages.mark('rng_gather', 'enter', step=step_number)
                 states = [None] * world
                 if world > 1:
                     dist.all_gather_object(states, rng_state())
                 else:
                     states[0] = rng_state()
+                stages.mark('rng_gather', 'complete', step=step_number)
                 if rank == 0:
+                    stages.mark('resume_save', 'enter', step=step_number)
                     save_checkpoint(output / f'resume_{step_number:05d}.pt', dict(
                         identity=identity, ordered_keys=ordered_keys, step=step_number,
                         next_position=step_number * batch_size, model=base.state_dict(),
                         optimizer=optimizer.state_dict(), rng=states,
                         scheduler=dict(step=step_number, lr=float(lr))))
+                    stages.mark('resume_save', 'complete', step=step_number)
                     if not args.no_deploy:
                         from src.modules.mcl_ph import deployment_package
-                        save_checkpoint(output / f'deploy_{step_number:05d}.pt', deployment_package(
+                        stages.mark('deployment_package', 'enter', step=step_number)
+                        package = deployment_package(
                             base.encoder, step_number, cutoffs=cutoffs,
                             router_dense_updates=dense_updates, router_top_k=top_k,
                             source={'cohort_hash': source.cohort['manifest_hash'],
                                     'statistics_sha256': sha256_file(args.statistics),
-                                    'shared_new_init_sha256': shared['sha256']}))
+                                    'shared_new_init_sha256': shared['sha256']},
+                            progress=stages.tensor_progress)
+                        stages.mark('deployment_package', 'complete', step=step_number)
+                        stages.mark('deploy_save', 'enter', step=step_number)
+                        save_checkpoint(output / f'deploy_{step_number:05d}.pt', package)
+                        stages.mark('deploy_save', 'complete', step=step_number)
+            stages.mark('barrier', 'enter', step=step_number)
             if world > 1:
                 dist.barrier()
+            stages.mark('step', 'complete', step=step_number)
         if rank == 0:
             runtime = json.loads((output / 'runtime.json').read_text(encoding='utf-8'))
             runtime.update(status='PASS', completed_steps=int(stop - start),
-                           finished_at_monotonic=time.perf_counter())
+                           finished_at_monotonic=time.perf_counter(),
+                           memory=memory_record())
             write_json(output / 'runtime.json', runtime)
+        stages.mark('loop', 'complete', steps=stop - start)
+    except BaseException as error:
+        # Write the failure before the cleanup below: ``source.close()`` and
+        # ``destroy_process_group()`` can both wait on other ranks, and a record
+        # that only lands after a successful teardown is no record at all.
+        stages.mark('failure', 'enter', error=type(error).__name__)
+        write_failure_record(error, rank, phase='before_cleanup')
+        raise
     finally:
+        stages.mark('cleanup', 'enter')
         source.close()
+        stages.mark('cleanup', 'source_closed')
         if dist.is_initialized():
             dist.destroy_process_group()
+        stages.mark('cleanup', 'process_group_destroyed')
+        stages.mark('cleanup', 'complete')
+        stages.close()
 
 
 def _scheduled_lr(step, config):
@@ -557,21 +721,10 @@ if __name__ == '__main__':
     try:
         main()
     except BaseException as error:
-        code = _failure_exit_code(error)
-        rank = int(os.environ.get('RANK', 0))
-        record = dict(status='FAILED', rank=rank, exit_code=code, command=sys.argv,
-                      error=f'{type(error).__name__}: {error}')
-        output = _OUTPUT[0]
-        # A failed run must leave a non-PASS record next to its partial products
-        # instead of only a traceback: rank 0 owns ``runtime.json``, and every
-        # rank writes its own error so the root cause survives the teardown.
-        if output is not None and output.is_dir():
-            try:
-                write_json(output / f'runtime_failure_rank{rank}.json', record)
-                if rank == 0:
-                    write_json(output / 'runtime.json', record)
-            except OSError as write_error:
-                record['record_error'] = f'{type(write_error).__name__}: {write_error}'
-        print(json.dumps({'status': 'FAILED', 'error': record['error'], 'exit_code': code}),
-              flush=True)
+        # A failure that never entered the training body (a bad argument, a
+        # missing file) has no stage log yet, so this handler still owns it; a
+        # failure inside the body was already recorded before the cleanup, and
+        # the ``phase`` field says which of the two a record came from.
+        write_failure_record(error, int(os.environ.get('RANK', 0)),
+                             phase='at_exit')
         raise

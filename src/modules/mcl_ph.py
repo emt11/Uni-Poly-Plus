@@ -291,14 +291,32 @@ class MCLPHBranch(nn.Module):
         logits, dense, hard = routed['logits'], routed['dense'], routed['top_k']
         entropy = -(dense.clamp_min(1e-12).log() * dense).sum(-1)
         flat = logits.detach()
+        probabilities = dense.detach()
+        entropy_flat = entropy.detach()
         tie = ((flat[:, 0] == flat[:, 1]) | (flat[:, 0] == flat[:, 2])
                | (flat[:, 1] == flat[:, 2]))
         return {
-            'router_probability_mean': [float(value) for value in dense.detach().mean(0)],
-            'router_probability_std': [float(value) for value in dense.detach().std(0)],
-            'router_entropy_mean': float(entropy.detach().mean()) if entropy.numel() else 0.0,
+            # Logits are reported as per-expert statistics: the full per-graph
+            # matrix is the same information at a size that grows with the batch.
+            'router_logits_mean': [float(value) for value in flat.mean(0)],
+            'router_logits_std': [float(value) for value in flat.std(0)],
+            'router_logits_min': [float(value) for value in flat.min(0).values],
+            'router_logits_max': [float(value) for value in flat.max(0).values],
+            'router_probability_mean': [float(value) for value in probabilities.mean(0)],
+            'router_probability_std': [float(value) for value in probabilities.std(0)],
+            'router_entropy_mean': float(entropy_flat.mean()) if entropy.numel() else 0.0,
+            'router_entropy_std': float(entropy_flat.std()) if entropy.numel() else 0.0,
+            'router_entropy_min': float(entropy_flat.min()) if entropy.numel() else 0.0,
+            'router_entropy_max': float(entropy_flat.max()) if entropy.numel() else 0.0,
             'router_hard_selection': ([int(value) for value in torch.bincount(
                 hard.detach().reshape(-1), minlength=3)] if hard is not None else None),
+            # Dense routing has no hard choice to report: every graph uses the
+            # soft mixture, so the field must stay null instead of inventing an
+            # argmax selection that the forward never made.
+            'router_hard_selection_note': ('counts of the Top-2 experts per graph'
+                                           if hard is not None else
+                                           'not_applicable: dense routing uses the soft '
+                                           'mixture for every graph'),
             'router_tie_count': int(tie.sum().item()),
             'router_tie_rate': float(tie.float().mean().item()) if tie.numel() else 0.0,
             'router_mode': self.router.mode,
@@ -431,6 +449,11 @@ class MCLPHEncoder(nn.Module):
     def _set_fusion_diagnostics(self, enabled):
         if self.fusion is not None and hasattr(self.fusion, 'collect_diagnostics'):
             self.fusion.collect_diagnostics = bool(enabled)
+        # The branch owns the router observations (logits, soft probabilities,
+        # entropy and routing mode).  Without this the switch reached the fusion
+        # only, so ``diagnostics.router`` stayed empty in every recorded run.
+        if hasattr(self.branch, 'collect_diagnostics'):
+            self.branch.collect_diagnostics = bool(enabled)
 
     def encode(self, data, *, atom_mask=None):
         self._set_fusion_diagnostics(self.collect_diagnostics)
@@ -489,8 +512,22 @@ class MCLPHEncoder(nn.Module):
 
 
 def deployment_package(encoder, step, *, cutoffs=(2.0, 3.0, 4.0),
-                       router_dense_updates=500, router_top_k=2, source=None):
-    """Section 9.3 inference bundle: O8, experts, router, fusion and their LNs."""
+                       router_dense_updates=500, router_top_k=2, source=None,
+                       progress=None):
+    """Section 9.3 inference bundle: O8, experts, router, fusion and their LNs.
+
+    ``progress`` is an optional ``callable(event, name)`` observation hook for
+    the host copies: the export is the last thing a run does, so a run that
+    stalls here leaves no record of which tensor it was inside.  Passing it
+    changes no value, no device placement and no ordering.
+    """
+    state = {}
+    for name, value in encoder.state_dict().items():
+        if progress is not None:
+            progress('tensor_start', name)
+        state[name] = value.detach().cpu().clone()
+        if progress is not None:
+            progress('tensor_complete', name)
     return {
         'architecture': encoder.architecture_name,
         'fusion_mode': encoder.fusion_mode,
@@ -507,8 +544,7 @@ def deployment_package(encoder, step, *, cutoffs=(2.0, 3.0, 4.0),
                    'inference_mode': 'top2'},
         'training_route': 'mcl_ph',
         'source': dict(source or {}),
-        'state_dict': {name: value.detach().cpu().clone()
-                       for name, value in encoder.state_dict().items()},
+        'state_dict': state,
     }
 
 

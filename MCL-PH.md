@@ -4,8 +4,8 @@
 
 ## 0. 状态、角色与授权
 
-- **状态：受阻（r3 第二阶段部分执行后停止）**。r2 的 5 项修复已落地并通过 r2 的针对性验证，但 r2 的证据表述与 P0 报告判定被审查指出缺陷；r3 的**证据收口（第一阶段）已完成并提交**；第二阶段按授权启动后，**cat 臂在导出/收尾阶段挂起**，依停止条件中止全部后续训练（gate/xattn 预训练与三条微调臂均未启动），cat 臂挂起**未根因化**。详见 §13.3。
-- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（本阶段新增：cat 完成 2/6 授权 update 但无 `deploy_00002.pt`，M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL，本轮未生成验收材料）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3。
+- **状态：需返修 / 执行中（r4 完成，待审查）**。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**），**根因仍未定位**；同时补齐 Router 诊断开关与内存记录（§13.4）。
+- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（cat 完成 2/6 授权 update 但无 r3 自己的 `deploy_00002.pt`，M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4。
 - r1 状态（历史，已被 r2 取代）：**待授权执行**。
 - Codex 规划和审查；ZCode 在用户授权后执行。推荐第一次仅授权 P0＋P1，后续阶段必须分别交回审查。
 - 文档基准：`dev@0d633d8`，已安全 pull、无远端更新。原 `MCL-PH.md` 为空；用户未跟踪 `.zcodeignore` 不修改、不提交。
@@ -686,3 +686,125 @@ cat 挂起证据（快照 `logs/mcl_ph_20260921/p1_pretrain_r3b_hang_evidence.tx
 - 第一阶段提交 `56f6071`、第二阶段提交 `89789cb`，均推送 `origin/dev`（`cca9bd3..89789cb`，非 force）；以 `git ls-remote origin dev` 核对远端确为 `89789cb3a5435dc278d2ef1555749cf3700dc820`。
 - 本次推送第 1 次因 `Failed to connect to github.com port 443 … Connection timed out` 失败，第 2 次成功；`git pull --ff-only origin dev` 同期遇到 `GnuTLS recv error (-110)`，故本轮提交基于开工时已核验的本地 `88c3f76` 基线、未含远端新提交（拉取失败已如实记录，不用 force、不重写历史）。用户未跟踪的 `.zcodeignore` 未修改、未提交。
 
+
+### 13.4 r4 执行记录（执行者 ZCode，2026-09-21 UTC，基准 `dev@08531dd`）
+
+**计划头**
+
+| 项目 | 内容 |
+| --- | --- |
+| 计划 ID / 修订 | `MCL-PH-20260921-01` / **r4「导出挂起零更新定位＋监控缺口最小修复」** |
+| 状态 | **执行完成（待 Codex 审查）**：A 通过、B 未复现、根因未定位，见本节「三～八」 |
+| 授权来源 | 用户 2026-09-21 的 r4 指令（本轮范围、预算与禁止项均由该指令给定） |
+| 角色 | Codex 规划与审查；ZCode 执行。ZCode 只标「待 Codex 审查」，不宣布验收通过 |
+| 基准 commit | `dev@08531dd`（r3 末尾提交）。开工前 `git ls-remote origin dev` 核对远端 = `08531dd`，与本地 HEAD 一致 |
+| 开工前本地改动 | 仅用户未跟踪的 `.zcodeignore`（**不修改、不提交**）；r1/r2/r3 的初始化、checkpoint、失败目录、日志、统计与 `runtime.json=RUNNING` 一律保留 |
+| 同步 | `git pull --ff-only origin dev` 首次直连失败（`GnuTLS recv error (-110)`／443 超时），改用已配置代理后成功：**Already up to date**（HEAD 仍为 `08531dd`），故本轮无未合并的远端工作 |
+
+**r4 范围、预算与停止条件（登记，防止事后追认）**
+
+| 项目 | 内容 |
+| --- | --- |
+| 允许 | 只读检查 r3 现场/checkpoint/日志；导出与收尾路径的最小诊断与针对性修复；Router 监控开关与内存记录修复；下述有界零更新验证 |
+| 禁止 | `optimizer.step`、训练 backward、预训练 update、微调 epoch；重跑 CAT 两步；启动 GATE/XATTN 或任何微调；P2/P3、outer-test、构象生成、冻结缓存修改；改模型数学/初始化/描述符/损失/batch/schedule；把独立导出成功追记为原训练 PASS |
+| A. CPU 离线导出 | **最多 1 次，墙钟 ≤5 min**；从已核验 resume 提取 encoder 状态经生产 deployment 逻辑写入新的 r4 候选路径；不覆盖原目录、不调用训练循环、不消费数据流；strict-load 并逐张量核对。**只验证离线导出可行性，不证明分布式挂起已解决**；超时或失败即停止实际模型定位、交回、不自动重试 |
+| B. 四 rank GPU 收尾复现 | **最多 1 次，墙钟 ≤3 min**；仅当 A 成功且静态检查不能排除分布式收尾问题时执行；同 rank/device/backend 布置；从已有 checkpoint 构造状态，**不做 forward/backward/update**；尽量复用生产收尾函数；明确未复现的部分；预置有限超时、栈输出与外部终止。不能复现时只报「本次零更新条件下未复现」，**不得写已修复**；失败或超时后不再进行第二次 GPU 复现 |
+| 本轮总计 | optimizer updates=0；backward=0；微调 epochs=0；GPU 实际定位 ≤1 次且 ≤3 min；**CPU 模型 forward ≤8 次**（仅用于监控/部署的局部验证）；CPU 模型验证累计墙钟 ≤10 min；所有失败、参考计算与子模块 forward 均计入 |
+| 预算核算 | 启动前核算，不足即停止、不自动追加 |
+| 交付限制 | r4 独立生成的 deploy 只能标**「恢复导出候选」**：不能说明 r3 完整 PASS、不能启动微调、不能作为最终 P1 验收材料 |
+
+**三、静态定位（只读）**
+
+1. **真实收尾顺序**（`scripts/pretrain_mcl_ph.py` 的 stop 分支与 `finally`，逐行核对，未按 mtime 推断）：
+
+| 序 | 步骤 | 执行者 | 是否集合通信 | 是否隐式同步 |
+| --- | --- | --- | --- | --- |
+| 1 | 末步记录构造/打印；`steps.jsonl` 仅 rank 0 | 所有 rank / rank 0 | 否 | 否 |
+| 2 | `rng_state()`（含 `torch.cuda.get_rng_state_all()`） | 所有 rank | 否 | 读 CUDA RNG 状态需与设备一致；**是否内部同步未在随包头文件核实**（`.cpp` 未随包发布） |
+| 3 | `dist.all_gather_object(states, rng_state())` | 所有 rank | **是** | NCCL 输出需取回，隐含设备同步 |
+| 4 | `save_checkpoint(resume_00002.pt)`（`.tmp` + `os.replace`） | **仅 rank 0** | 否 | 否（本地 IO） |
+| 5 | `deployment_package`：170 个 encoder 张量 `detach().cpu().clone()` | **仅 rank 0** | 否 | **是**（D2H 复制的同步语义） |
+| 6 | `save_checkpoint(deploy_00002.pt)` | **仅 rank 0** | 否 | 否（本地 IO） |
+| 7 | `dist.barrier()` | 所有 rank | **是** | 是 |
+| 8 | `runtime.json` 置 PASS（现增记 memory） | **仅 rank 0** | 否 | 否 |
+| 9 | `finally:` `source.close()` → `destroy_process_group()` | 所有 rank | destroy 为集合收尾 | source.close 为本地 LMDB env/注册表关闭（`frozen_store.py`：`_READ_ENV_REGISTRY_LOCK` + `env.close()`；`cache_lifecycle.py`：`flock(LOCK_UN)`） |
+| 10 | `main()` 返回 → DataLoader 迭代器析构 → 12 个 prep worker 收尾 | 所有 rank | 否 | torch 2.8.0：`w.join(timeout=MP_STATUS_CHECK_INTERVAL=5.0)` 后对残留进程 `w.terminate()`，**有界** |
+
+   核对结论：**收尾路径不存在 rank 条件集合通信**（集合操作只有第 3、7 步与第 9 步的 destroy，三者都要求全 rank 参与）；生产未设置进程组超时（用 NCCL 默认值），这与 r1/r3 观察到的「长时间无进展」一致但本身不构成故障。
+
+2. **`save_checkpoint` / `deployment_package` / DataLoader 生命周期**：`save_checkpoint` 为临时文件 + `os.replace`，无锁、无 IPC；`deployment_package` 是纯字典构造（本轮只加可选 `progress` 观察钩子）；DataLoader 用 `persistent_workers=False`、`pin_memory=False`，worker 收尾在**进程组销毁之后**且如上所述有界。未发现关闭等待构成无界阻塞。
+
+3. **checkpoint 核验**（`tests/_mcl_ph_r4_checkpoint_audit.py`，CPU 只读，**PASS / problems 空**）：`resume_00002.pt`（315,570,711 B，sha256 `e91bda10bfb0db5a…`）记录 `step=2`、`next_position=2016=2×1008`、`scheduler={step:2, lr:2.0000e-07}`；`ordered_keys` 911,391 条（sha256 `4e934987…`）；身份块与 `run.json` 完全一致，且 `statistics_sha256`、`shared_new_init_sha256` 与磁盘文件哈希一致；模型 186 张量 / 20,651,691 参数，键集合与 shape 与新建 `MCLPHPretrainer('cat')` 相同，**全部有限**；优化器 1 组（lr 2e-7、wd 0）、186 条 state 全为 `step=2` 且无 NaN/Inf；`rng` 4 条（每 rank 一条），每条含 python/numpy/torch/cuda，**cuda 每条约 4 个设备张量**（即每个 rank 都读了全部 4 个可见设备的 RNG 状态）。
+   限制：**文件可加载不等于精确 resume**；采样位置与冻结数据源的一致性未验证（本审计刻意不打开数据源），已在载荷的 `not_verified` 中标明。
+
+4. r1 与 r3 的「同阶段挂起」只作阶段一致记录，**本轮未认定同因**，也未据此两例推断任何共同机制。
+
+**四、最小取证（新增观测，不含机制修复）**
+
+- `StageLogger`：每 rank 独立文件 `stages_rank{rank}.log`，每条 `monotonic/rank/pid/stage/event` 立即 flush；分别在 `loop`、每步 `step`、`rng_gather`、`resume_save`、`deployment_package`、`deploy_save`、`barrier`、`cleanup` 落点。
+- **停滞看门狗**：`faulthandler.dump_traceback_later(stall, repeat=True, file=本rank文件)` 在每次 mark 时重新武装（默认 120 s，可用 `MCL_PH_STALL_SECONDS` 覆盖），只 dump 不杀进程，各 rank 写 `stall_stack_rank{rank}.txt`；不依赖 ptrace/gdb，也不改系统安全配置。
+- **CPU 复制定位**：`deployment_package(..., progress=...)` 在每次 `.cpu()` 复制前后记录 `tensor_start/tensor_complete` + 张量名，只记录名字，不打印内容、不逐元素。
+- **失败落盘顺序**：训练体内的异常现在在 `finally` **之前**写 `failure_rank{rank}.log`（append + flush）与 `runtime_failure_rank{rank}.json`，`phase='before_cleanup'`；最外层处理器保留为兜底，写 `phase='at_exit'`。失败路径不引入任何集合操作。
+- **构建与验证的对应关系**：上述 fixture 与 A/B 运行时，`finally:` 中 `source.close()` 与 `destroy_process_group()` 的顺序曾被编辑临时调换；随后已**改回原顺序**（source 先关闭，再销毁进程组，与本轮之前的代码一致），该处处只影响清理次序、不涉及任何被采集字段。fixture 与 A/B 结果按当时构建记录，未据此声称最终构建已复验该顺序。
+- **新增同步的自我登记**：上述观测本身**不新增任何同步**（文件写入、计时线程、只读取值）；`deployment_package` 的 `.cpu()` 与 `rng_state()` 的现有同步为**既有行为**，未被本轮引入。**没有把「加 sync/sleep/延长 timeout」当作修复**（外部 `timeout` 与 90 s 进程组超时仅出现在 B 的取证脚本中，不在生产路径）。
+
+**五、零更新验证（预算核算见下）**
+
+A. **CPU 离线导出**（`tests/_mcl_ph_r4_offline_export.py`，1 次，**PASS**，墙钟 **1.63 s**）：从核验过的 resume 装载 encoder 状态，经生产 `deployment_package` + `save_checkpoint` 写入新路径 `results/mcl_ph_20260921/p1/r4_recovery/deploy_00002_recovery_candidate.pt`（81,404,731 B，sha256 `b031880e748bb6ce…`）；以生产 `load_deployment` 严格加载通过（`expected_step=2`、`expected_fusion=cat`，加载后 `inference_mode='top2'`、`router_mode='top2'`）；**170/170 张量与 resume 中对应 encoder 权重逐张量 `torch.equal` 相同**。原目录未被覆盖。
+   限制：只证明离线导出可行；未覆盖 CUDA→host 复制、进程组、worker，**不证明 r3 分布式挂起已解决**，输出仅为「恢复导出候选」。
+
+B. **四 rank GPU 收尾复现**（`tests/_mcl_ph_r4_epilogue_replay.py`，`torchrun --nproc_per_node=4`，1 次，**未复现挂起**）：复现阶段全部完成，四 rank 均 PASS，外部 `timeout 175` 未触发（真实退出码 0），看门狗未触发（四个 `stall_stack_rank*.txt` 均为 0 字节）。rank 0 各阶段耗时：进程组 0.01 s、状态装载 0.70 s、DDP 包装 0.40 s、RNG gather 0.01 s、**deployment 包（CUDA→CPU，170 张量）0.07 s**、保存 0.06 s、barrier <0.01 s、销毁 0.09 s；全程 ≈1.9 s。
+   复现内容：生产设备/进程组选择、按 checkpoint 声明的设置构造模型、`DistributedDataParallel(find_unused_parameters=True)`、`rng_state()`+`all_gather_object`、rank 0 的 `deployment_package`（真实 D2H）+`save_checkpoint`、收尾 `barrier`。
+   **未复现内容（因此未被本轮排除）**：两次训练步本身、优化器与 DDP reducer 的状态、训练消耗过的 RNG 流、每 rank 12 个 prep worker 与 DataLoader、autocast/AMP 状态。
+   交叉校验：B 产生的 `deploy_00002_epilogue_replay.pt` 与 A 的候选包**170/170 张量相同**，两包仅在 `source` 溯源字段上不同（文件大小差 720 B 即来自该字段）。
+   结论措辞：**「本次零更新条件下未复现」**——不写「已修复」，不写「与 r3 无关」。
+
+**六、根因判定**
+
+- **未定位**：r3 挂起仍无 Python 栈（ptrace 受限），本轮无法给出证实的位置或机制。
+- **已由证据排除/削弱的候选**：① 导出代码本身的逻辑缺陷——A（CPU）1.63 s 完成、B（GPU，含真实 D2H）0.07 s 完成；② 「每 rank 读取全部 4 个可见设备 RNG 导致跨设备同步死锁」——B 在同样 4 设备可见下 `rng_gather` 仅 0.01 s 通过；③ DataLoader/worker 收尾等待——torch 2.8.0 中该路径 `join(timeout=5 s)` + `terminate()` 有界，且发生在进程组销毁之后；④ rank 条件集合通信——静态核对不存在。
+- **仍候选（均未证实）**：(i) 训练期内存/页回收或主机分配器在高占用下造成的 rank 0 主机侧停顿（本轮零更新环境的内存占用远小于训练时：无优化器状态、无预取批次、无 12×4 个 worker）；(ii) 与训练期并存的 prep worker / 预取队列的交互；(iii) 训练步遗留的设备侧工作与导出复制之间的次序问题；(iv) 一次性驱动/IO 抖动。
+   **重要限制**：r3 现场没有内存记录（本轮才补上），因此上述资源类候选**无法用已有数据检验**。
+- **本轮没有对导出路径做机制性修复**：因为证据不支持任何具体故障位置。实际改动的只有观测（阶段日志、看门狗、张量进度）与失败记录顺序（真实的记录缺陷：原实现只有在 `finally` 清理成功返回后才会写错误记录）。若后续仍要改导出语义（如 CPU 快照或调整保存顺序），**必须明确标注是「故障修复」还是「未确证机制的规避方案」**，本轮两者都没有做。
+
+**七、监控缺口修复**
+
+1. **Router 诊断开关接通**（`src/modules/mcl_ph.py`）：`MCLPHEncoder._set_fusion_diagnostics` 现在同时把开关传给 `self.branch`（此前只传 fusion，这解释了 r1/r3 每个 run 的 `diagnostics.router={}` 与 `monitoring.router=null`）；`MCLPHBranch._diagnostics` 从已有 forward 收集 **logits（每专家 mean/std/min/max）、soft 概率（mean/std）、熵（mean/std/min/max）、routing mode**，并新增 `router_hard_selection_note`：dense 阶段 `router_hard_selection` 保持 `null` 且注明 `not_applicable: dense routing uses the soft mixture for every graph`，**不伪造硬选择**；Top-2 阶段为每图两个选择的计数（2 图 → 4 个选择）。
+2. **内存记录**（`scripts/pretrain_mcl_ph.py::memory_record`）：每步写入 `record['memory']`，字段为 `cuda_peak_allocated_bytes`、`cuda_peak_reserved_bytes`（`window='step'`、`units='bytes'`，窗口在读取后 `reset_peak_memory_stats` 重开），以及 `cpu_peak_rss_bytes`（`cpu_scope='rank_process_peak_rss_dataloader_workers_excluded'`，明确不含 worker）；无 CUDA 时写 `'NOT_MEASURED'` 而非 0。`runtime.json` 的 PASS 记录也带一份。
+3. 监控不额外 backward、不改变 RNG/路由/loss/训练状态（下条验证）。
+4. **小 fixture 验证**（`tests/test_mcl_ph_r4_monitoring.py`，全部 CPU、无 backward）：开关接通且 `diagnostics.router` 非空、logits/概率/熵字段有限、soft 概率为归一化单纯形（和 ≈1）、dense 阶段硬选择为 `null` 且带 not-applicable 说明、Top-2 阶段给出选择计数；**同状态同输入下监控开/关：`fused`/`atom_states`/`mixed`/`alpha` 逐张量 `torch.equal`，`torch` RNG 状态逐位相同，模型参数相同**（dense 与 Top-2 两种模式各验一次）。首轮 7 次 forward（其中 1 项因**测试自身断言写错**——把 `report['monitoring']` 当作 pretrainer 的键，实际应为 `last_diagnostics['router']`——失败），修正断言后只重跑该项 1 次，**累计 8 次 forward，正好用满上限**；该失败与修正如实记录，模型代码未因该失败改动。
+
+**八、无模型 fixture（先于实际定位执行）**
+
+- `tests/test_mcl_ph_r4_forensics.py`：**5 passed in 31.28 s**——阶段标记立即落盘（模拟外部杀进程后仍在）、张量进度记录到具体张量名、停滞看门狗确实把**本 rank** 的栈写进独立文件、`memory_record` 的窗口/单位/范围字段正确、以及 **torchrun world-4 下训练体内失败在清理前落盘**（`failure_rank{rank}.log` 首条的 `phase` 必须是 `before_cleanup`）。
+- 回归：`tests/test_mcl_ph_protocol.py` **27 passed in 149.73 s**（runner 改动后失败记录契约、launcher 退出码契约未破坏）。
+
+**r4 预算账目**
+
+| 项目 | r4 上限 | 实际 | 结论 |
+| --- | --- | --- | --- |
+| optimizer updates / backward / 微调 epochs | 0 / 0 / 0 | 0 / 0 / 0 | 符合 |
+| GPU 实际定位 | ≤1 次且 ≤3 min | **1 次**（B，≈1.9 s，外部 `timeout 175` 未触发，退出码 0） | 未超 |
+| CPU 模型 forward | ≤8 | **8**（监控 fixture 7 + 修正断言后重跑 1） | 用满 |
+| CPU 模型验证累计墙钟 | ≤10 min | ≈3 min（checkpoint 审计 ~40 s、A 1.63 s、监控 fixture 11 s + 重跑 5 s、构造/装载等） | 未超 |
+| A. CPU 离线导出 | ≤1 次、≤5 min | **1 次**，1.63 s，PASS | 未超 |
+| B. 四 rank GPU 复现 | ≤1 次、≤3 min | **1 次**，未复现 | 未超 |
+| 其他训练 / 重试 / P2·P3 / outer-test | 禁止 | 0 | 符合 |
+
+**命令 / tmux window / 日志与产物**
+
+| 内容 | 命令（要点） | tmux window | 日志与产物 |
+| --- | --- | --- | --- |
+| checkpoint 核验 | `python tests/_mcl_ph_r4_checkpoint_audit.py` | `Uni-Poly: mcl_ph_r4_ckpt` | `logs/mcl_ph_20260921/r4_checkpoint_audit.{log,json}` |
+| 无模型 fixture | `python -m pytest tests/test_mcl_ph_r4_forensics.py -q` | `Uni-Poly: mcl_ph_r4_fixture` | `logs/mcl_ph_20260921/r4_forensics_fixture.log` |
+| 协议回归 | `python -m pytest tests/test_mcl_ph_protocol.py -q` | `Uni-Poly: mcl_ph_r4_protocol` | `logs/mcl_ph_20260921/r4_protocol_regression.log` |
+| A. CPU 离线导出 | `timeout 300 python tests/_mcl_ph_r4_offline_export.py` | `Uni-Poly: mcl_ph_r4_exportA` | `logs/mcl_ph_20260921/r4_offline_export.{log,json}`；产物 `results/mcl_ph_20260921/p1/r4_recovery/deploy_00002_recovery_candidate.pt` |
+| B. 四 rank 复现 | `timeout 175 python -m torch.distributed.run --standalone --nproc_per_node=4 tests/_mcl_ph_r4_epilogue_replay.py` | `Uni-Poly: mcl_ph_r4_replayB` | `logs/mcl_ph_20260921/r4_epilogue_replay.log`；产物 `results/mcl_ph_20260921/p1/r4_recovery/{deploy_00002_epilogue_replay.pt,epilogue_replay_rank*.json,stages_rank*.log,stall_stack_rank*.txt}` |
+| 监控 fixture | `python -m pytest tests/test_mcl_ph_r4_monitoring.py -q`（首轮）与单项重跑 | `Uni-Poly: mcl_ph_r4_monitor{,2}` | `logs/mcl_ph_20260921/r4_monitoring_fixture{,_retry}.log` |
+
+**r4 交付状态**
+
+- 产物定性：`results/mcl_ph_20260921/p1/r4_recovery/` 下的两个 deploy 均为**「恢复导出候选」**：**不表示 r3 完整 PASS**，**不能启动微调**，**不能作为最终 P1 验收材料**。
+- 未修改 r3 现场：`pretrain_r3b/cat/runtime.json` 仍为 `RUNNING`；新增独立事件说明 `MCL-PH-INCIDENT-r3-cat-export-hang.md` 与 `results/mcl_ph_20260921/p1/pretrain_r3b/cat/incident_operator_stop.json` 记录 launcher 退出、人工终止与证据，未伪造 runner 写出的 FAILED/PASS。
+- 未改动模型数学、初始化、描述符、损失、batch 或 schedule；未改冻结缓存；未生成构象；未跑 P2/P3、outer-test、正式 5k；未自动重试任何失败。
+- 未执行：任何训练恢复（CAT 是否复用恢复导出、是否追加验证、剩余训练是否恢复，均待 Codex 审查后由用户决定）。
