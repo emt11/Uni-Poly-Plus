@@ -4,8 +4,8 @@
 
 ## 0. 状态、角色与授权
 
-- **状态：r9 执行完成**（`optimizer_groups` 重复关键字缺陷已最小修复并无模型回归通过；五个 XC/fold0/1-epoch downstream smoke 全部 `exit 0`/`PASS`；五臂 aggregate `status=PASS`、`acceptance=PASS`、5/5/0，`outer_test=NOT_RUN`）——**P1 执行证据完整，待 ChatGPT 审查**；ZCode 不写 `P1 PASS`、不写「正式验收通过」，也不做任何性能/排序结论。此前 r8 部分完成并已停止（GATE/XATTN 当前代码生产 smoke 通过、三臂 deployment checker PASS；downstream 首个 unit `glt_ref` 因**既有代码缺陷**在写 `run.json` 时崩溃，按指令立即停止，未修代码、未重试、未继续其它臂；该轮未写 `P1 PASS`、未写 `CAT smoke fixed`）。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**）。r5 完成四项收尾状态修正与针对性验证（14 passed），但唯一一次真实运行因预建输出目录触发防覆盖守卫而中止（0 update）。r6 的唯一一次 cat 两步运行**完成了 2 个 update**（`resume_00002.pt` 与 r3b 逐字节相同），随后在导出窗口抛出 `IndexError` 并进入收尾死锁——**r3 挂起由此复现并定位到具体缺陷**（`shared` 变量遮蔽），另有看门狗 180 s 自动停止不可达的缺陷；按指令未改代码、未重试，详见 §13.5/§13.6。r7A 按授权**只**修这两个已定位缺陷（导出身份变量改名 + 停滞进度只认 `stages_rank*.log` 真实 mark）并做无模型回归（8 passed；GPU/forward/backward/update/训练启动均为 0），**未运行 CAT**，详见 §13.7。r7B 在 r7A 之后完成唯一一次 CAT 两步真实运行（world 4 / microbatch 84 / accumulation 3 / BF16）：2/2 updates、`resume_00002.pt` 与 r3b/r6 **逐字节相同**、**首次产出 `deploy_00002.pt`**、launcher exit 0 + verifier `PASS`（`strict_cleanup`）+ `ALL_ARMS_OK`、`runtime.json` `PASS/cleanup complete/main_returned true`、supervisor `ROOT_EXITED` 未介入、resume↔deploy encoder **170/170 逐张量相同**；但 §8 的 `_mcl_ph_r3_deployment_check.py` **首次运行**暴露其自身名称约定缺陷（`changed_shared_tensors` 恒为 0），该检查未取得 PASS，详见 §13.8。r7C 只修该 verifier（encoder 命名空间映射 + 缺失键报错 + `encoder.fusion.` 前缀）并新增 model-free regression（6 passed），随后**用现有 r7B 产物**（零训练、CPU only）复验：`status=PASS`、`problems=[]`、`shared_encoder_tensors=79`、`changed_shared_encoder_tensors=79`、`shared_encoder_missing_keys=[]`，详见 §13.9。r8 补齐 GATE 与 XATTN 的当前代码两步 smoke（各 1 次启动、2 个 update、launcher/verifier/supervisor/runtime 全 PASS，denominators 1008/1008、dense 路由、无 stall），三臂 deployment checker **PASS**（三臂 `shared_encoder_tensors=79`、`initial_value_difference_count=0`、init SHA 相同）；downstream 五臂在第一个 unit `glt_ref` 处失败（训练与评估正常完成，写 `run.json` 时报 `TypeError: dict() got multiple values for keyword argument 'optimizer_groups'`，由 `3d66198` 引入、自引入以来首次被执行），按指令 STOP，详见 §13.10。r9 按授权**只**修该缺陷（抽成 `build_summary` 纯函数，diff +14/−4），无模型回归 **4 passed**（GPU/forward/backward/update/训练启动均为 0），随后在全新输出根 `results/mcl_ph_20260921/p1/finetune_r9` 完成五个 XC/fold0/1-epoch downstream smoke（全部 `exit_code=0`、`status=PASS`、`executed_epochs=1`、`optimizer_updates=9`、`best_epoch=1`、`pretrain_step=2`、`outer_test=NOT_RUN`）并通过固定五臂 aggregate（`status=PASS`、`acceptance=PASS`、`units_expected=5`、`units_accepted=5`、`units_rejected=0`）；**本轮未运行任何预训练**，r8 失败现场保持原状，详见 §13.11。
-- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **执行证据完整、待审查**（CAT/GATE/XATTN 三条 MCL 路线两步 smoke、三臂 deployment 验收、五个 downstream smoke unit 与五臂 aggregate 均已通过；接口可用性已闭合，性能结论待 P2/授权，最终验收由 ChatGPT 审查远端 commit 后给出）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4，r5 见 §13.5，r6 见 §13.6，r7A 见 §13.7，r7B 见 §13.8，r7C 见 §13.9，r8 见 §13.10，r9 见 §13.11。
+- **状态：r10 / P2-E2E 阻断（P2 未完成）**：Phase I（P2 development aggregator `scripts/aggregate_mcl_ph_p2.py` + model-free regression，13 passed）已完成、已提交并推送 `fbd78ff`；Phase II 的**第一个正式启动 GLT_REF** 在 step 154 被我自己挂到的外部 stall supervisor 以 SIGTERM 停止（`STOPPED_BY_SUPERVISOR`；该 supervisor 的进度判据只认 MCL runner 才写的 `stages_rank*.log`，GLT dual runner 不写该文件，180 s 静默阈值必然触发）。按 §12/§21/§41 停止整个 P2 执行并交回：**未重试、未启动其它 arm、未改代码、失败现场保留**；**不写 `P2 execution evidence complete`**。P2 预算已消耗：GLT_REF 1 次启动 / 154 updates（无 checkpoint），其余 3 个 arm 0 启动，development 0 unit。详见 §13.12。此前 r9 执行完成（`optimizer_groups` 重复关键字缺陷已最小修复并无模型回归通过；五个 XC/fold0/1-epoch downstream smoke 全部 `exit 0`/`PASS`；五臂 aggregate `status=PASS`、`acceptance=PASS`、5/5/0，`outer_test=NOT_RUN`）——**P1 执行证据完整，待 ChatGPT 审查**；ZCode 不写 `P1 PASS`、不写「正式验收通过」，也不做任何性能/排序结论。此前 r8 部分完成并已停止（GATE/XATTN 当前代码生产 smoke 通过、三臂 deployment checker PASS；downstream 首个 unit `glt_ref` 因**既有代码缺陷**在写 `run.json` 时崩溃，按指令立即停止，未修代码、未重试、未继续其它臂；该轮未写 `P1 PASS`、未写 `CAT smoke fixed`）。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**）。r5 完成四项收尾状态修正与针对性验证（14 passed），但唯一一次真实运行因预建输出目录触发防覆盖守卫而中止（0 update）。r6 的唯一一次 cat 两步运行**完成了 2 个 update**（`resume_00002.pt` 与 r3b 逐字节相同），随后在导出窗口抛出 `IndexError` 并进入收尾死锁——**r3 挂起由此复现并定位到具体缺陷**（`shared` 变量遮蔽），另有看门狗 180 s 自动停止不可达的缺陷；按指令未改代码、未重试，详见 §13.5/§13.6。r7A 按授权**只**修这两个已定位缺陷（导出身份变量改名 + 停滞进度只认 `stages_rank*.log` 真实 mark）并做无模型回归（8 passed；GPU/forward/backward/update/训练启动均为 0），**未运行 CAT**，详见 §13.7。r7B 在 r7A 之后完成唯一一次 CAT 两步真实运行（world 4 / microbatch 84 / accumulation 3 / BF16）：2/2 updates、`resume_00002.pt` 与 r3b/r6 **逐字节相同**、**首次产出 `deploy_00002.pt`**、launcher exit 0 + verifier `PASS`（`strict_cleanup`）+ `ALL_ARMS_OK`、`runtime.json` `PASS/cleanup complete/main_returned true`、supervisor `ROOT_EXITED` 未介入、resume↔deploy encoder **170/170 逐张量相同**；但 §8 的 `_mcl_ph_r3_deployment_check.py` **首次运行**暴露其自身名称约定缺陷（`changed_shared_tensors` 恒为 0），该检查未取得 PASS，详见 §13.8。r7C 只修该 verifier（encoder 命名空间映射 + 缺失键报错 + `encoder.fusion.` 前缀）并新增 model-free regression（6 passed），随后**用现有 r7B 产物**（零训练、CPU only）复验：`status=PASS`、`problems=[]`、`shared_encoder_tensors=79`、`changed_shared_encoder_tensors=79`、`shared_encoder_missing_keys=[]`，详见 §13.9。r8 补齐 GATE 与 XATTN 的当前代码两步 smoke（各 1 次启动、2 个 update、launcher/verifier/supervisor/runtime 全 PASS，denominators 1008/1008、dense 路由、无 stall），三臂 deployment checker **PASS**（三臂 `shared_encoder_tensors=79`、`initial_value_difference_count=0`、init SHA 相同）；downstream 五臂在第一个 unit `glt_ref` 处失败（训练与评估正常完成，写 `run.json` 时报 `TypeError: dict() got multiple values for keyword argument 'optimizer_groups'`，由 `3d66198` 引入、自引入以来首次被执行），按指令 STOP，详见 §13.10。r9 按授权**只**修该缺陷（抽成 `build_summary` 纯函数，diff +14/−4），无模型回归 **4 passed**（GPU/forward/backward/update/训练启动均为 0），随后在全新输出根 `results/mcl_ph_20260921/p1/finetune_r9` 完成五个 XC/fold0/1-epoch downstream smoke（全部 `exit_code=0`、`status=PASS`、`executed_epochs=1`、`optimizer_updates=9`、`best_epoch=1`、`pretrain_step=2`、`outer_test=NOT_RUN`）并通过固定五臂 aggregate（`status=PASS`、`acceptance=PASS`、`units_expected=5`、`units_accepted=5`、`units_rejected=0`）；**本轮未运行任何预训练**，r8 失败现场保持原状，详见 §13.11。
+- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **执行证据完整、待审查**（CAT/GATE/XATTN 三条 MCL 路线两步 smoke、三臂 deployment 验收、五个 downstream smoke unit 与五臂 aggregate 均已通过；接口可用性已闭合，性能结论待 P2/授权，最终验收由 ChatGPT 审查远端 commit 后给出）；P2 已按 r10 授权启动但**在第一个正式预训练 arm 处阻断**（Phase I 已完成并推送；GLT_REF 单次启动被外部 supervisor 误停，其余 arm、30 个 development unit 与 P2 aggregation **均未执行**，等待规划方对第二次启动与 supervisor 策略的决定）；P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4，r5 见 §13.5，r6 见 §13.6，r7A 见 §13.7，r7B 见 §13.8，r7C 见 §13.9，r8 见 §13.10，r9 见 §13.11，r10/P2 见 §13.12。
 - r1 状态（历史，已被 r2 取代）：**待授权执行**。
 - Codex 规划和审查；ZCode 在用户授权后执行。推荐第一次仅授权 P0＋P1，后续阶段必须分别交回审查。
 - 文档基准：`dev@0d633d8`，已安全 pull、无远端更新。原 `MCL-PH.md` 为空；用户未跟踪 `.zcodeignore` 不修改、不提交。
@@ -1573,6 +1573,91 @@ python scripts/aggregate_mcl_ph.py --root results/mcl_ph_20260921/p1/finetune_r9
 - 未改写 r3–r8 历史记录（含 r8 的 FAILED 记录）；未恢复 `Plan.md`；未修改 `.zcodeignore`、`PH.md`、`3D.md`。未回滚其它执行者的改动。
 
 **八、提交与同步**：本轮 3 个文件（`scripts/finetune_mcl_ph.py`、`tests/test_mcl_ph_r9_summary.py`、`MCL-PH.md`）提交为 **`eee5583`**，非 force push 成功 `73bd4cc..eee5583 dev -> dev`；`git ls-remote origin dev` = `eee55832ec160519e8625965d258bed5ad278511`，与本地 HEAD 一致。产物与日志：`results/mcl_ph_20260921/p1/finetune_r9/{<arm>/xc/fold0/,aggregate.json}`、`logs/mcl_ph_20260921/{r9_regression.log,r9_finetune_smoke.log,r9_tmux_finetune.log}`，按 `.gitignore` 不提交，只按路径引用。**未自动启动 P2 或任何后续实验**；交回 ChatGPT/Codex 审查。
+
+### 13.12 r10 / P2-E2E 执行记录（ZCode 执行；2026-09-21 UTC；基准 `dev@be9fee6`；**Phase I 完成并已提交；Phase II 在 GLT_REF 单次启动被外部 supervisor 误停后按 §21/§41 阻断**）
+
+**计划头**
+
+| 项目 | 内容 |
+| --- | --- |
+| 计划 ID / 修订 | `MCL-PH-20260921-01` / **r10「P2-E2E：P2 aggregator → 4×5000 正式预训练 → 5 arms × 3 tasks × 2 folds FULL 微调 → 30-unit 验收 → P2 aggregation + parent selection」** |
+| 状态 | **阻断（计划未完成）**：Phase I（P2 development aggregator + model-free regression）已完成、已提交并推送（`fbd78ff`）；Phase II 的**第一个正式启动 GLT_REF** 在 step 154 被我自己挂上的外部 stall supervisor 以信号 15 停止（`STOPPED_BY_SUPERVISOR`）。按 §12「任一失败 STOP」与 §21「每个 arm 最多 1 次正式启动、失败已执行 updates 永久计入预算、不自动 resume/retry」、§41「supervisor intervention → 立即停止、只允许只读定位、不边修边继续」**停止整个 P2 执行并交回**。**不写 `P2 execution evidence complete`，不写 `P2 accepted`。** |
+| 授权来源 | 用户 2026-09-21 的 r10 指令（完整 P2）：4 starts / ≤20,000 pretrain updates，30 development units / ≤900 epochs，P3 与 outer-test 为 0 |
+| 角色 | Codex/ChatGPT 规划与审查；ZCode 执行 |
+| 开始时 HEAD / pull | `dev@be9fee6`（= 计划 §1 写的 HEAD）；`git pull --ff-only origin dev` → **Already up to date**；`git ls-remote origin dev` = `be9fee6…`；无其它执行者改动目标代码；未触发停止条件 |
+| tmux | session `Uni-Poly`，window **83 `mcl_ph_p2_pretrain`**（`mcl_ph_p2_downstream` 窗口未使用，Phase III 未启动） |
+
+**一、Phase I（§4–§11）——完成并已提交**
+
+新增 `scripts/aggregate_mcl_ph_p2.py`：复用 `scripts.aggregate_mcl_ph.check_unit`（**未另写一套 unit 校验**），固定 scope = 5 arms × 3 tasks × 2 folds = 30 units、`stage=development`、`expected_pretrain_step=5000`；输出 `status/units_expected=30/units_accepted/units_rejected/outer_test=NOT_RUN`、每臂 task×fold×mean 与 `macro3`、三个 MCL 臂对 `O8_ONLY`/`GLT_REF` 的 matched deltas、§9 预注册 gate（**同时**对两个 baseline）与 §10 parent selection（CAT 默认、GATE/XATTN 替代条件、Macro3 差 <0.002 视为工程持平并优先 GATE、无合格臂 → `NO_QUALIFIED_ARM`）。任何 unit 缺失/失败/NaN/错误 step/protocol/split/`outer_test` → `INCOMPLETE` 且**不计算 winner**（`r2/deltas/qualification` 置 null，退出码 4）。**未改动 P1 aggregator 与任何生产代码。**
+
+新增 `tests/test_mcl_ph_p2_aggregate.py`（纯 CPU、无模型、无 forward/backward）：覆盖 §11 要求的全部 10 个用例（完整 30 units→PASS；缺 unit / NaN / outer_test 错误→INCOMPLETE；CAT qualified→CAT；GATE 满足替代条件→GATE；XATTN 不满足 XC fold 一致性→不可替代；CAT 失败 GATE 合格→GATE；无合格臂→`NO_QUALIFIED_ARM`；Macro3 近似持平→GATE tie preference）另加 3 个纯函数/单 baseline 用例，**13 passed in 5.18s**（`logs/mcl_ph_20260921/p2_aggregator_regression.log`）。CLI 端到端复核：合成 30 units → `PASS/30/30/0/parent=m_cat` exit 0；对真实 r9 根（smoke 产物）→ `INCOMPLETE`、30 rejected、首条理由 `run stage is 'smoke', not 'development'`（不会把 smoke 当 development 接受）。
+
+提交：**`fbd78ff`**（`scripts/aggregate_mcl_ph_p2.py`、`tests/test_mcl_ph_p2_aggregate.py`），非 force push `be9fee6..fbd78ff dev -> dev`，`git ls-remote origin dev` 与本地 HEAD 一致。
+
+**二、Phase II 正式预训练——GLT_REF 单次启动被误停（阻断点）**
+
+启动前核验（全部通过）：4 张 GPU 空闲、无其它训练进程；§14 的数据路径（cohort `…/pi1m/cohort_30f17b59bc5862a1`、cache `data/processed/mips_trimer_scage`、dual static `…/pi1m/dual_static_v1`、split `pretrain_split_v1.json`、MCL `statistics.npz`）与 §27 的四个 config 均存在；config 实测与 §16/§17 完全一致（seed 42、microbatch 84、global_batch 1008、max_steps 5000、save_every 1000、lr 2e-4、warmup 2000、schedule 20000、bf16、router dense 500 → top2、balance 1e-3、cutoffs 2/3/4）；输出根 `results/mcl_ph_20260921/p2/pretrain` 不存在（四个 arm 目录与 `shared_new_init.pt` 均 `test ! -e` 通过）。
+
+执行方式：`/tmp/p2_pretrain_driver.sh`（执行侧驱动，**未改任何生产代码**）按 §12 顺序 `glt_ref → cat → gate → xattn` 串行启动，逐 arm 复刻 `scripts/run_mcl_ph_pretrain_smoke.sh` 的 arm 命令与 `verify_mcl_ph_arm.py` 校验（MCL 臂 `--strict-cleanup`），任一非零退出/校验失败即中止；GLT_REF 额外把 §18 要求的 `--diagnostic-save-steps 1000 2000 3000 4000 5000` 显式写出（生产 launcher 只能传单一值，故该臂直调同一 runner）。实际命令（window `mcl_ph_p2_pretrain`，16:09:53Z 启动）：
+
+```bash
+timeout -k 60 14400 python3 -m torch.distributed.run --nproc_per_node=4 --standalone \
+  scripts/pretrain_glt_dual.py --config configs/mts/glt_pred_s3b_b_fp.json \
+  --cohort-root data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1 \
+  --cache-root data/processed/mips_trimer_scage \
+  --dual-static-root data/processed/glt_dual_v2/pi1m/dual_static_v1 \
+  --pretrain-target-root data/processed/glt_dual_v2/pi1m/pretrain_targets_v1 \
+  --third-task fp --diagnostics --diagnostic-save-steps 1000 2000 3000 4000 5000 \
+  --stop-after-step 5000 --prep-workers 12 --output results/mcl_ph_20260921/p2/pretrain/glt_ref
+# 同一 shell 内并行启动：tests/_mcl_ph_r5_stall_supervisor.py --root-pid <runner>
+#   --stages-dir results/mcl_ph_20260921/p2/pretrain/glt_ref --report .../stall_supervisor_glt_ref.json
+```
+
+**训练本身是健康的**：4 rank 正常前向/反向，`losses` 有限（step 8 时 `[4.5606, 2.2497, 0.6944]`），lr 随 warmup 正常上升，实测 **0.857 s/step**（step 35→105 / 60 s），到停止前已执行 **step 1–154（154 个 update，全部有 diagnostics 记录）**。
+
+**停止事实**（`stall_supervisor_glt_ref.json`、`runtime.json`、arm 日志）：
+
+| 证据 | 值 |
+| --- | --- |
+| supervisor | `status=STOPPED_BY_SUPERVISOR`、`intervened=true`、`silent_seconds_at_stop=180.016`、`stack_requested_after_silent_seconds=120.012` |
+| 进度信号 | **`progress_at_stop=[]`、`stage_tail={}`**（supervisor 的进度定义只有 `stages_rank*.log` 的新增 mark） |
+| 终止方式 | SIGTERM(15) → `torchrun` 报 `SignalException: Process … got signal: 15`；`tree.survivors_after_kill=[]`，现场无残留进程 |
+| 时间 | 启动 16:09:53Z → 停止 16:12:55Z，墙钟 ≈182 s（≈ 180 s 静默阈值） |
+| 产物 | `glt_ref/` 只有 `run.json`、`runtime.json`（仍为 `status: RUNNING`）、`records_rank{0..3}.jsonl`、`diagnostics_steps.jsonl`；**无 `resume_*.pt`、无 `deploy_*.pt`**；`cat/`、`gate/`、`xattn/`、`shared_new_init.pt` 均未创建 |
+
+**三、根因（只读定位；执行侧驱动缺陷，非模型/生产代码缺陷）**
+
+- supervisor 的进度判据**只**认 `stages_rank*.log` 的真实 append（r7A 授权的最小机制）。该文件由 **MCL runner**（`scripts/pretrain_mcl_ph.py`）写出（r7B `pretrain_r7b/cat/` 内实测有 `stages_rank0-3.log` 与 `stall_stack_rank*.txt`）。
+- **GLT dual runner（`scripts/pretrain_glt_dual.py`）根本不写 stage log**：`find results/mcl_ph_20260921/p2/pretrain/glt_ref -name 'stages_rank*.log' -o -name 'stall_stack*'` 为空（supervisor 的 `progress_at_stop=[]` 是同一事实的另一侧证据）。因此把该 supervisor 挂到 glt_ref 上，**必然**在 180 s 后误判为“停滞”并杀掉一个正常推进的训练。
+- 该 supervisor 在 r7B/r8 只被挂到过 MCL runner（cat/gate/xattn），**从未**用于 GLT_REF；本轮执行侧驱动为了让四个 arm 的停止契约一致而统一挂载，这就是本次误停的直接原因。
+- 结论：**不是**数据/identity/NaN/NaN-grad/checkpoint/strict-load 失败，也**不是** §41 所列的模型或生产实现缺陷；被停止的是一个健康的正式训练启动。按 §41 本轮**只做只读定位，未改任何代码，未 resume/retry，未启动后续 arms**。
+
+**四、预算核算（失败计入，不写 0）**
+
+| 项目 | 上限 | 实际 |
+| --- | --- | --- |
+| 正式预训练启动 | 4（每 arm 1） | **1**（GLT_REF；被 supervisor 误停，其余 3 个 arm **未启动**） |
+| 正式预训练 updates | ≤20,000 | **154**（GLT_REF step 1–154；CAT/GATE/XATTN = 0） |
+| 产出 checkpoint | — | **0**（无 `resume_05000.pt`/`deploy_05000.pt`，GLT_REF 全部 cadence 点均未到达） |
+| development units | ≤30 starts / ≤900 epochs | **0 / 0** |
+| P2 aggregate / qualification / parent selection | — | **未运行** |
+| P3 / outer-test / 额外 seed / sweep | 0 | **0**（各 unit `outer_test` 从未被访问；本轮无 downstream unit） |
+| 代码修改 | 仅 §43 允许的两处新增 | `scripts/aggregate_mcl_ph_p2.py`、`tests/test_mcl_ph_p2_aggregate.py`（生产代码与 P1 aggregator 未改） |
+
+**五、未执行 / 未声称**
+
+- 未启动 `cat`/`gate`/`xattn` 三个 MCL 正式预训练；未创建 P2 的 `shared_new_init.pt`，故 §19 的 schema/SHA 校验尚未发生。
+- 未做 §22 三臂 deployment 验收、未做 §23 GLT_REF 5k strict-load 验收（无 5k 产物）。
+- 未运行任何 development unit、未运行 P2 aggregator、未做 qualification 与 parent selection；**不写 `P2 execution evidence complete`、不写任何合格臂/selected parent、不做任何性能结论**。
+- 未重试 GLT_REF、未 resume、未改 batch/worker/lr/radius；未删除或覆盖失败现场；未恢复 `Plan.md`；未修改 `.zcodeignore`、`PH.md`、`3D.md`。
+
+**六、交回 ChatGPT 的决策点（执行者不自行决定）**
+
+1. GLT_REF 的**唯一一次正式启动已消耗**（154 updates，无 checkpoint）。是否授权第二次启动、以及是否仍按 §13 的 `p2/pretrain/glt_ref` 路径（该目录已存在，runner 的防覆盖守卫会拒绝新建训练），需由规划方决定（例如换新根目录或新修订号）。
+2. 是否把 GLT_REF（`pretrain_glt_dual.py`）**排除在外部 stall supervisor 之外**，或改为不对 dual runner 设静默停止（MCL runner 的 `stages_rank*.log` 机制不适用于它）。
+3. 其余三个 MCL arm 与 Phase III 的 30 个 unit 是否仍按原预算执行（本轮的启动计数与 update 数需按上表计入）。
+
 
 
 
