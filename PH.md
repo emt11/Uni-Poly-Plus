@@ -468,3 +468,7 @@ runner拟支持 `audit / preflight / pretrain / finetune / aggregate`，明确 `
 * **未执行**：P2-B 5k 预训练、P3-B 开发比较、方案 A/C 的任何实现或运行、全量 STAT 缓存构建、局部 PH 全量构建、正式微调、outer-test、OOF、train+validation refit、构象生成；CURRENT 未重训。
 * **限制**：P1 的 smoke 用缩减 batch（micro 4 / global 16，配置显式标 `smoke_only`）与 SMOKE_ONLY 统计；P2 必须用 `configs/mts/ph_fusion/{common,b}.json` 与另行拟合的 P_train 统计并从共同初始状态开始，**不能续训 P1 模型**。三臂在初始 uniform 路由下输出相同（已声明并测试），因此"输入不同"不等于"当前已产生功能差异"；可训练性/接线通过不构成属性预测增益。P0 的下游边数只记录了 6Å；DDP 空几何为合成案例；R0/R2D 的 P1 验证基于 4-update 部署。
 * **待 Codex 审查的问题**：(1) 三空间图的边规模（6Å 均值 4376/样本，投影 86 GiB 输入）是否要求 P2 前先做按 query 分块以外的结构削减；(2) 我自行决定的两项工程选择——参考臂走原 `galformer_collate` 数据路径、smoke 使用缩减 batch——是否符合计划意图；(3) P2 的离线特征构建（全量 STAT + P_train 统计）需单独授权与预算，本轮未启动；(4) 零初始化 router 使 conditional encoder 首步无梯度（已声明），是否需要在 P2 首 256 步检查中单独记录其解冻时点。
+
+### 14.8 Git
+
+本轮实现与记录为 commit `41b8566`（`phfusion: P0 audit and family-B implementation with the P1 validation evidence`），推送 `origin/dev` 后 fetch 核验：`HEAD...origin/dev = 0/0`，`origin/dev` 指向 `41b8566`；工作树除用户自己的 `D Plan.md` 与未跟踪 `.zcodeignore`、`3D.md` 外干净。`results/**` 与 `logs/**` 由 `.gitignore` 排除，**未**提交任何 checkpoint 或大产物。PH.md 本轮同时包含用户此前对「与 Plan.md 的关系」一行的删除（用户改动，未回退）。
