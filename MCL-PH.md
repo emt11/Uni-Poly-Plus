@@ -681,3 +681,8 @@ cat 挂起证据（快照 `logs/mcl_ph_20260921/p1_pretrain_r3b_hang_evidence.tx
 - 要求 (5) 的 Router logits/概率/熵与内存指标两项未满足，属实现缺口而非本次运行偶发；需下一轮以最小改动补齐。
 - 不是性能结论：两次 update 的 loss 只是训练期观测量，本轮未做任何预测评估、未比较 R²、不宣称提升。
 
+**同步（r3）**
+
+- 第一阶段提交 `56f6071`、第二阶段提交 `89789cb`，均推送 `origin/dev`（`cca9bd3..89789cb`，非 force）；以 `git ls-remote origin dev` 核对远端确为 `89789cb3a5435dc278d2ef1555749cf3700dc820`。
+- 本次推送第 1 次因 `Failed to connect to github.com port 443 … Connection timed out` 失败，第 2 次成功；`git pull --ff-only origin dev` 同期遇到 `GnuTLS recv error (-110)`，故本轮提交基于开工时已核验的本地 `88c3f76` 基线、未含远端新提交（拉取失败已如实记录，不用 force、不重写历史）。用户未跟踪的 `.zcodeignore` 未修改、未提交。
+
