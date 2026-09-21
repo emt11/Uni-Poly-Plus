@@ -18,6 +18,7 @@ Budget contract: CPU only, zero model calls, zero optimizer updates.
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -37,7 +38,20 @@ FROZEN_REPORT = 'results/mcl_ph_20260921/p0/audit.json'
 FROZEN_STATISTICS = 'results/mcl_ph_20260921/p0/statistics.npz'
 DEFAULT_OUTPUT = 'results/mcl_ph_20260921/p0/statistics_randic_revision.json'
 DEFAULT_NPZ = 'results/mcl_ph_20260921/p0/statistics_randic_revision.npz'
-COLUMNS = ('randic', 'wiener', 'efficiency', 'betti0_per_atom', 'betti1_per_edge')
+# Column order and names of section 5.1.  Column 4 is the *interval*
+# normalization ``beta1_norm(r) = active H1 intervals / max(1, B1)`` with B1 the
+# total number of positive-length H1 intervals born up to 4.5 A -- it is not a
+# per-edge quantity, which is why the r2 name ``betti1_per_edge`` was wrong.
+# (Naming only: the formula, data and input semantics are unchanged.)
+COLUMNS = ('randic', 'wiener', 'efficiency', 'betti0_per_atom', 'beta1_norm')
+COLUMN_DEFINITIONS = {
+    'randic': '2/n * sum_edges 1/sqrt(deg(u)deg(v)) (section 5.1 column 0)',
+    'wiener': 'revised per-component normalized Wiener (section 5.1 column 1)',
+    'efficiency': 'sum_{u!=v} 1/shortest_path / (n(n-1)), disconnected 0',
+    'betti0_per_atom': 'active H0 intervals / n (section 5.1 column 3)',
+    'beta1_norm': 'active H1 intervals / max(1, B1) (section 5.1 column 4; '
+                  'named betti1_per_edge in the r2 revision report)',
+}
 BUDGET_SECONDS = 30 * 60
 
 
@@ -52,6 +66,69 @@ def _column_summary(stack):
             'within_declared_range': bool(values.min() >= 0.0 and values.max() <= 1.0),
         }
     return summary
+
+
+DECLARED_RANGES = {name: (0.0, 1.0) for name in COLUMNS}
+RANGE_TOLERANCE = 1e-6
+
+
+def _frozen_sample_sha(frozen):
+    """The sample identity recorded by the frozen r1 audit, if any."""
+    for container, key in (('sample_sets', 'ordered_key_sha256'),
+                           ('sample_set', 'ordered_key_sha256')):
+        value = (frozen or {}).get(container, {}).get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def judge(payload, frozen):
+    """``(status, problems)`` for one revision record against the frozen audit.
+
+    PASS is refused unless every one of these holds: the run records the sample
+    identity of its own set, the frozen audit records one too and the two agree,
+    every requested sample was used, and every column statistic is finite and
+    inside its declared range (up to ``RANGE_TOLERANCE``).  A missing frozen
+    identity is a problem, never a silent match.
+    """
+    problems = []
+    sample_set = payload.get('sample_set') or {}
+    own_sha = sample_set.get('ordered_key_sha256')
+    frozen_sha = _frozen_sample_sha(frozen)
+    if not own_sha:
+        problems.append('the run does not record the sample identity of its own set')
+    if not frozen_sha:
+        problems.append('the frozen audit records no sample identity: the two sample '
+                        'sets cannot be shown to be the same')
+    elif own_sha and frozen_sha != own_sha:
+        problems.append('the sample set differs from the frozen audit')
+    statistics = payload.get('statistics') or {}
+    used, requested = statistics.get('samples_used'), statistics.get('samples_requested')
+    if not used:
+        problems.append('no sample was used')
+    if statistics.get('partial') or not requested or used != requested:
+        problems.append(f'the sample set is incomplete ({used} of {requested})')
+    columns = statistics.get('columns') or {}
+    for name, (low, high) in DECLARED_RANGES.items():
+        entry = columns.get(name)
+        if not isinstance(entry, dict):
+            problems.append(f'the {name} column is missing')
+            continue
+        finite = True
+        for key in ('min', 'max', 'mean', 'std'):
+            value = entry.get(key)
+            if value is None or not math.isfinite(float(value)):
+                problems.append(f'{name}.{key} is not finite')
+                finite = False
+        if not finite:
+            continue
+        if float(entry['min']) < low - RANGE_TOLERANCE or \
+                float(entry['max']) > high + RANGE_TOLERANCE:
+            problems.append(f'the {name} column leaves its declared range '
+                            f'[{low}, {high}]')
+        if not entry.get('within_declared_range'):
+            problems.append(f'the {name} column is flagged out of its declared range')
+    return ('PASS' if not problems else 'FAILED'), problems
 
 
 def main():
@@ -123,9 +200,10 @@ def main():
         },
     }
     report['sample_set']['ordered_key_sha256'] = _sha256_keys(keys, order)
-    frozen_sha = frozen['sample_sets'].get('ordered_key_sha256')
+    frozen_sha = _frozen_sample_sha(frozen)
+    report['sample_set']['frozen_ordered_key_sha256'] = frozen_sha
     report['sample_set']['matches_frozen_sample_set'] = bool(
-        frozen_sha is None or frozen_sha == report['sample_set']['ordered_key_sha256'])
+        frozen_sha is not None and frozen_sha == report['sample_set']['ordered_key_sha256'])
     stack, partial = [], False
     loop_started = time.perf_counter()
     for position in order:
@@ -146,15 +224,15 @@ def main():
         'router_mean': matrix.mean(axis=0).tolist() if matrix.shape[0] else None,
         'router_std': matrix.std(axis=0).tolist() if matrix.shape[0] else None,
         'columns': _column_summary(matrix) if matrix.shape[0] else None,
-        'declared_ranges': {
-            'randic': [0.0, 1.0], 'wiener': [0.0, 1.0], 'efficiency': [0.0, 1.0],
-            'betti0_per_atom': [0.0, 1.0], 'betti1_per_edge': [0.0, 1.0]},
+        'declared_ranges': {name: [low, high]
+                            for name, (low, high) in DECLARED_RANGES.items()},
+        'column_definitions': COLUMN_DEFINITIONS,
         'router_mean_range': ([float(matrix.mean(axis=0).min()),
                                float(matrix.mean(axis=0).max())]
                               if matrix.shape[0] else None),
         'radii': list(view.ROUTER_RADII),
     }
-    report['status'] = 'PARTIAL' if partial else 'PASS'
+    report['status'], report['problems'] = judge(report, frozen)
     report['outer_test'] = 'NOT_RUN'
     report['frozen_artifacts_modified'] = False
     if matrix.shape[0]:
@@ -173,12 +251,15 @@ def main():
     summary = {name: (round(value['min'], 6), round(value['max'], 6))
                for name, value in (report['statistics']['columns'] or {}).items()}
     print(json.dumps({'status': report['status'],
+                      'problems': report['problems'],
                       'seconds': round(report['statistics']['seconds'], 1),
                       'samples_used': report['statistics']['samples_used'],
                       'column_ranges': summary,
                       'router_mean_range': report['statistics']['router_mean_range'],
                       'output': str(destination)}, ensure_ascii=False), flush=True)
-    if partial:
+    if report['status'] == 'FAILED':
+        raise SystemExit(4)
+    if report['status'] == 'PARTIAL':
         raise SystemExit(3)
 
 

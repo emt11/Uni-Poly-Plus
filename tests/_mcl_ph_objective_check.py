@@ -18,9 +18,13 @@ Three stages:
                microstep by microstep, including the accumulation average.
 ``model``      the real pre-trainer on a tiny fixture with two ranks whose
                effective counts differ (one rank has no geometry, and a smaller
-               atom mask), one optimizer update of two microsteps; the
-               DDP-averaged gradient must equal the gradient of the same
-               objective evaluated as a single global computation.
+               atom mask); the rank-averaged gradient of ``atom_head`` -- one
+               explicit AllReduce emulation, no ``DistributedDataParallel`` --
+               must equal the gradient of the same objective evaluated as a
+               single global computation in one process.  Only ``atom_head`` is
+               compared, so this is evidence about one parameter block under
+               ``eval()`` and ``accumulation=1``, not a whole-model or DDP
+               acceptance (r3 extends the parameter coverage separately).
 
 Prints one JSON verdict line on rank 0.
 """
@@ -210,11 +214,15 @@ def model_stage(rank, world, accumulation=1):
     accumulation arithmetic itself is covered by the ``synthetic`` stage, which
     drives the production objective at accumulation three.
 
-    ``DistributedDataParallel`` averages the gradient of a shared parameter over
-    the ranks, and that average is emulated here with one explicit
-    ``all_reduce``: real DDP with a rank-dependent parameter-use order is not a
-    legal configuration, because the collective order has to match on every
-    rank.
+    The average over ranks of a shared parameter's gradient is emulated here
+    with one explicit ``all_reduce`` over the rank-local gradients.  What the
+    earlier r2 revision concluded from this -- that DDP with a rank-dependent
+    parameter-use order is "not a legal configuration" -- was wrong and has been
+    removed: ``find_unused_parameters`` handles unused parameters, and the
+    collective order is a separate question.  The hang r2 hit came from this
+    stage's own single-process reference, which runs the production forward (and
+    therefore ``balance_term``'s two collectives) on rank 0 while the other
+    ranks were already inside ``all_gather_object``.
 
     The balance weight is zero in this stage on purpose.  The balance term is a
     mean over the *globally* valid graphs, so a single-process pass over one

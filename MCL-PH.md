@@ -4,7 +4,8 @@
 
 ## 0. 状态、角色与授权
 
-- **状态：需返修（r2 修复已完成、待 Codex 审查）**。r1 审查发现 5 项缺陷（Randić 归一化、初始化作用域、主任务全局分母与 balance 缩放、metrics.json 的 `optimizer_groups`、验收臂数），r2 已完成最小修复与针对性验证；**P1 仍未完成**（CAT 预训练无成功 unit、`m_cat` 微调 unit 缺失），P2/P3 仍未授权。r2 的修改、证据与预算见 §13.2。
+- **状态：需返修 / 执行中（r3）**。r2 的 5 项修复已落地并通过 r2 的针对性验证，但 r2 的证据表述与 P0 报告判定被审查指出缺陷；r3 正在做**证据收口**（更正表述、修复 P0 修订脚本判定、扩展真实模型梯度参考、补真实 DDP partial-zero/all-zero 检查），**并在第一阶段全部通过后**才恢复 P1 smoke（M_CAT/M_GATE/M_XATTN 各 2 个预训练 updates 与 XC/fold0 各 1 epoch）。
+- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **未完成**（CAT 预训练无成功 unit、`m_cat` 微调 unit 缺失、五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3。
 - r1 状态（历史，已被 r2 取代）：**待授权执行**。
 - Codex 规划和审查；ZCode 在用户授权后执行。推荐第一次仅授权 P0＋P1，后续阶段必须分别交回审查。
 - 文档基准：`dev@0d633d8`，已安全 pull、无远端更新。原 `MCL-PH.md` 为空；用户未跟踪 `.zcodeignore` 不修改、不提交。
@@ -282,6 +283,8 @@ strict-load必须拒绝旧GLT/GALPH部署包与错误fusion模式；预训练融
 
 所有阶段当前均未获执行授权。用户仅授权某阶段时，不能启动后续；本计划中的总量不是一次运行许可。
 
+> 历史说明（r3 登记）：本节以下的 P0/P1/P2/P3 段落是 r1 规划时的合同文本。P0/P1 已先后获用户授权并在 r1/r2/r3 执行，P2/P3 仍未授权。段落中的预算是**上限**，不是已执行量；实际消耗见 §13.1–§13.3。
+
 ### P0：数据/泄漏/拓扑成本审计
 
 CPU最多60分钟、0模型调用、0 optimizer updates。超过一分钟在tmux。按key固定前512个P_train样本审计映射与五描述符、边数/PH计算时间/拓扑差异；4096个固定train样本计算§7统计与路由常量（同参考noisy view），不扫描outer-test。若时限内未完成，交回部分报告，不静默减样本后填完整PASS。
@@ -389,13 +392,17 @@ GPU/worker/超过一分钟的命令只能在tmux session `Uni-Poly` 独立window
 
 当前完成的是**计划文档**。P0/P1/P2/P3均未执行。第一建议授权范围仅P0＋P1；通过后由Codex根据成本和正确性决定下一步。旧PH retention、旧D2及3D.md预算不续用，历史超额不追认。
 
+> 历史说明（r3 登记，2026-09-21）：本段是 r1 规划时状态。事实更新——P0 已执行（r1 定版审计 PASS 499.8 s，r2 受限 Randić 修订 PASS 315.4 s）；P1 已执行但**未完成**（4 臂中 3 臂预训练可用、微调 4/5 unit、五臂验收 PARTIAL）；P2/P3 未执行也未授权。原文保留，不改写当时结论。
+
 ## 13. 执行记录与审查区
 
 ZCode在每阶段后追加：实际基准/变更、命令和tmux window、结果与失败、预算消耗、产物/日志、未完成项、待审查问题。不得擦除失败或以新跑覆盖旧跑。Codex追加逐项验收与下一步；当前均为空，尚无新模型验证或预测结果。
 
 ### 13.1 r1 执行记录（执行者 ZCode，2026-09-21 UTC，基准 `dev@cca9bd3`）
 
-**授权与范围**：用户仅授权 P0＋P1。GPU 未使用；预训练 smoke 的 optimizer updates 与微调 smoke 的 epoch 在计划 P1 硬预算表内。
+**授权与范围**：用户仅授权 P0＋P1。预训练 smoke 的 optimizer updates 与微调 smoke 的 epoch 在计划 P1 硬预算表内。
+
+**设备更正（r3，2026-09-21）**：上文 r1 曾记为“GPU 未使用”，该表述**不正确**。证据：`results/mcl_ph_20260921/p1/pretrain/*/runtime.json` 记录 `device="cuda:0"`、`world_size=4`，且 `cat_failed_diagnostics_device` 的失败信息为 `Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!`——即 r1 的预训练/微调 smoke 实际在 GPU 上运行。P0 审计本身为 CPU（`devices: cpu`、`model_calls: 0`）。更正后 r1 的实际 GPU 用量：预训练 smoke 4 臂（含失败重跑）与微调 smoke 5 次运行，均为 world_size=4 的短程 smoke，未做正式训练轨迹。
 
 **P0：数据/泄漏/拓扑成本审计**
 
@@ -428,7 +435,7 @@ ZCode在每阶段后追加：实际基准/变更、命令和tmux window、结果
 | 微调 smoke | 5 epochs | 4（m_cat 未运行） | 未超 |
 | 额外 DDP 检查 | 4 rank × 8 次调用 | 4-rank DDP 测试 + 多次失败重跑 | **超支（未逐次计数）** |
 | P0 墙钟 | 60 min | 499.8 s | 未超 |
-| GPU / 正式实验 | 0 | 0 | 符合 |
+| GPU / 正式实验 | 0 正式实验 | **r1 smoke 使用了 GPU（cuda:0，world_size=4）**，无正式训练轨迹 | 更正（见上） |
 
 超支主因：CAT 3 次失败后的定位与重跑、以及 4-rank DDP 检查的调试；数字来自本轮日志统计，其中"额外 DDP 检查"未逐次计数，标为**未核实**。
 
@@ -463,8 +470,10 @@ ZCode在每阶段后追加：实际基准/变更、命令和tmux window、结果
 - 主任务梯度 vs 解析闭式：偏差 3.4e-8；`math_loss`×`world`=`loss`、`backward_scale`=`world/有效图数`（分离检查）。
 - 全局无几何：分母 0，梯度恰为 0.0（可反传的有限零），统计 `effective_graphs=0`、`numerator=0`、`loss=0`。
 - balance（生产 `balance_term`，accumulation=3）：对照全局闭式梯度偏差 1.5e-8。
-- 真实模型（rank 0 两原子/两几何图、rank 1 一原子/无几何、rank≥2 空监督）：update 级分母 `{atom:3, geometry:2}` ≠ 任何 rank 的局部计数；**rank 平均梯度与单进程全局计算逐元素相等（偏差 0.0，范数 15.935277 相同）**。该阶段关闭随机干扰（`eval()`）——`BondPathO8` 的 dropout 在 train 模式下会使两次前向不可比。
-- 说明：真实模型阶段 accumulation=1 以控制本轮 CPU 预算；accumulation=3 的累积语义由驱动生产 `objective` 的合成阶段覆盖。rank 平均用一次显式 AllReduce 模拟 DDP 的平均语义：rank 参数使用顺序不同时真实 DDP 不是合法配置（集合通信顺序须在各 rank 一致），该事实写在该阶段的 docstring 中。
+- 真实模型（rank 0 两原子/两几何图、rank 1 一原子/无几何、rank≥2 空监督）：update 级分母 `{atom:3, geometry:2}` ≠ 任何 rank 的局部计数；**atom_head 的 rank 平均梯度与单进程全局计算逐元素相等（偏差 0.0，范数 15.935277 相同）**。该阶段关闭随机干扰（`eval()`）——`BondPathO8` 的 dropout 在 train 模式下会使两次前向不可比。
+  **证据边界（r3 更正）**：该比较只覆盖 `atom_head` 一个参数块，且是在 `eval()`、`accumulation=1`、balance 权重 0、rank 平均由脚本内一次显式 AllReduce 手工模拟（**未使用 `DistributedDataParallel`**）的条件下得到的。因此它**不能**称为“全模型梯度一致”，也**不是**真实 DDP 验收；O8、专家、几何 decoder、fusion、router 的梯度与真实 DDP 的运行正确性在 r2 均为未检验（r3 已补，见 §13.3）。
+- 说明（r3 更正）：真实模型阶段 accumulation=1 以控制本轮 CPU 预算；accumulation=3 的累积语义由驱动生产 `objective` 的合成阶段覆盖。
+  r2 原文曾由“不同 rank 的参数使用不同”推断“真实 DDP 不合法”，该结论**已删除**：DDP 的 unused-parameter 处理（`find_unused_parameters=True` 会把未被使用的参数标记为就绪）与**集合通信顺序**是两个独立问题，前者不决定后者。r2 观测到的挂起由**测试参考路径自身**造成——单进程 reference 在 rank 0 上调用带隐式 collective 的生产 forward（`balance_term` 内的两次 AllReduce），而其余 rank 已进入 `all_gather_object`，集合通信次序错配，gloo 在 90 s 超时后中止。真实 DDP 在按 rank 同序调用时不存在该问题；r3 因此新增了真实 DDP 的 partial-zero / all-zero 检查。
 
 **P0 修订（仅 Randić 影响面）**：`scripts/audit_mcl_ph_p0_randic.py`（新增，模型无关，CPU）→ `results/mcl_ph_20260921/p0/statistics_randic_revision.json` 与 `.npz`。4096 样本、315.4 s（≤30 min）、`matches_frozen_sample_set=true`（与冻结审计同一 `ordered_key_sha256=c0402dca…`）。修正后五列全在 [0,1]：
 
@@ -486,13 +495,24 @@ ZCode在每阶段后追加：实际基准/变更、命令和tmux window、结果
 
 | 项目 | r2 上限 | 实际 | 结论 |
 | --- | --- | --- | --- |
-| CPU 模型 forwards | 48 | 48–56（含首次挂起运行 ≤8 次**未核实**） | **超支 0–8** |
-| CPU 模型 backwards | 32 | 48–56 | **超支 16–24** |
+| CPU 模型 forwards | 48 | 已核实 ≥64，另有未核实额外消耗（见下） | **超支 ≥16** |
+| CPU 模型 backwards | 32 | 已核实 ≥64，另有未核实额外消耗 | **超支 ≥32** |
 | CPU 模型验证墙钟 | 30 min | ≈12.9 min | 未超 |
 | P0 修订墙钟（模型无关） | 30 min | 316.7 s（smoke 1.3 s + 正式 315.4 s） | 未超 |
 | `optimizer.step` / 预训练 updates / 微调 epochs / GPU | 0 | 0 / 0 / 0 / 0 | 符合 |
 
-Test C 逐次明细（每次 4 rank）：`r2_objective_check.log` 在 DDP 模型阶段挂起被终止（用满 653 s 墙钟，模型调用数未核实，因此记为"≤8"）；`check2`、`check3` 各 12 forwards + 12 backwards；`check4`、pytest 入口（首次断言容差失败、复跑、以及最终三套件联合运行各一次）各 6 + 6，合计 48 次已核实。超支集中在**测试工具本身**的调试（DDP 集合通信配置、dropout 随机性、fixture 计数一致性），生产代码的修复未因此改动。r2 的消耗不冲抵 r1 的 P1 预算（r1 自身已超支，见 §13.1）；r2 早期运行的 `tests/test_mcl_ph_pretrain.py`（含 4-rank DDP）与初始化测试的逐次模型调用未登记，标为**未核实**。
+Test C 逐次账目（r3 更正；逐条按当时脚本结构与日志阶段推进推算，**不通过重跑恢复账目，也不给伪造的精确总数**）：
+
+| 运行 | 日志 | 已核实 forwards / backwards | 依据 |
+| --- | --- | --- | --- |
+| check.log（DDP 版，被终止） | `logs/mcl_ph_20260921/r2_objective_check.log` | 8 / 8 | rank 1–3 打印 `model_partial done`，rank 0 已完成主阶段后卡在 reference；脚本结构为 4 rank × 2 microsteps |
+| check2 | `r2_objective_check2.log` | 12 / 12 | 脚本结构：主阶段 8 + rank0 reference 4 |
+| check3 | `r2_objective_check3.log` | 12 / 12 | 同上（在比较处失败，reference 已跑完） |
+| check4 | `r2_objective_check4.log` | 6 / 6 | accumulation=1：主 4 + reference 2 |
+| pytest 入口 ×3 | `r2_objective_math_pytest{,2}.log` 与联合运行 | 18 / 18 | 每次 6 / 6 |
+| **已核实合计** | | **≥64 / ≥64** | 相对 r2 上限 48/32：forwards 超支 ≥16、backwards 超支 ≥32 |
+
+**未核实的额外消耗**（只列出，不重跑补齐）：① `r2_objective_check.log` 中 rank 0 的 reference 首个前向卡死在集合通信内部，是否计入无法核实；② r2 早期运行的 `tests/test_mcl_ph_pretrain.py`（含 4-rank DDP 测试）与初始化测试的模型调用没有留下日志。因此 r2 原文的“48–56”**不是包含所有运行的可靠总量上界**。超支集中在**测试工具本身**的调试（DDP 集合通信配置、dropout 随机性、fixture 计数一致性），生产代码的修复未因此改动。r2 的消耗不冲抵 r1 的 P1 预算（r1 自身已超支，见 §13.1）；r2 早期运行的 `tests/test_mcl_ph_pretrain.py`（含 4-rank DDP）与初始化测试的逐次模型调用未登记，标为**未核实**。
 
 **未完成 / 待审查**
 
@@ -500,3 +520,101 @@ Test C 逐次明细（每次 4 rank）：`r2_objective_check.log` 在 DDP 模型
 - `results/mcl_ph_20260921/p1/pretrain/cat_failed_rng_collective/runtime.json` 仍为 `RUNNING`（进程被用户停止请求中止，未写终态），保留现场不追溯修改。
 - 修复后是否补跑三条既有预训练 arm 与相应微调、以及新增预算，**待本轮审查后由用户与 Codex 决定**；本轮未启动任何训练。
 - 同步：r1 提交 `3d66198` 与 r2 提交 `91626cb` 已推送 `origin/dev`（`cca9bd3..91626cb`，非 force），并以 `git ls-remote origin dev` 核对远端确为 `91626cb`。r1 期间 HTTPS 推送因 `GnuTLS recv error (-110)` 失败属暂时性网络故障，r2 复核时同一凭据与代理配置下 fetch/push 均恢复；r1 的未推送事实保留在 §13.1，不追改。
+
+### 13.3 r3 执行记录（执行者 ZCode，2026-09-21 UTC，基准 `dev@88c3f76`）
+
+**计划头**
+
+| 项目 | 内容 |
+| --- | --- |
+| 计划 ID / 修订 | `MCL-PH-20260921-01` / **r3「证据收口＋有界恢复 P1 smoke」** |
+| 状态 | **执行中（第一阶段完成，待 Codex 审查；第二阶段见本节末尾）** |
+| 授权来源 | 用户 2026-09-21 的 r3 指令（本轮执行范围、预算与停止条件均由该指令给定） |
+| 角色 | Codex 规划与审查；ZCode 执行。ZCode 只标「待 Codex 审查」，不宣布验收通过 |
+| 基准 commit | `dev@88c3f76`（r2 末尾提交）。开工前 `git ls-remote origin dev` 核对远端 = `88c3f76`，与本地 HEAD 一致 |
+| 开工前本地改动 | `MCL-PH.md`、`scripts/audit_mcl_ph_p0_randic.py`、`tests/_mcl_ph_objective_check.py` 为 r2 已改未提交内容；用户未跟踪的 `.zcodeignore` **未修改、未提交**；r1/r2 的初始化、checkpoint、日志与产物一律保留 |
+| 预算与停止条件 | 见下表 |
+
+**授权范围、预算与停止条件（登记，防止事后追认）**
+
+| 阶段 | 范围 | 预算 | 停止条件 |
+| --- | --- | --- | --- |
+| 第一阶段 A | 证据表述更正（r2 的 atom_head 局限、删除 DDP 结论、重列账目、r1 GPU 更正、历史状态标注） | 仅文档 | — |
+| 第一阶段 B | P0 审计报告判定修复 + H1 列更名 + 合成记录测试 | CPU、模型无关 | — |
+| 第一阶段 C | 针对性数学与真实 DDP 验证（广参数块参考比较、r2 既有证据沿用、一次真实 DDP partial/all-zero） | **CPU 模型验证 ≤24 forwards、≤20 backwards，累计墙钟 ≤20 min；GPU=0；`optimizer.step`=0；预训练 updates=0；微调 epochs=0；不跑整份 pytest** | **任何模型验证失败或超时 → 停止模型调用，只允许只读定位，不自动重跑，交回 Codex，不进入第二阶段** |
+| 第二阶段 | M_CAT/M_GATE/M_XATTN 各 2 预训练 updates（共 6）＋ 三臂 XC/fold0 各 1 微调 epoch（共 3） | 新增**不可转移**训练预算 6 updates + 3 epochs；任一训练失败即停止后续训练、不自动重试 | 部署导出/严格加载失败则该臂不启动微调 |
+| 第三阶段 | GLT_REF / O8_ONLY / M_CAT / M_GATE / M_XATTN 五臂汇总与验收材料 | 只读 | 缺证据或冲突即 INCOMPLETE，不得以子集充当完整 |
+| 全轮禁止 | P2/P3、正式 5k、development、outer-test、OOF、新 seed、新 probe、conformer 生成、改冻结缓存、清理历史 | — | — |
+
+**第一阶段 A：证据表述更正**
+
+| 编号 | 问题 | 修改 | 位置 |
+| --- | --- | --- | --- |
+| A1 | r2 把「真实模型梯度参考」写成整模梯度一致性 | 明确该参考只覆盖 `atom_head`（eval、accumulation=1、balance 权重 0、手写 rank 平均），不得称整模梯度一致性或真实 DDP 验收 | §13.2 A1 |
+| A2 | r2 曾写「不同 rank 使用不同参数 → 真实 DDP 非法」 | **删除该结论**；区分「unused 参数处理」与「集合通信次序」两个独立问题；记录 hang 的真实原因（该阶段的单进程 reference 在其它 rank 处于 `all_gather_object` 时触发了 `balance_term` 的两次集合通信） | §13.2 A2、`tests/_mcl_ph_objective_check.py` docstring |
+| A3 | r2 的「48–56」不是全部运行的可靠上界 | 改为逐次可核实账目（≥64/≥64）＋单列未核实项；**不重跑补齐、不给伪造精确总数** | §13.2 表 |
+| A4 | r1「GPU未使用」与旧状态表述 | 按 `runtime.json` 与 `cuda:0 and cpu` 报错更正为 r1 smoke 使用 `cuda:0`、world_size 4；旧「P0/P1均未执行」段标注为历史 | §13.1、§0、§12 历史说明 |
+
+**第一阶段 B：P0 修订报告判定修复**
+
+- `scripts/audit_mcl_ph_p0_randic.py` 的 `judge()` 重写：样本身份缺失（自己的或冻结审计的）、身份不一致、样本不完整（`partial` 或 `used != requested`）、任一列 `min/max/mean/std` 非有限、任一列超出声明区间（容差 `1e-6`）或 `within_declared_range` 标记为假，**均不得 PASS**；缺失的冻结身份记为问题而非静默匹配。
+- 列更名（仅命名，公式/数据/输入语义不变）：`betti1_per_edge` → **`beta1_norm`**（第 4 列 = 活跃 H1 区间数 / `max(1, B1)`，不是逐边量）。`COLUMNS`、`COLUMN_DEFINITIONS`、`DECLARED_RANGES` 与脚本输出字段统一使用新名；`COLUMN_DEFINITIONS['beta1_norm']` 内保留到 r2 名称的桥接说明。
+- 覆盖测试：新增 `tests/test_mcl_ph_p0_audit_judgement.py`（模型无关）——合成记录覆盖 PASS / 缺自身身份 / 缺冻结身份 / 身份不一致 / 非有限 / 超区间（1.001）／区间内舍入仍 PASS / 未完成样本 / 缺列 / 命名桥接 / `_column_summary` 越界标记。**14 passed in 4.90 s**。
+- 旧报告处理（**只读**）：**不重算 4096、不修改 `statistics_randic_revision.json`**。以 r3 判定只读复核该报告的结果如实记录：冻结样本身份 `c0402dca…341a` 与旧报告记录的 `ordered_key_sha256` **完全一致**（真实 hash-match 证据成立），五列范围证据保留；唯一「问题」是旧报告沿用 r2 时期列名 `betti1_per_edge` 而 r3 判定按 `beta1_norm` 查找，故报「该列缺失」——**属命名不一致，不是数据缺陷，也不构成「旧报告被判定失败」的实质结论**。不改旧产物、不改旧结论。
+
+**第一阶段 C：针对性数学与真实 DDP 验证**
+
+工具：`tests/_mcl_ph_r3_reference_ddp_check.py`（2 rank gloo，真实 `DistributedDataParallel(find_unused_parameters=True)`，生产 forward/objective）、`tests/test_mcl_ph_r3_reference_ddp.py`（启动入口）、`tests/_mcl_ph_r3_unused_probe.py`（单进程探针）、`tests/test_mcl_ph_r3_payload.py`（模型无关的判定与载荷测试）。
+
+1. **广参数块参考比较**（不再只比 `atom_head`）：比较块为 `encoder.o8`、`encoder.branch.experts`、`encoder.branch.router`、`encoder.fusion`、`local_decoder`、`nonbond_decoder`、`atom_head`；两侧同为构造后 `eval()`、同一初始化（`load_state_dict` 后逐张量 `torch.equal` 断言）、同一输入与精度、关闭随机性；被比较损失为 `atom + geometry`（balance 权重 0，平衡项不计入本验证，由 r2 闭式覆盖）。逐参数区分 `None`／恒零／非零。`partial` 配置实测（`logs/mcl_ph_20260921/r3_reference_ddp_partial.json`）：
+
+| 块 | verified_on | 非零比较 | 两侧恒零 | 两侧皆 None | 本 rank 无梯度 | 最大偏差 |
+| --- | --- | --- | --- | --- | --- | --- |
+| encoder.o8 | [0, 1] | 74 | 6 | 3 | 0 | 0 |
+| encoder.branch.experts | [0, 1] | 53 | 0 | 22 | 0 | 8.97e-44 |
+| encoder.branch.router | [0, 1] | 4 | 0 | 0 | 0 | 0 |
+| encoder.fusion | [0, 1] | 9 | 0 | 0 | 0 | 0 |
+| local_decoder | [0, 1] | 10 | 0 | 0 | 0 | 0 |
+| nonbond_decoder | [0, 1] | 4 | 0 | 0 | 0 | 0 |
+| atom_head | [0, 1] | 2 | 0 | 0 | 0 | 0 |
+
+   参考梯度为零的块记为**未验证**（`all_zero` 配置下两个 decoder 的 `compared_nonzero = 0`、`verified_on = []`），不作为通过。
+2. **r2 已通过的证据沿用、不重跑**：`accumulation=3` 的更新级分母、累加平均与平衡项闭式（`logs/mcl_ph_20260921/r2_objective_check4.log`）保持原样，仅在本轮载荷中标注 `CARRIED_OVER_FROM_R2`、`re_run: false`，并明确规定它**不替代**另外两项判定。
+3. **一次真实 DDP partial + all-zero**（生产 forward/objective、正确的 unused-parameter 配置、有限 loss/backward、**不使用手写 AllReduce**）：更新级分母实测 `partial = {atom: 3.0, geometry: 2.0}`（rank 0 贡献 2 原子/2 几何，geometry-free rank 贡献 1 原子/0 几何）、`all_zero = {atom: 4.0, geometry: 0.0}`；`denominators_source = update_level`；loss 有限（partial rank 0 = 5.5373）。
+4. **通信次序与超时退出路径（静态核对 + 运行约束）**：所有 rank 以相同顺序执行 forward / objective / backward / reference；被比较路径中除 DDP reducer 外只有 `balance_term` 的两次集合通信（`effective_term` 使用调用方给的更新级分母，不引入集合通信）；进程组超时 90 s、`faulthandler` 300 s 打印栈并退出，故次序不匹配会显式失败而不是挂死。r2 hang 的原因按 A2 记录。
+5. **三项判定分开记录**：`analytic_formula_consistency`（沿用 r2，未重跑）、`model_gradient_reference`（本轮广参数块比较）、`real_ddp_runtime`（本轮真实 DDP 运行），载荷中三者并列且互不替代。
+
+**第一阶段的关键发现（含对既有结论的更正）**
+
+- **单进程探针**（`logs/mcl_ph_20260921/r3_unused_probe.log`）：对 `partial` 第二个 rank 的同一 fixture（`geometry=False`、`atom_mask=(True, False, False)`）做一次普通前向/反向，loss 有限 = 4.1697，`report` 计数 `atom 1 / geometry 0 / local 0 / nonbond 0`；参数梯度状态为——`local_decoder` 10/10 与 `nonbond_decoder` 4/4 全为 `None`；`encoder.o8` 83 个中 3 个 `None`、6 个恒零、74 个非零；`encoder.branch.experts` 75 个中 22 个 `None`、22 个恒零、31 个非零；`router` 4、`fusion` 9、`atom_head` 2 全非零。这满足「正确区分 None、零和非零」的要求，也是「哪些块在该 rank 真的没被前向触达」的直接证据。
+- **更正一条 r2 遗留推论**：真实 DDP 运行时，本 rank 未使用（`grad is None`）的参数**不会被留成无梯度**。生产配置只设 `find_unused_parameters=True`，`skip_all_reduce_unused_params` 保持默认 `False`，DDP 会跨 rank 归约 locally-used map，仅跳过**所有 rank 都未使用**的桶（`reducer.hpp`：`all_reduce_local_used_map`／`is_unused_bucket`／`should_skip_all_reduce_bucket`）。因此 geometry-free rank 的两个 decoder 拿到的是 **rank 平均梯度**，与「全体 rank fixture 的单进程参考」一致——这正是 `partial` 实测中两个 decoder 在 rank 0/1 都被比较且验证、`unused_on_this_rank = 0` 的原因。据此**撤回**「production update 会在该 rank 跳过该参数」的旧说法；`_verdict` 中相应提示文本改为中性描述（若真出现无梯度则标为「需另行定位」）。
+- **`all_zero` 载荷未持久化**：首次启动（含两个配置）的载荷在 pytest 失败输出里被截断，`all_zero` 分支的证据是当次 pytest 断言（`logs/mcl_ph_20260921/r3_reference_ddp.log`：`1 failed, 5 passed`，失败项即本轮已修正的错误断言，`all_zero` 相关断言通过）。按预算与「不自动重跑」要求未再启动，标为**证据仅存于日志**。
+- **载荷结构补强**：`partial` 重跑时新增逐 rank 证据（`local_counts`、更新级分母、`numerator/effective_graphs`、`same_initial_state`）与 `--output` 持久化，避免再次出现「结论在日志、逐 rank 证据丢失」；判定逻辑与载荷结构由 `tests/test_mcl_ph_r3_payload.py`（模型无关，10 passed）覆盖，并以合成载荷**重放**启动入口的全部断言，替代无法负担的第二次真实启动。
+
+**第一阶段预算账目（r3，含失败与探针，未冲抵 r1/r2）**
+
+| 项目 | 第一阶段上限 | 实际 | 结论 |
+| --- | --- | --- | --- |
+| CPU 模型 forwards | 24 | 19（首次启动 12 + `partial` 重跑 6 + 探针 1） | 未超 |
+| CPU 模型 backwards | 20 | 19（同上） | 未超 |
+| CPU 模型验证墙钟 | 20 min | ≈1 min（启动均为十秒量级；pytest 自报 10.68 s） | 未超 |
+| GPU / `optimizer.step` / 预训练 updates / 微调 epochs | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 符合 |
+| 整份 pytest | 不运行 | 只运行模型无关测试文件（`tests/test_mcl_ph_r3_payload.py`、`tests/test_mcl_ph_p0_audit_judgement.py`） | 符合 |
+| 重算 4096 样本 / 改旧报告 | 禁止 | 未重算、未修改旧报告 | 符合 |
+
+命令 / tmux window / 日志：
+
+| 内容 | 命令（要点） | tmux window | 日志与产物 |
+| --- | --- | --- | --- |
+| 首次真实 DDP 启动（两配置） | `python -m pytest tests/test_mcl_ph_r3_reference_ddp.py -q` | `Uni-Poly: mclph_r3_ddp` | `logs/mcl_ph_20260921/r3_reference_ddp.log` |
+| `partial` 证据重跑 | `python -m torch.distributed.run --standalone --nproc_per_node=2 tests/_mcl_ph_r3_reference_ddp_check.py --configurations partial --output …` | `Uni-Poly: mcl_ph_r3_refddp` | `logs/mcl_ph_20260921/r3_reference_ddp_partial.{log,json}` |
+| 单进程 unused 探针 | `python tests/_mcl_ph_r3_unused_probe.py` | `Uni-Poly: mcl_ph_r3_probe` | `logs/mcl_ph_20260921/r3_unused_probe.log` |
+| 模型无关测试 | `python -m pytest tests/test_mcl_ph_r3_payload.py tests/test_mcl_ph_p0_audit_judgement.py -q` | 前台（秒级，无 GPU/worker） | 10 passed / 14 passed |
+
+**第一阶段未完成 / 待审查**
+
+- 三层验证必须分别审查：解析式一致性（沿用 r2 证据）、模型梯度参考（本轮扩块）、真实 DDP 运行（本轮 partial + all_zero），不得互相替代。
+- `all_zero` 的逐 rank 载荷未持久化（仅日志断言）；如需正式证据，建议下一轮以明确的 forward/backward 预算执行一次 `--configurations all_zero --output …`。
+- 启动入口改动后未再真实启动（预算所限），其断言以模型无关的合成载荷重放验证；如实标为「未二次真实运行」。
+- 不是性能结论：本阶段无任何预测评估，也未比较 R²，不宣称任何提升。
+
