@@ -930,4 +930,5 @@ B. **四 rank GPU 收尾复现**（`tests/_mcl_ph_r4_epilogue_replay.py`，`torc
 - 修改文件：`scripts/pretrain_mcl_ph.py`、`scripts/run_mcl_ph_pretrain_smoke.sh`、`scripts/verify_mcl_ph_arm.py`（新增）、`src/modules/mcl_ph.py`、`tests/test_mcl_ph_r5_completion.py`（新增）、`tests/_mcl_ph_r5_stall_supervisor.py`（新增）、`tests/_mcl_ph_r5_stub_runner.py`（新增）、`tests/test_mcl_ph_r4_forensics.py`（内存断言）、`MCL-PH.md`。
 - 未改动：模型数学/初始化/数据语义/超参/batch/worker 数；冻结缓存；r3 现场（`pretrain_r3b/cat/runtime.json` 仍 `RUNNING`，文件清单与 sha 未变）；r4 恢复导出候选；`.zcodeignore`（未跟踪、未提交）。
 - 未取得任何性能或收敛结论；本轮不写「挂起已修复」，也不宣称任何 PASS。
+- 提交与同步：本轮改动提交为 `c9fcb50`，推送 `cf2199c..c9fcb50 dev -> dev`（非 force），`git ls-remote origin dev` 核对远端 = `c9fcb50c9708e9aaad525fa6246c5ef36bb1190f`，与本地 HEAD 一致；`.zcodeignore`（用户未跟踪文件）未修改、未提交；`logs/`、`results/` 下的运行产物按仓库 `.gitignore` 不提交，只按路径引用。远端在本轮开始与提交前均为 `cf2199c`，无他人未合并的提交。
 
