@@ -4,8 +4,8 @@
 
 ## 0. 状态、角色与授权
 
-- **状态：需返修 / 执行中（r3）**。r2 的 5 项修复已落地并通过 r2 的针对性验证，但 r2 的证据表述与 P0 报告判定被审查指出缺陷；r3 正在做**证据收口**（更正表述、修复 P0 修订脚本判定、扩展真实模型梯度参考、补真实 DDP partial-zero/all-zero 检查），**并在第一阶段全部通过后**才恢复 P1 smoke（M_CAT/M_GATE/M_XATTN 各 2 个预训练 updates 与 XC/fold0 各 1 epoch）。
-- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **未完成**（CAT 预训练无成功 unit、`m_cat` 微调 unit 缺失、五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3。
+- **状态：受阻（r3 第二阶段部分执行后停止）**。r2 的 5 项修复已落地并通过 r2 的针对性验证，但 r2 的证据表述与 P0 报告判定被审查指出缺陷；r3 的**证据收口（第一阶段）已完成并提交**；第二阶段按授权启动后，**cat 臂在导出/收尾阶段挂起**，依停止条件中止全部后续训练（gate/xattn 预训练与三条微调臂均未启动），cat 臂挂起**未根因化**。详见 §13.3。
+- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（本阶段新增：cat 完成 2/6 授权 update 但无 `deploy_00002.pt`，M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL，本轮未生成验收材料）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3。
 - r1 状态（历史，已被 r2 取代）：**待授权执行**。
 - Codex 规划和审查；ZCode 在用户授权后执行。推荐第一次仅授权 P0＋P1，后续阶段必须分别交回审查。
 - 文档基准：`dev@0d633d8`，已安全 pull、无远端更新。原 `MCL-PH.md` 为空；用户未跟踪 `.zcodeignore` 不修改、不提交。
@@ -528,7 +528,7 @@ Test C 逐次账目（r3 更正；逐条按当时脚本结构与日志阶段推�
 | 项目 | 内容 |
 | --- | --- |
 | 计划 ID / 修订 | `MCL-PH-20260921-01` / **r3「证据收口＋有界恢复 P1 smoke」** |
-| 状态 | **执行中（第一阶段完成，待 Codex 审查；第二阶段见本节末尾）** |
+| 状态 | **受阻（第一阶段完成；第二阶段部分执行后按停止条件中止，待 Codex 审查）** |
 | 授权来源 | 用户 2026-09-21 的 r3 指令（本轮执行范围、预算与停止条件均由该指令给定） |
 | 角色 | Codex 规划与审查；ZCode 执行。ZCode 只标「待 Codex 审查」，不宣布验收通过 |
 | 基准 commit | `dev@88c3f76`（r2 末尾提交）。开工前 `git ls-remote origin dev` 核对远端 = `88c3f76`，与本地 HEAD 一致 |
@@ -617,4 +617,67 @@ Test C 逐次账目（r3 更正；逐条按当时脚本结构与日志阶段推�
 - `all_zero` 的逐 rank 载荷未持久化（仅日志断言）；如需正式证据，建议下一轮以明确的 forward/backward 预算执行一次 `--configurations all_zero --output …`。
 - 启动入口改动后未再真实启动（预算所限），其断言以模型无关的合成载荷重放验证；如实标为「未二次真实运行」。
 - 不是性能结论：本阶段无任何预测评估，也未比较 R²，不宣称任何提升。
+
+**第二阶段执行记录（部分执行；cat 臂在导出/收尾阶段挂起，按停止条件中止）**
+
+前置：不训练 fixture（要求 3，先验证再训练）
+
+- 命令 `python -m pytest tests/test_mcl_ph_protocol.py tests/test_mcl_ph_r3_payload.py tests/test_mcl_ph_p0_audit_judgement.py -q`（tmux `Uni-Poly:mcl_ph_r3_fixture2`，日志 `logs/mcl_ph_20260921/p1_protocol_fixture_r3b_final.log`）：**51 passed in 150.88 s**。
+- 其中 `tests/test_mcl_ph_protocol.py` 含两个真实 torchrun world-4 启动（缺数据、不训练），覆盖：输出目录已存在时 rank 0 写 `runtime.json` 状态 `FAILED`、`exit_code` 与进程退出码一致、错误为 `FileNotFoundError`，四个 rank 各写 `runtime_failure_rank{0..3}.json`，stdout 末行 `FAILED`，**不写 `run.json`**，日志中不出现 `ALL_ARMS_OK`；输出目录尚未建立时只在 stdout 报 FAILED 且不留下目录。即「结果先写、诊断失败不丢结果、失败不写 PASS/ALL_DONE」在无训练 fixture 下成立。
+- 修复前那次运行（`logs/mcl_ph_20260921/p1_protocol_fixture_r3b.log`）为 `1 failed, 25 passed`：失败项是该测试自身在**非 torchrun** 下启动 runner（runner 在世界大小守卫处退出，早于建立输出目录，故契约的 `is_dir()` 守卫无法记录），属测试脚手架缺陷，不是 runner 契约缺陷；改为 torchrun world-4 fixture 并补一条「目录未建立」用例后全绿。该失败与修复如实保留。
+
+共同初始化（要求 1；构造级检查，0 forward / 0 backward / 0 `optimizer.step`）
+
+- 工具 `tests/_mcl_ph_r3_init_check.py`：只构造三臂模型并调用生产 `apply_shared_init`，不调用前向；tmux `Uni-Poly:mcl_ph_r3_initcheck2`，载荷 `logs/mcl_ph_20260921/r3_init_check.json`，**status PASS、problems 为空**。
+- 产物 `results/mcl_ph_20260921/p1/pretrain_r3b/shared_new_init.pt`：schema `mcl-ph-shared-new-init-v2`、seed 20260921、`source MCLPHPretrainer(fusion=gate)`、95 张量、sha256 `499309392d578daf…b85a`；与 cat 臂 `step_0000.json` 记录的 `shared_new_initialization` 哈希与张量数**逐项一致**——运行所用即该文件。
+- 三臂接受同一份 v2：共同块（`encoder.branch.*`、`atom_head.*`、`local_decoder.*`、`nonbond_decoder.*`）实测各 95 张量，逐张量 `torch.equal` 应用 95/95；跨三臂比较 95 个共同张量**零差异**。
+- 专属初始化保留：融合参数不在共同初始化内（三臂融合张量集合为 cat 8、gate 9、xattn 8 个，互不相同），应用共同初始化后融合张量**零变化**。声明初始化保留：Router `net.0.weight` std 实测 0.019960（声明 0.02）、`net.0.bias` 最大绝对值 0；gate 臂 `fusion.gate.weight` std 实测 0.0010002（声明 0.001）。
+- v1 被拒绝且量化了缺陷：`results/mcl_ph_20260921/p1/pretrain/shared_new_init.pt`（schema `mcl-ph-shared-new-init-v1`、sha `fc4e236ca24b14ce…`）的 Router `net.0.weight` std 实测 **0.083650**（≈ 声明值的 4 倍，即被递归 `apply` 覆写后的状态）；`apply_shared_init` 明确拒绝它并给出「v1 predates the r2 initialization fix」信息。**未用任何 v1 或 r1 checkpoint 恢复。**
+- 受控变化（AGENTS §5 对照）：三份 arm 配置逐键比较，**唯一差异键为 `fusion_mode`**；其余 37 个键（world size 4、microbatch 84、accumulation 3、global batch 1008、bf16、AdamW lr 2e-4 / wd 0、warmup 2000、schedule 20000、seed 42、cutoffs [2,3,4]、dropout 0.1、balance 1e-3、router dense 500 → Top-2、common/statistics 产物路径）完全一致。
+
+启动、消费与产物
+
+- 命令（tmux `Uni-Poly:mcl_ph_r3_pretrain`，日志 `logs/mcl_ph_20260921/p1_pretrain_smoke_r3b.log`）：`ARMS="cat gate xattn" UPDATES=2 NPROC=4 PREP_WORKERS=12 OUTPUT=results/mcl_ph_20260921/p1/pretrain_r3b LOG=logs/mcl_ph_20260921/p1_pretrain_smoke_r3b.log PYTHON=$(command -v python) bash scripts/run_mcl_ph_pretrain_smoke.sh`。
+- 时间线（launcher 日志）：`12:56:02` 启动 cat；四个 rank 均写出 step 1 与 step 2 记录（step 1 用时 14.67 s，其中数据准备 11.4 s；step 2 用时 0.36 s）；`12:56:42` 写出 `resume_00002.pt`；此后**在导出/收尾阶段挂起**；`13:02:08` 中止。
+- 已消耗 **2/6 预训练 updates（仅 cat）**；gate、xattn 与三条微调臂 0。产物保留现场、未补写终态：`results/mcl_ph_20260921/p1/pretrain_r3b/{shared_new_init.pt,cat/{run.json,runtime.json,step_0000.json,steps.jsonl,resume_00002.pt}}`，**无 `deploy_00002.pt`**，`runtime.json` 仍为 `RUNNING`（进程被中止，未写终态）。
+- 运行期实测（全部取自既有 forward/backward，未为监控额外加一次 backward）：`update_denominators = {atom: 1008, geometry: 1008}`（= 84×4×3，与锁定的 world/microbatch/accumulation 一致）、`denominators_source = update_level`、`accumulation = 3`、`weights [1, 1, 0.001]`、`router_mode = dense`、loss 有限、`grad_total_preclip ≈ 63.6`；`grad_norms` 覆盖 `router 0.1267`、`fusion 13.04`、`expert_2a/3a/4a ≈ 7.83/8.03/7.99`、`atom_head 10.76`、`local_geometry_decoder 0.200`、`nonbond_decoder 0.067`、`o8_2d_encoder 59.78`——Router 在两次生产更新中确实取得非零梯度。
+
+cat 挂起证据（快照 `logs/mcl_ph_20260921/p1_pretrain_r3b_hang_evidence.txt`）
+
+- rank 0 主线程处于 `futex_wait_queue`，8 s 采样内 0 字节 IO、无 deploy 文件描述符、GPU 0 利用率 0%；rank 1–3 状态 R、CPU 94–97%、GPU 1–3 利用率 100%（NCCL busy-wait）。
+- `py-spy`、`/proc/<tid>/stack`、`gdb -p` 均因权限（`ptrace_scope`）不可用，**未能取得 Python 栈，未定位到具体代码行**：挂起**未根因化**。
+- 与 r1 的 `cat_failed_rng_collective` 处于同一阶段（step 记录写入后、导出完成前）；本轮**不声称**两次挂起同因。
+- 停止手段：先 `SIGINT`（20 s 内无响应，说明阻塞在 C 调用而非 Python 循环）→ `SIGTERM` 关闭 torchrun 与四个 rank。launcher 如实记录 `=== ARM=cat EXIT=1 ===` 与 `=== ABORT after cat (exit 1); no rerun within this budget ===`，日志中**无 `ALL_ARMS_OK`**（先写结果、再写 ALL_DONE 的退出码契约在真实失败中成立）。
+
+要求 (5) 的收集结果（分项）
+
+- 已满足：路由模式、更新级全局分母（atom/geometry = 1008）、专家/路由/融合梯度、平衡项与累加平均、实际更新与 `resume_00002.pt`、真实退出码、时间（step / forward_backward / preparation seconds）、每 rank `valid_graphs`/`target_counts`、PH 五列轨迹统计（`trajectory.per_column_mean/std`）、专家更新范数、融合增量范数与 `distance_copy_baseline`。
+- **未满足**：Router logits、soft 概率、熵与硬选择**未收集**——四个 rank 一致地 `diagnostics.router = {}`、`monitoring.router = null`。静态定位根因：`MCLPHBranch.collect_diagnostics` 从未被设置，`MCLPHEncoder._set_fusion_diagnostics`（`src/modules/mcl_ph.py:431-433`）只把开关传给 `self.fusion`，而 `MCLPHBranch.forward`（`src/modules/mcl_ph.py:285-287`）读取的是分支自身的 `collect_diagnostics`（`:241`）；r1 产物同样为空。最小修复（下一轮候选，**本轮未改模型**）：在 encoder 中同时设置分支开关。
+- **未满足**：记录中没有内存字段（`runtime.json`、`step_*.json` 均无显存/RSS 指标），只能靠外部 `nvidia-smi` 采样；本轮未做外部采样，故不给出内存数字。
+
+第二阶段预算账目
+
+| 项目 | 第二阶段授权 | 实际 | 说明 |
+| --- | --- | --- | --- |
+| 预训练 optimizer updates | 6（三臂各 2） | **2**（仅 cat） | gate/xattn 未启动 |
+| 微调 epochs | 3（三臂 XC/fold0 各 1） | **0** | 未启动 |
+| 其他训练 / 重试 | 禁止 | 0 | 无重试、无额 run |
+| 监控用额外 forward/backward | 不允许 | 0 | 监控数据全部取自既有 forward/backward |
+| 构造级初始化检查 | 未单列（CPU、无前向） | 3 次模型构造，0 forward / 0 backward / 0 step | `tests/_mcl_ph_r3_init_check.py` |
+| 不训练 fixture | 要求 3 前置 | 51 passed（含 2 次 torchrun world-4 失败记录 fixture） | 无训练 |
+
+不冲抵 r1/r2：上述 2 次 update 与 r1/r2 的消耗分别计账。
+
+第三阶段：未执行
+
+- 五臂汇总未启动：M_CAT 缺 `deploy_00002.pt`（导出未完成），M_GATE/M_XATTN 未运行；按指令不得以子集充当完整，故本轮**没有生成任何验收材料**，状态只能是 PARTIAL/INCOMPLETE。
+- `scripts/aggregate_mcl_ph.py` 未运行、未改动；本轮**未**添加来源映射（无新臂产物可映射），也未复制任何产物、未改动旧 metrics。
+- `tests/_mcl_ph_r3_deployment_check.py` 已写好并通过 `py_compile`，但**未运行**：不存在任何 `deploy_*.pt`，要求 6 的严格加载验证没有对象。
+
+第二阶段未完成 / 待审查
+
+- cat 臂导出/收尾阶段挂起**未根因化**（无 Python 栈）；与 r1 同阶段、同因未知。是否授予新的定位预算（例如导出阶段的分阶段轻量日志，或把 `faulthandler` 覆盖到导出路径）由 Codex 决定。
+- 因 cat 无 deploy 包，三条 MCL 微调臂与五臂验收**均不具备启动条件**；本轮已在停止条件处停止，未自动重试、未进入 P2/P3。
+- 要求 (5) 的 Router logits/概率/熵与内存指标两项未满足，属实现缺口而非本次运行偶发；需下一轮以最小改动补齐。
+- 不是性能结论：两次 update 的 loss 只是训练期观测量，本轮未做任何预测评估、未比较 R²、不宣称提升。
 

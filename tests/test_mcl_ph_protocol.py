@@ -498,6 +498,58 @@ def test_the_mcl_arms_require_the_shared_statistics_artifact(tmp_path):
 
 
 def test_the_pretrain_runner_records_a_non_pass_runtime_on_failure(tmp_path):
+    """The failure record of a run that reaches the output directory.
+
+    The runner is launched the way production launches it (``torchrun``, the
+    config's four ranks), so the failure at the missing statistics file happens
+    *after* the output directory exists -- the only situation in which the
+    contract promises a record on disk.  Rank 0 owns ``runtime.json`` and every
+    rank writes its own error, and no ``run.json`` or success marker may appear.
+    """
+    if not os.environ.get('TMUX'):
+        pytest.skip('the pre-training runner requires the logged tmux session')
+    probe = subprocess.run(['tmux', 'display-message', '-p', '#S'], capture_output=True, text=True)
+    if probe.stdout.strip() != 'Uni-Poly':
+        pytest.skip('the pre-training runner requires tmux session Uni-Poly')
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.device_count() < 4:
+        pytest.skip('the four-rank configuration needs four visible devices')
+    config = tmp_path / 'gate.json'
+    config.write_text((ROOT / 'configs' / 'mts' / 'mcl_ph_gate.json').read_text(encoding='utf-8'),
+                      encoding='utf-8')
+    output = tmp_path / 'out'
+    completed = subprocess.run(
+        [sys.executable, '-m', 'torch.distributed.run', '--standalone',
+         '--nproc_per_node', '4', str(ROOT / 'scripts' / 'pretrain_mcl_ph.py'),
+         '--config', str(config),
+         '--cohort-root', str(ROOT / 'missing'), '--cache-root', str(ROOT / 'missing'),
+         '--dual-static-root', str(ROOT / 'missing'), '--statistics', str(ROOT / 'missing'),
+         '--shared-new-init', str(tmp_path / 'shared.pt'), '--output', str(output)],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=600)
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    runtime = json.loads((output / 'runtime.json').read_text(encoding='utf-8'))
+    assert runtime['status'] == 'FAILED'
+    assert runtime['exit_code'] == completed.returncode
+    assert 'FileNotFoundError' in runtime['error']
+    for rank in range(4):
+        record = json.loads((output / f'runtime_failure_rank{rank}.json').read_text(
+            encoding='utf-8'))
+        assert record['status'] == 'FAILED', rank
+        assert record['rank'] == rank, rank
+    assert json.loads(completed.stdout.strip().splitlines()[-1])['status'] == 'FAILED'
+    assert not (output / 'run.json').exists(), 'a failed run must not leave a run record'
+    assert 'ALL_ARMS_OK' not in completed.stdout
+
+
+def test_a_failure_before_the_output_directory_is_reported_on_stdout_only(tmp_path):
+    """A preparation failure cannot leave a record: it has no directory to leave it in.
+
+    Invoked outside ``torchrun`` the runner dies on the world-size guard before it
+    creates the output directory.  What it must still do is exit non-zero, print a
+    FAILED status, never print PASS or a done marker, and leave nothing behind that
+    a later resume could mistake for a started run.
+    """
     if not os.environ.get('TMUX'):
         pytest.skip('the pre-training runner requires the logged tmux session')
     probe = subprocess.run(['tmux', 'display-message', '-p', '#S'], capture_output=True, text=True)
@@ -514,12 +566,11 @@ def test_the_pretrain_runner_records_a_non_pass_runtime_on_failure(tmp_path):
          '--shared-new-init', str(tmp_path / 'shared.pt'), '--output', str(output)],
         cwd=str(ROOT), capture_output=True, text=True, timeout=600)
     assert completed.returncode == 1, completed.stdout + completed.stderr
-    runtime = json.loads((output / 'runtime.json').read_text(encoding='utf-8'))
-    assert runtime['status'] == 'FAILED'
-    assert runtime['exit_code'] == completed.returncode
-    assert 'FileNotFoundError' in runtime['error']
-    assert json.loads(completed.stdout.strip().splitlines()[-1])['status'] == 'FAILED'
-    assert not (output / 'run.json').exists(), 'a failed run must not leave a run record'
+    assert json.loads(completed.stdout.strip().splitlines()[0])['status'] == 'FAILED'
+    assert 'world size' in completed.stdout + completed.stderr
+    assert 'PASS' not in completed.stdout.replace('FAILED', '')
+    assert 'ALL_ARMS_OK' not in completed.stdout
+    assert not output.exists(), 'a refused invocation must not create the output directory'
 
 
 def test_the_pretrain_runner_refuses_a_top1_router_config(tmp_path):
