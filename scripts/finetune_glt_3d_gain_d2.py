@@ -67,6 +67,8 @@ SCHEDULE_WARMUP_EPOCHS = 5
 STAGE_EPOCH_LIMIT = {'smoke': 1, 'development': SCHEDULE_TOTAL_EPOCHS}
 TASKS = ('xc', 'eps', 'eat')
 FOLDS = (0, 1)
+SPLIT_PROTOCOL = 'outer5_inner20'
+SPLIT_NAMES = ('train', 'validation', 'test')
 
 
 class IsolatedRandomStream:
@@ -303,12 +305,37 @@ def prepare_unit_directory(path):
     return path
 
 
-def resolve_fold(manifest, task, fold, *, cohort_rows):
-    """Train/validation rows of one fold, after checking the three sets stay apart.
+def split_indices(entry, name, sample_count):
+    """One fold's index array: integral, in range and free of duplicates."""
+    values = entry.get(f'{name}_indices')
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f'the split manifest has no usable {name}_indices array')
+    indices = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f'{name}_indices holds a non-integer entry: {value!r}')
+        if not 0 <= value < sample_count:
+            raise ValueError(f'{name}_indices holds an out-of-range index: {value}')
+        indices.append(value)
+    if len(set(indices)) != len(indices):
+        raise ValueError(f'{name}_indices repeats an index')
+    return indices
 
-    The outer-test rows are counted and checked here only; the runner never
-    materialises them, so no outer-test label or prediction is ever read.
+
+def resolve_fold(manifest, task, fold, *, cohort_rows):
+    """Train/validation rows of one fold, after checking the whole split contract.
+
+    The manifest is only read: the fixed ``outer5_inner20`` split is validated
+    here, never rebuilt or rewritten.  The three index arrays must be integral,
+    in range, duplicate-free, pairwise disjoint and jointly cover the cohort
+    exactly.  The outer-test rows appear only in that coverage check; the runner
+    never materialises them, so no outer-test label or prediction is ever read.
     """
+    if str(manifest.get('protocol')) != SPLIT_PROTOCOL:
+        raise ValueError(f'split manifest protocol {manifest.get("protocol")!r} '
+                         f'!= {SPLIT_PROTOCOL!r}')
+    if manifest.get('validation_is_test') is not False:
+        raise ValueError('split manifest does not declare validation_is_test=false')
     if str(manifest.get('task')) != str(task):
         raise ValueError(f'split manifest task {manifest.get("task")!r} != {task!r}')
     entry = next((item for item in manifest['folds'] if int(item['fold']) == int(fold)), None)
@@ -316,21 +343,24 @@ def resolve_fold(manifest, task, fold, *, cohort_rows):
         raise ValueError(f'split manifest has no fold {fold}')
     if int(manifest['sample_count']) != int(cohort_rows):
         raise ValueError('downstream cohort task row count differs from the fixed split')
-    splits = {name: [int(v) for v in entry[f'{name}_indices']]
-              for name in ('train', 'validation', 'test')}
+    count = int(manifest['sample_count'])
+    splits = {name: split_indices(entry, name, count) for name in SPLIT_NAMES}
     sets = {name: set(values) for name, values in splits.items()}
     for left, right in (('train', 'validation'), ('train', 'test'), ('validation', 'test')):
         shared = sets[left] & sets[right]
         if shared:
             raise ValueError(f'{left} and {right} overlap on {len(shared)} rows')
-    covered = sum(len(values) for values in sets.values())
-    if covered != int(manifest['sample_count']):
-        raise ValueError(f'the fold covers {covered} of {manifest["sample_count"]} cohort rows')
+    union = sets['train'] | sets['validation'] | sets['test']
+    if union != set(range(count)):
+        raise ValueError(f'the fold does not cover the cohort exactly: '
+                         f'{count - len(union)} of {count} rows are missing')
     evidence = {'protocol': manifest.get('protocol'), 'fold': int(fold), 'task': str(task),
-                'sample_count': int(manifest['sample_count']),
+                'validation_is_test': manifest.get('validation_is_test'),
+                'sample_count': count,
                 'train_rows': len(splits['train']), 'validation_rows': len(splits['validation']),
                 'test_rows': len(splits['test']), 'sets_disjoint': True,
-                'outer_test': 'NOT_RUN'}
+                'indices': 'integral, in range, duplicate-free',
+                'union_equals_full_cohort': True, 'outer_test': 'NOT_RUN'}
     return splits['train'], splits['validation'], evidence
 
 

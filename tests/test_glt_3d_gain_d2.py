@@ -439,6 +439,74 @@ def test_resolve_fold_checks_task_and_three_set_separation(xc_unit):
         resolve_fold(manifest, 'xc', 0, cohort_rows=int(manifest['sample_count']) + 1)
 
 
+def _synthetic_manifest():
+    """A small but complete fold under the fixed split contract."""
+    return {'protocol': 'outer5_inner20', 'task': 'xc', 'sample_count': 6,
+            'validation_is_test': False,
+            'folds': [{'fold': 0, 'train_indices': [0, 1, 2], 'validation_indices': [3],
+                       'test_indices': [4, 5]}]}
+
+
+def _broken_manifest(**changes):
+    manifest = json.loads(json.dumps(_synthetic_manifest()))
+    fold = manifest['folds'][0]
+    if 'fold' in changes:
+        fold.update(changes.pop('fold'))
+    manifest.update(changes)
+    return manifest
+
+
+def test_resolve_fold_accepts_a_complete_split():
+    train, validation, evidence = resolve_fold(_synthetic_manifest(), 'xc', 0, cohort_rows=6)
+    assert train == [0, 1, 2] and validation == [3]
+    assert evidence['protocol'] == 'outer5_inner20' and evidence['validation_is_test'] is False
+    assert evidence['union_equals_full_cohort'] is True and evidence['sets_disjoint'] is True
+    assert evidence['test_rows'] == 2 and evidence['outer_test'] == 'NOT_RUN'
+
+
+def test_resolve_fold_rejects_a_manifest_that_is_not_the_fixed_protocol():
+    with pytest.raises(ValueError, match='protocol'):
+        resolve_fold(_broken_manifest(protocol='outer5_inner30'), 'xc', 0, cohort_rows=6)
+    without = _synthetic_manifest()
+    del without['protocol']
+    with pytest.raises(ValueError, match='protocol'):
+        resolve_fold(without, 'xc', 0, cohort_rows=6)
+
+
+def test_resolve_fold_rejects_a_shared_validation_test_flag():
+    with pytest.raises(ValueError, match='validation_is_test'):
+        resolve_fold(_broken_manifest(validation_is_test=True), 'xc', 0, cohort_rows=6)
+    without = _synthetic_manifest()
+    del without['validation_is_test']
+    with pytest.raises(ValueError, match='validation_is_test'):
+        resolve_fold(without, 'xc', 0, cohort_rows=6)
+
+
+def test_resolve_fold_rejects_broken_index_arrays():
+    cases = (
+        ('repeats', {'train_indices': [0, 0, 2]}),           # an index used twice
+        ('repeats', {'train_indices': [0, 0, 1, 2]}),        # duplicate, union still complete
+        ('out-of-range', {'train_indices': [-1, 1, 2]}),     # negative index
+        ('out-of-range', {'test_indices': [4, 6]}),          # index past sample_count
+        ('non-integer', {'train_indices': [0, 1, '2']}),     # not an integer
+    )
+    for message, change in cases:
+        with pytest.raises(ValueError, match=message):
+            resolve_fold(_broken_manifest(fold=change), 'xc', 0, cohort_rows=6)
+    with pytest.raises(ValueError, match='usable train_indices'):
+        resolve_fold(_broken_manifest(fold={'train_indices': None}), 'xc', 0, cohort_rows=6)
+
+
+def test_resolve_fold_rejects_missing_and_overlapping_rows():
+    with pytest.raises(ValueError, match='missing'):          # a row in no split at all
+        resolve_fold(_broken_manifest(fold={'test_indices': [4]}), 'xc', 0, cohort_rows=6)
+    with pytest.raises(ValueError, match='overlap'):          # a row in two splits
+        resolve_fold(_broken_manifest(fold={'train_indices': [0, 1, 2, 3]}), 'xc', 0,
+                     cohort_rows=6)
+    with pytest.raises(ValueError, match='row count'):        # wrong cohort size
+        resolve_fold(_synthetic_manifest(), 'xc', 0, cohort_rows=7)
+
+
 def test_run_epochs_records_the_epochs_that_actually_ran():
     """Early stopping must be reflected in the executed-epoch count."""
     features = torch.linspace(-1.0, 1.0, 8).reshape(-1, 1)
