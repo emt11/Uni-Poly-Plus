@@ -1658,6 +1658,8 @@ timeout -k 60 14400 python3 -m torch.distributed.run --nproc_per_node=4 --standa
 2. 是否把 GLT_REF（`pretrain_glt_dual.py`）**排除在外部 stall supervisor 之外**，或改为不对 dual runner 设静默停止（MCL runner 的 `stages_rank*.log` 机制不适用于它）。
 3. 其余三个 MCL arm 与 Phase III 的 30 个 unit 是否仍按原预算执行（本轮的启动计数与 update 数需按上表计入）。
 
+**七、提交与同步**：本轮共两个 commit，均已非 force push 到 `origin/dev`：**`fbd78ff`**（Phase I：`scripts/aggregate_mcl_ph_p2.py`、`tests/test_mcl_ph_p2_aggregate.py`）与 **`e86d795`**（本记录，仅 `MCL-PH.md`）；`git ls-remote origin dev` = `e86d7953816809abd0bd2f3f7d0d6ca6e950ee4e`，与本地 HEAD 一致。产物与日志：`results/mcl_ph_20260921/p2/pretrain/glt_ref/`（失败现场，未删除未覆盖）、`results/mcl_ph_20260921/p2/pretrain/stall_supervisor_glt_ref.json`、`logs/mcl_ph_20260921/{p2_pretrain_driver.log,p2_pretrain_glt_ref.log,p2_supervisor_glt_ref.log,p2_tmux_pretrain.log,p2_aggregator_regression.log}`，按 `.gitignore` 不提交，只按路径引用。**未自动重试 GLT_REF、未启动任何后续 arm 或下游实验**；交回 ChatGPT/Codex 决定后继续。
+
 
 
 
