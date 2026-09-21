@@ -10,8 +10,8 @@ updates of each arm this checks, without any forward or backward:
 * the deployment's recorded contract keeps the training/inference distinction the
   plan declares: the run trained with dense routing and the package fixes Top-2
   *inference*; the two are reported side by side and never mixed into one claim;
-* the two updates really happened: the shared initialisation snapshot no longer
-  matches every shared tensor;
+* the two updates really happened: every encoder-relative tensor of the shared
+  initialisation snapshot is present in the bundle and no longer unchanged;
 * the three arms start from the same common initialisation (identical
   ``shared_new_init_sha256`` and ``common_init_artifact_sha256``) while their
   fusion parameters are arm-specific.
@@ -30,13 +30,78 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 FUSION = {'cat': 'cat', 'gate': 'gate', 'xattn': 'xattn'}
-FUSION_PREFIX = 'fusion.'
+ENCODER_PREFIX = 'encoder.'
+# ``step_0000.json`` records full pre-trainer names, so the arm-specific fusion
+# parameters carry the same ``encoder.`` prefix as the shared ones: the fusion
+# namespace there is ``encoder.fusion.*``, never ``fusion.*``.
+FUSION_PREFIX = 'encoder.fusion.'
 
 
 def _initial_values(directory):
     record = json.loads((directory / 'step_0000.json').read_text(encoding='utf-8'))
     return {name: (value.get('rms'), value.get('mean'))
             for name, value in (record.get('parameters') or {}).items()}
+
+
+def shared_encoder_state(shared_state):
+    """The shared snapshot mapped into the encoder bundle's own namespace.
+
+    ``shared_new_state`` records its names relative to the full pre-trainer
+    (``encoder.branch.*``, ``atom_head.*``, ...) while ``deployment_package``
+    stores ``encoder.state_dict()`` (``o8.*``, ``branch.*``, ``fusion.*``), so
+    only the ``encoder.`` entries have a counterpart in the bundle.  The
+    pre-training heads are excluded here by construction instead of being
+    dropped silently by an intersection afterwards.
+    """
+    return {name[len(ENCODER_PREFIX):]: value
+            for name, value in shared_state.items()
+            if name.startswith(ENCODER_PREFIX)}
+
+
+def shared_encoder_deltas(shared_encoder, package_state):
+    """Max-abs delta per shared encoder tensor, plus the keys the bundle lacks.
+
+    A mapped key that the bundle does not carry is reported as missing rather
+    than skipped, so a namespace change fails as a key mismatch instead of
+    shrinking the comparison to nothing and looking like "no update happened".
+    """
+    missing = sorted(set(shared_encoder) - set(package_state))
+    deltas = {name: float((package_state[name].float()
+                           - shared_encoder[name].float()).abs().max())
+              for name in sorted(set(shared_encoder) & set(package_state))}
+    return deltas, missing
+
+
+def shared_initial_names(common_names):
+    """Common names that must start from the same value in every arm.
+
+    Arm-specific fusion parameters are excluded even when two arms happen to
+    share a key set, so they can never be reported as a shared initialisation
+    difference.
+    """
+    return sorted(name for name in common_names if not name.startswith(FUSION_PREFIX))
+
+
+def arm_problems(arm, record, expected_sha):
+    """Contract problems of one arm record.  Pure, so the rules stay testable."""
+    problems = []
+    if record['inference_mode'] != 'top2':
+        problems.append(f'{arm}: the deployment does not fix Top-2 inference')
+    if record['training_route'] != 'mcl_ph':
+        problems.append(f'{arm}: not an MCL-PH route package')
+    if record['shared_encoder_tensors'] == 0:
+        problems.append(f'{arm}: the shared snapshot maps to no encoder tensor, so the '
+                        f'deployment cannot be compared with its initial state')
+    if record['shared_encoder_missing_keys']:
+        problems.append(f'{arm}: {len(record["shared_encoder_missing_keys"])} shared encoder '
+                        f'keys are missing from the deployment package: '
+                        f'{record["shared_encoder_missing_keys"][:4]}')
+    if record['changed_shared_encoder_tensors'] == 0:
+        problems.append(f'{arm}: no shared encoder tensor differs from the initial snapshot, '
+                        f'so no update happened')
+    if record['shared_new_init_sha256'] != expected_sha:
+        problems.append(f'{arm}: the package cites a different shared initialisation artifact')
+    return problems
 
 
 def main():
@@ -94,35 +159,26 @@ def main():
                 'common_init_sha256': (package.get('source') or {}).get(
                     'common_init_artifact_sha256'),
             })
-            deltas = {name: float((package['state_dict'][name].float()
-                                   - value.float()).abs().max())
-                      for name, value in shared_state.items()
-                      if name in package['state_dict']}
-            record['shared_tensors'] = len(deltas)
-            record['changed_shared_tensors'] = sum(1 for value in deltas.values()
-                                                   if value > 0.0)
-            record['max_abs_delta_from_shared_init'] = max(deltas.values()) if deltas else 0.0
+            shared_encoder = shared_encoder_state(shared_state)
+            deltas, missing = shared_encoder_deltas(shared_encoder, package['state_dict'])
+            record['shared_encoder_tensors'] = len(shared_encoder)
+            record['changed_shared_encoder_tensors'] = sum(
+                1 for value in deltas.values() if value > 0.0)
+            record['max_abs_delta_from_shared_init'] = (max(deltas.values())
+                                                        if deltas else 0.0)
+            record['shared_encoder_missing_keys'] = missing
             initials[arm] = _initial_values(directory)
         except Exception as error:  # noqa: BLE001 - reported, not swallowed
             record['error'] = f'{type(error).__name__}: {error}'
             payload['problems'].append(f'{arm}: {record["error"]}')
             continue
-        if record['inference_mode'] != 'top2':
-            payload['problems'].append(f'{arm}: the deployment does not fix Top-2 inference')
-        if record['training_route'] != 'mcl_ph':
-            payload['problems'].append(f'{arm}: not an MCL-PH route package')
-        if record['changed_shared_tensors'] == 0:
-            payload['problems'].append(f'{arm}: no shared tensor differs from the '
-                                       f'initial snapshot, so no update happened')
-        if record['shared_new_init_sha256'] != payload['shared_new_init_sha256']:
-            payload['problems'].append(f'{arm}: the package cites a different shared '
-                                       f'initialisation artifact')
+        payload['problems'].extend(
+            arm_problems(arm, record, payload['shared_new_init_sha256']))
 
     arms = sorted(initials)
     if len(arms) > 1:
         common = set.intersection(*[set(initials[arm]) for arm in arms])
-        shared_names = sorted(name for name in common
-                              if not name.startswith(FUSION_PREFIX))
+        shared_names = shared_initial_names(common)
         differences = []
         for name in shared_names:
             values = {initials[arm][name] for arm in arms}
