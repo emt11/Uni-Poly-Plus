@@ -4,8 +4,8 @@
 
 ## 0. 状态、角色与授权
 
-- **状态：需返修 / 执行中（r4 完成，待审查）**。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**），**根因仍未定位**；同时补齐 Router 诊断开关与内存记录（§13.4）。
-- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（cat 完成 2/6 授权 update 但无 r3 自己的 `deploy_00002.pt`，M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4。
+- **状态：受阻 / 待审查（r5 部分交付）**。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**），**根因仍未定位**；同时补齐 Router 诊断开关与内存记录（§13.4）。r5 完成四项收尾状态修正与针对性验证（14 passed），但**唯一一次** cat 两步真实运行因我方预建输出目录触发防覆盖守卫而在预备阶段中止（0 update、未重试），故「真实两步复现」目标未完成，详见 §13.5。
+- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（cat 完成 2/6 授权 update 但无 r3 自己的 `deploy_00002.pt`，M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4，r5 见 §13.5。
 - r1 状态（历史，已被 r2 取代）：**待授权执行**。
 - Codex 规划和审查；ZCode 在用户授权后执行。推荐第一次仅授权 P0＋P1，后续阶段必须分别交回审查。
 - 文档基准：`dev@0d633d8`，已安全 pull、无远端更新。原 `MCL-PH.md` 为空；用户未跟踪 `.zcodeignore` 不修改、不提交。
@@ -746,7 +746,7 @@ cat 挂起证据（快照 `logs/mcl_ph_20260921/p1_pretrain_r3b_hang_evidence.tx
 - **CPU 复制定位**：`deployment_package(..., progress=...)` 在每次 `.cpu()` 复制前后记录 `tensor_start/tensor_complete` + 张量名，只记录名字，不打印内容、不逐元素。
 - **失败落盘顺序**：训练体内的异常现在在 `finally` **之前**写 `failure_rank{rank}.log`（append + flush）与 `runtime_failure_rank{rank}.json`，`phase='before_cleanup'`；最外层处理器保留为兜底，写 `phase='at_exit'`。失败路径不引入任何集合操作。
 - **构建与验证的对应关系**：上述 fixture 与 A/B 运行时，`finally:` 中 `source.close()` 与 `destroy_process_group()` 的顺序曾被编辑临时调换；随后已**改回原顺序**（source 先关闭，再销毁进程组，与本轮之前的代码一致），该处处只影响清理次序、不涉及任何被采集字段。fixture 与 A/B 结果按当时构建记录，未据此声称最终构建已复验该顺序。
-- **新增同步的自我登记**：上述观测本身**不新增任何同步**（文件写入、计时线程、只读取值）；`deployment_package` 的 `.cpu()` 与 `rng_state()` 的现有同步为**既有行为**，未被本轮引入。**没有把「加 sync/sleep/延长 timeout」当作修复**（外部 `timeout` 与 90 s 进程组超时仅出现在 B 的取证脚本中，不在生产路径）。
+- **新增同步的自我登记（r5 更正）**：上述观测不新增任何**显式集合通信**（文件写入、看门狗计时线程，均不发起 collective）。但本节先前「不新增任何同步」的表述过宽，r5 予以更正：**把 CUDA 标量取回主机本身可能产生等待**——`_diagnostics` / `_step_diagnostics` / `_gradient_groups` 中的 `.item()`、`float(tensor)`（router 统计、tie rate、`readout_valid_graphs`、loss 与 grad 标量）都会在该设备上隐式等待已入队的计算完成。这与本轮之前就存在的逐步标量记录属同一类取值模式，是既有行为的延续而非新机制；r5 明确**不**为消除此类等待改写训练路径（见 §13.5）。`deployment_package` 的 `.cpu()` 与 `rng_state()` 的既有同步同理，未被本轮引入。**没有把「加 sync/sleep/延长 timeout」当作修复**（外部 `timeout` 与 90 s 进程组超时仅出现在 B 的取证脚本中，不在生产路径）。
 
 **五、零更新验证（预算核算见下）**
 
@@ -808,3 +808,126 @@ B. **四 rank GPU 收尾复现**（`tests/_mcl_ph_r4_epilogue_replay.py`，`torc
 - 未修改 r3 现场：`pretrain_r3b/cat/runtime.json` 仍为 `RUNNING`；新增独立事件说明 `MCL-PH-INCIDENT-r3-cat-export-hang.md` 与 `results/mcl_ph_20260921/p1/pretrain_r3b/cat/incident_operator_stop.json` 记录 launcher 退出、人工终止与证据，未伪造 runner 写出的 FAILED/PASS。
 - 未改动模型数学、初始化、描述符、损失、batch 或 schedule；未改冻结缓存；未生成构象；未跑 P2/P3、outer-test、正式 5k；未自动重试任何失败。
 - 未执行：任何训练恢复（CAT 是否复用恢复导出、是否追加验证、剩余训练是否恢复，均待 Codex 审查后由用户决定）。
+
+### 13.5 r5 执行记录（执行者 ZCode，2026-09-21 UTC，基准 `dev@cf2199c`）
+
+**计划头（执行前登记）**
+
+| 项目 | 内容 |
+| --- | --- |
+| 计划 ID / 修订 | `MCL-PH-20260921-01` / **r5「收尾状态修正＋一次真实 CAT 两步复现」** |
+| 状态 | **受阻（部分交付）**：修正与针对性验证完成；唯一一次真实运行在预备守卫处中止（0 update，未重试），见本节「七～十二」 |
+| 授权来源 | 用户 2026-09-21 的 r5 指令（本轮范围、预算、停止条件与禁止项均由该指令给定） |
+| 角色 | Codex 规划与审查；ZCode 执行。ZCode 只写「待 Codex 审查」，不宣布验收通过 |
+| 基准 commit | `dev@cf2199c`（r4 末尾提交）。开工前 `git ls-remote origin dev` 核对远端 = `cf2199c9fe16aa36d87c82ed45521715cecc4fb3`，与本地 HEAD 一致 |
+| 同步 | `git pull --ff-only origin dev` → **Already up to date**（首次直连即成功，未使用代理绕行） |
+| 开工前状态 | `git status` 仅 `?? .zcodeignore`（用户未跟踪文件，不修改、不提交）；无 `pretrain_mcl_ph`/`finetune_mcl_ph`/torch.distributed 进程；4 张 GPU 空闲（GPU3 有 490 MiB 常驻，非本轮进程） |
+
+**一、范围（用户指令给定，不自行扩大）**
+
+- 只做两项：① 最小代码修正（本节「二」四项）；② **一次** cat 两步真实运行（本节「四」）。
+- 不启动 GATE/XATTN、任何微调、P2/P3、正式 5k 或 outer-test；不改模型数学、初始化、数据语义、超参数、batch、worker 数量；不使用恢复导出候选启动微调。
+- 新产物写入**独立目录** `results/mcl_ph_20260921/p1/pretrain_r5/`；不修改 r3 现场（`pretrain_r3b/cat/runtime.json` 保持 `RUNNING` 原样）与 r4 恢复候选。
+
+**二、最小代码修正（四项）**
+
+| 序 | 缺陷 | 修正方向 |
+| --- | --- | --- |
+| 1 | 完成状态未区分：训练/导出完成、清理完成、真实进程退出成功混为一个 `PASS` | runner 分三级写状态（`TRAINING_COMPLETE` → `cleanup='complete'` → `PASS` 只在 `main()` 返回后）；launcher 在子进程退出码 0 **且** 必要产物齐全 **且** 记录显示清理完成时才允许写 `ALL_ARMS_OK`；异常路径不新增可能无界等待的 collective |
+| 2 | Router 诊断 `std` 使用默认无偏估计 | 改 `correction=0`；单图与空集合给出有限统计或 `NOT_APPLICABLE` 显式语义；不改 forward/路由/loss |
+| 3 | 内存记录用同一个含糊「step」窗口覆盖 CUDA 与 CPU | 拆成两项各自标注：CUDA = 自上次 reset 以来的 step 窗口峰值；CPU = rank 进程生命周期峰值（不含 workers） |
+| 4 | §13.4 的「监控不新增任何同步」表述过宽 | 区分「不新增显式 collective」与「CUDA 标量取回主机可能产生等待」；不为消除等待改写训练路径 |
+
+**三、先做针对性验证的预算与停止条件（执行前登记）**
+
+- 用假进程/合成记录验证四项：清理失败或未完成不得最终 `PASS`；只有真实退出成功才允许完成标记；单图与空集合诊断不产生 NaN；内存窗口标签正确。
+- 预算：CPU 诊断函数/子模块 forward **≤4**、backward **0**、optimizer update **0**、累计墙钟 **≤5 min**；**不得**运行整套模型测试文件。
+- 停止条件：验证失败即停止，**不自动重跑**，**不进入**真实运行。
+
+**四、CAT 真实运行的预算与停止条件（执行前登记）**
+
+- 预算：CAT optimizer updates **≤2**，启动次数 **≤1**；从与 r3 相同的已核验 v2 初态**重新开始**（不 resume、不续旧轨迹）。
+- 保持不变：world=4、microbatch、accumulation、BF16、schedule、数据顺序、噪声、prep workers（12）与训练配置；保留 r4 新增的每 rank 阶段日志与即时 flush、faulthandler 停滞栈、逐张量导出开始/完成、Router 与内存记录、清理前失败落盘。
+- 运行前静态核对：命令、目录、权限、初始化与输出路径、报告写入路径。
+- 外部总超时 **≤15 min**；收尾阶段连续 **120 s** 无进展 → 产生栈；连续 **180 s** 无进展 → 停止本次进程组并保存现场；**只终止本轮明确的 PID/进程组**。
+- 不通过延长超时、减少 worker 或改变保存方式规避复现。
+- 任何失败、超时或人工终止：**立即停止**，本轮不重试、不启动其他臂；记录最后完成阶段、每 rank 最后日志、栈、内存、真实退出码与已完成 update 数；无法取得栈也如实报告。
+
+**五、成功后的有限核验（执行前登记）**
+
+- 仅做权重/metadata 核验：两个 updates 与分母、loss、梯度、Router 统计有限；resume 与 deploy 可加载；deploy 与 resume 对应 encoder 张量逐一一致；strict-load 为规定的 Top-2 推理模式；清理记录与 launcher 退出码一致。
+- **不**额外运行预测 forward 或微调。即使成功，也只写「本次完整训练条件下两步 smoke 成功，旧挂起根因仍未确定」，不写「挂起已彻底修复」，不自动恢复剩余训练。
+
+**六、本轮硬上限**
+
+| 项目 | 上限 |
+| --- | --- |
+| CPU 诊断/子模块 forward | ≤4 |
+| 训练启动 | ≤1 |
+| CAT optimizer updates | ≤2 |
+| 额外 backward | 0 |
+| 微调 epochs | 0 |
+| 其他臂训练 | 0 |
+
+（结果、证据与预算核算见下。）
+
+**七、实际修改（对照「二」；ZCode 实现，未改模型数学/初始化/数据语义/超参）**
+
+| 序 | 文件 | 实际改动 |
+| --- | --- | --- |
+| 1 | `scripts/pretrain_mcl_ph.py` | `runtime.json` 改为三级状态：训练体与导出完成 → `status='TRAINING_COMPLETE'`, `cleanup='pending'`, `main_returned=false`；`finally` 清理跑到末尾（`source.close()` 后 `destroy_process_group()`，原顺序不变）→ `cleanup='complete'`；只有 `main()` 正常返回后由新增 `finalize_runtime_record()` 写 `status='PASS'`, `main_returned=true`, `process_exit='observed_by_launcher'`。清理未完成时该函数**拒绝**升级为 PASS。失败时 `training_complete` 为假，`finally` 不改写记录；最外层处理器仍写 FAILED。异常路径**未新增**任何 collective（新增的只是文件读写） |
+| 1 | `scripts/run_mcl_ph_pretrain_smoke.sh` | 每个臂退出码 0 后追加独立校验 `scripts/verify_mcl_ph_arm.py`；校验不通过 → `ABORT after <arm> (verification N)`、`exit 6`，**不写** `ALL_ARMS_OK`。glt_ref 臂用基础级校验（其 runner 无 cleanup 字段、且本轮不改它），MCL 臂用 `--strict-cleanup`（要求 `cleanup='complete'`、`main_returned=true`、`run.json`/`steps.jsonl`、`resume_00002.pt` 与 `deploy_00002.pt` 齐全、`completed_steps==UPDATES`） |
+| 1 | `scripts/verify_mcl_ph_arm.py`（新增） | 无模型、只读产物目录的判定器，输出一行 JSON 证据并在不通过时返回 1；供 launcher 调用，也可用合成记录单独测试 |
+| 2 | `src/modules/mcl_ph.py` | `MCLPHBranch._diagnostics`：新增 `graphs = logits.size(0)`；`graphs == 0` 时返回 `router_statistics='NOT_APPLICABLE_EMPTY_BATCH'` 且全部统计字段为 `None`（不再出现空张量最小值报错或 NaN）；`graphs >= 1` 时改用**总体标准差** `std(correction=0)`，单图给出有限 0 并在 `router_statistics_note` 注明「单图总体标准差按定义为 0」；`router_tie_rate` 在非空集合才有值。**同类兄弟修复**（同一缺陷类别、同属仅观测字段）：`FusionGate` 诊断同样加 `gate_statistics` 语义与 `correction=0`，`scripts/pretrain_mcl_ph.py` 的 `_step_diagnostics.trajectory.per_column_std` 同样处理。forward/路由/loss **未改动** |
+| 3 | `scripts/pretrain_mcl_ph.py` | `memory_record()` 改为两个独立子记录：`cuda.window='step_since_last_reset'`（自上次 `reset_peak_memory_stats` 起的 step 窗口峰值）与 `cpu.window='rank_process_lifetime'`（rank 进程生命周期峰值 RSS），`cpu.scope` 保留「不含 dataloader workers」；不再出现共用的 `window='step'` |
+| 4 | `MCL-PH.md` §13.4 | 「不新增任何同步」更正为：不新增**显式集合通信**；但 CUDA 标量取回主机（`.item()`/`float(tensor)`）可能等待设备上已入队的计算，属既有取值模式；不为此改写训练路径 |
+
+**八、针对性验证（假进程 / 合成记录）**
+
+- 新增 `tests/test_mcl_ph_r5_completion.py`：**14 passed**（28.92 s）。覆盖：完成形态被接受；`TRAINING_COMPLETE`（清理未完成、无 deploy）被拒并列出 `cleanup is 'pending'`/`missing file: deploy_00002.pt`；缺产物被拒；update 数不符被拒；参照臂基础级契约；**真实 launcher + 假 runner** 三种失败形态（记录停在 TRAINING_COMPLETE → `exit 6` 且无 `ALL_ARMS_OK`；子进程失败 → 无标记；外部 `timeout` 杀进程 → `exit 124` 且无标记）与成功形态（`VERIFY=0` 后才出现 `ALL_ARMS_OK`）；看门狗在 180 s 无进展时**只停自己那棵树**并保留现场、在运行正常结束时不动手；Router 单图/空集合与门控单图/空集合诊断的有限性与 `NOT_APPLICABLE` 语义；内存窗口标签。
+- 更新 `tests/test_mcl_ph_r4_forensics.py` 的内存断言到新标签：**1 passed**（4.65 s）。
+- 本次验证**发现并修复了两个仪器缺陷**：① 监督器把僵尸进程当作存活（`/proc` 仍存在），导致「运行已结束」时不下线；改为按 `/proc/<pid>/stat` 的 `Z` 状态判定。② 停树报告未记录根进程被 `SIGTERM`，与「只终止本次 PID/进程组」的取证要求不符；现将根进程一并记入 `signalled_terminate`。另修正一处测试预期：torchrun 会把子进程退出码 3 掩码为 1，launcher 记录的是 1。
+- 预算：CPU 诊断函数/子模块 forward **4/4**（2 次 `_diagnostics` 直调 + 2 次 `FusionGate` 前向，尺寸为 1 行与 0 行）、backward **0**、optimizer update **0**、累计墙钟 **≈34 s**（≤5 min）；未运行整套模型测试文件。
+
+**九、一次 CAT 真实运行：启动 1 次，在预备守卫处中止（0 optimizer update）**
+
+| 项目 | 内容 |
+| --- | --- |
+| tmux | `Uni-Poly: mcl_ph_r5_cat`（命令结束后 window 自动关闭） |
+| 命令 | `ARMS='cat' UPDATES=2 NPROC=4 PREP_WORKERS=12 OUTPUT=results/mcl_ph_20260921/p1/pretrain_r5 LOG=logs/mcl_ph_20260921/r5_pretrain_cat.log MCL_PH_STALL_SECONDS=120 timeout -k 30 900 bash scripts/run_mcl_ph_pretrain_smoke.sh`，同 window 内以 `tests/_mcl_ph_r5_stall_supervisor.py --root-pid <launcher> --stack-seconds 120 --stop-seconds 180` 监督 |
+| 开始 / 结束 | 14:22:26Z → 14:22:35Z（≈9 s，远低于 900 s 外部超时） |
+| 中止原因 | `FileExistsError: new training requires a new output directory`（runner 预备阶段防覆盖守卫，rank0 判定后广播到四 rank）。根因是**我在执行前静态核对时用 `mkdir -p .../pretrain_r5/cat` 预建了 arm 输出目录**，而该守卫要求新训练的输出目录**不存在** |
+| 真实退出码 | torchrun `ChildFailedError` → launcher `=== ARM=cat EXIT=1 ===` → `=== ABORT after cat (exit 1) ===`，**无** `ALL_ARMS_OK`，未进入 `verify_mcl_ph_arm.py`（日志无 `VERIFY=`） |
+| 已完成 update 数 | **0**（未读数据、未建模前向/反向、无阶段日志、无 checkpoint、未消耗 CUDA 训练） |
+| 失败落盘证据 | `results/.../pretrain_r5/cat/`：`failure_rank{0..3}.log`（`phase='at_exit'`，append+flush，monotonic）、`runtime_failure_rank{0..3}.json`、rank0 `runtime.json` = `FAILED/exit_code=1/phase=at_exit` |
+| 收尾监督 | `stall_supervisor.json`：`status='ROOT_EXITED'`、`intervened=false`、`silent_seconds=5.0` —— 正常/快速失败路径下**未误杀**，也未触发 120 s 栈 |
+| 本轮修正的验证价值 | 修正 1 的**失败分支在真实 4-rank torchrun 下被验证**：四 rank 各自落 FAILED 记录、rank0 写 `runtime.json=FAILED`、launcher 不写完成标记 |
+| 未取得 | 任何关于「两步运行是否再次在导出/收尾挂起」的证据；旧挂起根因与本轮之前一样**未定位** |
+
+**十、预算核算（本轮硬上限）**
+
+| 项目 | 上限 | 实际 | 结论 |
+| --- | --- | --- | --- |
+| CPU 诊断/子模块 forward | ≤4 | **4** | 用满 |
+| 训练启动 | ≤1 | **1**（14:22:26Z，在预备守卫处中止，0 update） | 用满，**不再启动** |
+| CAT optimizer updates | ≤2 | **0/2** | 未消耗 |
+| 额外 backward | 0 | **0** | 符合 |
+| 微调 epochs | 0 | **0** | 符合 |
+| 其他臂训练（gate/xattn/glt_ref 等） | 0 | **0** | 符合 |
+| P2/P3、正式 5k、outer-test、构象生成、恢复导出候选微调 | 禁止 | **0** | 符合 |
+| 外部总超时 | ≤15 min | 9 s（未触发） | 符合 |
+
+**十一、限制与下一步（待用户/Codex 授权，不在本轮执行）**
+
+- 我的操作错误（预建 arm 目录）触发了防覆盖守卫；这不是代码缺陷，也不是 r3 挂起复现。**静态核对应为只读检查**：用父目录探测可写性、不创建 arm 输出目录；下一轮请使用**尚不存在**的新目录（如 `results/mcl_ph_20260921/p1/pretrain_r5b/cat`）。
+- 依 r5 指令「任何失败、超时或人工终止：立即停止，本轮不重试」与硬上限「训练启动 ≤1」，本轮**未重试**、未启动其他臂。故「一次真实两步运行」这一目标**未完成**。
+- 请求的下一步（待授权）：在相同预算与停止条件下再授权**一次** cat 两步运行（输出目录预先不存在；其余命令、初态、配置、preworker、BF16、schedule、数据顺序均不变），以取得悬挂相关证据；CLEANUP/退出状态的三级语义与监控输出已可用。
+- 仍未完成/未定位：r3 导出挂起的根因；`resume`/`deploy` 的第三步核验（本轮未产生新 checkpoint，无法执行）；gate/xattn 预训练与三条微调；五臂验收。
+
+**十二、交付状态**
+
+- 状态：**受阻（部分交付）**——修正 1–4 与针对性验证完成；唯一一次真实运行在预备守卫处中止，0 update，未重试。
+- 修改文件：`scripts/pretrain_mcl_ph.py`、`scripts/run_mcl_ph_pretrain_smoke.sh`、`scripts/verify_mcl_ph_arm.py`（新增）、`src/modules/mcl_ph.py`、`tests/test_mcl_ph_r5_completion.py`（新增）、`tests/_mcl_ph_r5_stall_supervisor.py`（新增）、`tests/_mcl_ph_r5_stub_runner.py`（新增）、`tests/test_mcl_ph_r4_forensics.py`（内存断言）、`MCL-PH.md`。
+- 未改动：模型数学/初始化/数据语义/超参/batch/worker 数；冻结缓存；r3 现场（`pretrain_r3b/cat/runtime.json` 仍 `RUNNING`，文件清单与 sha 未变）；r4 恢复导出候选；`.zcodeignore`（未跟踪、未提交）。
+- 未取得任何性能或收敛结论；本轮不写「挂起已修复」，也不宣称任何 PASS。
+

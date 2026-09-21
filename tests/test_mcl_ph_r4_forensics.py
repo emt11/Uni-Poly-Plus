@@ -58,16 +58,19 @@ def test_the_stall_watchdog_writes_this_ranks_stack(tmp_path):
 
 
 def test_memory_record_states_its_window_units_and_scope():
+    """r5: the two measurements carry their own window label, not one shared one."""
     record = memory_record()
-    assert record['window'] == 'step' and record['units'] == 'bytes'
-    for key in ('cuda_peak_allocated_bytes', 'cuda_peak_reserved_bytes'):
-        value = record[key]
+    assert record['units'] == 'bytes'
+    assert record['cuda']['window'] == 'step_since_last_reset'
+    assert record['cpu']['window'] == 'rank_process_lifetime'
+    for key in ('peak_allocated_bytes', 'peak_reserved_bytes'):
+        value = record['cuda'][key]
         assert value == 'NOT_MEASURED' or (isinstance(value, int) and value >= 0)
-    assert record['cpu_peak_rss_bytes'] == 'NOT_MEASURED' or \
-        isinstance(record['cpu_peak_rss_bytes'], int)
+    assert record['cpu']['peak_rss_bytes'] == 'NOT_MEASURED' or \
+        isinstance(record['cpu']['peak_rss_bytes'], int)
     # The CPU number covers this rank only; saying so is part of the record.
-    assert 'dataloader_workers_excluded' in record['cpu_scope'] or \
-        record['cpu_scope'] == 'NOT_MEASURED'
+    assert 'dataloader_workers_excluded' in record['cpu']['scope'] or \
+        record['cpu']['scope'] == 'NOT_MEASURED'
 
 
 def _torchrun_prepare_failure(tmp_path, extra):

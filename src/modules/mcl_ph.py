@@ -293,21 +293,8 @@ class MCLPHBranch(nn.Module):
         flat = logits.detach()
         probabilities = dense.detach()
         entropy_flat = entropy.detach()
-        tie = ((flat[:, 0] == flat[:, 1]) | (flat[:, 0] == flat[:, 2])
-               | (flat[:, 1] == flat[:, 2]))
-        return {
-            # Logits are reported as per-expert statistics: the full per-graph
-            # matrix is the same information at a size that grows with the batch.
-            'router_logits_mean': [float(value) for value in flat.mean(0)],
-            'router_logits_std': [float(value) for value in flat.std(0)],
-            'router_logits_min': [float(value) for value in flat.min(0).values],
-            'router_logits_max': [float(value) for value in flat.max(0).values],
-            'router_probability_mean': [float(value) for value in probabilities.mean(0)],
-            'router_probability_std': [float(value) for value in probabilities.std(0)],
-            'router_entropy_mean': float(entropy_flat.mean()) if entropy.numel() else 0.0,
-            'router_entropy_std': float(entropy_flat.std()) if entropy.numel() else 0.0,
-            'router_entropy_min': float(entropy_flat.min()) if entropy.numel() else 0.0,
-            'router_entropy_max': float(entropy_flat.max()) if entropy.numel() else 0.0,
+        graphs = int(flat.size(0))
+        record = {
             'router_hard_selection': ([int(value) for value in torch.bincount(
                 hard.detach().reshape(-1), minlength=3)] if hard is not None else None),
             # Dense routing has no hard choice to report: every graph uses the
@@ -317,12 +304,50 @@ class MCLPHBranch(nn.Module):
                                            if hard is not None else
                                            'not_applicable: dense routing uses the soft '
                                            'mixture for every graph'),
-            'router_tie_count': int(tie.sum().item()),
-            'router_tie_rate': float(tie.float().mean().item()) if tie.numel() else 0.0,
             'router_mode': self.router.mode,
             'readout_valid_graphs': int(valid.sum().item()),
-            'graphs': int(count and valid.numel()),
+            'graphs': graphs,
         }
+        if graphs == 0:
+            # No graph means no statistic: zeros would be a fabricated
+            # measurement and the empty reductions are NaN or raise.  The
+            # fields stay present and explicitly not applicable.
+            record.update({
+                'router_statistics': 'NOT_APPLICABLE_EMPTY_BATCH',
+                'router_statistics_note': 'no graph in this batch; nothing was measured',
+                'router_logits_mean': None, 'router_logits_std': None,
+                'router_logits_min': None, 'router_logits_max': None,
+                'router_probability_mean': None, 'router_probability_std': None,
+                'router_entropy_mean': None, 'router_entropy_std': None,
+                'router_entropy_min': None, 'router_entropy_max': None,
+                'router_tie_count': None, 'router_tie_rate': None})
+            return record
+        tie = ((flat[:, 0] == flat[:, 1]) | (flat[:, 0] == flat[:, 2])
+               | (flat[:, 1] == flat[:, 2]))
+        record.update({
+            # Logits are reported as per-expert statistics: the full per-graph
+            # matrix is the same information at a size that grows with the batch.
+            # The population standard deviation (``correction=0``) is used so a
+            # single graph reports a finite 0 instead of dividing by n-1 = 0.
+            'router_statistics': 'population_std_correction_0',
+            'router_statistics_note': ('single graph: the population std is 0 by definition, '
+                                       'not a failed measurement' if graphs == 1 else
+                                       f'population std over {graphs} graphs'),
+            'router_logits_mean': [float(value) for value in flat.mean(0)],
+            'router_logits_std': [float(value) for value in flat.std(0, correction=0)],
+            'router_logits_min': [float(value) for value in flat.min(0).values],
+            'router_logits_max': [float(value) for value in flat.max(0).values],
+            'router_probability_mean': [float(value) for value in probabilities.mean(0)],
+            'router_probability_std': [float(value)
+                                       for value in probabilities.std(0, correction=0)],
+            'router_entropy_mean': float(entropy_flat.mean()),
+            'router_entropy_std': float(entropy_flat.std(correction=0)),
+            'router_entropy_min': float(entropy_flat.min()),
+            'router_entropy_max': float(entropy_flat.max()),
+            'router_tie_count': int(tie.sum().item()),
+            'router_tie_rate': float(tie.float().mean().item()),
+        })
+        return record
 
 
 class FusionGate(nn.Module):
@@ -349,11 +374,21 @@ class FusionGate(nn.Module):
         v = self.to_value(self.norm3(tokens))
         gate = torch.sigmoid(self.gate(torch.cat([u, v, u * v, (u - v).abs()], dim=-1)))
         if self.collect_diagnostics:
-            self.last_diagnostics = {
-                'gate_mean': [float(value) for value in gate.detach().mean(0)],
-                'gate_std': [float(value) for value in gate.detach().std(0)],
-                'gate_min': float(gate.detach().min()), 'gate_max': float(gate.detach().max()),
-            }
+            # Same reporting rule as the router: an empty batch has nothing to
+            # measure (and its reductions are NaN or raise), a single graph gets
+            # a finite population std instead of the n-1 = 0 division.
+            detached = gate.detach()
+            graphs = int(detached.size(0))
+            if graphs == 0:
+                self.last_diagnostics = {
+                    'gate_statistics': 'NOT_APPLICABLE_EMPTY_BATCH',
+                    'gate_mean': None, 'gate_std': None, 'gate_min': None, 'gate_max': None}
+            else:
+                self.last_diagnostics = {
+                    'gate_statistics': 'population_std_correction_0',
+                    'gate_mean': [float(value) for value in detached.mean(0)],
+                    'gate_std': [float(value) for value in detached.std(0, correction=0)],
+                    'gate_min': float(detached.min()), 'gate_max': float(detached.max())}
         return hidden + FUSION_SCALE * self.out(gate * v)
 
 

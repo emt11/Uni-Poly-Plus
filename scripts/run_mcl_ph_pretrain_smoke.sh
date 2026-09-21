@@ -3,9 +3,12 @@
 # (MCL-PH-20260921-01/r1, P1).
 #
 # Failure contract: the log is appended, never truncated; a subprocess failure
-# stops the loop immediately and propagates that subprocess's own exit code; the
-# completion marker is written only when every path succeeded.  RUNNER, ARMS and
-# the per-run knobs are environment-overridable so the failure rules can be
+# stops the loop immediately and propagates that subprocess's own exit code; a
+# successful exit code is then checked against the arm's own products
+# (scripts/verify_mcl_ph_arm.py: runtime record PASS, cleanup finished, required
+# artifacts present, completed updates matching UPDATES); the completion marker
+# is written only when every path passed both checks.  RUNNER, ARMS and the
+# per-run knobs are environment-overridable so the failure rules can be
 # exercised with a stub runner instead of consuming real budget.
 set -u
 cd /root/workspace/Uni-Poly-Plus-master
@@ -53,6 +56,23 @@ for arm in $ARMS; do
   if [ "$code" -ne 0 ]; then
     echo "=== ABORT after $arm (exit $code); no rerun within this budget $(date -u +%FT%TZ) ===" >> "$LOG"
     exit "$code"
+  fi
+  # An exit code of 0 is necessary but not sufficient: the arm is accepted only
+  # if its own products say the same thing. A record left at TRAINING_COMPLETE
+  # (training and export done, cleanup unfinished, no deploy package) is the
+  # shape the r3 hang left behind and must never be promoted to success here.
+  if [ "$arm" = "glt_ref" ]; then
+    "$PYTHON" scripts/verify_mcl_ph_arm.py --label "$arm" --arm-dir "$OUTPUT/$arm" \
+      --updates "$UPDATES" >> "$LOG" 2>&1
+  else
+    "$PYTHON" scripts/verify_mcl_ph_arm.py --label "$arm" --arm-dir "$OUTPUT/$arm" \
+      --updates "$UPDATES" --strict-cleanup >> "$LOG" 2>&1
+  fi
+  vcode=$?
+  echo "=== ARM=$arm VERIFY=$vcode $(date -u +%FT%TZ) ===" >> "$LOG"
+  if [ "$vcode" -ne 0 ]; then
+    echo "=== ABORT after $arm (verification $vcode); no rerun within this budget $(date -u +%FT%TZ) ===" >> "$LOG"
+    exit 6
   fi
 done
 echo "=== RUNNER DONE ALL_ARMS_OK $(date -u +%FT%TZ) ===" >> "$LOG"

@@ -153,29 +153,32 @@ class _NullStages:
 
 
 def memory_record():
-    """Per-rank memory observation for one step window.
+    """Per-rank memory observation, one labelled record per measurement window.
 
-    CUDA peaks are read as ``bytes`` over a window that starts at the previous
-    ``reset_peak_memory_stats`` call, so ``window`` travels with the numbers.
-    The CPU figure is this rank process's peak RSS: the dataloader workers are
-    separate processes and are *not* included, which the ``cpu_scope`` field
-    states rather than leaving the number to be misread as a whole-node figure.
+    The two numbers do not cover the same interval, so they must not be read as
+    two fields of one window: the CUDA peaks start at the previous
+    ``reset_peak_memory_stats`` call (a step window), while the CPU figure covers
+    the whole life of this rank process.  Each side therefore carries its own
+    ``window`` label, and the CPU side states that the dataloader workers are
+    separate processes that its peak RSS does not include.
     """
-    record = {'window': 'step', 'units': 'bytes'}
+    record = {'units': 'bytes',
+              'cuda': {'window': 'step_since_last_reset'},
+              'cpu': {'window': 'rank_process_lifetime'}}
     if torch.cuda.is_available():
-        record['cuda_peak_allocated_bytes'] = int(torch.cuda.max_memory_allocated())
-        record['cuda_peak_reserved_bytes'] = int(torch.cuda.max_memory_reserved())
-        record['cuda_statistics_available'] = True
+        record['cuda'].update(peak_allocated_bytes=int(torch.cuda.max_memory_allocated()),
+                              peak_reserved_bytes=int(torch.cuda.max_memory_reserved()),
+                              statistics_available=True)
     else:
-        record['cuda_peak_allocated_bytes'] = 'NOT_MEASURED'
-        record['cuda_peak_reserved_bytes'] = 'NOT_MEASURED'
-        record['cuda_statistics_available'] = False
+        record['cuda'].update(peak_allocated_bytes='NOT_MEASURED',
+                              peak_reserved_bytes='NOT_MEASURED',
+                              statistics_available=False)
     try:
-        record['cpu_peak_rss_bytes'] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
-        record['cpu_scope'] = 'rank_process_peak_rss_dataloader_workers_excluded'
+        record['cpu'].update(
+            peak_rss_bytes=int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024,
+            scope='rank_process_peak_rss_dataloader_workers_excluded')
     except (ValueError, OSError):  # pragma: no cover - platform dependent
-        record['cpu_peak_rss_bytes'] = 'NOT_MEASURED'
-        record['cpu_scope'] = 'NOT_MEASURED'
+        record['cpu'].update(peak_rss_bytes='NOT_MEASURED', scope='NOT_MEASURED')
     return record
 
 
@@ -320,8 +323,16 @@ def _step_diagnostics(model, report, batch, labels, world):
             'gate': report.get('gate_diagnostics'),
         },
         'trajectory': {
-            'per_column_mean': [float(value) for value in trajectory.mean((0, 1))],
-            'per_column_std': [float(value) for value in trajectory.std((0, 1))],
+            # Same reporting rule as the router diagnostics: the population std
+            # stays finite for a single graph, and an empty batch reports that
+            # nothing was measured instead of NaN.
+            'per_column_mean': ([float(value) for value in trajectory.mean((0, 1))]
+                                if int(trajectory.size(0)) else None),
+            'per_column_std': ([float(value) for value in
+                                trajectory.std((0, 1), correction=0)]
+                               if int(trajectory.size(0)) else None),
+            'statistics': ('NOT_APPLICABLE_EMPTY_BATCH' if not int(trajectory.size(0))
+                           else 'population_std_correction_0'),
             'nonzero_graphs': int((trajectory.abs().sum(-1).sum(-1) > 0).sum()),
         },
         'distance_copy_baseline': {
@@ -411,6 +422,9 @@ def main():
     source, frame = open_source(args.cohort_root, args.cache_root,
                                dual_static_root=args.dual_static_root)
     stages = _NullStages()
+    # Set only after the training body and the export epilogue both finished, so
+    # that the cleanup below never promotes a record belonging to a failed run.
+    training_complete = False
     try:
         sample_index = load_sample_index_artifact(
             args.sample_index_artifact or config.get('sample_index_artifact'),
@@ -686,12 +700,18 @@ def main():
                 dist.barrier()
             stages.mark('step', 'complete', step=step_number)
         if rank == 0:
+            # Training and the export epilogue are done; the cleanup below and
+            # this process's own exit are not.  The record says exactly that
+            # much: a stall in the cleanup must leave a record that never
+            # reached PASS instead of one that claims the run finished.
             runtime = json.loads((output / 'runtime.json').read_text(encoding='utf-8'))
-            runtime.update(status='PASS', completed_steps=int(stop - start),
+            runtime.update(status='TRAINING_COMPLETE', completed_steps=int(stop - start),
                            finished_at_monotonic=time.perf_counter(),
-                           memory=memory_record())
+                           export_complete=bool(not args.no_deploy),
+                           cleanup='pending', main_returned=False, memory=memory_record())
             write_json(output / 'runtime.json', runtime)
         stages.mark('loop', 'complete', steps=stop - start)
+        training_complete = True
     except BaseException as error:
         # Write the failure before the cleanup below: ``source.close()`` and
         # ``destroy_process_group()`` can both wait on other ranks, and a record
@@ -708,6 +728,38 @@ def main():
         stages.mark('cleanup', 'process_group_destroyed')
         stages.mark('cleanup', 'complete')
         stages.close()
+        if training_complete and rank == 0:
+            # Cleanup ran to its end.  Still not PASS: nothing inside this
+            # process can witness its own exit code, so the record stops one
+            # level short and waits for the launcher's evidence.
+            runtime = json.loads((output / 'runtime.json').read_text(encoding='utf-8'))
+            runtime.update(cleanup='complete', cleanup_finished_at_monotonic=time.perf_counter())
+            write_json(output / 'runtime.json', runtime)
+
+
+def finalize_runtime_record():
+    """Write the PASS record once ``main()`` returned and its cleanup completed.
+
+    A process cannot observe its own exit code, so this record claims only what
+    is true from the inside: the training body finished, the export finished and
+    the cleanup finished.  The exit code itself is the launcher's evidence, and
+    the launcher writes the completion marker on that basis.
+    """
+    output = _OUTPUT[0]
+    if os.environ.get('RANK', '0') != '0' or output is None or not Path(output).is_dir():
+        return
+    path = Path(output) / 'runtime.json'
+    try:
+        runtime = json.loads(path.read_text(encoding='utf-8'))
+        if runtime.get('cleanup') != 'complete':
+            # Training ended without a completed cleanup: leave the record at
+            # ``TRAINING_COMPLETE`` rather than promoting it to PASS.
+            return
+        runtime.update(status='PASS', main_returned=True, process_exit='observed_by_launcher')
+        write_json(path, runtime)
+    except (OSError, ValueError) as error:
+        print(json.dumps({'status': 'RUNTIME_RECORD_FAILED',
+                          'error': f'{type(error).__name__}: {error}'}), flush=True)
 
 
 def _scheduled_lr(step, config):
@@ -728,3 +780,8 @@ if __name__ == '__main__':
         write_failure_record(error, int(os.environ.get('RANK', 0)),
                              phase='at_exit')
         raise
+    else:
+        # Reached only when ``main()`` returned, and therefore only after the
+        # cleanup in its ``finally`` block.  What is still missing at this point
+        # is the process's own exit code, which the launcher observes.
+        finalize_runtime_record()
