@@ -1254,7 +1254,7 @@ rank1–3：无 deploy 段（导出仅 rank0），均经过 `barrier:enter(2) �
 - §8 的 `deployment_check.py` **未取得 PASS**（原因见「七」，已定位为检查器自身缺陷）；该缺陷**本轮未修**。
 - 未改写 r3–r7A 历史记录；未恢复根目录 `Plan.md`；未修改 `.zcodeignore`、`PH.md`、`3D.md`；r3 现场保持原状。
 
-**十二、提交与同步**：本轮只改 `MCL-PH.md`（追加本记录），提交与远端核对结果见下条补记。
+**十二、提交与同步**：本轮只改 `MCL-PH.md`，提交为 **`2d8d589`**，非 force push 成功 `bd9fd63..2d8d589 dev -> dev`；`git ls-remote origin dev` = `2d8d589b743f50d696416fea23b22bf48b9ffd7d`，与本地 HEAD 一致。运行产物位于 `results/mcl_ph_20260921/p1/pretrain_r7b/` 与 `logs/mcl_ph_20260921/`（按 `.gitignore` 不提交，只按路径引用）；未提交 checkpoint、缓存或临时目录。**未自动启动 GATE/XATTN 或微调**；交回 ChatGPT/Codex 审查。
 
 
 
