@@ -15,8 +15,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.aggregate_mcl_ph_p2 import (ARMS, FOLDS, TASKS, aggregate,
-                                         arm_table, matched_deltas,
+from scripts.aggregate_mcl_ph_p2 import (ARMS, FOLDS, TASK_SACRIFICE_FLOOR, TASKS,
+                                         aggregate, arm_table, matched_deltas,
                                          qualification, selection)
 
 STEP = 5000
@@ -241,6 +241,55 @@ def test_k_macro3_tie_prefers_gate(tmp_path):
     payload = run(tmp_path, scheme)
     assert payload['selection']['selected_parent'] == 'm_gate'
     assert payload['qualification']['m_xattn']['qualified'] is True
+
+
+# --------------------------------------------------------------- gate bounds
+
+def _means_table(means):
+    """A synthetic R^2 table from per-arm task means (folds set equal to the mean)."""
+    table = {}
+    for arm, entry in means.items():
+        xc, eps, eat = entry['xc'], entry['eps'], entry['eat']
+        table[arm] = {'xc': {'fold0': xc, 'fold1': xc, 'mean': xc},
+                      'eps': {'fold0': eps, 'fold1': eps, 'mean': eps},
+                      'eat': {'fold0': eat, 'fold1': eat, 'mean': eat},
+                      'macro3': (xc + eps + eat) / 3}
+    return table
+
+
+def _sacrifice_checks(candidate_eps):
+    """One candidate against both baselines; only the EPS mean is at issue.
+
+    The baseline EPS mean is 0.01, so the candidate's EPS mean *is* its delta.
+    """
+    means = {'o8_only': {'xc': 0.30, 'eps': 0.01, 'eat': 0.40},
+             'glt_ref': {'xc': 0.30, 'eps': 0.01, 'eat': 0.40},
+             'm_cat': {'xc': 0.36, 'eps': candidate_eps, 'eat': 0.42},
+             'm_gate': {'xc': 0.36, 'eps': candidate_eps, 'eat': 0.42},
+             'm_xattn': {'xc': 0.36, 'eps': candidate_eps, 'eat': 0.42}}
+    report = qualification(matched_deltas(_means_table(means)))
+    return report['m_cat']['vs_o8_only'], report['m_cat']['vs_glt_ref']
+
+
+def test_n_a_task_mean_at_exactly_the_floor_still_qualifies():
+    """The locked contract is ``delta >= -0.01``; exactly -0.01 is not a sacrifice.
+
+    ``0.0 - 0.01`` is the float -0.01 itself, so this is the exact boundary and
+    the old strict ``>`` would have failed it.
+    """
+    delta = 0.00 - 0.01
+    assert delta == TASK_SACRIFICE_FLOOR
+    for checks in _sacrifice_checks(0.00):
+        assert checks['no_task_sacrifice'] is True
+        assert checks['qualified'] is True
+
+
+def test_o_a_task_mean_below_the_floor_is_a_sacrifice():
+    delta = -0.0001 - 0.01
+    assert delta < TASK_SACRIFICE_FLOOR
+    for checks in _sacrifice_checks(-0.0001):
+        assert checks['no_task_sacrifice'] is False
+        assert checks['qualified'] is False
 
 
 # --------------------------------------------------------------- pure helpers

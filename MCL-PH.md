@@ -1660,6 +1660,48 @@ timeout -k 60 14400 python3 -m torch.distributed.run --nproc_per_node=4 --standa
 
 **七、提交与同步**：本轮共两个 commit，均已非 force push 到 `origin/dev`：**`fbd78ff`**（Phase I：`scripts/aggregate_mcl_ph_p2.py`、`tests/test_mcl_ph_p2_aggregate.py`）与 **`e86d795`**（本记录，仅 `MCL-PH.md`）；`git ls-remote origin dev` = `e86d7953816809abd0bd2f3f7d0d6ca6e950ee4e`，与本地 HEAD 一致。产物与日志：`results/mcl_ph_20260921/p2/pretrain/glt_ref/`（失败现场，未删除未覆盖）、`results/mcl_ph_20260921/p2/pretrain/stall_supervisor_glt_ref.json`、`logs/mcl_ph_20260921/{p2_pretrain_driver.log,p2_pretrain_glt_ref.log,p2_supervisor_glt_ref.log,p2_tmux_pretrain.log,p2_aggregator_regression.log}`，按 `.gitignore` 不提交，只按路径引用。**未自动重试 GLT_REF、未启动任何后续 arm 或下游实验**；交回 ChatGPT/Codex 决定后继续。
 
+### 13.13 r10R1 执行记录（ZCode 执行；2026-09-21 UTC；基准 `dev@a5d996e`；**P2-E2E 续行：阈值边界返修 + GLT_REF 第二次正式启动授权**）
+
+**计划头**
+
+| 项目 | 内容 |
+| --- | --- |
+| 计划 ID / 修订 | `MCL-PH-20260921-01` / **r10R1「P2 aggregator 预注册阈值边界修复 + GLT_REF 第二次正式启动 + 继续原 P2-E2E」** |
+| 状态 | **执行中**：返修与回归已完成并提交（见一、三）；GLT_REF 第二次正式启动与后续 P2 阶段在本记录末尾追加（见四） |
+| 授权来源 | 用户 r10R1 指令：新增 **GLT_REF extra start = 1**（≤5000 updates、**from step0**、禁止从 step154 resume）；返修只允许改 aggregator 阈值与 regression |
+| 角色 | Codex/ChatGPT 规划与审查（含 r10 的 aggregate gate 边界审查）；ZCode 执行 |
+| 开始时 HEAD / pull | `dev@a5d996e`（= 审查基线）；`git pull --ff-only origin dev` → **Already up to date**；`git ls-remote origin dev` = `a5d996e…`；工作区干净 |
+| 被保留的失败预算 | GLT_REF formal starts = **1**、updates = **154**（r10，`STOPPED_BY_SUPERVISOR`，执行侧 supervisor 挂载错误）；现场 `results/mcl_ph_20260921/p2/pretrain/glt_ref/` **永久保留，不删不移不覆盖** |
+
+**一、预注册阈值边界修复（§2/§3）**
+
+锁定合同是「任一任务均值退化**不超过** 0.01」，即 ΔR²_task **≥ −0.01**（含等号）。原实现用了严格大于：
+
+```python
+'no_task_sacrifice': all(delta[f'{task}_mean'] > TASK_SACRIFICE_FLOOR for task in TASKS)   # 旧
+'no_task_sacrifice': all(delta[f'{task}_mean'] >= TASK_SACRIFICE_FLOOR for task in TASKS)  # 新
+```
+
+| 项目 | 结果 |
+| --- | --- |
+| 修改范围 | **只改这一处比较符**（+1 行注释）；`MACRO3_MIN_DELTA`、`XC_MEAN_MIN_DELTA`、`xc_fold0/1_positive`、替代条件、tie band、selection 规则**均未改动** |
+| 边界行为实测 | `delta = 0.0 - 0.01`（正好是 float(−0.01)）：旧 `>` → `False`（**误判为 sacrifice**），新 `>=` → `True`；`delta = −0.0101` 两者皆 `False` |
+| 新增回归 | `test_n_a_task_mean_at_exactly_the_floor_still_qualifies`（恰好 −0.01 → `no_task_sacrifice=True` 且 `qualified=True`）、`test_o_a_task_mean_below_the_floor_is_a_sacrifice`（−0.0101 → 均为 `False`）；两者为纯函数、无模型 |
+| 回归结果 | `python -m pytest tests/test_mcl_ph_p2_aggregate.py -q` → **15 passed in 5.22s**，exit 0；CPU-only（GPU/forward/backward/optimizer update = 0） |
+| 未改 | `src/modules/mcl_ph.py`、`src/dataset/mcl_ph_view.py`、`scripts/pretrain_mcl_ph.py`、`scripts/pretrain_glt_dual.py`、`scripts/finetune_mcl_ph.py`、`configs/mts/*.json`；**未给 dual runner 添加 StageLogger**（该问题不是 production runner bug） |
+
+**二、预算与运行策略修订（§5/§6/§7/§12）**
+
+| 项目 | 内容 |
+| --- | --- |
+| 已消费（永久计入） | GLT_REF formal starts = **1**、optimizer updates = **154**（不得改写为 0） |
+| 新增授权 | GLT_REF extra start = **1**、retry updates ≤ **5000**、**from step0**（正式 matched trajectory 必须从原始初始化开始，禁止从 step154 resume） |
+| 修订后历史上限 | **154 + 4×5000 = 20,154** optimizer updates；formal starts = **5**（1 次失败 GLT_REF + 1 次重试 + CAT + GATE + XATTN） |
+| GLT_REF 新输出根 | `results/mcl_ph_20260921/p2/pretrain/glt_ref_r10r1/`（不得写入旧失败目录）；日志 `logs/mcl_ph_20260921/p2_glt_ref_r10r1_pretrain.log` |
+| GLT_REF 训练语义 | 与失败启动保持一致：world 4、seed 42、`third_task=fp`、5000 updates、同一 P_train/common-init/batch/schedule、`--diagnostics --diagnostic-save-steps 1000 2000 3000 4000 5000 --stop-after-step 5000`（仅去掉错误挂载的外部 supervisor） |
+| supervisor 策略（§7） | `tests/_mcl_ph_r5_stall_supervisor.py` **禁止**用于 GLT_REF（dual runner 不产生 `stages_rank*.log`，必然误判）；CAT/GATE/XATTN **继续启用**（120 s stack / 180 s stop，MCL runner 确有 StageLogger marks） |
+| downstream 映射（§14） | `glt_ref` 与 `o8_only` **必须**使用 `p2/pretrain/glt_ref_r10r1/deploy_05000.pt`；不得误用失败目录 |
+
 
 
 

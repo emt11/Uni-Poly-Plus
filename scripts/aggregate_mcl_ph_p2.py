@@ -120,7 +120,9 @@ def qualification(deltas):
                 'xc_mean': delta['xc_mean'] >= XC_MEAN_MIN_DELTA,
                 'xc_fold0_positive': delta['xc_fold0'] > 0,
                 'xc_fold1_positive': delta['xc_fold1'] > 0,
-                'no_task_sacrifice': all(delta[f'{task}_mean'] > TASK_SACRIFICE_FLOOR
+                # Locked contract: a task mean may drop by at most 0.01, so the
+                # floor is inclusive -- exactly -0.01 still qualifies.
+                'no_task_sacrifice': all(delta[f'{task}_mean'] >= TASK_SACRIFICE_FLOOR
                                          for task in TASKS),
             }
             checks['qualified'] = all(checks.values())
