@@ -4,8 +4,8 @@
 
 ## 0. 状态、角色与授权
 
-- **状态：r7A 工程返修完成，待 Codex 审查**（本轮无任何真实训练，不代表 CAT 两步成功，也不代表 P1 完成）。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**）。r5 完成四项收尾状态修正与针对性验证（14 passed），但唯一一次真实运行因预建输出目录触发防覆盖守卫而中止（0 update）。r6 的唯一一次 cat 两步运行**完成了 2 个 update**（`resume_00002.pt` 与 r3b 逐字节相同），随后在导出窗口抛出 `IndexError` 并进入收尾死锁——**r3 挂起由此复现并定位到具体缺陷**（`shared` 变量遮蔽），另有看门狗 180 s 自动停止不可达的缺陷；按指令未改代码、未重试，详见 §13.5/§13.6。r7A 按授权**只**修这两个已定位缺陷（导出身份变量改名 + 停滞进度只认 `stages_rank*.log` 真实 mark）并做无模型回归（8 passed；GPU/forward/backward/update/训练启动均为 0），**未运行 CAT**，详见 §13.7。
-- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（cat 在 r3 与 r6 各完成 2/6 授权 update、均无 deploy 包；M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4，r5 见 §13.5，r6 见 §13.6，r7A 见 §13.7。
+- **状态：r7B CAT 两步 smoke 生产闭环通过；P1 仍未完成**（不写 `P1 PASS`）。r3 第二阶段在 cat 臂导出阶段挂起后按停止条件中止（详见 §13.3 与 [MCL-PH-INCIDENT-r3-cat-export-hang.md](MCL-PH-INCIDENT-r3-cat-export-hang.md)）。r4 在不恢复训练的前提下完成：checkpoint 核验（PASS）、CPU 离线导出（PASS，产物仅为「恢复导出候选」）、四 rank GPU 收尾复现（**未复现**）。r5 完成四项收尾状态修正与针对性验证（14 passed），但唯一一次真实运行因预建输出目录触发防覆盖守卫而中止（0 update）。r6 的唯一一次 cat 两步运行**完成了 2 个 update**（`resume_00002.pt` 与 r3b 逐字节相同），随后在导出窗口抛出 `IndexError` 并进入收尾死锁——**r3 挂起由此复现并定位到具体缺陷**（`shared` 变量遮蔽），另有看门狗 180 s 自动停止不可达的缺陷；按指令未改代码、未重试，详见 §13.5/§13.6。r7A 按授权**只**修这两个已定位缺陷（导出身份变量改名 + 停滞进度只认 `stages_rank*.log` 真实 mark）并做无模型回归（8 passed；GPU/forward/backward/update/训练启动均为 0），**未运行 CAT**，详见 §13.7。r7B 在 r7A 之后完成唯一一次 CAT 两步真实运行（world 4 / microbatch 84 / accumulation 3 / BF16）：2/2 updates、`resume_00002.pt` 与 r3b/r6 **逐字节相同**、**首次产出 `deploy_00002.pt`**、launcher exit 0 + verifier `PASS`（`strict_cleanup`）+ `ALL_ARMS_OK`、`runtime.json` `PASS/cleanup complete/main_returned true`、supervisor `ROOT_EXITED` 未介入、resume↔deploy encoder **170/170 逐张量相同**；但 §8 的 `_mcl_ph_r3_deployment_check.py` **首次运行**暴露其自身名称约定缺陷（`changed_shared_tensors` 恒为 0），该检查未取得 PASS，详见 §13.8。
+- 当前完成度：P0 已完成（r1 定版审计 + r2 受限修订，判定缺陷见 §13.3）；P1 **仍未完成**（cat 在 r3/r6/r7B 各完成 2 个授权 update，r7B 首次产出 deploy 包；M_GATE/M_XATTN 与三条微调未运行，五臂验收仅 4/5 PARTIAL）；P2/P3 未授权。r3 的范围、预算、停止条件与实际基准见 §13.3，r4 见 §13.4，r5 见 §13.5，r6 见 §13.6，r7A 见 §13.7，r7B 见 §13.8。
 - r1 状态（历史，已被 r2 取代）：**待授权执行**。
 - Codex 规划和审查；ZCode 在用户授权后执行。推荐第一次仅授权 P0＋P1，后续阶段必须分别交回审查。
 - 文档基准：`dev@0d633d8`，已安全 pull、无远端更新。原 `MCL-PH.md` 为空；用户未跟踪 `.zcodeignore` 不修改、不提交。
@@ -1141,6 +1141,120 @@ python -m pytest tests/test_mcl_ph_r5_completion.py -q -k supervisor  # 2 passed
 - 结论层级：本记录属于**实现 + 无模型测试**，不是 smoke、不是消融、不是正式实验。
 
 **七、提交与同步**：本轮 4 个文件（`scripts/pretrain_mcl_ph.py`、`tests/_mcl_ph_r5_stall_supervisor.py`、`tests/test_mcl_ph_r7a_repair.py`、`MCL-PH.md`）创建**单独 commit `8b44361`**，非 force push 成功 `8108dc3..8b44361 dev -> dev`；`git ls-remote origin dev` = `8b443610c7a459d09c60e4b404d002c22e2af189`，与本地 HEAD 一致。运行产物位于 `results/`、`logs/`（按 `.gitignore` 不提交，只按路径引用）；未提交 checkpoint、缓存或临时目录。下一步（不在本轮执行）：在用户授权下做修好后的真实 CAT 两步运行，以验证导出写出与 launcher 验收，并在真实运行中确认修正后的定向停止生效。
+
+---
+
+### 13.8 r7B 执行记录（ZCode 执行；2026-09-21 UTC；基准 `dev@bd9fd63`）
+
+**计划头**
+
+| 项目 | 内容 |
+| --- | --- |
+| 计划 ID / 修订 | `MCL-PH-20260921-01` / **r7B「r7A 修复后的真实 CAT 两步生产闭环验证」** |
+| 状态 | **r7B CAT 两步生产闭环通过（launcher/verifier/runtime/supervisor 全 PASS，resume↔deploy 170/170 一致）；§8 的 `deployment_check.py` 首次运行暴露其自身名称约定缺陷（非本轮引入），该检查未取得 PASS；P1 仍未完成**（不等于 `P1 PASS`） |
+| 授权来源 | 用户 2026-09-21 的 r7B 指令：**最多 1 次 CAT 启动、最多 2 个 optimizer updates**，不启动其它 arm、不做性能实验 |
+| 角色 | Codex/ChatGPT 规划与审查；ZCode 执行 |
+| 开始时 HEAD / pull | `dev@bd9fd63`（= 审查基线）；`git pull --ff-only origin dev` → **Already up to date**，`git ls-remote origin dev` = `bd9fd633bfef433bbdf389f01b5b116410bf8505`；`8b44361` 经 `merge-base --is-ancestor` 确认为 HEAD 祖先；`shared_init`/`reduce_update_denominators`/supervisor 进度判定经 grep 与 r7A 回归（8 passed）复核，远端未改动相关代码，未触发停止条件 |
+
+**一、唯一一次启动**
+
+| 项目 | 数值 |
+| --- | --- |
+| tmux | session `Uni-Poly`，新 window `mcl_ph_r7b_cat`（window 78） |
+| 驱动脚本 | `/tmp/mcl_ph_r7b_driver.sh`（非仓库文件） |
+| launcher PID | `2271111`（`timeout -k 30 900 bash scripts/run_mcl_ph_pretrain_smoke.sh`） |
+| 命令 | `ARMS='cat' UPDATES=2 NPROC=4 PREP_WORKERS=12 OUTPUT=results/mcl_ph_20260921/p1/pretrain_r7b LOG=logs/mcl_ph_20260921/r7b_pretrain_cat.log MCL_PH_STALL_SECONDS=120 timeout -k 30 900 bash scripts/run_mcl_ph_pretrain_smoke.sh &`，随后 `python tests/_mcl_ph_r5_stall_supervisor.py --root-pid 2271111 --stages-dir …/pretrain_r7b/cat --log …/r7b_pretrain_cat.log --report …/pretrain_r7b/stall_supervisor.json` |
+| 时间 | 启动 15:09:09Z → launcher 退出 15:09:51Z，window 汇总 15:09:54Z；**墙钟 ≈45 s**（外部时限 ≤15 min，未触发） |
+| 启动次数 | **1 / 1（用满，无重试）** |
+| 输出目录 | `results/mcl_ph_20260921/p1/pretrain_r7b/`（父目录预先创建，`cat/` 由生产 runner 自建；启动前 `test ! -e` 与 `test ! -L` 均通过） |
+
+**二、训练：2/2 updates 真实完成**（`cat/steps.jsonl`，rank0 记录）
+
+| step | lr | loss atom | loss geometry | loss balance | grad_total_preclip | update_denominators | router_mode | finite |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1.0e-07 | 5.193426 | 0.251861 | 1.182954e-04 | 63.7255 | `{atom: 1008.0, geometry: 1008.0}` | dense | 全部有限 |
+| 2 | 2.0e-07 | 5.162579 | 0.252755 | 1.176198e-04 | 63.6309 | `{atom: 1008.0, geometry: 1008.0}` | dense | 全部有限 |
+
+两步均 < `router_dense_updates=500`，故训练用 dense 路由（与部署包固定的 Top-2 **推理**模式不是同一件事，不混写）。
+
+**三、resume / deploy 产物**
+
+| 文件 | 大小 (B) | SHA256 |
+| --- | --- | --- |
+| `cat/resume_00002.pt` | 315,570,711 | `e91bda10bfb0db5a6da5f0a05c6bd0c22458ef48bb8a1053c2ef9e13f8818af2` |
+| `cat/deploy_00002.pt` | 81,401,259 | `c0f20f0643f2a08ec9a168f459ccb093d6a110c931d53ef4b993fcbab15e53cc` |
+
+resume 字段实测：`step = 2`、`next_position = 2016`、`scheduler.step = 2`、`identity` 与本次 `run.json identity` **逐键相等**。deploy 由**本轮生产运行**生成，未使用 r4 recovery candidate。
+
+**四、闭环阶段证据**（`cat/stages_rank*.log`，rank0 共 360 条 mark）
+
+rank0：`loop:enter → step:enter(1) → barrier:enter(1) → step:complete(1) → step:enter(2) → rng_gather(2) → resume_save(2) → deployment_package:enter(2) → [95 个 tensor 的 start/complete] → deployment_package:complete → deploy_save:enter → deploy_save:complete → barrier:enter(2) → step:complete(2) → loop:complete → cleanup:enter → cleanup:source_closed → cleanup:process_group_destroyed → cleanup:complete`。
+rank1–3：无 deploy 段（导出仅 rank0），均经过 `barrier:enter(2) → step:complete(2) → loop:complete → cleanup:* → complete`。**没有任何 rank 停在 barrier 或 destroy_process_group。**
+`stall_stack_rank*.txt` 四个文件均为 **0 字节**：进程内 120 s 看门狗从未触发。
+
+**五、runtime / launcher / verifier / supervisor**
+
+- `cat/runtime.json`：`status='PASS'`、`completed_steps=2`、`cleanup='complete'`、`main_returned=true`、`export_complete=true`；memory 窗口为 `step_since_last_reset`（CUDA）/`rank_process_lifetime`（CPU）。
+- launcher：`ARM=cat EXIT=0`（15:09:51Z）→ `verify_mcl_ph_arm.py --strict-cleanup` 输出 `{"verdict": "PASS", "problems": [], "strict_cleanup": true, "evidence": {"cleanup": "complete", "completed_steps": 2, "deploy_00002.pt": 81401259, "main_returned": true, "resume_00002.pt": 315570711, "status": "PASS"}}` → `ARM=cat VERIFY=0` → `=== RUNNER DONE ALL_ARMS_OK ===`。
+- window 汇总：`R7B_CAT_LAUNCHER_EXIT=0 SUPERVISOR_EXIT=0`；supervisor 报告 `status='ROOT_EXITED'`、`intervened=false`、`silent_seconds=5.0`、`stack_seconds=120`、`stop_seconds=180`。无 `STOPPED_BY_SUPERVISOR`。
+- 日志：`logs/mcl_ph_20260921/r7b_pretrain_cat.log`、`logs/mcl_ph_20260921/r7b_tmux_window.log`。
+
+**六、v2 初始化身份核验（§7）——通过**
+
+`pretrain_r7b/shared_new_init.pt`：schema `mcl-ph-shared-new-init-v2`、95 张量、4278237 B、SHA256 `499309392d578daf7a7baf1d102d7a7f5c652e5a9b42ca2904ac9d83d1fab85a`（与历史期望值一致，且与 r3b/r6 副本 `cmp` 逐字节相同）。三处引用实测全部等于该 SHA：`run.json identity.shared_new_init_sha256`、`step_0000.json shared_new_initialization.sha256`、`deploy source.shared_new_init_sha256`。
+
+**七、§8 CPU 只读 deployment 验证——FAILED（单一条款），根因已只读定位，非本轮引入**
+
+命令：`python tests/_mcl_ph_r3_deployment_check.py --pretrain-root results/mcl_ph_20260921/p1/pretrain_r7b --step 2 --arms cat --output results/mcl_ph_20260921/p1/pretrain_r7b/deployment_check.json` → 退出码 4，`status = FAILED`，`problems = ["cat: no shared tensor differs from the initial snapshot, so no update happened"]`。
+
+通过的条款：`strict_load=true`、`architecture=MCL-PH-O8-MultiscaleDistanceRouter`、`training_route=mcl_ph`、`fusion_mode=cat`、`step=2`、`inference_mode=top2`、`inference_top_k=2`、`dense_updates=500`、`tensor_count=170`、`parameter_count=20651691`、`shared_new_init_sha256` 与文件一致。未通过的只有「update 是否真的发生」这一条，其判据是 `changed_shared_tensors == 0`，而根因是**名称约定不匹配**：
+
+- `shared_new_state(model)` 取的是**完整 pretrainer** 的名字（前缀 `encoder.branch.`、`atom_head.`、`local_decoder.`、`nonbond_decoder.`）；`deployment_package(encoder, …)` 序列化的是 **encoder 自身** 的 `state_dict()`（`o8.*` / `branch.*` / `fusion.*`）。
+- 检查器直接做 `name in package['state_dict']`，两类名字永不相等（实测直接交集 = 0，加 `encoder.` 前缀仍是 0），因此 `shared_tensors = 0` → 无论训练是否发生都会报「no update happened」。
+- 该脚本自 r3 起未修改（`git log` 仅 `89789cb`），r7A（`8b44361`）只改了 4 个文件、未触碰它或 `src/modules/mcl_ph.py`；且 §13.3 记录（`MCL-PH.md:675`）明确写着该脚本「已写好并通过 `py_compile`，但**未运行**：不存在任何 `deploy_*.pt`」——r7B 是它的**首次执行**，不是回归。
+
+**等价事实的独立只读证据**（零 forward）：把初始化快照去掉 `encoder.` 前缀后与部署包比较，79/79 个共有张量**全部**不同于初始值，最大绝对差 `3.0174851417541504e-07`（与 lr 1e-7/2e-7 两步一致）；训练侧 loss 由 5.193426 降到 5.162579。故「没有发生更新」的结论**不成立**。
+
+按本轮规则：**不修代码**，该检查器缺陷连同上面证据交回 ChatGPT 决定修法（修法方向：比较前任一侧统一去掉 `encoder.` 前缀，并排除 16 个不属于 encoder 的预训练头张量）。
+
+**八、§9 resume ↔ deploy encoder 逐张量一致性——通过**
+
+纯 CPU、只读、零 forward：`resume['model']['encoder.<name>']` ↔ `deploy['state_dict']['<name>']`。
+
+| 指标 | 结果 |
+| --- | --- |
+| encoder 张量数（resume / deploy） | 170 / 170 |
+| 缺失 / 多余 | 0 / 0 |
+| shape 或 dtype 不一致 | 0 |
+| 数值不一致 | 0 |
+| `torch.equal == True` | **170 / 170** |
+| mismatch count | **0** |
+
+**九、§10 resume SHA 复现诊断**：本轮 `resume_00002.pt` 与 r6（以及 r3b）的 `resume_00002.pt` **SHA256 完全相同**（`e91bda10…`），在 r7A 只做数学等价改造的前提下，这是「改造未改变数值」的额外复现证据；未据此重跑任何训练。
+
+**十、预算核算**
+
+| 项目 | 上限 | 实际 |
+| --- | --- | --- |
+| CAT 训练启动 | ≤1 | **1（用满，无重试）** |
+| optimizer updates | ≤2 | **2（两步均真实完成）** |
+| 额外模型 forward / backward | 0 / 0 | **0 / 0**（验收仅 `torch.load` + CPU `load_deployment` 严格加载，无前向/反向） |
+| 微调 epoch | 0 | **0** |
+| GATE / XATTN / GLT_REF / O8_ONLY / P2 / P3 / outer-test / 新缓存 | 0 | **0** |
+| 其它 arm | 0 | **0**（`ARMS='cat'`） |
+| 外部总时限 | ≤15 min | **≈45 s** |
+| 修改范围 | 只允许文档 | **仅 `MCL-PH.md`**（本轮未改任何代码） |
+| 遗留进程 / GPU | 0 | **0**（无残留进程；`nvidia-smi --query-compute-apps` 为空） |
+
+**十一、未执行 / 未声称**
+
+- **未**运行 GATE / XATTN / GLT_REF / O8_ONLY / 微调 / P2 / P3 / outer-test / 5k；未增加 update；未新建缓存；未启动其它 arm。
+- **不声称** `P1 PASS`（本轮只得到「r7A 修复后的 CAT 两步真实 smoke 生产闭环通过」）；五臂验收、三条微调、M_GATE/M_XATTN 仍未完成。
+- **不声称**性能、收敛或泛化结论：本记录属**真实两步 smoke**，不是消融或正式实验；两步 loss 变化不能作为性能证据。
+- §8 的 `deployment_check.py` **未取得 PASS**（原因见「七」，已定位为检查器自身缺陷）；该缺陷**本轮未修**。
+- 未改写 r3–r7A 历史记录；未恢复根目录 `Plan.md`；未修改 `.zcodeignore`、`PH.md`、`3D.md`；r3 现场保持原状。
+
+**十二、提交与同步**：本轮只改 `MCL-PH.md`（追加本记录），提交与远端核对结果见下条补记。
 
 
 
