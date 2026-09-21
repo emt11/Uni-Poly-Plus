@@ -1354,7 +1354,7 @@ python tests/_mcl_ph_r3_deployment_check.py \
 - **无性能、收敛或泛化结论**；本记录属**实现 + 无模型测试 + 对既有产物的只读复验**，不是新的 smoke、消融或正式实验。
 - 未改写 r3–r7B 历史记录；未恢复根目录 `Plan.md`；未修改 `.zcodeignore`、`PH.md`、`3D.md`。
 
-**七、提交与同步**：本轮 3 个文件（checker、新增 regression、`MCL-PH.md`）提交与远端核对见下条补记。
+**七、提交与同步**：本轮 3 个文件（`tests/_mcl_ph_r3_deployment_check.py`、`tests/test_mcl_ph_r7c_deployment_check.py`、`MCL-PH.md`）提交为 **`2a519ee`**，非 force push 成功 `8c1454f..2a519ee dev -> dev`；`git ls-remote origin dev` = `2a519ee605e303c2455b6f15b40278aa466cabd1`，与本地 HEAD 一致。产物与日志位于 `results/mcl_ph_20260921/p1/pretrain_r7b/`（`deployment_check_r7c.json`）与 `logs/mcl_ph_20260921/`（`r7c_regression.log`、`r7c_final.log`），按 `.gitignore` 不提交，只按路径引用。**未自动启动 GATE/XATTN 或微调**；交回 ChatGPT/Codex 审查。
 
 
 
