@@ -507,3 +507,28 @@ XC 在三条路线中均为最低（0.279/0.226/0.309），与既有记录一致
 **上游背景（同周期）**：旧 C1 的 PH encoder 在下游失去可观测样本区分性（step 1000 仍可分辨、step 2000 低于容差、step ≥3000 逐位一致），机制为耦合 weight decay 压过被门控抑制的任务梯度（r2）；修复配方（PH 路径 `weight_decay=0` + `tanh(alpha)` 初值 0.02）在 5k 内不再退化，但门控自身收敛到 ≈2e-4（r4）。该背景不构成本轮下游结果的因果解释。
 
 **产物与提交**：`results/glt_galph_ph_retention_20260920/p4/{smoke_r6,development,development_aggregate.json,smoke_r6_verification.json,diagnostics_path_check.json}`；日志 `logs/glt_galph_ph_retention_20260920/{p3,p4}/`；提交链 `886623a`/`9c0bc7e`（r6），周期全链见 `PROJECT_HISTORY.md`。**本周期以该限定负结果结束，不再追加实验。**
+
+## GLT-3D-GAIN-20260921-01｜D2 四臂开发比较（2026-09-21，限定负结果）
+
+同一个 S5 `B_FP` step5000 部署包（`results/glt_pred_20260918/s3b_formal/b_fp/pretrain/deploy_05000.pt`）抽取的四臂，在 `mips_outer5_inner20` 上做单 seed、三任务两折的 30-epoch 开发比较（`configs/mts/glt_pred_s3b_b_fp.json`；seed 42、patience 10、batch 32、eval 64、wd 0.02、train-only scaler、validation 选最佳 checkpoint）。四臂唯一差别是学习率：`F2D` 只跑 O8（head 输入 `[norm2(z2), 0]`）、`FBASE` 双路原配置（o8/glt 1e-5、norm2/norm3 1e-4、head 1e-4）、`FNORM` 把 norm 降到 1e-5、`FSTABLE` 再把 GLT 降到 3e-6。
+
+| arm | xc | eps | eat | macro3 |
+| --- | --- | --- | --- | --- |
+| F2D | 0.41646 | 0.80583 | 0.98107 | **0.73445** |
+| FBASE | 0.38152 | 0.82123 | 0.98701 | 0.72992 |
+| FNORM | 0.38139 | 0.82122 | 0.98751 | 0.73004 |
+| FSTABLE | 0.38990 | 0.82256 | 0.98664 | 0.73303 |
+
+配对差值（逐任务两折均值 / macro3）：`FBASE − F2D` 为 xc **−0.03495**、eps +0.01541、eat +0.00594，macro3 **−0.00453**；`FNORM − FBASE` 为 xc −0.00013、eps −0.00001、eat +0.00050，macro3 **+0.00012**；`FSTABLE − FNORM` 为 xc **+0.00852**（两折 +0.00525／+0.01179）、eps +0.00134、eat −0.00087，macro3 **+0.00299**。
+
+预登记门槛（候选相对 FBASE **和** F2D 的 macro3 均 ≥ +0.005；XC 均值 ≥ +0.01 且两折为正；任一任务两折均值不降超 0.01）：**FNORM 与 FSTABLE 均未达到**——相对 FBASE 的 macro3 分别为 **+0.00012** 与 **+0.00311**，相对 F2D 分别为 **−0.00441** 与 **−0.00142**；FSTABLE 的 XC 均值 **+0.00838** 也低于 +0.01。聚合器 selection 为空；`fstable/xc/fold1` 的 best_epoch 触及 30 上限（按要求未延长训练）。预算：24/24 单元 PASS、0 失败 0 重试、**668/720 epochs**、**5544 optimizer updates**、网格墙钟 833 s。
+
+**解释边界（必须与数值同时引用）**
+
+* 这是**单 seed、三任务两折的开发比较**：**不是 outer-test**、**不是 OOF／refit**、**不是独立盲测**，也**不是显著性检验**；阈值只是工程分支条件，小数位级别的差值不能读作稳定收益。
+* **`FBASE − F2D` 为负不等于“3D 普遍无效”**：本轮只覆盖当前**单冻结 Trimer**、heavy-only token、无显式立构字段、30-epoch 开发预算的协议；xc 的差距集中在单折（fold0 −0.06650，fold1 −0.00339），且 eps／eat 上双路反而更高（+0.01541／+0.00594），属任务间收益抵消。
+* **FNORM 在本轮等价于无效改动**：与 FBASE 的差异落在第 4–5 位小数（最大单折 +0.00099），不能据此判定 norm 分组机制不存在。
+* **FSTABLE 是唯一有动向的杠杆但仍不足**：XC 均值 +0.00838 未达 +0.01，macro3 +0.00311 未达 +0.005，且与 F2D 相比 XC 仍为 −0.02656；eat 出现 −0.00038 的小幅回退。
+* 公共随机流的末态摘要因各臂早停长度不同而不同，**不作跨臂相等要求**；`best.pt` 只是 validation 最佳权重，**不是完整训练 resume 状态**。
+
+**产物与提交**：`results/glt_3d_gain_20260921/d2_development/{schedule.json,grid_runtime.json,aggregate.json,report.md,<arm>/<task>/fold<k>/}`；日志 `logs/glt_3d_gain_20260921/d2_development*/`；tmux window `glt3d_r6_dev`。提交链 `95e3185`（r1 D0/D1）→ `563668f`（r2）→ `eae7b81`（r3）→ `4d9f302`（r4）→ `751a35b`（r5）→ `6aba976`／`1981466`（r6 与记录补记），全部推送至 `origin/dev`。**本周期以该限定负结果结束，不追加 sweep、D3、PH 或额外 seed。**
