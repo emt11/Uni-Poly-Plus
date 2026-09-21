@@ -1055,6 +1055,7 @@ python tests/_mcl_ph_r5_stall_supervisor.py --root-pid <launcher pid> \
 - 产物与证据：`results/mcl_ph_20260921/p1/pretrain_r6/`（`cat/` 阶段日志、栈、FAILED 记录、resume；`stall_supervisor.json`、`stall_supervisor_manual_stop.json`、`shared_new_init.pt`）；日志 `logs/mcl_ph_20260921/r6_pretrain_cat.log`、`logs/mcl_ph_20260921/r6_tmux_window.log`。
 - 未改动：模型数学/初始化/数据语义/超参/batch/worker 数；r3 现场（`pretrain_r3b/cat/runtime.json` 仍 `RUNNING`）；r4 恢复导出候选；`.zcodeignore`（`7fc7779` 由用户提交，本轮未碰）。
 - 未取得：部署包与 §三 的 CPU/strict-load 核验；gate/xattn 与微调线索；任何性能结论。
+- 提交与同步：本轮改动（仅 `MCL-PH.md`）提交为 `f7f42f2`；首次 `git push` 因 `gnutls_handshake() failed: The TLS connection was non-properly terminated.` 失败（本地提交已完成），随即重试成功 `7fc7779..f7f42f2 dev -> dev`（非 force），`git ls-remote origin dev` = `f7f42f279a794e2b3adab4e86863004e8bbec84d`，与本地 HEAD 一致。运行产物位于 `results/`、`logs/`（按 `.gitignore` 不提交，只按路径引用）；`.zcodeignore` 未修改。
 
 
 
