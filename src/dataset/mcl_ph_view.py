@@ -687,13 +687,105 @@ def reference_view(trimer, key, *, sigma, seed=42):
     return _perturb(trimer, sigma, view_generator(seed, key, 0, REFERENCE_SUBSTREAM))
 
 
+def validate_geometry_carrier(topology, trimer):
+    """The coordinate-free identity check ``build_dual_sample`` runs on a fallback row.
+
+    Exposed so that an offline consumer of the same presentation validates
+    exactly the carrier the online path validates, instead of re-implementing
+    the check and drifting from it.  A structurally complete row is accepted.
+    """
+    if not bool(getattr(trimer, 'trimer_geometry_valid', False)):
+        from .glt_dual import _validate_geometry_fallback_carrier
+
+        _validate_geometry_fallback_carrier(topology, trimer)
+
+
+class MCLPHView:
+    """Everything random about one presentation, drawn once, in stream order.
+
+    The motif mask and the coordinate noise come from the *same* generator, and
+    the mask is drawn first, so the noisy coordinates of a presentation are not a
+    function of ``(seed, key, position)`` alone.  Any consumer that needs those
+    coordinates -- the training stream, the audit passes and the offline
+    trajectory cache alike -- has to come through :func:`build_mcl_ph_view`, so
+    that no second implementation of the draw order can exist.
+    """
+
+    __slots__ = ('view', 'generator', 'mask', 'fallback', 'identity', 'base_view',
+                 'changed', 'field_view')
+
+    def __init__(self, view, generator, mask, fallback, identity, base_view, changed,
+                 field_view):
+        self.view = str(view)
+        self.generator = generator
+        self.mask = mask
+        self.fallback = fallback
+        self.identity = identity
+        self.base_view = base_view
+        self.changed = changed
+        self.field_view = field_view
+
+
+def build_mcl_ph_view(topology, trimer, smiles, *, seed, key, position, sigma=0.03,
+                      ratio=None, identity=None, view='noisy'):
+    """Draw the mask and the perturbation that define one presentation's 3D view.
+
+    ``view='noisy'`` is the pre-training configuration: the shared stream is
+    consumed as ``motif mask`` then ``coordinate noise``, in that order, so the
+    noisy coordinates depend on ``ratio`` as well as on ``sigma``.  A consumer
+    that skipped the mask draw would silently see a different molecule.
+
+    ``view='clean'`` keeps the frozen coordinates and draws nothing, which is the
+    fine-tuning and deployment configuration of section 5.3.
+    """
+    if sigma < 0 or not math.isfinite(float(sigma)):
+        raise ValueError('noise sigma must be finite and non-negative')
+    if ratio is not None and not 0 < float(ratio) < 1:
+        raise ValueError('the masking ratio must lie strictly inside (0,1)')
+    if str(view) not in {'noisy', 'clean'}:
+        raise ValueError('view must be noisy or clean')
+    generator = sample_generator(seed, key, position)
+    mask, fallback = None, False
+    if ratio is not None:
+        from .canonical_periodic import resolve_normalized_identity
+        from .glt_dual_pretrain import chemical_groups
+        if identity is None:
+            identity = resolve_normalized_identity(topology, smiles, require_fields=True)
+        mask, fallback = motif_mask(
+            topology, chemical_groups(identity['normalized_smiles']), generator, float(ratio))
+    shared = view == 'noisy'
+    changed = _perturb(trimer, sigma, generator) if shared else trimer
+    base_view = build_trimer_view(trimer)
+    field_view = build_trimer_view(changed) if shared else base_view
+    return MCLPHView(view, generator, mask, fallback, identity, base_view, changed,
+                     field_view)
+
+
+def cached_topology_trajectory(trajectory):
+    """Validate one cached ``[31,5]`` trajectory; the dtype is never converted.
+
+    A cache that is offered to the training path either matches the declared
+    online product exactly or is refused here: there is no code path that mixes
+    part of a cached presentation with part of a recomputed one.
+    """
+    value = np.asarray(trajectory)
+    shape = (len(ROUTER_RADII), DESCRIPTOR_COLUMNS)
+    if value.shape != shape:
+        raise ValueError(f'cached topology trajectory shape {value.shape} is not {shape}')
+    if value.dtype != np.float32:
+        raise ValueError(f'cached topology trajectory dtype {value.dtype} is not float32')
+    if not np.isfinite(value).all():
+        raise ValueError('cached topology trajectory contains NaN/Inf')
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Sample construction and collation
 # ---------------------------------------------------------------------------
 
 def prepare_mcl_ph_sample(topology, trimer, smiles, *, seed, key, position,
                           sigma=0.03, ratio=None, static=None, identity=None,
-                          statistics=None, view='noisy'):
+                          statistics=None, view='noisy', trajectory_override=None):
     """Build one MCL-PH sample and its independent supervision targets.
 
     ``view='noisy'`` is the pre-training configuration: the experts, the RBF,
@@ -706,25 +798,23 @@ def prepare_mcl_ph_sample(topology, trimer, smiles, *, seed, key, position,
     ``ratio=None`` disables the chemical mask (fine-tuning); otherwise the
     pre-existing 30% motif mask is drawn first from the shared stream, exactly
     as the dual route draws it, so the shared stream keeps its position.
+
+    ``trajectory_override`` replaces one and only one thing: the ``[31,5]``
+    topology trajectory that would otherwise be recomputed by
+    :func:`five_descriptors`.  Everything else -- the noisy coordinates, the
+    expert relations, the mask and every target -- is still built by this
+    function from the same stream.  An override that is not exactly the declared
+    product (shape, ``float32``, finite) is refused rather than repaired, so a
+    cached presentation can never be silently half-used.
     """
-    if sigma < 0 or not math.isfinite(float(sigma)):
-        raise ValueError('noise sigma must be finite and non-negative')
-    if ratio is not None and not 0 < float(ratio) < 1:
-        raise ValueError('the masking ratio must lie strictly inside (0,1)')
-    if str(view) not in {'noisy', 'clean'}:
-        raise ValueError('view must be noisy or clean')
     if static is None:
         raise ValueError('the MCL-PH route requires the frozen dual-static rows')
-    generator = sample_generator(seed, key, position)
-    mask, fallback = None, False
-    if ratio is not None:
-        from .canonical_periodic import resolve_normalized_identity
-        from .glt_dual_pretrain import chemical_groups
-        if identity is None:
-            identity = resolve_normalized_identity(topology, smiles, require_fields=True)
-        mask, fallback = motif_mask(
-            topology, chemical_groups(identity['normalized_smiles']), generator, float(ratio))
-    changed = _perturb(trimer, sigma, generator) if str(view) == 'noisy' else trimer
+    shared = build_mcl_ph_view(topology, trimer, smiles, seed=seed, key=key,
+                               position=position, sigma=sigma, ratio=ratio,
+                               identity=identity, view=view)
+    mask, fallback, changed = shared.mask, shared.fallback, shared.changed
+    identity = shared.identity
+    base_view, field_view = shared.base_view, shared.field_view
     clean = build_dual_sample(topology, trimer, smiles, identity=identity, static=static)
     result = clean
     if str(view) == 'noisy':
@@ -733,8 +823,6 @@ def prepare_mcl_ph_sample(topology, trimer, smiles, *, seed, key, position,
                       'bond_center', 'bond_type'):
             if not torch.equal(getattr(clean, field), getattr(result, field)):
                 raise ValueError('coordinate perturbation changed physical topology')
-    base_view = build_trimer_view(trimer)
-    field_view = build_trimer_view(changed) if str(view) == 'noisy' else base_view
     central_index, image_to_canonical, non_heavy_canonical = centre_mapping(
         topology, trimer, base_view)
     canonical_to_base = torch.as_tensor(
@@ -757,10 +845,18 @@ def prepare_mcl_ph_sample(topology, trimer, smiles, *, seed, key, position,
     edge_distance = torch.zeros(0)
     edge_type = torch.zeros(0, dtype=torch.long)
     if geometry_valid:
-        trajectory = five_descriptors(field_view.positions.numpy()).astype(np.float32)
+        trajectory = (five_descriptors(field_view.positions.numpy()).astype(np.float32)
+                      if trajectory_override is None
+                      else cached_topology_trajectory(trajectory_override))
         edge_index, edge_scale, edge_distance = expert_relations(field_view.positions)
         if int(edge_index.size(1)):
             edge_type = _bond_category(edge_index.t().contiguous(), bond_index, bond_type)
+    elif trajectory_override is not None:
+        # The online path stores the declared all-zero row for a sample without a
+        # usable geometry.  A cached row that says anything else is a mismatch
+        # between the cache and this run, not a richer trajectory.
+        if cached_topology_trajectory(trajectory_override).any():
+            raise ValueError('cached topology trajectory disagrees with an invalid geometry')
     result.mcl_z = element
     result.mcl_charge = charge
     result.mcl_aromatic = aromatic
@@ -983,7 +1079,7 @@ class MCLPHMicrobatchStream:
 
     def __init__(self, source, *, seed, world, rank, microbatch, accumulation,
                  start_step, max_steps, sigma, ratio, statistics, order=None,
-                 view='noisy'):
+                 view='noisy', trajectory_cache=None):
         from src.training.glt_dual_runtime import OrderedSampleStream
 
         self.source = source
@@ -1001,6 +1097,10 @@ class MCLPHMicrobatchStream:
         self.statistics = statistics
         self.order = order
         self.view = str(view)
+        # One reader per process: the cache opens its shards lazily, so a worker
+        # that never touches a shard never pays for it, and the 3 GB is never
+        # pickled into a worker.
+        self.trajectory_cache = trajectory_cache
 
     def __len__(self):
         return self.steps * self.accumulation
@@ -1020,7 +1120,9 @@ class MCLPHMicrobatchStream:
                 *self.source[index], seed=self.seed, key=key, position=position,
                 sigma=self.sigma, ratio=self.ratio,
                 static=self.source.static_for(index), statistics=self.statistics,
-                view=self.view))
+                view=self.view,
+                trajectory_override=(None if self.trajectory_cache is None
+                                     else self.trajectory_cache[position])))
         return mcl_ph_collate(rows)
 
 
@@ -1034,12 +1136,14 @@ __all__ = [
     'NONBOND_MAX_PAIRS', 'NONBONDED_CATEGORY', 'NORMALIZATION_STD_FLOOR',
     'PAIR_SUBSTREAM', 'RBF_BINS', 'RBF_CENTERS', 'RBF_WIDTH', 'REFERENCE_SUBSTREAM',
     'ROUTER_RADII', 'ROUTER_RADII_ARRAY', 'UNKNOWN_CATEGORY', 'VR_MAX_EDGE',
-    'TrimerView', 'aromatic_categories', 'build_trimer_view', 'centre_angle_rows',
+    'TrimerView', 'aromatic_categories', 'build_mcl_ph_view', 'build_trimer_view',
+    'cached_topology_trajectory', 'centre_angle_rows',
     'centre_mapping', 'charge_categories', 'connectivity_echo', 'descriptor_channel_variance',
     'distance_matrix', 'element_categories', 'expert_relations', 'five_descriptors',
-    'MCLPHMicrobatchStream', 'geometric_statistics', 'load_geometric_statistics',
+    'MCLPHMicrobatchStream', 'MCLPHView', 'geometric_statistics', 'load_geometric_statistics',
     'local_targets', 'mcl_ph_collate', 'normalise_geometric',
     'nonbond_candidates', 'persistence_pairs', 'physical_bonds',
     'prepare_mcl_ph_sample', 'rbf_features', 'reference_view',
-    'sample_nonbond_pairs', 'synchronised_mask', 'view_generator',
+    'sample_nonbond_pairs', 'synchronised_mask', 'validate_geometry_carrier',
+    'view_generator',
 ]

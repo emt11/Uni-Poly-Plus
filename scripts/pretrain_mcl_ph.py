@@ -366,6 +366,41 @@ def _step_diagnostics(model, report, batch, labels, world):
 _OUTPUT = [None]
 
 
+def _trajectory_cache_identity(config, *, batch_size, sample_index, source):
+    """The identity an offline topology cache must match field for field."""
+    from src.dataset.mcl_ph_trajectory_cache import cache_identity
+
+    return cache_identity(seed=int(config['seed']),
+                          noise_sigma=float(config['noise_sigma']),
+                          mask_ratio=float(config['atom_mask_ratio']),
+                          global_batch=int(batch_size),
+                          sample_index_split=sample_index['split'],
+                          sample_index_artifact_sha256=sample_index['sha256'],
+                          cohort_manifest_hash=source.cohort['manifest_hash'],
+                          dual_static_manifest_hash=source.static_cache.manifest_hash)
+
+
+def open_trajectory_cache(path, *, config, batch_size, sample_index, source):
+    """Open the offline topology cache and return ``(cache, identity block)``.
+
+    A cache that does not describe this run's presentations is refused here,
+    before the model is built and before any position is read.  ``None`` keeps
+    the declared online behaviour of every earlier MCL-PH run.
+    """
+    from src.dataset.mcl_ph_trajectory_cache import MCLPHTrajectoryCache, online_provenance
+
+    if not path:
+        return None, online_provenance()
+    expected = _trajectory_cache_identity(config, batch_size=batch_size,
+                                          sample_index=sample_index, source=source)
+    cache = MCLPHTrajectoryCache(path, expected=expected)
+    block = {'mode': 'cached', 'path': str(Path(path).resolve()),
+             'schema': cache.manifest['schema'], 'dtype': cache.manifest['dtype'],
+             'total_positions': cache.total_positions, 'shard_size': cache.shard_size,
+             'manifest_identity': expected}
+    return cache, block
+
+
 def _failure_exit_code(error):
     if isinstance(error, SystemExit):
         code = error.code
@@ -385,6 +420,8 @@ def main():
                         help='fixed shared initial state for the new parameters; created once '
                              'if it does not exist yet')
     parser.add_argument('--prep-workers', type=int, default=0)
+    parser.add_argument('--trajectory-cache', help='offline noisy-topology cache root; '
+                                                   'omitted means the declared online path')
     parser.add_argument('--diagnostics', action='store_true')
     parser.add_argument('--stop-after-step', type=int, default=0)
     parser.add_argument('--no-deploy', action='store_true')
@@ -458,6 +495,9 @@ def main():
         if batch_size % (micro * world):
             raise ValueError('microbatch * accumulation * world must equal global_batch')
         accumulation = batch_size // (micro * world)
+        trajectory_cache, trajectory_block = open_trajectory_cache(
+            args.trajectory_cache, config=config, batch_size=batch_size,
+            sample_index=sample_index, source=source)
         set_global_seed(int(config['seed']))
         base = MCLPHPretrainer(fusion_mode, dropout=float(config.get('dropout', 0.1)),
                                cutoffs=cutoffs, router_dense_updates=dense_updates,
@@ -502,7 +542,8 @@ def main():
             shared_new_init_sha256=shared_init['sha256'],
             fusion_mode=fusion_mode, cutoffs=list(cutoffs),
             router_dense_updates=dense_updates, router_top_k=top_k,
-            route='mcl_ph', third_task='none', use_md200=False)
+            route='mcl_ph', third_task='none', use_md200=False,
+            trajectory_cache=trajectory_block)
         ordered_keys = [key.hex() for key, _ in source.samples]
         resume_rng = None
         if args.resume:
@@ -526,14 +567,22 @@ def main():
             if not start < int(args.stop_after_step) <= stop:
                 raise ValueError('--stop-after-step must satisfy start < stop <= max_optimizer_steps')
             stop = int(args.stop_after_step)
+        if trajectory_cache is not None:
+            # Coverage is a property of the schedule, not of the data: the run may
+            # only read positions that a *completed* shard actually holds.
+            trajectory_cache.require_positions(stop * batch_size)
+            trajectory_block = trajectory_cache.provenance(
+                required_positions=stop * batch_size)
         if rank == 0:
             write_json(output / 'run.json', dict(identity=identity, command=sys.argv,
-                                                 accumulation=accumulation, stop_after_step=stop))
+                                                 accumulation=accumulation, stop_after_step=stop,
+                                                 trajectory_cache=trajectory_block))
             write_json(output / 'runtime.json', dict(
                 status='RUNNING', architecture=base.encoder.architecture_name,
                 command=sys.argv, config=config, identity=identity, rank=rank,
                 world_size=world, device=str(device), prep_workers=int(args.prep_workers),
                 diagnostics=bool(args.diagnostics), fusion_mode=fusion_mode,
+                trajectory_cache=trajectory_block,
                 parameter_count=int(sum(p.numel() for p in base.parameters())),
                 started_at_monotonic=time.perf_counter()))
             digest, summary = _parameter_snapshot(base)
@@ -557,7 +606,7 @@ def main():
                 source, seed=int(config['seed']), world=world, rank=rank,
                 microbatch=micro, accumulation=accumulation, start_step=start, max_steps=stop,
                 sigma=float(config['noise_sigma']), ratio=float(config['atom_mask_ratio']),
-                statistics=statistics)
+                statistics=statistics, trajectory_cache=trajectory_cache)
             prefetch = iter(torch.utils.data.DataLoader(
                 dataset, batch_size=None, num_workers=int(args.prep_workers),
                 prefetch_factor=4, persistent_workers=False, pin_memory=False))
@@ -585,7 +634,9 @@ def main():
                             key=source.samples[index][0].hex(), position=position,
                             sigma=float(config['noise_sigma']),
                             ratio=float(config['atom_mask_ratio']),
-                            static=source.static_for(index), statistics=statistics))
+                            static=source.static_for(index), statistics=statistics,
+                            trajectory_override=(None if trajectory_cache is None
+                                                 else trajectory_cache[position])))
                     prepared.append(mcl_ph_collate(rows))
             preparation_seconds = time.perf_counter() - prep_started
             lr = _scheduled_lr(step, config)
