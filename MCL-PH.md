@@ -1768,7 +1768,7 @@ timeout -k 60 14400 python3 -m torch.distributed.run --nproc_per_node=4 --standa
 
 
 
-### 13.14 r10R2 执行记录（ZCode 执行；2026-09-22 UTC；基准 `dev@9bad4c8` → 实现提交 `ff32085`；**离线 topology trajectory cache 实现并通过 hard gate；full 5.04M 构建运行中，构建器记录事故已定位并修复**）
+### 13.14 r10R2 执行记录（ZCode 执行；2026-09-22 UTC；基准 `dev@9bad4c8` → 实现提交 `ff32085`；**离线 topology trajectory cache 实现、通过 hard gate，full 5.04M 构建已完成并经独立校验**）
 
 **一、计划头**
 
@@ -1805,20 +1805,30 @@ timeout -k 60 14400 python3 -m torch.distributed.run --nproc_per_node=4 --standa
 **四、full build 事故：driver 记录中断（已定位、已修复，数据无损）**
 
 - **现象（04:39:47Z）**：driver 的进度日志停在 `04:39:45Z rows=93000`、manifest 的 `updated_at` 停在 `04:28:18Z` 且 `shards=[]`，但 24 个 worker 继续正常产出（05:19 仍 ≈140 positions/s）。
-- **根因（已用最小复现证明）**：CPython 3.11 `multiprocessing.Pool` 的两条语义叠加——(a) worker 抛出的异常会经结果流在 driver 主线程重新抛出；(b) `Pool.join()` 在 `pool._cache` 非空时（即迭代器未取完结果）会一直等待，而 `_handle_workers` 只有在 cache 排空后才给 worker 发哨兵。因此 driver 一旦中途异常退出循环，`finally: pool.close(); pool.join()` 就会**阻塞到整个任务队列被算完**（本例 ≈10 h），worker 却继续跑。最小复现：200 个 0.3 s 任务、消费 20 条结果后 `close()+join()` → 15.1 s 才返回（脚本 `/tmp/mp_deadlock_repro3.py`）。
-- **排除数据缺陷（只读证据）**：(i) 全量 zero-scan（`logs/mcl_ph_20260921/trajectory_cache_zeroscan.log`）显示 **shard 0–3 共 400,000 rows 零 zero row**（1600/1600 segment 可采纳），即前四个分片**没有缺口**；(ii) 用同一 `position_trajectory` 单进程复算 positions **88,000–100,000**（`logs/mcl_ph_20260921/p2r2_failure_probe.log`）→ **0 failure**。故该异常不是 per-position 数据故障；真实异常类型待 driver 退出时的 traceback（约 10 h 后随队列排空出现）。
-- **修复（§32 允许文件内，最小机制）**：① 每段写盘 flush 后由**写盘的进程**落 `build_state/segments/segment_<shard>_<first>.json`；② worker 不再向上抛异常，而是回传 `SEGMENT FAILED shard=… first_position=… <异常>`（定位到 position）；③ driver 以 **marker 为准**判定进度/完成（结果流只作失败报告），④ 结束/异常一律 `pool.terminate()`（不再 `close()+join()`），⑤ `--stall-seconds` 看门狗 + 有界重派（`--max-requeues`），⑥ 断点续建：已标记段不重算、manifest 丢失可由 marker 重建（`RECOVERED shard …`）、`--adopt-written-segments` 按「整段非零」规则接手已写数据（该规则只会把已写行判成需重建，不会反向）。
+- **根因（已由 driver 退出时的 traceback 确证）**：`ff32085` 版 driver 第 151 行是
+  `remaining = {index: sum(task[2] for task in tasks if task[0] == index) for index, _ in bounds}`。
+  `bounds = shard_bounds(...)` 是 `(first_position, rows)` 的列表，`for index, _ in bounds` 取到的是 **first position**（0, 100000, …）而不是 shard 序号；shard 0 因 first=0 恰好命中，driver 因此撑过了前 100,000 行，第一个 shard 1 的结果到达时父进程在 `remaining[shard] -= rows` 处抛 **`KeyError: 1`**。这与日志最后一行 `04:39:45Z rows=93000`（即第 400 个 250 行块 = 100,000 行附近）完全吻合。
+- **为什么“卡死”而不是立刻退出**：CPython 3.11 `multiprocessing.Pool` 的 `join()` 在 `pool._cache` 非空（结果迭代器未取完）时不会给 worker 发哨兵，因此 `finally: pool.close(); pool.join()` 会**阻塞到整个任务队列被算完**（本例 9.5 h）。该语义已用最小复现证明：200 个 0.3 s 任务、消费 20 条结果后 `close()+join()` → 15.1 s 才返回（`/tmp/mp_deadlock_repro3.py`）。
+- **结论修正**：此处先前记录的假设（把异常解释为“worker 抛出的异常经结果流在父线程重抛”）**已被 traceback 取代**——真实异常是**父进程自身的索引 bug**；`join()` 的排空语义（即“卡死”的原因）仍成立。**这是 driver 缺陷，不是数据、模型或 checkpoint 缺陷**，与下方只读证据一致。
+- **排除数据缺陷（只读证据）**：(i) 全量 zero-scan（`logs/mcl_ph_20260921/trajectory_cache_zeroscan.log`）显示 **shard 0–3 共 400,000 rows 零 zero row**（1600/1600 segment 可采纳）；(ii) 用同一 `position_trajectory` 单进程复算 positions **88,000–100,000**（`logs/mcl_ph_20260921/p2r2_failure_probe.log`）→ **0 failure**。
+- **数据无损**：原进程在被异常打断后仍把 **全部 5,040,000 行写完**（13:58:41Z 退出，`EXIT=1`），未产生任何缺口。
+- **修复（§32 允许文件内，最小机制）**：① 每段写盘 flush 后由**写盘的进程**落 `build_state/segments/segment_<shard>_<first>.json`；② worker 不再向上抛异常，而是回传 `SEGMENT FAILED shard=… first_position=… <异常>`（定位到 position）；③ driver 以 **marker 为准**判定进度/完成（结果流只作失败报告），**不再有任何 `bounds[shard]`/`remaining` 式下标算术**；④ 结束/异常一律 `pool.terminate()`（不再 `close()+join()`），⑤ `--stall-seconds` 看门狗 + 有界重派（`--max-requeues`），⑥ 断点续建：已标记段不重算、manifest 丢失可由 marker 重建（`RECOVERED shard …`）、`--adopt-written-segments` 按「整段非零」规则接手已写数据（该规则只会把已写行判成需重建，不会反向）。
 - **回归**：修复后单测 39→40 passed；§23 hard gate 重跑 **PASS**，且 cache shard sha256 与修复前**逐字节一致**（`84250fb2…122ed4`）。
 
-**五、full build 现状（进行中，未完成）**
+**五、full build 最终状态（已完成）**
 
 | 项目 | 值 |
 | --- | --- |
 | 启动 | 2026-09-22T04:28:18Z，tmux `Uni-Poly:mcl_ph_cache`，日志 `logs/mcl_ph_20260921/trajectory_cache_build.log` |
-| 参数 | 24 workers、shard 100 000、chunk 250、positions 0–5,039,999（51 分片）、CPU-only（无 GPU） |
-| 实测速率 | ≈140 positions/s（05:29Z 时 shard 0–3 完整、shard 4 部分、约 43.7 万 rows）；预计约 10 h 跑完 |
-| 现场 | `data/processed/mcl_ph_cache/p2_noisy_seed42_sigma003_step5000_v1/`（按 `.gitignore` 不提交） |
-| 完成后动作 | 用修复后的 builder `--adopt-written-segments` 采纳已写满段 → 仅补缺口 → 写 `manifest.json`（`complete=true`）→ reader 校验 `require_positions(5,040,000)` |
+| 参数 | 24 workers、shard 100 000、chunk 250、positions 0–5,039,999（51 分片）、CPU-only（无 GPU）；构建期 load1 ≈108–140（112 核） |
+| 数据完成 | 2026-09-22T13:58:41Z（末分片 `trajectory_5000000_5039999.npy` 写满 40 000 行）；原 driver 于同一时刻以 `EXIT=1` 退出并打印上述 traceback |
+| 墙钟 / 速率 | **9.51 h**（34 223 s）→ 5 040 000 rows，**平均 147.3 positions/s** |
+| 分片 | **51**（50 × 100 000 + 1 × 40 000） |
+| 体积 | **3 124 806 528 B = 2.91 GiB**（= 5 040 000 × 31 × 5 × 4 B，零额外开销；与 §6 预估一致） |
+| 收尾（采纳+补建） | `--adopt-written-segments`：**20 160/20 160 段全部采纳、0 段需要重算、0 zero row**；14:00:06Z 写出 `complete=true` 的 manifest（`completed_shards=51`、`adopted_segments=20160`、逐 shard sha256、`builder_commit=d711514`） |
+| reader 校验 | `MCLPHTrajectoryCache(root, required_positions=5 040 000)` 0.348 s 打开；51 shard 逐分片全量扫描 **0 zero row**、首次打开校验 **0 checksum 失配**；另用独立 `hashlib` 复算 51 个文件的 sha256，**0 失配** |
+| 端到端等价（采纳数据） | positions **0 / 1007 / 1 234 567 / 2 500 000 / 3 777 777 / 5 000 000 / 5 039 999**：`np.array_equal(cached, online trajectory)` 全部成立；带 `trajectory_override` 时 `mcl_trajectory / mcl_pos / mcl_masked / mcl_edge_index / mcl_edge_distance / mcl_edge_type` 与全部 19 个 label 字段 `torch.equal` 成立（含末位 5 039 999，即被采纳而非重算的数据） |
+| 现场 | `data/processed/mcl_ph_cache/p2_noisy_seed42_sigma003_step5000_v1/`（3 GB，按 `.gitignore` 不提交）；校验日志 `logs/mcl_ph_20260921/trajectory_cache_verify.log` |
 
 **六、预算核算**
 
@@ -1828,13 +1838,13 @@ timeout -k 60 14400 python3 -m torch.distributed.run --nproc_per_node=4 --standa
 | cached smoke | ≤ 2 steps | **2 steps**（另加同 smoke 的 online 对照 2 steps，非正式训练） |
 | 正式 CAT retry（`cat_r10r2`） | 0（须先经 ChatGPT 审查 cache 与 benchmark） | **0（未启动）** |
 | GATE / XATTN / Phase III 30 units / aggregate / downstream | 0 | **0** |
-| full cache 构建 | 授权（§14） | **运行中**（未完成） |
+| full cache 构建 | 授权（§14） | **完成 1 次**（9.51 h CPU；含一次 driver 事故的收尾采纳，未追加第二次全量构建） |
 
 **七、未执行 / 未声称**
 
-- cache **未完成**：目前无 `complete=true` 的 manifest，尚无 reader 可用的正式 cache；因此**未**把 §35 要求的「total bytes / shard count / build wall time」当作已完成事实。
-- 未启动 CAT/GATE/XATTN，未跑 downstream/finetune，未做任何性能或科学结论；§24 的 samples/s 是 4-rank 数据管线代理 benchmark，不是训练吞吐结论。
-- 未修改 `src/modules/mcl_ph*.py`（含 `mcl_ph_pretrain.py:77` 的既有 `global_sum` NameError，仅上报不修）。
-- 3 GB cache 不提交；`results/mcl_ph_20260921/p2/pretrain/cat/`（旧 CAT 现场）与 `shared_new_init.pt` 未被触碰。
+- cache 已完成并独立校验（`complete=true`、51 shard、0 缺口、0 校验失配、7 个跨全量位置逐位等价），但**未**据此声称任何训练/科学结论：§24 的 samples/s +52.9% 仍是 4-rank **数据管线**代理 benchmark，不是训练吞吐，也未验证 CAT/GATE/XATTN 的收益。
+- 未启动 CAT/GATE/XATTN，未跑 downstream/finetune/Phase III/aggregate；`results/mcl_ph_20260921/p2/pretrain/cat/`（旧 CAT 现场）与 `shared_new_init.pt`（SHA 未变）未被触碰。
+- 未修改 `src/modules/mcl_ph*.py`（含 `mcl_ph_pretrain.py:77` 的既有 `global_sum` NameError，仅上报不修）、fusion/router/loss/configs/finetune/aggregators/downstream。
+- 3 GB cache 不提交；事故期间使用的探针脚本在 `/tmp`，未纳入仓库。
 
-**八、提交与同步**：实现提交 `ff32085`（7 个文件，含两个新测试驱动脚本）已非 force push 到 `origin/dev`；本轮修复（segment marker + 失败上报 + terminate + 续建 + 单测 + 本节）见随后 commit。
+**八、提交与同步**：实现提交 `ff32085`、修复提交 `e2c89af`、trainer identity 测试提交 `d711514` 已非 force push 到 `origin/dev`；本轮收尾（§五最终数据、§四根因确证、§六/§七更新）见随后 commit。
