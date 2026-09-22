@@ -388,6 +388,8 @@ logs/mcl_ph_20260921/
 
 GPU/worker/超过一分钟的命令只能在tmux session `Uni-Poly` 独立window并保留日志；先查现有任务。不频繁监控：长训练默认每10分钟检查或事件触发，异常不等待下一轮。无授权不停止其他进程。Git按AGENTS先安全pull，显式暂存本轮文件，提交推送并核对远端，不提交缓存/权重/大日志。
 
+**正式 MCL-PH 预训练不得施加 wall-clock timeout（2026-09-22 用户指示）。** 生产路径本身没有任何时限：`scripts/pretrain_mcl_ph.py` 没有 `--timeout`、deadline 或 `alarm`；`dist.init_process_group` 只用 torch 默认的集合通信看门狗（仅在集合通信真正挂起时触发，不会停掉仍在推进的运行）；`StageLogger` 的 stall 看门狗只经 `faulthandler.dump_traceback_later` **打印栈**、不终止进程；已提交的 `scripts/run_mcl_ph_pretrain_smoke.sh` 无 `timeout`；`scripts/finetune_mcl_ph.py` 亦无。唯一的停止条件是 **step 预算**（`--stop-after-step` / config `max_optimizer_steps`）、外部信号，以及可选的外部停滞监督器 `tests/_mcl_ph_r5_stall_supervisor.py`（只在「stage 日志连续无进展」时对自身进程树发 SIGTERM，不限制持续有进展的运行）。r10 的 CAT 在 step 4928 被驱动侧 `timeout -k 60 14400` 杀掉，属**执行侧包装错误**（MCL 臂实测 ≈2.9 s/step，5000 步需 ≈4.2–4.5 h）；该包装不在仓库内，今后正式 5000-step 运行不得重新引入。
+
 阶段完成必须同时有代码/测试或运行证据、预算真实账目、完整产物、失败记录与边界；ZCode只标待审查，Codex才验收。性能问题只由匹配development和后续授权确认回答，不能用smoke或strict-load替代。
 
 当前完成的是**计划文档**。P0/P1/P2/P3均未执行。第一建议授权范围仅P0＋P1；通过后由Codex根据成本和正确性决定下一步。旧PH retention、旧D2及3D.md预算不续用，历史超额不追认。
