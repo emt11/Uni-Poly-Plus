@@ -1946,3 +1946,75 @@ paired 逐步差（online − cached，steps 1–30）：总和 **+43.41 / +43.9
 - 未修改 cache builder、未重建 cache；`src/dataset/mcl_ph_trajectory_cache.py` 的 `verify_checksums=True` 默认未被删除。
 
 **十、提交与同步**：代码提交 `a4ec194`（hot path + 4 项针对性测试）已 push 到 `origin/dev`；本节与两个证据脚本见随后 commit。
+
+### 13.16 r10R2-perf-rev 执行记录（ZCode 执行；2026-09-22 UTC；基准 `dev@954310c`；**反序 cross-over 消除运行顺序混杂 + 修订性能 acceptance**）
+
+**一、计划头**
+
+| 项目 | 内容 |
+| --- | --- |
+| 计划 ID / 修订 | `MCL-PH-20260921-01` / **r10R2-perf-rev**（用户当轮消息） |
+| 授权来源 | 用户当轮消息：执行 reverse-order cross-over（cached 先跑）以消除上一轮固定 `online → cached` 顺序造成的热缓存/运行顺序混杂；**并明确自本轮起把性能 acceptance 改为**「`cached training_seconds_full < online` 且 `cached training_seconds_steady < online` 且 `cached steady p90 step_seconds <= online` 且 numerical equivalence PASS」，`median step_seconds` 仅报告、不再作为 PASS/FAIL gate |
+| 时间顺序（**不追溯改写**） | §13.15 的判定（按旧 median-step 合并 gate，`all_three_cached_faster = false`）**保持原样，本轮不改写、不覆盖、不重新解释**；修订 gate 自本轮（§13.16）起生效，依据即上述用户消息 |
+| 角色 | 执行：ZCode；规划/审查：ChatGPT（Codex 角色） |
+| 基线 commit | `dev@954310c17090151cb59dffc082cba41ac01d4af5`（= remote HEAD；`git pull --ff-only` up-to-date；开始前工作区干净、无正式训练进程、4 GPU 空闲） |
+| 本轮禁止项（已遵守） | **未修改**模型、数据、cache 内容、PH 定义、fusion、router、loss、训练配置；未重建 cache；未启动 CAT/GATE/XATTN 5000-step、downstream、P3、outer-test；未覆盖上一轮 benchmark 或任何正式 P2 目录 |
+| 预算 | 6 starts × 30 updates = **180 optimizer updates**（performance validation，不计入 P2 pretraining budget，不用于模型排名） |
+
+**二、代码改动**
+
+生产代码**零改动**（仍为 `a4ec194` 的 production reader）。本轮仅新增两个证据脚本并更新本节：`tests/_mcl_ph_r10r2perfrev_bench.sh`（反序 launcher）、`tests/_mcl_ph_r10r2perf_crossover.py`（两种顺序并列分析 + 修订 gate + cross-over 判定，可复算）。两次运行都不修改 cache 内容：`data/processed/mcl_ph_cache/p2_noisy_seed42_sigma003_step5000_v1` 只读挂载（manifest 仍为 `complete=true`、51 shards、5 040 000 positions、builder_commit `d711514`）。
+
+**三、设置（与 A 轮逐项 matched，仅顺序不同）**
+
+新 scratch root `results/mcl_ph_20260921/p2r2_perf_bench_rev/`（含 `README.md` 标注 **PERF BENCH (reverse order)**）；顺序 CAT cached→online、GATE cached→online、XATTN cached→online；world 4、seed 42、各臂同 config、同一 `shared_new_init.pt`（SHA 前后 `499309392d578daf7a7baf1d102d7a7f5c652e5a9b42ca2904ac9d83d1fab85a`）、同 sample-index（pretrain_split_v1/train）、microbatch 84、accumulation 3、global_batch 1008、BF16、`--diagnostics`、`--prep-workers 12`、`--stop-after-step 30`；唯一数据路径差异 = cached 传 `--trajectory-cache data/processed/mcl_ph_cache/p2_noisy_seed42_sigma003_step5000_v1`。**6/6 `EXIT=0`**，日志无 NaN/Inf。上一轮 root 未被触碰：`find … | sha256sum` 指纹前后同为 `0f3e48a1…b36fa`。
+
+**四、数值等价（steps 1/2）与 sample ordering——两种顺序、三臂全部 PASS**
+
+| arm | A 轮（online 先） | B 轮（cached 先） | sample ordering |
+| --- | --- | --- | --- |
+| cat | PASS | PASS | `ordered_keys` 911 391 键逐位相同、`next_position` 相同 |
+| gate | PASS | PASS | 同上 |
+| xattn | PASS | PASS | 同上 |
+
+核对字段：losses（三项分项逐位）、update_denominators、grad_total_preclip、router_mode（dense）、valid_graphs、target_counts。额外确定性证据：**跨顺序**同 arm 的 steps 1/2 losses 与 grad_total_preclip 亦逐位相同（例：cat step2 atom `5.16257905960083`；gate `5.007333755493164`；xattn `4.9781174659729`，两种顺序一致）。未重复 full cache checksum，也未重复 1008-position equality gate。
+
+**五、两种顺序并列统计（steps 1–30 full；steps 6–30 steady；单位 s）**
+
+| order | arm | mode | wall | full | steady | step med | p90 | p99 | max | prep med | prep p90 | prep max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A online→cached | cat | online | 125.3 | 97.17 | 69.28 | 0.555 | 6.522 | 8.566 | 8.566 | 0.139 | 3.578 | 4.614 |
+| A | cat | cached | 81.4 | 53.77 | 38.24 | 0.521 | 3.424 | 7.539 | 7.539 | 0.014 | 1.784 | 2.137 |
+| A | gate | online | 125.4 | 97.01 | 68.72 | 0.541 | 8.497 | 11.086 | 11.086 | 0.012 | 2.898 | 5.582 |
+| A | gate | cached | 81.2 | 53.05 | 36.64 | 0.571 | 3.430 | 3.475 | 3.475 | 0.002 | 2.422 | 2.905 |
+| A | xattn | online | 124.9 | 97.67 | 71.23 | 0.535 | 8.376 | 11.267 | 11.267 | 0.012 | 2.438 | 5.569 |
+| A | xattn | cached | 80.7 | 52.88 | 36.07 | 0.551 | 3.246 | 4.477 | 4.477 | 0.001 | 1.125 | 2.041 |
+| **B cached→online** | cat | cached | 82.0 | **54.04** | **37.71** | 0.469 | **3.775** | 6.031 | 6.031 | 0.012 | 1.862 | 4.328 |
+| B | cat | online | 125.7 | 97.93 | 70.97 | 1.513 | 5.954 | 8.869 | 8.869 | 0.092 | 4.151 | 5.475 |
+| B | gate | cached | 81.2 | **53.96** | **36.21** | 1.053 | **3.264** | 4.443 | 4.443 | 0.001 | 2.922 | 3.942 |
+| B | gate | online | 127.1 | 99.01 | 72.45 | 0.460 | 9.032 | 12.931 | 12.931 | 0.012 | 2.745 | 5.524 |
+| B | xattn | cached | 81.0 | **52.63** | **36.74** | 0.543 | **3.350** | 5.193 | 5.193 | 0.002 | 1.103 | 2.291 |
+| B | xattn | online | 124.0 | 96.53 | 68.71 | 0.565 | 8.225 | 10.811 | 10.811 | 0.010 | 4.118 | 5.437 |
+
+speedup（online/cached）：A 轮 wall 1.541/1.544/1.547、full 1.807/1.829/1.847、steady 1.812/1.876/1.975、p90 1.905/2.477/2.580；B 轮 wall 1.533/1.565/1.531、full **1.812/1.835/1.834**、steady **1.882/2.001/1.870**、p90 1.577/2.767/2.455。
+
+**六、修订 gate 逐条判定（两种顺序）**
+
+| arm | order | full cached<online | steady cached<online | steady p90 cached≤online | equivalence | 该顺序成立 |
+| --- | --- | --- | --- | --- | --- | --- |
+| cat | A | ✔ (53.77<97.17) | ✔ (38.24<69.28) | ✔ (3.424≤6.522) | PASS | **是** |
+| cat | B | ✔ (54.04<97.93) | ✔ (37.71<70.97) | ✔ (3.775≤5.954) | PASS | **是** |
+| gate | A | ✔ (53.05<97.01) | ✔ (36.64<68.72) | ✔ (3.430≤8.497) | PASS | **是** |
+| gate | B | ✔ (53.96<99.01) | ✔ (36.21<72.45) | ✔ (3.264≤9.032) | PASS | **是** |
+| xattn | A | ✔ (52.88<97.67) | ✔ (36.07<71.23) | ✔ (3.246≤8.376) | PASS | **是** |
+| xattn | B | ✔ (52.63<96.53) | ✔ (36.74<68.71) | ✔ (3.350≤8.225) | PASS | **是** |
+
+**判定：`cached_pretraining_path = QUALIFIED`**（三个 arm、两种运行顺序均满足修订 gate 的四项条件；完整 5.04M cache 可作为 CAT/GATE/XATTN 正式预训练 production path）。
+
+median 仅报告、不作 gate，本轮数据也给出直接理由：同 arm 同 mode 的 steady median 在两种顺序间最多漂移 **+173%**（cat online 0.555→1.513）、**+84%**（gate cached 0.571→1.053），而同一对照下 full 变化 ≤2.1%、steady ≤5.4%、p90 ≤10.2%；xattn 的 median 条件在 A 轮 false、B 轮 true。旧 gate 判定（§13.15）与此不冲突且**保持不变**。
+
+**七、预算与未执行**
+
+180 updates（6×30，performance validation，不计入 P2 预算）；正式预训练/微调 **0**；CAT/GATE/XATTN 5000-step、downstream、outer-test、P3 **均未启动**。benchmark 产物全部位于 `results/mcl_ph_20260921/p2r2_perf_bench{,_rev}/`（`results/` 按 `.gitignore` 不提交）；`results/mcl_ph_20260921/p2/pretrain/` 与 cache 未被写入。未做任何模型优劣或科学结论：本轮只回答「cache 是否降低真实训练 wall/累计训练时间且不恶化 p90」。
+
+**八、提交与同步**：本轮证据脚本与本节见随后 commit（基线 `954310c`）；不自动启动 CAT/GATE/XATTN 5000-step、downstream、P3、outer-test。
