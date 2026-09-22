@@ -393,7 +393,12 @@ def open_trajectory_cache(path, *, config, batch_size, sample_index, source):
         return None, online_provenance()
     expected = _trajectory_cache_identity(config, batch_size=batch_size,
                                           sample_index=sample_index, source=source)
-    cache = MCLPHTrajectoryCache(path, expected=expected)
+    # The cache is 2.9 GiB and every rank would hash it again on first touch, which
+    # costs more than the online trajectory it replaces.  Integrity of a finished
+    # cache is a forensic pass (`MCLPHTrajectoryCache(path, verify_checksums=True)`,
+    # the reader's default, or `_mcl_ph_r10r2_pipeline_bench.py`), not a per-run cost.
+    # Identity, coverage, layout, dtype and file presence still fail closed here.
+    cache = MCLPHTrajectoryCache(path, expected=expected, verify_checksums=False)
     block = {'mode': 'cached', 'path': str(Path(path).resolve()),
              'schema': cache.manifest['schema'], 'dtype': cache.manifest['dtype'],
              'total_positions': cache.total_positions, 'shard_size': cache.shard_size,

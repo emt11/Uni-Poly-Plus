@@ -677,3 +677,123 @@ def test_trainer_refuses_a_cache_built_for_another_run(tmp_path):
                 cohort={'manifest_hash': 'e' * 64},
                 static_cache=types.SimpleNamespace(
                     manifest_hash=BASE_IDENTITY['dual_static_manifest_hash'])))
+
+
+# ---------------------------------------------------------------------------
+# The production entry point: no per-run shard hashing, everything else closed
+# ---------------------------------------------------------------------------
+
+def _trainer_arguments():
+    """The (config, sample_index, source) triple a matching run supplies."""
+    sample_index = {'sha256': BASE_IDENTITY['sample_index_artifact_sha256'],
+                    'split': BASE_IDENTITY['sample_index_split']}
+    source = types.SimpleNamespace(
+        cohort={'manifest_hash': BASE_IDENTITY['cohort_manifest_hash']},
+        static_cache=types.SimpleNamespace(
+            manifest_hash=BASE_IDENTITY['dual_static_manifest_hash']))
+    config = {'seed': BASE_IDENTITY['seed'], 'noise_sigma': BASE_IDENTITY['noise_sigma'],
+              'atom_mask_ratio': BASE_IDENTITY['mask_ratio'],
+              'global_batch': BASE_IDENTITY['global_batch']}
+    return config, sample_index, source
+
+
+def _open_production(path, **overrides):
+    import scripts.pretrain_mcl_ph as runner
+
+    config, sample_index, source = _trainer_arguments()
+    return runner.open_trajectory_cache(
+        str(path), config=overrides.get('config', config),
+        batch_size=overrides.get('batch_size', BASE_IDENTITY['global_batch']),
+        sample_index=overrides.get('sample_index', sample_index),
+        source=overrides.get('source', source))
+
+
+def test_the_production_reader_does_not_hash_shards(tmp_path, monkeypatch):
+    """The pre-training hot path reads the cache; it does not re-verify it.
+
+    Hashing every shard on first touch costs a full pass over 2.9 GiB per rank per
+    run, which is the cost this test pins down: the entry point must not call the
+    hasher at all, while the reader's own default keeps calling it.
+    """
+    pytest.importorskip('torch')
+    import src.dataset.mcl_ph_trajectory_cache as cache_module
+
+    write_cache(tmp_path)
+    hashed = []
+    real = cache_module.sha256_file
+    monkeypatch.setattr(cache_module, 'sha256_file',
+                        lambda path: (hashed.append(Path(path).name), real(path))[1])
+    cache, block = _open_production(tmp_path)
+    assert block['mode'] == 'cached'
+    for position in range(ROWS):
+        assert cache[position].shape == SHAPE
+    assert hashed == [], 'the production reader must not hash shards'
+
+    # The forensic default is untouched: a direct open hashes every shard it reads.
+    forensic = MCLPHTrajectoryCache(tmp_path)
+    for position in range(ROWS):
+        forensic[position]
+    assert hashed == [shard_file_name(*bound) for bound in shard_bounds(SHARD_SIZE, ROWS)], \
+        'verify_checksums=True stays the reader default'
+
+
+def test_the_production_reader_trades_the_hash_for_the_field_checks(tmp_path):
+    """Disabling hashing hides byte corruption from the run, and only that.
+
+    This is the documented trade-off rather than a defect: a corrupted row is read
+    as-is by the production path and rejected by the forensic default.
+    """
+    pytest.importorskip('torch')
+
+    write_cache(tmp_path)
+    path = tmp_path / SHARDS_DIRNAME / shard_file_name(0, SHARD_SIZE)
+    handle = np.load(path, mmap_mode='r+', allow_pickle=False)
+    handle[0] = np.full(SHAPE, np.float32(-1.0), dtype=np.float32)
+    handle.flush()
+    del handle
+
+    cache, _ = _open_production(tmp_path)
+    assert np.array_equal(cache[0], np.full(SHAPE, np.float32(-1.0), dtype=np.float32))
+    with pytest.raises(ValueError, match='manifest hash'):
+        MCLPHTrajectoryCache(tmp_path)[0]
+
+
+def test_the_production_reader_still_fails_closed_without_checksums(tmp_path):
+    """Every guard that is not the content hash still stops the run."""
+    pytest.importorskip('torch')
+
+    write_cache(tmp_path)
+    cache, _ = _open_production(tmp_path)
+    assert cache.require_positions(ROWS)
+
+    for field, value in (('seed', 7), ('noise_sigma', 0.05), ('atom_mask_ratio', 0.5)):
+        with pytest.raises(ValueError, match='identity mismatch'):
+            _open_production(tmp_path, config=dict(_trainer_arguments()[0], **{field: value}))
+    with pytest.raises(ValueError, match='identity mismatch'):
+        _open_production(tmp_path, batch_size=16)
+    with pytest.raises(ValueError, match='identity mismatch'):
+        _open_production(tmp_path,
+                         sample_index=dict(_trainer_arguments()[1], sha256='d' * 64))
+    with pytest.raises(ValueError, match='identity mismatch'):
+        _open_production(tmp_path, source=types.SimpleNamespace(
+            cohort={'manifest_hash': 'e' * 64},
+            static_cache=types.SimpleNamespace(
+                manifest_hash=BASE_IDENTITY['dual_static_manifest_hash'])))
+
+    last_first, last_rows = shard_bounds(SHARD_SIZE, ROWS)[-1]
+    (tmp_path / SHARDS_DIRNAME / shard_file_name(last_first, last_rows)).unlink()
+    with pytest.raises(FileNotFoundError, match='shard is missing'):
+        cache[last_first]
+    assert cache[0].shape == SHAPE
+
+
+def test_the_production_reader_refuses_incomplete_coverage(tmp_path):
+    """A missing shard is refused by coverage, independently of hashing."""
+    pytest.importorskip('torch')
+
+    write_cache(tmp_path, shards=[0, 1])
+    cache, block = _open_production(tmp_path)
+    assert block['total_positions'] == ROWS
+    with pytest.raises(ValueError, match='incomplete over the requested range'):
+        cache.require_positions(ROWS)
+
