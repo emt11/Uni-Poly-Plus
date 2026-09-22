@@ -1848,3 +1848,101 @@ timeout -k 60 14400 python3 -m torch.distributed.run --nproc_per_node=4 --standa
 - 3 GB cache 不提交；事故期间使用的探针脚本在 `/tmp`，未纳入仓库。
 
 **八、提交与同步**：实现提交 `ff32085`、修复提交 `e2c89af`、trainer identity 测试提交 `d711514` 已非 force push 到 `origin/dev`；本轮收尾（§五最终数据、§四根因确证、§六/§七更新）见随后 commit。
+
+### 13.15 r10R2-perf 执行记录（ZCode 执行；2026-09-22 UTC；基准 `dev@5e29c4f` → 代码提交 `a4ec194`；**hot path 去掉 per-run shard HASH + 三臂 paired 真实训练 benchmark**）
+
+**一、计划头**
+
+| 项目 | 内容 |
+| --- | --- |
+| 计划 ID / 修订 | `MCL-PH-20260921-01` / **r10R2-perf**（用户当轮消息） |
+| 授权来源 | 用户当轮消息：① 删除正式训练 cache reader hot path 中重复的 shard SHA256 扫描（保留 `verify_checksums=True` 作为显式 forensic/debug 能力）；② 用真实训练循环确认 CAT/GATE/XATTN 三臂 cached wall 低于 online |
+| 角色 | 执行：ZCode；规划/审查：ChatGPT（Codex 角色） |
+| 基准 commit | `dev@5e29c4f`（= remote HEAD，本轮开始前 `git pull --ff-only` 为 up-to-date）；本轮代码提交 **`a4ec194`** |
+| 允许 / 禁止 | 只改 production 打开路径 + 针对性测试 + 本节；**未**修改或重建 cache builder、未改 `src/dataset/mcl_ph_trajectory_cache.py` 的 reader 能力；未启动 5000-step retry、downstream、outer-test、P3；未覆盖任何正式 pretrain 目录 |
+| 预算 | 6 个 scratch start × 每个 ≤30 updates = **180 updates**（性能验证，不计入 P2 pretraining 预算，不用于任何模型/科学排名） |
+
+**二、代码改动（最小）**
+
+| 文件 | 变化 |
+| --- | --- |
+| `scripts/pretrain_mcl_ph.py` | `open_trajectory_cache()` 改为 `MCLPHTrajectoryCache(path, expected=expected, **verify_checksums=False**)`，并加注释说明：2.9 GiB × 每 rank 一次全量 HASH 的成本高于它省下的在线 trajectory；完整性属于显式 forensic 通道。reader 默认仍为 `verify_checksums=True`，本轮**未**改动 `src/dataset/mcl_ph_trajectory_cache.py` |
+| 仍然 fail-closed（未因关闭 SHA 而放宽） | schema、dtype=float32、shape `[31,5]`、seed、noise_sigma、mask_ratio、global_batch、sample-index split + split SHA256、cohort manifest hash、dual-static manifest hash、requested position coverage、shard 文件存在、`.npy` shape/dtype |
+
+**三、测试（只跑相关 cache tests）**
+
+`python3 -m pytest tests/test_mcl_ph_trajectory_cache.py -q` → **44 passed**（既有 40 + 新增 4），未跑全仓测试。
+
+| 新增测试 | 证明内容 |
+| --- | --- |
+| `test_the_production_reader_does_not_hash_shards` | 以计数 monkeypatch 替换 `sha256_file`：经 production 入口打开并读完 10 个 position（跨 3 个 shard）→ **HASH 调用 0 次**；同一个 cache 用 `MCLPHTrajectoryCache(path)`（默认）读同样位置 → 每个 shard 恰好 1 次（默认能力保留） |
+| `test_the_production_reader_trades_the_hash_for_the_field_checks` | 就地篡改 shard 字节（manifest 哈希过期）：production 路径按原值读出，forensic 默认路径报 `does not match its manifest hash` |
+| `test_the_production_reader_still_fails_closed_without_checksums` | seed / noise_sigma / atom_mask_ratio / global_batch / split-SHA / cohort-hash 逐项仍报 `identity mismatch`；删除 shard 文件后读取仍报 `FileNotFoundError: shard is missing` |
+| `test_the_production_reader_refuses_incomplete_coverage` | manifest 缺 shard 时 `require_positions` 仍报 `incomplete over the requested range` |
+
+**四、paired benchmark 设置（全部为真实训练入口）**
+
+6 次 `python3 -m torch.distributed.run --nproc_per_node=4 --standalone scripts/pretrain_mcl_ph.py`，`arm × mode`，scratch root `results/mcl_ph_20260921/p2r2_perf_bench/`（含 `README.md` 标注 **PERF BENCH**、非 P2 arm、不计预算）；`results/mcl_ph_20260921/p2/pretrain/` 只读未动。
+
+| matched 项 | 值 |
+| --- | --- |
+| world size / seed | 4 / 42（config） |
+| config | `configs/mts/mcl_ph_{cat,gate,xattn}.json`；三份除 `fusion_mode` 外逐键相同（microbatch 84、global_batch 1008、bf16、router_dense_updates 500、noise_sigma 0.03、atom_mask_ratio 0.3、cutoffs 2/3/4、`sample_index_artifact`=pretrain_split_v1 train） |
+| accumulation / global batch | 3（=1008/(84×4)）/ 1008 |
+| `shared_new_init.pt` | 同一个文件，运行前后 SHA 均为 `499309392d578daf7a7baf1d102d7a7f5c652e5a9b42ca2904ac9d83d1fab85a` |
+| sample-index | `results/glt_pred_20260918/s3b_prep/pretrain_split_v1.json` / train |
+| 其他 | `--diagnostics`、`--prep-workers 12`、`--stop-after-step 30`、BF16 |
+| **唯一变化** | 是否 `--trajectory-cache`（cached 指向完整 5.04M cache） |
+
+脚本与日志：`tests/_mcl_ph_r10r2perf_bench.sh`（launcher）、`tests/_mcl_ph_r10r2perf_analyse.py`（等价性 + 计时分析，可复算）；`logs/mcl_ph_20260921/p2r2perf_bench.log`、每臂 `results/mcl_ph_20260921/p2r2_perf_bench/{arm}_{mode}.stdout.log`；tmux `Uni-Poly:mcl_ph_perf_bench`。**6/6 `EXIT=0`**。
+
+**五、数值等价（steps 1 与 2）——三臂全部 PASS**
+
+| arm | losses（三项分项逐位相同） | update_denominators | grad_total_preclip | router_mode | 其他 |
+| --- | --- | --- | --- | --- | --- |
+| cat | step2 atom 5.16257905960083 / geometry 0.25275495648384094 / balance 0.00011761983478209004 | 相同 | 63.630943298339844（online=cached） | dense/dense | valid_graphs、target_counts 相同 |
+| gate | step1 atom 5.045283317565918（grad 94.16641998291016） | 相同 | 相同 | dense/dense | 同上 |
+| xattn | step2 atom 4.9781174659729 / geometry 0.2527552545070648 / balance 0.00011750062549253926 | 相同 | 相同 | dense/dense | 同上 |
+
+- sample ordering：两模式 `resume_00030.pt` 的 `ordered_keys`（911 391 个样本键）**逐位相同**，`next_position` 相同（30×1008=30 240）。
+- provenance：online = `{"mode":"online"}`；cached = `{"mode":"cached", path, schema, dtype, total_positions 5040000, shard_size 100000, manifest_identity(8 字段)}`。
+
+**六、性能（steady = steps 6–30；全程 = steps 1–30）**
+
+| arm | mode | 30-step wall (s) | 训练 30 步 (s) | steady 总和 (s) | mean | median | p90 | p99 | max | prep median | prep p90 | fb median |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| cat | online | 125.3 | 97.17 | 69.28 | 2.771 | 0.555 | 6.522 | 8.566 | 8.566 | 0.139 | 3.578 | 0.398 |
+| cat | cached | **81.4** | **53.77** | **38.24** | 1.529 | **0.521** | 3.424 | 7.539 | 7.539 | 0.014 | 1.784 | 0.387 |
+| gate | online | 125.4 | 97.01 | 68.72 | 2.749 | 0.541 | 8.497 | 11.086 | 11.086 | 0.012 | 2.898 | 0.458 |
+| gate | cached | **81.2** | **53.05** | **36.64** | 1.466 | 0.571 | 3.430 | 3.475 | 3.475 | 0.002 | 2.422 | 0.383 |
+| xattn | online | 124.9 | 97.67 | 71.23 | 2.849 | 0.535 | 8.376 | 11.267 | 11.267 | 0.012 | 2.438 | 0.447 |
+| xattn | cached | **80.7** | **52.88** | **36.07** | 1.443 | 0.551 | 3.246 | 4.477 | 4.477 | 0.001 | 1.125 | 0.411 |
+
+speedup（online/cached）：30-step wall **1.54 / 1.54 / 1.55×**；训练 30 步 **1.81 / 1.83 / 1.85×**；steady 总和 **1.81 / 1.88 / 1.98×**；steady mean 同量级；**steady median step 1.065 / 0.947 / 0.972×**（GATE、XATTN 的 cached median 反而略高 0.02–0.03 s）。
+
+steady 时间分解（prep / forward-backward / 其余）：cat 28.83/9.92/30.53 → **9.83/10.16/18.25**；gate 26.63/10.79/31.30 → **12.11/10.42/14.11**；xattn 23.72/11.34/36.17 → **7.77/11.10/17.20**。即 forward-backward 总和两模式相同（差异 ≤0.4 s），省下的是 prep 与**其余步内时间**（CPU 争用）。
+
+paired 逐步差（online − cached，steps 1–30）：总和 **+43.41 / +43.96 / +44.80 s**，中位数 +0.179 / +0.027 / +0.115 s，online 更慢的步数 **24 / 20 / 23（共 30）**；prep > 0.5 s 的步数 online **12** vs cached **8 / 8 / 7**。
+
+**七、对本轮验收条件的逐条判定**
+
+| 条件 | cat | gate | xattn |
+| --- | --- | --- | --- |
+| cached steady median `step_seconds` < online | **PASS**（0.521 < 0.555） | **FAIL**（0.571 > 0.541） | **FAIL**（0.551 > 0.535） |
+| cached 30-step total wall < online | PASS（81.4 < 125.3） | PASS（81.2 < 125.4） | PASS（80.7 < 124.9） |
+| numerical equivalence | PASS | PASS | PASS |
+| 无新的严重 tail regression | PASS（p90/p99/max 全面更小） | PASS | PASS |
+
+- **`all_three_cached_faster`（按字面合并条件，含 median 项）= false**；若以「30-step 总时间 + 数值等价 + 无 tail regression」为准 = **true**。本条如实并列，不选择有利版本。
+- 机制（有数据支持）：该管线用 DataLoader 预取，约 2/3 的步在两种模式下 `preparation_seconds ≈ 0.001 s`，因此 **median 对在线 PH 成本不敏感**；在线成本体现在队列排空的少数步（prep p90 2.4–3.6 s，online 12 步 prep >0.5 s）与 CPU 争用导致的其余步变慢（steady「其余」30.5–36.2 s → 14.1–18.3 s）。故 median 判据在 GATE/XATTN 上是 ±5% 量级的统计噪声，而总量差 1.5–1.9× 是一致的。
+- 局限（如实记录）：每对按用户指定顺序 online 先跑，cached 因此受益于 page cache / GPU 状态，但 prep 差值本身是 worker 的 CPU 工作（24.1/24.5/27.9 s），无法由 page cache 解释；steady 窗口仅 25 步，median 统计不稳定。**本轮不追加 GPU 运行**，是否更换判据（总时间/稳态总和/p90/p99/max）由规划方决定。
+
+**八、预算核算**：scratch benchmark **6 starts × 30 updates = 180 optimizer updates**（性能验证，不计入 P2 预算）；正式预训练/微调 **0**；5000-step retry、downstream、outer-test、P3 **均 0**。
+
+**九、未执行 / 未声称**
+
+- 未重跑 CAT/GATE/XATTN 5000-step，未跑 downstream/outer-test/P3，未用本 benchmark 做任何模型优劣或科学结论。
+- benchmark 产物仅在 scratch root（`results/` 按 `.gitignore` 不提交）；`results/mcl_ph_20260921/p2/pretrain/{cat,glt_ref,glt_ref_r10r1,shared_new_init.pt}` 未被写入或覆盖。
+- 未修改 cache builder、未重建 cache；`src/dataset/mcl_ph_trajectory_cache.py` 的 `verify_checksums=True` 默认未被删除。
+
+**十、提交与同步**：代码提交 `a4ec194`（hot path + 4 项针对性测试）已 push 到 `origin/dev`；本节与两个证据脚本见随后 commit。
