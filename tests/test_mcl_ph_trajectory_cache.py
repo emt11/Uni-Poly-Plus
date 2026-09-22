@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import pickle
 import sys
+import types
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -617,3 +618,62 @@ def test_no_resume_discards_shards_and_markers(tmp_path, synthetic_builder):
     manifest, _ = _build(tmp_path, extra=extra, resume=False)
     assert manifest['complete']
     assert len(calls.read_text(encoding='utf-8').split()) == 2 * len(position_chunks(4, ROWS, 3))
+
+
+# ---------------------------------------------------------------------------
+# The pre-training entry point
+# ---------------------------------------------------------------------------
+
+def test_trainer_refuses_a_cache_built_for_another_run(tmp_path):
+    """Sections 18/22: the entry point validates the whole identity, not a prefix.
+
+    A cached run whose identity does not match field for field must stop here --
+    before the model is built and before a single position is read -- rather
+    than fall back to the online trajectory for the disagreeing presentations.
+    """
+    pytest.importorskip('torch')
+    import scripts.pretrain_mcl_ph as runner
+
+    write_cache(tmp_path)
+    source = types.SimpleNamespace(
+        cohort={'manifest_hash': BASE_IDENTITY['cohort_manifest_hash']},
+        static_cache=types.SimpleNamespace(
+            manifest_hash=BASE_IDENTITY['dual_static_manifest_hash']))
+    sample_index = {'sha256': BASE_IDENTITY['sample_index_artifact_sha256'],
+                    'split': BASE_IDENTITY['sample_index_split']}
+    config = {'seed': BASE_IDENTITY['seed'], 'noise_sigma': BASE_IDENTITY['noise_sigma'],
+              'atom_mask_ratio': BASE_IDENTITY['mask_ratio'], 'global_batch': 1008}
+
+    cache, block = runner.open_trajectory_cache(
+        str(tmp_path), config=config, batch_size=BASE_IDENTITY['global_batch'],
+        sample_index=sample_index, source=source)
+    assert block['mode'] == 'cached' and block['schema'] == CACHE_SCHEMA
+    assert block['dtype'] == np.dtype(DESCRIPTOR_DTYPE).name
+    assert block['total_positions'] == ROWS and block['shard_size'] == SHARD_SIZE
+    assert block['manifest_identity']['mask_ratio'] == BASE_IDENTITY['mask_ratio']
+    assert cache.require_positions(ROWS)
+    assert runner.open_trajectory_cache(
+        None, config=config, batch_size=BASE_IDENTITY['global_batch'],
+        sample_index=sample_index, source=source) == (None, {'mode': 'online'})
+
+    for field, value in (('seed', 43), ('noise_sigma', 0.05), ('atom_mask_ratio', 0.5)):
+        with pytest.raises(ValueError, match='identity mismatch'):
+            runner.open_trajectory_cache(
+                str(tmp_path), config=dict(config, **{field: value}),
+                batch_size=BASE_IDENTITY['global_batch'], sample_index=sample_index,
+                source=source)
+    with pytest.raises(ValueError, match='identity mismatch'):
+        runner.open_trajectory_cache(str(tmp_path), config=config, batch_size=16,
+                                     sample_index=sample_index, source=source)
+    with pytest.raises(ValueError, match='identity mismatch'):
+        runner.open_trajectory_cache(
+            str(tmp_path), config=config, batch_size=BASE_IDENTITY['global_batch'],
+            source=source, sample_index=dict(sample_index, sha256='d' * 64))
+    with pytest.raises(ValueError, match='identity mismatch'):
+        runner.open_trajectory_cache(
+            str(tmp_path), config=config, batch_size=BASE_IDENTITY['global_batch'],
+            sample_index=sample_index,
+            source=types.SimpleNamespace(
+                cohort={'manifest_hash': 'e' * 64},
+                static_cache=types.SimpleNamespace(
+                    manifest_hash=BASE_IDENTITY['dual_static_manifest_hash'])))

@@ -1789,14 +1789,14 @@ timeout -k 60 14400 python3 -m torch.distributed.run --nproc_per_node=4 --standa
 | `src/dataset/mcl_ph_trajectory_cache.py`（新增） | `MCLPHTrajectoryCache` 只读 reader（`np.load(mmap_mode='r')`、惰性开 shard、fork 后重开映射、首次打开校验 manifest sha256、identity/coverage 失败即报错）；`position_trajectory(...)`（position → `OrderedSampleStream.index_at` → sample key → 共享 noisy view → `materialize_dual_geometry` 校验 → `five_descriptors`）；`TrajectoryCacheBuilder`（每段写盘后落 **segment marker**） |
 | `scripts/build_mcl_ph_trajectory_cache.py`（新增） | 分片并行 builder：**不**计算 2/3/4 Å 图、`edge_distance`、nonbond 候选、模型前反向与优化器；完成证据由文件系统（marker）而非 driver 内存承担；`--adopt-written-segments` 用于接手一份 driver 记录丢失的已写数据 |
 | `scripts/pretrain_mcl_ph.py` | 新增 `--trajectory-cache`；缺省 `trajectory_cache={'mode':'online'}`，提供时先按 run identity（seed/σ/mask ratio/global_batch/split/split-SHA/cohort hash/static hash）**精确校验**，并在 `run.json` / `runtime.json` 写入 `mode/path/schema/dtype/total_positions/shard_size/manifest_identity` |
-| `tests/test_mcl_ph_trajectory_cache.py`（新增） | 39 项：布局、reader 值/dtype/可写/惰性/pickle、8 个 identity 字段逐项拒绝、覆盖不足/缺 shard/损坏 sha/截断/shape-dtype/布局不符/无 manifest 全部拒绝、该 helper 的严格性、真实数据 online≡cached（`torch.equal`）、worker 数不变性（0/1/4/12）、以及本轮新增的 builder 驱动层（marker/续建/恢复/失败上报/采纳） |
+| `tests/test_mcl_ph_trajectory_cache.py`（新增） | 40 项：布局、reader 值/dtype/可写/惰性/pickle、8 个 identity 字段逐项拒绝、覆盖不足/缺 shard/损坏 sha/截断/shape-dtype/布局不符/无 manifest 全部拒绝、该 helper 的严格性、真实数据 online≡cached（`torch.equal`）、worker 数不变性（0/1/4/12）、以及本轮新增的 builder 驱动层（marker/续建/恢复/失败上报/采纳） |
 
 **三、验证结果（全部为真实执行）**
 
 | 验证 | 命令 / 产物 | 结果 |
 | --- | --- | --- |
 | §23 hard gate（真实 1 个 global batch） | `tests/_mcl_ph_r10r2_batch_gate.py`（positions 0–1007，DataLoader worker + inline 两条路径） | **PASS**：1008 samples，17 个 batch 字段 + 19 个 label 字段逐项相等，`mcl_fallback_count`、`mcl_statistics_applied` 相等；cache shard sha256 `84250fb2…122ed4` |
-| 单测 | `pytest tests/test_mcl_ph_trajectory_cache.py` | **39 passed**（含真实 cohort 等价性与 worker 不变性） |
+| 单测 | `pytest tests/test_mcl_ph_trajectory_cache.py` | **40 passed**（含真实 cohort 等价性、worker 不变性、以及 trainer 侧 identity 拒绝） |
 | 既有测试回归 | `test_mcl_ph_pretrain / protocol / modules` | 12 项失败**与本轮无关**：10 项为 `src/modules/mcl_ph_pretrain.py:77` 的 `global_sum` NameError（仅在不传 `global_count` 的调用下触发，生产调用点都传），2 项 launcher 协议测试早于本轮；已在 `git worktree`（`dev@9bad4c8`）复现同样失败 |
 | §13 worker benchmark（positions 0–19999） | `logs/mcl_ph_20260921/trajectory_cache_bench.log` | 12 workers **89.3/s**（224.0 s）、24 workers **117.0/s**（170.9 s，load1 66.9）、48 workers **109.3/s**（183.0 s，load1 182.7）→ 选择 **24 workers**（不按核数直接开 112） |
 | §24 数据管线 benchmark（4 rank × 12 workers，19 steps = 19,152 positions） | `results/mcl_ph_20260921/p2r2_gate/pipeline_{online,cached}.json` | online **220.32 samples/s**（86.93 s）vs cached **336.94 samples/s**（56.84 s）= **+52.9%**；max-over-ranks 每步 prep 等待 median 4.6725 → 1.9512 s（**−58.2%**）、p90 9.5332 → 6.4945 s（**−31.9%**）、p99 14.1065 → 7.3540 s、max 14.1065 → 7.3540 s；**无新增长尾** → §25 的「samples/s +30%」分支达成（p90 −50% 分支未达成，如实记录） |
@@ -1808,7 +1808,7 @@ timeout -k 60 14400 python3 -m torch.distributed.run --nproc_per_node=4 --standa
 - **根因（已用最小复现证明）**：CPython 3.11 `multiprocessing.Pool` 的两条语义叠加——(a) worker 抛出的异常会经结果流在 driver 主线程重新抛出；(b) `Pool.join()` 在 `pool._cache` 非空时（即迭代器未取完结果）会一直等待，而 `_handle_workers` 只有在 cache 排空后才给 worker 发哨兵。因此 driver 一旦中途异常退出循环，`finally: pool.close(); pool.join()` 就会**阻塞到整个任务队列被算完**（本例 ≈10 h），worker 却继续跑。最小复现：200 个 0.3 s 任务、消费 20 条结果后 `close()+join()` → 15.1 s 才返回（脚本 `/tmp/mp_deadlock_repro3.py`）。
 - **排除数据缺陷（只读证据）**：(i) 全量 zero-scan（`logs/mcl_ph_20260921/trajectory_cache_zeroscan.log`）显示 **shard 0–3 共 400,000 rows 零 zero row**（1600/1600 segment 可采纳），即前四个分片**没有缺口**；(ii) 用同一 `position_trajectory` 单进程复算 positions **88,000–100,000**（`logs/mcl_ph_20260921/p2r2_failure_probe.log`）→ **0 failure**。故该异常不是 per-position 数据故障；真实异常类型待 driver 退出时的 traceback（约 10 h 后随队列排空出现）。
 - **修复（§32 允许文件内，最小机制）**：① 每段写盘 flush 后由**写盘的进程**落 `build_state/segments/segment_<shard>_<first>.json`；② worker 不再向上抛异常，而是回传 `SEGMENT FAILED shard=… first_position=… <异常>`（定位到 position）；③ driver 以 **marker 为准**判定进度/完成（结果流只作失败报告），④ 结束/异常一律 `pool.terminate()`（不再 `close()+join()`），⑤ `--stall-seconds` 看门狗 + 有界重派（`--max-requeues`），⑥ 断点续建：已标记段不重算、manifest 丢失可由 marker 重建（`RECOVERED shard …`）、`--adopt-written-segments` 按「整段非零」规则接手已写数据（该规则只会把已写行判成需重建，不会反向）。
-- **回归**：修复后单测 39 passed；§23 hard gate 重跑 **PASS**，且 cache shard sha256 与修复前**逐字节一致**（`84250fb2…122ed4`）。
+- **回归**：修复后单测 39→40 passed；§23 hard gate 重跑 **PASS**，且 cache shard sha256 与修复前**逐字节一致**（`84250fb2…122ed4`）。
 
 **五、full build 现状（进行中，未完成）**
 
