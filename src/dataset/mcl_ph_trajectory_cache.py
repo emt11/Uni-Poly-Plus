@@ -27,12 +27,20 @@ Two consequences of the key choice are worth stating explicitly.
 The reader fails closed: an identity mismatch, a missing shard, a truncated or
 corrupt shard, or a run that needs more positions than the cache holds is an
 error, never a fallback to the online computation.
+
+Build state lives beside the shards rather than in the driver's memory.  Every
+work segment writes a small marker under ``build_state/segments/`` once its rows
+are flushed, so resuming, recovering from a failed driver and deciding whether a
+shard is finished all read the filesystem instead of trusting a process that may
+already be gone.  ``adopt_written_segments`` recovers an existing shard set whose
+markers were never written; the manifest stays the reader's only contract.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +55,15 @@ SHARD_PREFIX = 'trajectory'
 DEFAULT_SHARD_SIZE = 100_000
 DESCRIPTOR_DTYPE = np.float32
 SHARD_ROW_FIELDS = ('shard', 'file', 'first_position', 'rows', 'sha256')
+
+# Completion evidence of a build lives in the filesystem, one small JSON marker
+# per *segment* (the unit of work), written by the process that wrote the rows.
+# The driver's bookkeeping is derived from these markers rather than from the
+# worker result stream, so a driver-side failure can never make a ten-hour build
+# unreadable: the markers are still on disk and the next invocation adopts them.
+BUILD_STATE_DIRNAME = 'build_state'
+SEGMENTS_DIRNAME = 'segments'
+MARKER_FIELDS = ('shard', 'first_position', 'rows', 'finished_at', 'pid')
 
 # The fields that define *which* presentations the cache describes.  A run whose
 # identity differs in any of them is refused.  ``total_positions`` is coverage
@@ -168,6 +185,99 @@ def describe_shard(root, shard, first_position, rows):
     path = Path(root) / SHARDS_DIRNAME / shard_file_name(first_position, rows)
     return {'shard': int(shard), 'file': path.name, 'first_position': int(first_position),
             'rows': int(rows), 'sha256': sha256_file(path)}
+
+
+def segment_key(shard, first_position):
+    """The identity of one segment: its shard and its first position."""
+    return int(shard), int(first_position)
+
+
+def segment_marker_path(root, shard, first_position):
+    name = f'segment_{int(shard):05d}_{int(first_position):09d}.json'
+    return Path(root) / BUILD_STATE_DIRNAME / SEGMENTS_DIRNAME / name
+
+
+def write_segment_marker(root, shard, first_position, rows):
+    """Record, atomically, that one segment's rows are written.
+
+    The marker is written by the process that wrote the rows, after the mapping
+    was flushed, so its presence is evidence about the shard file -- not about
+    the driver, whose own bookkeeping may be lost.
+    """
+    path = segment_marker_path(root, shard, first_position)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {'shard': int(shard), 'first_position': int(first_position), 'rows': int(rows),
+               'finished_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+               'pid': os.getpid()}
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(payload, sort_keys=True) + '\n', encoding='utf-8')
+    os.replace(temporary, path)
+    return payload
+
+
+def read_segment_markers(root):
+    """Every written segment marker of a cache, keyed by ``(shard, first_position)``."""
+    directory = Path(root) / BUILD_STATE_DIRNAME / SEGMENTS_DIRNAME
+    if not directory.is_dir():
+        return {}
+    markers = {}
+    for path in sorted(directory.glob('*.json')):
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f'segment marker {path.name} is unreadable: {exc}') from exc
+        missing = [name for name in MARKER_FIELDS if name not in payload]
+        if missing:
+            raise ValueError(f'segment marker {path.name} is missing: ' + ','.join(missing))
+        key = segment_key(payload['shard'], payload['first_position'])
+        if int(payload['rows']) <= 0:
+            raise ValueError(f'segment marker {path.name} declares {payload["rows"]} rows')
+        if key in markers:
+            raise ValueError(f'segment marker {path.name} repeats {key}')
+        markers[key] = payload
+    return markers
+
+
+def adopt_written_segments(root, shard_size, total_positions, *, chunk_size, log=None):
+    """Mark the segments of an existing shard set whose rows are already written.
+
+    A shard file is created as a sparse zero-filled ``.npy`` and every row is
+    written exactly once by the segment that owns it, so a row that is still all
+    zeros was never written -- unless the online path legitimately stores the
+    declared zero trajectory of an invalid geometry.  Adoption therefore accepts
+    a segment only when *all* of its rows are non-zero and reports the rest as
+    missing, which can only turn a written row into a rebuild, never the other
+    way round.  It exists to recover a build whose driver lost its bookkeeping.
+    """
+    root = Path(root)
+    bounds = shard_bounds(shard_size, total_positions)
+    handles, adopted, missing, zero_rows, segments = {}, 0, [], 0, 0
+    for shard, first_position, rows in position_chunks(shard_size, total_positions, chunk_size):
+        segments += 1
+        index, offset = shard, int(first_position) - bounds[shard][0]
+        if shard not in handles:
+            path = root / SHARDS_DIRNAME / shard_file_name(*bounds[shard])
+            if not path.is_file():
+                raise FileNotFoundError(f'trajectory cache shard is missing: {path}')
+            handles[shard] = np.load(path, mmap_mode='r', allow_pickle=False)
+        block = handles[shard][offset:offset + int(rows)]
+        zeros = int(np.count_nonzero(~np.asarray(block).any(axis=(1, 2))))
+        if zeros:
+            zero_rows += zeros
+            if len(missing) < 16:
+                missing.append({'shard': int(index), 'first_position': int(first_position),
+                                'rows': int(rows), 'zero_rows': zeros})
+            continue
+        write_segment_marker(root, shard, first_position, rows)
+        adopted += 1
+    for handle in handles.values():
+        del handle
+    summary = {'segments': segments, 'adopted': adopted, 'missing_count': segments - adopted,
+               'missing': missing, 'zero_rows': zero_rows}
+    if log is not None:
+        log(f'=== ADOPTED {adopted}/{segments} written segment(s); '
+            f'{summary["missing_count"]} still to build, {zero_rows} zero row(s)')
+    return summary
 
 
 class MCLPHTrajectoryCache:
@@ -400,7 +510,12 @@ class TrajectoryCacheBuilder:
         self.source_base.close()
 
     def build_chunk(self, shard, first_position, positions):
-        """Fill ``positions`` rows of one shard; writers touch disjoint row ranges."""
+        """Fill ``positions`` rows of one shard; writers touch disjoint row ranges.
+
+        The segment marker is written only after the rows are flushed, so a
+        segment whose computation raised keeps no marker and is rebuilt rather
+        than trusted.
+        """
         shard = int(shard)
         first, rows = self.bounds[shard]
         path = self.output / SHARDS_DIRNAME / shard_file_name(first, rows)
@@ -418,6 +533,7 @@ class TrajectoryCacheBuilder:
             handle.flush()
         finally:
             del handle
+        write_segment_marker(self.output, shard, first_position, positions)
         return int(positions)
 
     def _trajectory(self, position):

@@ -5,12 +5,17 @@ One row per *presentation position* of the declared pre-training schedule, never
 per molecule: position ``p`` is resolved through the same ``OrderedSampleStream``
 and the same shared noisy-view draw the training run uses, and the stored value
 is the ``[31, 5]`` float32 trajectory the online path would compute for it.  The
-build is CPU-only and shard-parallel; a completed shard is never rebuilt, and an
-incomplete shard is rebuilt from its start rather than partially trusted.
+build is CPU-only and shard-parallel; a completed segment is never rebuilt, and
+an incomplete one is rebuilt from its start rather than partially trusted.
 
 The script deliberately stops before everything the training path does after the
 trajectory: no expert relations, no non-bond candidates, no model, no forward or
 backward pass.  Those stay online.
+
+Progress is tracked through the segment markers the workers write, not through
+the pool's result stream, and the pool is always torn down with ``terminate()``:
+a worker that fails is reported instead of derailing the driver, and a driver
+that fails still leaves a cache the next invocation can resume from.
 """
 import argparse
 from datetime import datetime, timezone
@@ -22,15 +27,19 @@ import resource
 import subprocess
 import sys
 import time
+import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.dataset.mcl_ph_view import DESCRIPTOR_COLUMNS, ROUTER_RADII
-from src.dataset.mcl_ph_trajectory_cache import (CACHE_SCHEMA, DESCRIPTOR_DTYPE,
-                                                 MANIFEST_NAME, SHARDS_DIRNAME,
-                                                 TrajectoryCacheBuilder, cache_identity,
+from src.dataset.mcl_ph_trajectory_cache import (BUILD_STATE_DIRNAME, CACHE_SCHEMA,
+                                                 DESCRIPTOR_DTYPE, MANIFEST_NAME,
+                                                 SEGMENTS_DIRNAME, SHARDS_DIRNAME,
+                                                 TrajectoryCacheBuilder,
+                                                 adopt_written_segments, cache_identity,
                                                  create_shard_files, describe_shard,
-                                                 position_chunks, shard_bounds,
+                                                 position_chunks, read_segment_markers,
+                                                 segment_key, shard_bounds, shard_paths,
                                                  sha256_file, write_manifest)
 
 BUILDER_CLASS = TrajectoryCacheBuilder
@@ -66,11 +75,23 @@ def _init_worker(payload):
     _WORKER['builder'] = BUILDER_CLASS(**payload)
 
 
-def _run_chunk(task):
+def _run_segment(task):
+    """Build one segment; a failure is returned as a record, never raised.
+
+    A raising task would come back through the pool as an exception in the
+    driver, which can abandon the build after hours of work; returning the
+    failure keeps the driver's loop and the segment markers in charge.
+    """
     shard, first, rows = (int(task[0]), int(task[1]), int(task[2]))
     started = time.perf_counter()
-    _WORKER['builder'].build_chunk(shard, first, rows)
-    return shard, first, rows, time.perf_counter() - started
+    try:
+        _WORKER['builder'].build_chunk(shard, first, rows)
+    except Exception as exc:                                   # noqa: BLE001 - reported
+        return {'shard': shard, 'first_position': first, 'rows': rows, 'ok': False,
+                'seconds': time.perf_counter() - started, 'error': f'{type(exc).__name__}: {exc}',
+                'traceback': traceback.format_exc()[-4000:]}
+    return {'shard': shard, 'first_position': first, 'rows': rows, 'ok': True,
+            'seconds': time.perf_counter() - started, 'error': None, 'traceback': None}
 
 
 def _load_manifest(root):
@@ -80,129 +101,207 @@ def _load_manifest(root):
     return json.loads(path.read_text(encoding='utf-8'))
 
 
-def _keep_existing_shards(root, manifest, shard_size, total_positions, log):
-    """Completed shards of a previous build, after verifying them on disk."""
-    bounds = shard_bounds(shard_size, total_positions)
-    kept, problems = [], []
-    for entry in (manifest or {}).get('shards', []):
-        index = int(entry['shard'])
-        first, rows = bounds[index]
-        path = Path(root) / SHARDS_DIRNAME / str(entry['file'])
-        if int(entry['first_position']) != first or int(entry['rows']) != rows:
-            problems.append(f'shard {index} disagrees with the declared layout')
-        elif not path.is_file():
-            problems.append(f'shard {index} file is missing')
-        elif sha256_file(path) != str(entry['sha256']):
-            problems.append(f'shard {index} does not match its recorded hash')
-        else:
-            kept.append(entry)
-    if problems:
-        log(f'=== DISCARDED {len(problems)} recorded shard(s): ' + '; '.join(problems[:5])
-            + (' ...' if len(problems) > 5 else ''))
-    return kept
+def _reset_cache(root, shard_size, total_positions, log):
+    """Forget every shard file and segment marker of a previous build."""
+    for path in shard_paths(root, shard_size, total_positions):
+        path.unlink(missing_ok=True)
+    directory = Path(root) / BUILD_STATE_DIRNAME / SEGMENTS_DIRNAME
+    if directory.is_dir():
+        for path in directory.glob('*.json'):
+            path.unlink(missing_ok=True)
+    log(f'=== DISCARDED the recorded shards and markers of a previous build')
 
 
 def build_cache(*, builder_payload, root, shard_size, total_positions, chunk_size, workers,
                 requested_total_positions, max_updates, log=print, progress_seconds=30.0,
-                resume=True):
-    """Fill every missing shard of one cache; returns the finished manifest."""
+                resume=True, adopt_written=False, poll_seconds=5.0, stall_seconds=900.0,
+                max_requeues=2):
+    """Fill every unbuilt segment of one cache; returns the finished manifest.
+
+    Completion is read from the segment markers on disk.  The worker result
+    stream only carries failure reports, so a driver that stops receiving
+    results still finishes the build and writes its manifest, and every failure
+    is named with its ``position`` instead of ending the run silently.
+    """
     root = Path(root)
     bounds = shard_bounds(shard_size, total_positions)
     (root / SHARDS_DIRNAME).mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     manifest = _load_manifest(root)
-    completed = (_keep_existing_shards(root, manifest, shard_size, total_positions, log)
-                 if resume else [])
-    if not resume and manifest is not None:
-        for entry in manifest.get('shards', []):
-            (root / SHARDS_DIRNAME / str(entry['file'])).unlink(missing_ok=True)
-        completed = []
+    if not resume:
+        _reset_cache(root, shard_size, total_positions, log)
+        manifest = None
     create_shard_files(root, shard_size, total_positions)
-    done = {int(entry['shard']): entry for entry in completed}
-    manifest = dict(schema=CACHE_SCHEMA, dtype=DESCRIPTOR_DTYPE.__name__,
-                    shape_per_item=[len(ROUTER_RADII), DESCRIPTOR_COLUMNS],
-                    total_positions=int(total_positions), shard_size=int(shard_size),
-                    requested_total_positions=int(requested_total_positions),
-                    max_updates=int(max_updates),
-                    router_radii=[float(value) for value in ROUTER_RADII],
-                    descriptor_columns=DESCRIPTOR_COLUMNS,
-                    builder='scripts/build_mcl_ph_trajectory_cache.py',
-                    builder_commit=_builder_commit(),
-                    created_at=(manifest or {}).get('created_at', _now()),
-                    updated_at=_now(), complete=False,
-                    shards=sorted(done.values(), key=lambda row: row['shard']))
-    manifest.update(builder_payload['identity'])
-    write_manifest(root, manifest)
-    tasks = [task for task in position_chunks(shard_size, total_positions, chunk_size)
-             if task[0] not in done]
-    pending_rows = sum(task[2] for task in tasks)
+    adopted = None
+    if adopt_written:
+        adopted = adopt_written_segments(root, shard_size, total_positions,
+                                         chunk_size=chunk_size, log=log)
+    tasks = position_chunks(shard_size, total_positions, chunk_size)
+    expected = {}
+    for shard, first, rows in tasks:
+        expected.setdefault(int(shard), {})[int(first)] = int(rows)
+    markers = read_segment_markers(root)
+    done, problems = {}, []
+    for entry in (manifest or {}).get('shards', []):
+        index = int(entry['shard'])
+        first, rows = bounds[index]
+        path = root / SHARDS_DIRNAME / str(entry['file'])
+        marked = {key for key in markers if key[0] == index}
+        if int(entry['first_position']) != first or int(entry['rows']) != rows:
+            problems.append(f'shard {index} disagrees with the declared layout')
+        elif not path.is_file():
+            problems.append(f'shard {index} file is missing')
+        elif len(marked) < len(expected.get(index, {})):
+            problems.append(f'shard {index} has not every segment marked as written')
+        elif sha256_file(path) != str(entry['sha256']):
+            problems.append(f'shard {index} does not match its recorded hash')
+        else:
+            done[index] = entry
+    if problems:
+        log(f'=== DISCARDED {len(problems)} recorded shard(s): ' + '; '.join(problems[:5])
+            + (' ...' if len(problems) > 5 else ''))
+    recovered = []
+    for index in sorted(expected):
+        if index in done:
+            continue
+        if all(segment_key(index, first) in markers and
+               int(markers[segment_key(index, first)]['rows']) == int(rows)
+               for first, rows in expected[index].items()):
+            done[index] = describe_shard(root, index, *bounds[index])
+            recovered.append(index)
+    if recovered:
+        log(f'=== RECOVERED {len(recovered)} shard(s) from their segment markers: '
+            f'{recovered[:8]}' + (' ...' if len(recovered) > 8 else ''))
+
+    def publish(complete, extra=None):
+        payload = dict(schema=CACHE_SCHEMA, dtype=DESCRIPTOR_DTYPE.__name__,
+                       shape_per_item=[len(ROUTER_RADII), DESCRIPTOR_COLUMNS],
+                       total_positions=int(total_positions), shard_size=int(shard_size),
+                       requested_total_positions=int(requested_total_positions),
+                       max_updates=int(max_updates),
+                       router_radii=[float(value) for value in ROUTER_RADII],
+                       descriptor_columns=DESCRIPTOR_COLUMNS,
+                       builder='scripts/build_mcl_ph_trajectory_cache.py',
+                       builder_commit=_builder_commit(),
+                       created_at=(manifest or {}).get('created_at', _now()),
+                       updated_at=_now(), complete=bool(complete),
+                       completed_shards=len(done), adopted_segments=(
+                           int(adopted['adopted']) if adopted is not None else 0),
+                       shards=sorted(done.values(), key=lambda row: row['shard']))
+        payload.update(builder_payload['identity'])
+        if extra:
+            payload.update(extra)
+        write_manifest(root, payload)
+        return payload
+
+    publish(False)
+    pending = [task for task in tasks if segment_key(task[0], task[1]) not in markers]
+    pending_rows = sum(int(task[2]) for task in pending)
     log(f'=== CACHE BUILD START {_now()} root={root} positions={total_positions} '
         f'shards={len(bounds)} chunk={chunk_size} workers={workers} '
-        f'todo_chunks={len(tasks)} todo_rows={pending_rows} '
-        f'reused_shards={len(done)}')
-    if not tasks:
-        manifest['complete'] = len(done) == len(bounds)
-        manifest['updated_at'] = _now()
-        write_manifest(root, manifest)
+        f'todo_segments={len(pending)} todo_rows={pending_rows} reused_shards={len(done)}')
+    if not pending:
+        final = publish(len(done) == len(bounds),
+                        {'build_seconds': round(time.perf_counter() - started, 3),
+                         'build_workers': int(workers), 'build_chunk_size': int(chunk_size)})
         log(f'=== CACHE BUILD NOTHING TO DO {_now()} shards={len(done)}')
-        return manifest
-    clock = {'rows': 0, 'chunks': 0, 'shards': 0, 'last_log': started, 'window_start': started,
-             'window_rows': 0}
-    remaining = {index: sum(task[2] for task in tasks if task[0] == index) for index, _ in bounds}
+        return final
+
+    clock = {'rows': 0, 'segments': 0, 'shards': 0, 'last_log': time.monotonic()}
+    failures, lost = {}, []
+
+    def on_segment(record):
+        if record.get('ok'):
+            return
+        key = segment_key(record['shard'], record['first_position'])
+        failures[key] = record.get('error')
+        log(f'--- SEGMENT FAILED {_now()} shard={record["shard"]} '
+            f'first_position={record["first_position"]} rows={record["rows"]} '
+            f'{record["error"]}')
+
+    def on_lost(exc):
+        lost.append(f'{type(exc).__name__}: {exc}')
+
     context = mp.get_context('fork')
-    pool = context.Pool(max(1, int(workers)), initializer=_init_worker,
-                        initargs=(builder_payload,))
+    pool, requeues, outstanding, last_progress = None, 0, {}, time.monotonic()
     try:
-        for shard, first, rows, seconds in pool.imap_unordered(_run_chunk, tasks, chunksize=1):
-            clock['rows'] += rows
-            clock['chunks'] += 1
-            clock['window_rows'] += rows
-            remaining[shard] -= rows
-            if remaining[shard] == 0:
-                entry = describe_shard(root, shard, bounds[shard][0], bounds[shard][1])
-                done[shard] = entry
-                manifest['shards'] = sorted(done.values(), key=lambda row: row['shard'])
-                manifest['completed_shards'] = len(done)
-                manifest['updated_at'] = _now()
-                write_manifest(root, manifest)
-                clock['shards'] += 1
-            now = time.perf_counter()
+        while True:
+            if pending and pool is None:
+                pool = context.Pool(max(1, int(workers)), initializer=_init_worker,
+                                    initargs=(builder_payload,))
+                for task in pending:
+                    pool.apply_async(_run_segment, (task,), callback=on_segment,
+                                     error_callback=on_lost)
+                outstanding = {segment_key(task[0], task[1]): task for task in pending}
+                pending, last_progress = [], time.monotonic()
+            time.sleep(max(0.2, float(poll_seconds)))
+            markers = read_segment_markers(root)
+            fresh = [key for key in outstanding if key in markers]
+            for key in fresh:
+                del outstanding[key]
+                clock['rows'] += int(markers[key]['rows'])
+                clock['segments'] += 1
+            if fresh:
+                last_progress = time.monotonic()
+            for index in sorted(expected):
+                if index in done:
+                    continue
+                if all(segment_key(index, first) in markers and
+                       int(markers[segment_key(index, first)]['rows']) == int(rows)
+                       for first, rows in expected[index].items()):
+                    done[index] = describe_shard(root, index, *bounds[index])
+                    clock['shards'] += 1
+                    publish(False)
+            now = time.monotonic()
             if now - clock['last_log'] >= float(progress_seconds):
-                elapsed = now - started
-                window = now - clock['window_start']
-                rate = clock['window_rows'] / window if window > 0 else 0.0
-                overall = clock['rows'] / elapsed if elapsed > 0 else 0.0
-                left = (pending_rows - clock['rows']) / overall if overall > 0 else float('inf')
+                window = now - clock['last_log']
                 log(f'--- {_now()} rows={clock["rows"]}/{pending_rows} '
                     f'({100.0 * clock["rows"] / max(1, pending_rows):.2f}%) '
-                    f'shards_done={clock["shards"]} chunk_s={seconds:.1f} '
-                    f'rate={rate:.1f}/s overall={overall:.1f}/s eta={left / 60.0:.1f}min '
+                    f'segments={clock["segments"]}/{len(outstanding) + clock["segments"]} '
+                    f'shards_done={clock["shards"]} rate={clock["rows"] / window:.1f}/s '
+                    f'outstanding={len(outstanding)} requeues={requeues} '
                     f'load1={os.getloadavg()[0]:.1f} rss={(_resident_bytes() or 0) / 2**30:.2f}GiB '
                     f'child_max_rss={_child_max_rss_bytes() / 2**30:.2f}GiB')
                 clock['last_log'] = now
-                clock['window_start'] = now
-                clock['window_rows'] = 0
+            if not outstanding:
+                break
+            if now - last_progress > float(stall_seconds):
+                requeues += 1
+                missing = sorted(outstanding)
+                log(f'--- STALLED {_now()} no new segment for {stall_seconds:.0f}s; '
+                    f'{len(missing)} segment(s) outstanding, requeue {requeues}/'
+                    f'{max_requeues}: {missing[:8]}' + (' ...' if len(missing) > 8 else ''))
+                pool.terminate()
+                pool.join()
+                pool = None
+                if requeues > int(max_requeues):
+                    raise RuntimeError(
+                        f'the cache build stalled: {len(missing)} segment(s) still unbuilt '
+                        f'after {max_requeues} requeue(s), first {missing[:8]}; '
+                        f'last reported failure: {failures.get(missing[0]) or lost[-1:] or None}')
+                pending = [task for _, task in sorted(outstanding.items())]
+                outstanding = {}
     finally:
-        pool.close()
-        pool.join()
-    elapsed = time.perf_counter() - started
+        if pool is not None:
+            pool.terminate()
+            pool.join()
     complete = len(done) == len(bounds)
-    manifest['shards'] = sorted(done.values(), key=lambda row: row['shard'])
-    manifest['completed_shards'] = len(done)
-    manifest['complete'] = complete
-    manifest['updated_at'] = _now()
-    manifest['build_seconds'] = round(elapsed, 3)
-    manifest['build_workers'] = int(workers)
-    manifest['build_chunk_size'] = int(chunk_size)
-    write_manifest(root, manifest)
+    missing_shards = sorted(set(range(len(bounds))) - set(done))
+    final = publish(complete, {'build_seconds': round(time.perf_counter() - started, 3),
+                               'build_workers': int(workers),
+                               'build_chunk_size': int(chunk_size)})
     log(f'=== CACHE BUILD END {_now()} rows={clock["rows"]} shards={len(done)}/{len(bounds)} '
-        f'complete={complete} seconds={elapsed:.1f} '
-        f'rate={clock["rows"] / elapsed if elapsed > 0 else 0.0:.1f}/s '
-        f'load1={os.getloadavg()[0]:.1f} child_max_rss={_child_max_rss_bytes() / 2**30:.2f}GiB')
+        f'complete={complete} seconds={time.perf_counter() - started:.1f} '
+        f'rate={clock["rows"] / max(1e-9, time.perf_counter() - started):.1f}/s '
+        f'load1={os.getloadavg()[0]:.1f} child_max_rss={_child_max_rss_bytes() / 2**30:.2f}GiB '
+        f'failed_segments={len(failures)} lost_results={len(lost)}')
+    if failures:
+        for key in sorted(failures)[:5]:
+            log(f'=== FAILED SEGMENT shard={key[0]} first_position={key[1]} {failures[key]}')
     if not complete:
-        missing = sorted(set(range(len(bounds))) - set(done))
-        raise SystemExit(f'the cache is incomplete; missing shards {missing[:8]}')
-    return manifest
+        raise SystemExit(f'the cache is incomplete; missing shards {missing_shards[:8]} '
+                         f'({len(missing_shards)} of {len(bounds)})')
+    return final
 
 
 def main():
@@ -215,12 +314,19 @@ def main():
     parser.add_argument('--max-updates', type=int, default=5000)
     parser.add_argument('--global-batch', type=int, default=1008)
     parser.add_argument('--shard-size', type=int, default=100_000)
-    parser.add_argument('--chunk-size', type=int, default=10_000)
+    parser.add_argument('--chunk-size', type=int, default=10_000,
+                        help='rows per work unit; also the granularity of completion state')
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--limit-positions', type=int, default=0,
                         help='build only the first N positions (benchmark and gate builds)')
     parser.add_argument('--no-resume', action='store_true',
                         help='discard recorded shards and rebuild every position')
+    parser.add_argument('--adopt-written-segments', action='store_true',
+                        help='mark the segments whose rows are already fully written; used to '
+                             'resume a build whose driver lost its own bookkeeping')
+    parser.add_argument('--poll-seconds', type=float, default=5.0)
+    parser.add_argument('--stall-seconds', type=float, default=900.0)
+    parser.add_argument('--max-requeues', type=int, default=2)
     parser.add_argument('--progress-seconds', type=float, default=30.0)
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
@@ -251,6 +357,9 @@ def main():
                 total_positions=int(total), chunk_size=int(args.chunk_size),
                 workers=int(args.workers), requested_total_positions=int(requested),
                 max_updates=int(args.max_updates), resume=not args.no_resume,
+                adopt_written=bool(args.adopt_written_segments),
+                poll_seconds=float(args.poll_seconds), stall_seconds=float(args.stall_seconds),
+                max_requeues=int(args.max_requeues),
                 progress_seconds=float(args.progress_seconds))
 
 

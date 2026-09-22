@@ -18,13 +18,18 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 import pytest
 
-from src.dataset.mcl_ph_trajectory_cache import (CACHE_SCHEMA, DESCRIPTOR_DTYPE,
-                                                 IDENTITY_FIELDS, MCLPHTrajectoryCache,
-                                                 cache_identity, create_shard_files,
-                                                 describe_shard, position_chunks,
-                                                 shard_bounds, shard_file_name, write_manifest)
+from src.dataset.mcl_ph_trajectory_cache import (BUILD_STATE_DIRNAME, CACHE_SCHEMA,
+                                                 DESCRIPTOR_DTYPE, IDENTITY_FIELDS,
+                                                 SEGMENTS_DIRNAME, SHARDS_DIRNAME,
+                                                 MCLPHTrajectoryCache,
+                                                 adopt_written_segments, cache_identity,
+                                                 create_shard_files, describe_shard,
+                                                 position_chunks, read_segment_markers,
+                                                 segment_key, shard_bounds, shard_file_name,
+                                                 write_manifest, write_segment_marker)
 from src.dataset.mcl_ph_view import (DESCRIPTOR_COLUMNS, ROUTER_RADII,
                                      cached_topology_trajectory)
+import scripts.build_mcl_ph_trajectory_cache as cli
 
 SHAPE = (len(ROUTER_RADII), DESCRIPTOR_COLUMNS)
 ROWS = 10
@@ -411,3 +416,204 @@ def test_worker_count_does_not_change_a_presented_sample():
                 assert torch.equal(atom, expected[6])
     finally:
         source.close()
+
+
+# ---------------------------------------------------------------------------
+# The build driver: segment markers, resume, recovery and failures
+# ---------------------------------------------------------------------------
+
+class _FakeBuilder:
+    """A CPU-only stand-in for ``TrajectoryCacheBuilder`` writing synthetic rows.
+
+    ``fail_at``  -- positions whose segment always raises inside ``build_chunk``.
+    ``fail_once``-- a sentinel path: the first attempt raises and creates it, so a
+                    later attempt through the driver's requeue succeeds.
+    ``calls``    -- a path every built segment appends ``shard:first`` to, which is
+                    how a test proves exactly which segments a run recomputed.
+    """
+
+    def __init__(self, **payload):
+        self.output = Path(payload['output'])
+        self.bounds = shard_bounds(payload['shard_size'], payload['total_positions'])
+        self.fail_at = {int(value) for value in (payload.get('fail_at') or ())}
+        self.fail_once = Path(payload['fail_once']) if payload.get('fail_once') else None
+        self.calls = Path(payload['calls']) if payload.get('calls') else None
+
+    def build_chunk(self, shard, first_position, positions):
+        shard, first_position = int(shard), int(first_position)
+        if self.calls is not None:
+            with self.calls.open('a', encoding='utf-8') as handle:
+                handle.write(f'{shard}:{first_position}\n')
+        if first_position in self.fail_at:
+            raise RuntimeError(f'synthetic failure at position {first_position}')
+        if self.fail_once is not None and not self.fail_once.exists():
+            self.fail_once.write_text('seen', encoding='utf-8')
+            raise RuntimeError(f'synthetic transient failure at position {first_position}')
+        bound_first, _ = self.bounds[shard]
+        path = self.output / SHARDS_DIRNAME / shard_file_name(*self.bounds[shard])
+        handle = np.load(path, mmap_mode='r+', allow_pickle=False)
+        try:
+            offset = first_position - bound_first
+            for step in range(int(positions)):
+                handle[offset + step] = row_value(shard, first_position, step)
+            handle.flush()
+        finally:
+            del handle
+        write_segment_marker(self.output, shard, first_position, positions)
+        return int(positions)
+
+
+def _build(root, *, rows=ROWS, shard_size=SHARD_SIZE, chunk=3, workers=2, **kwargs):
+    """Drive a synthetic build through the production ``build_cache``."""
+    log, extra = [], kwargs.pop('extra', {})
+    payload = dict(output=str(root), shard_size=shard_size, total_positions=rows,
+                   identity=BASE_IDENTITY, **extra)
+    manifest = cli.build_cache(builder_payload=payload, root=root, shard_size=shard_size,
+                               total_positions=rows, chunk_size=chunk, workers=workers,
+                               requested_total_positions=rows, max_updates=1, log=log.append,
+                               progress_seconds=999.0, poll_seconds=0.05, **kwargs)
+    return manifest, log
+
+
+@pytest.fixture()
+def synthetic_builder(monkeypatch):
+    def install(**payload_extra):
+        monkeypatch.setattr(cli, 'BUILDER_CLASS', _FakeBuilder)
+        return payload_extra
+
+    return install
+
+
+def test_driver_builds_and_marks_every_segment(tmp_path, synthetic_builder):
+    calls = tmp_path / 'calls.txt'
+    extra = synthetic_builder(calls=str(calls))
+    manifest, _ = _build(tmp_path, extra=extra)
+    assert manifest['complete'] and manifest['completed_shards'] == 3
+    assert len(manifest['shards']) == 3
+    markers = read_segment_markers(tmp_path)
+    assert sorted(markers) == sorted((shard, first) for shard, first, _ in position_chunks(4, ROWS, 3))
+    assert all(entry['rows'] > 0 for entry in markers.values())
+    cache = MCLPHTrajectoryCache(tmp_path, required_positions=ROWS)
+    assert cache.complete
+    for position in range(ROWS):
+        assert np.array_equal(cache[position],
+                              np.full(SHAPE, np.float32(position) + np.float32(0.5),
+                                      dtype=np.float32))
+    assert len(calls.read_text(encoding='utf-8').split()) == len(markers)
+
+
+def test_a_second_run_rebuilds_nothing(tmp_path, synthetic_builder):
+    calls = tmp_path / 'calls.txt'
+    extra = synthetic_builder(calls=str(calls))
+    _build(tmp_path, extra=extra)
+    before = calls.read_text(encoding='utf-8').split()
+    manifest, log = _build(tmp_path, extra=extra)
+    assert calls.read_text(encoding='utf-8').split() == before
+    assert manifest['complete']
+    assert any('NOTHING TO DO' in line for line in log)
+
+
+def test_driver_recovers_a_manifest_lost_by_the_driver(tmp_path, synthetic_builder):
+    calls = tmp_path / 'calls.txt'
+    extra = synthetic_builder(calls=str(calls))
+    _build(tmp_path, extra=extra)
+    before = calls.read_text(encoding='utf-8').split()
+    (tmp_path / 'manifest.json').unlink()
+    manifest, log = _build(tmp_path, extra=extra)
+    assert manifest['complete'] and manifest['completed_shards'] == 3
+    assert calls.read_text(encoding='utf-8').split() == before, 'markers must not be rebuilt'
+    assert any('RECOVERED' in line for line in log)
+    MCLPHTrajectoryCache(tmp_path, required_positions=ROWS)
+
+
+def test_a_recorded_shard_without_markers_is_rebuilt(tmp_path, synthetic_builder):
+    calls = tmp_path / 'calls.txt'
+    extra = synthetic_builder(calls=str(calls))
+    _build(tmp_path, extra=extra)
+    markers = tmp_path / BUILD_STATE_DIRNAME / SEGMENTS_DIRNAME
+    for path in markers.glob('*.json'):
+        path.unlink()
+    manifest, _ = _build(tmp_path, extra=extra)
+    assert manifest['complete']
+    assert len(calls.read_text(encoding='utf-8').split()) == 2 * len(position_chunks(4, ROWS, 3))
+
+
+def test_a_failing_segment_is_reported_without_hanging(tmp_path, synthetic_builder):
+    extra = synthetic_builder(fail_at=[3])
+    with pytest.raises(RuntimeError, match='stalled'):
+        _build(tmp_path, extra=extra, max_requeues=0, stall_seconds=0.3)
+    assert segment_key(0, 3) not in read_segment_markers(tmp_path)
+
+
+def test_a_transient_failure_is_retried_and_the_build_completes(tmp_path, synthetic_builder):
+    sentinel = tmp_path / 'transient.sentinel'
+    extra = synthetic_builder(fail_once=str(sentinel))
+    manifest, log = _build(tmp_path, extra=extra, max_requeues=1, stall_seconds=0.3)
+    assert sentinel.exists()
+    assert manifest['complete']
+    assert any('SEGMENT FAILED' in line for line in log)
+    assert any('STALLED' in line for line in log)
+    MCLPHTrajectoryCache(tmp_path, required_positions=ROWS)
+
+
+def test_adoption_marks_written_rows_and_leaves_the_rest_to_build(tmp_path, synthetic_builder):
+    create_shard_files(tmp_path, SHARD_SIZE, ROWS)
+    path = tmp_path / SHARDS_DIRNAME / shard_file_name(0, SHARD_SIZE)
+    handle = np.load(path, mmap_mode='r+', allow_pickle=False)
+    for index in range(3):
+        handle[index] = row_value(0, 0, index)
+    handle.flush()
+    del handle
+    summary = adopt_written_segments(tmp_path, SHARD_SIZE, ROWS, chunk_size=3)
+    assert summary['adopted'] == 1 and summary['missing_count'] == 4
+    assert summary['zero_rows'] > 0
+    assert sorted(read_segment_markers(tmp_path)) == [segment_key(0, 0)]
+
+    calls = tmp_path / 'calls.txt'
+    extra = synthetic_builder(calls=str(calls))
+    manifest, _ = _build(tmp_path, extra=extra, adopt_written=True)
+    assert manifest['complete'] and manifest['adopted_segments'] == 1
+    written = calls.read_text(encoding='utf-8').split()
+    assert '0:0' not in written, 'an adopted segment must not be recomputed'
+    assert len(written) == len(position_chunks(4, ROWS, 3)) - 1
+    cache = MCLPHTrajectoryCache(tmp_path, required_positions=ROWS)
+    assert np.array_equal(cache[0], np.full(SHAPE, np.float32(0.5), dtype=np.float32))
+    assert np.array_equal(cache[3], np.full(SHAPE, np.float32(3.5), dtype=np.float32))
+
+
+def test_a_single_zero_row_keeps_a_segment_unbuilt(tmp_path):
+    create_shard_files(tmp_path, SHARD_SIZE, ROWS)
+    path = tmp_path / SHARDS_DIRNAME / shard_file_name(0, SHARD_SIZE)
+    handle = np.load(path, mmap_mode='r+', allow_pickle=False)
+    for index in range(3):
+        handle[index] = row_value(0, 0, index)
+    handle[1] = np.zeros(SHAPE, dtype=np.float32)
+    handle.flush()
+    del handle
+    summary = adopt_written_segments(tmp_path, SHARD_SIZE, ROWS, chunk_size=3)
+    assert summary['adopted'] == 0 and summary['missing_count'] == 5
+    assert read_segment_markers(tmp_path) == {}
+
+
+def test_segment_markers_round_trip_and_reject_a_malformed_file(tmp_path):
+    write_segment_marker(tmp_path, 2, 8, 2)
+    markers = read_segment_markers(tmp_path)
+    assert markers[segment_key(2, 8)]['rows'] == 2
+    directory = tmp_path / BUILD_STATE_DIRNAME / SEGMENTS_DIRNAME
+    broken = directory / 'segment_00003_000000012.json'
+    broken.write_text(json.dumps({'shard': 3}), encoding='utf-8')
+    with pytest.raises(ValueError, match='missing'):
+        read_segment_markers(tmp_path)
+    broken.write_text(json.dumps({'shard': 3, 'first_position': 12, 'rows': 0,
+                                  'finished_at': 'now', 'pid': 1}), encoding='utf-8')
+    with pytest.raises(ValueError, match='0 rows'):
+        read_segment_markers(tmp_path)
+
+
+def test_no_resume_discards_shards_and_markers(tmp_path, synthetic_builder):
+    calls = tmp_path / 'calls.txt'
+    extra = synthetic_builder(calls=str(calls))
+    _build(tmp_path, extra=extra)
+    manifest, _ = _build(tmp_path, extra=extra, resume=False)
+    assert manifest['complete']
+    assert len(calls.read_text(encoding='utf-8').split()) == 2 * len(position_chunks(4, ROWS, 3))
