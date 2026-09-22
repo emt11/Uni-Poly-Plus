@@ -1762,6 +1762,8 @@ timeout -k 60 14400 python3 -m torch.distributed.run --nproc_per_node=4 --standa
 2. 是否把「每臂超时」纳入计划固定参数（本轮 4 h 由执行侧自定，属计划未明确项）。
 3. GATE/XATTN 与 Phase III/IV 是否在本轮授权内继续（目前均未启动、预算未消耗）。
 
+**八、提交与同步**：本轮共两个 commit，均已非 force push 到 `origin/dev`：**`c34fbc2`**（阈值边界返修 + 边界 regression + r10R1 计划头/返修记录）与 **`65820e4`**（本节执行结果与阻断记录）；`git ls-remote origin dev` 与本地 HEAD 一致（`65820e44bed9a1f847e47258a903fd79c5898ed1`）。产物与日志：`results/mcl_ph_20260921/p2/pretrain/glt_ref_r10r1/`（5k 成功产物）、`results/mcl_ph_20260921/p2/pretrain/{cat,glt_ref}/`（两处失败现场，均原样保留）、`logs/mcl_ph_20260921/{p2r1_driver.log,p2r1_tmux.log,p2_glt_ref_r10r1_pretrain.log,p2_pretrain_cat.log,p2_supervisor_cat.log}`，按 `.gitignore` 不提交，只按路径引用。**未自动重试 CAT、未启动 GATE/XATTN 或任何下游实验**；交回 ChatGPT/Codex 决定后继续。
+
 
 
 
