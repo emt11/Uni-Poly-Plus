@@ -1,6 +1,6 @@
 # MCL-PH-20260921-01 / r10R3 执行记录
 
-状态：**执行中（CAT 正式预训练已启动）**。基准：`dev@29e359e`；2026-09-23 UTC 开始前 `git pull --ff-only origin dev` 成功。授权来源：用户本轮明确要求实施 r10R3 方案。规划、执行与自检：Codex；本轮没有第二执行者的独立审查。
+状态：**执行中（CAT 正式预训练运行中；监控已交接）**。基准：`dev@29e359e`；2026-09-23 UTC 开始前 `git pull --ff-only origin dev` 成功。授权来源：用户本轮明确要求实施 r10R3 方案。规划、执行与自检：Codex；本轮没有第二执行者的独立审查。
 
 ## 目标与边界
 
@@ -28,7 +28,8 @@
 - 配置比对：CAT/GATE/XATTN JSON 除 `fusion_mode` 外相同，world 4、84×3×4、BF16、5000 steps、save_every 1000、warmup 2000、scheduler 20000、dense 500→Top-2 501 均未变。
 - 代码与计划预检提交：`31ff03f`，已推送并核实 `origin/dev` 同哈希。
 - CAT：`Uni-Poly:mcl_ph_r10r3_cat`，`python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrain_mcl_ph.py` 加 CAT 配置、新统计、共享初值、完整 trajectory cache、`--diagnostics --prep-workers 12 --stop-after-step 5000`；输出 `p2/pretrain/cat_r10r3/`，日志 `logs/mcl_ph_20260921/p2_cat_r10r3_pretrain.log`，退出码文件同路径 `.exit`；**已启动，结果待核验**。
-- 后续串行执行由 `scripts/run_mcl_ph_r10r3.py` 在 `Uni-Poly` 独立 window 等待 CAT 真正退出。它对每臂做退出码、runtime、五组千步文件、统计/共同初值身份、500/501 路由、有限损失/梯度及部署 strict-load 检查；失败立即记录 `STOPPED`，不启动下一臂。三臂齐全后严格读取 GLT_REF/O8_ONLY 包，30 个 unit 逐个核对退出码、unit checker、包 SHA 与 `best.pt` 身份，再运行 P2 聚合。运行状态和停止原因写入 `logs/mcl_ph_20260921/r10r3_driver_status.json`，全程不设墙钟 timeout、不自动重试。
+- `scripts/run_mcl_ph_r10r3.py` 原计划在独立 window 等待 CAT 退出，并按退出码、runtime、五组千步文件、统计/共同初值身份、500/501 路由、有限损失/梯度及部署 strict-load 等门槛串行执行后续阶段。用户于 2026-09-23 01:06 UTC 要求停止当前监控并交给其他模型；该执行器在 `WAIT_CAT` 时以 Ctrl-C **有意停止**，`r10r3_driver_status.json` 为 `STOPPED/KeyboardInterrupt`，进程已退出，未启动 GATE/XATTN 或 development。CAT 训练进程未中断。接手者应先核对实际产物和进程，再决定是否使用执行器；不得把其 `STOPPED` 当作 CAT 失败，也不得在已有输出目录重启 CAT。
+- 交接时 CAT 日志最近完整记录为四 rank 的 step 301、dense、损失及梯度有限；`runtime.json=RUNNING`，CAT 退出码尚未写出。此为瞬时观察，不代表 CAT 已完成。
 - 初始工作区干净；修改过程中出现非本轮的 `.zcodeignore` 删除，未恢复、未暂存、未纳入本任务。
 
 本节只记录真实进度；后续结果、提交和远端同步核实后更新。历史失败与超预算记录保留在 `MCL-PH.md`。
