@@ -2082,3 +2082,25 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrai
 - 独立验收命令 `python3 scripts/verify_mcl_ph_arm.py --label gate_r10r3 --arm-dir results/mcl_ph_20260921/p2/pretrain/gate_r10r3 --updates 5000 --strict-cleanup` 返回退出码 0、verdict PASS；证据日志：`logs/mcl_ph_20260921/p2_gate_r10r3_acceptance.log`，退出码记录 `logs/mcl_ph_20260921/p2_gate_r10r3_acceptance.exit=0`。另在独立 tmux window `mcl_ph_r10r3_gate_strictcheck` 完成逐项日志/身份/文件检查和 CPU `build_mcl_arm('gate', package, expected_step=5000)` strict-load；其日志 `logs/mcl_ph_20260921/p2_gate_r10r3_strictcheck.log`、退出码文件 `.exit=0`，输出 verdict `GATE_ACCEPTANCE_PASS`，encoder 参数数 19,958,723。
 - 用户曾要求停止周期监控；当时没有给训练发送信号。2026-09-23 08:10 UTC 的点查确认 GATE 已结束且完整通过。按用户要求不恢复 5 分钟周期监控。GATE 消耗 5000 updates / 1 次启动；此前正式预算 15,082 updates / 4 次启动，因此累计 20,082 / 5，余额 5000 / 1 次启动。
 - 本段记录写入时，XATTN 输出目录与日志均尚不存在，XATTN 尚未启动。按已授权顺序，下一步仅启动 XATTN 一次；不启动 development、P3、OOF 或 outer-test。
+
+#### XATTN 阶段启动记录（Codex；2026-09-23 UTC）
+
+- GATE 的退出码、runtime、五组检查点、全 rank 有限性、step 500/501 路由、输入身份、部署包 SHA 与 CPU strict-load 均已通过后，才启动 XATTN。启动前再次确认 XATTN 输出目录/日志/退出码文件均不存在，配置三臂只有 `fusion_mode` 不同，统计 SHA `9dc8160f1de5152f6c04a963c40569bac8facd21e68a700f40186363798cf8b1`、共同新初值 SHA `499309392d578daf7a7baf1d102d7a7f5c652e5a9b42ca2904ac9d83d1fab85a`、CAT 成功包 SHA `eed6276565f0bc827fc1f56056a25cd8469db184b0e334d04c3dd0f3cfea0e49` 均匹配；四张 RTX 4090 空闲，未发现其他 MCL-PH 训练进程。
+- 于 2026-09-23 08:17:32 UTC 在独立 tmux window `Uni-Poly:mcl_ph_r10r3_xattn` 单次启动，工作目录 `/root/workspace/Uni-Poly-Plus-master`。实际训练命令：
+
+```bash
+python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrain_mcl_ph.py \
+  --config configs/mts/mcl_ph_xattn.json \
+  --cohort-root data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1 \
+  --cache-root data/processed/mips_trimer_scage \
+  --dual-static-root data/processed/glt_dual_v2/pi1m/dual_static_v1 \
+  --statistics results/mcl_ph_20260921/p0_r10r3/statistics.npz \
+  --shared-new-init results/mcl_ph_20260921/p2/pretrain/shared_new_init.pt \
+  --trajectory-cache data/processed/mcl_ph_cache/p2_noisy_seed42_sigma003_step5000_v1 \
+  --diagnostics --prep-workers 12 --stop-after-step 5000 \
+  --output results/mcl_ph_20260921/p2/pretrain/xattn_r10r3
+```
+
+- 完整 stdout/stderr 写入 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.log`；真实退出码将写入 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.exit`。08:18 UTC 的单次启动确认中，tmux pane 存活，runtime=`RUNNING`、fusion=`xattn`、world=4；microbatch=84、accumulation=3、global batch=1008、lr=2e-4、warmup=2000、scheduler total=20000、BF16、dense 500→Top-2、stop_after_step=5000。runtime 的 statistics/shared-new-init/common-init SHA 与固定输入一致；trajectory cache 为 cached 模式、目标路径一致、positions=5,040,000。该时点训练退出码文件尚未生成；本段不推断该快照之后的进度或数值。
+- 用户要求停止周期监控；08:18 UTC 仅进行一次启动确认，不恢复 5 分钟轮询。XATTN 的训练是否完成、五组 checkpoint、逐 rank 有限值及最终包均待后续现场核验；不得据启动确认宣称完成或验收通过。
+- 预算：历史已完成 15,082 updates / 4 次启动，GATE 完成 5,000 / 1 次启动；累计已完成 20,082 updates / 5 次完成启动。XATTN 已使用剩余第 6 次启动，最多 5,000 updates；无 retry/resume 预算。仍禁止 development、P3、OOF、outer-test，且不作预测性能结论。

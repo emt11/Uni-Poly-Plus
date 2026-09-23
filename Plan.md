@@ -1,6 +1,6 @@
 # MCL-PH-20260921-01 / r10R3 GATE→XATTN 执行记录
 
-计划修订：r10R3-GX1。状态：**执行中（GATE 已完整验收通过；XATTN 尚未启动，是下一步）**。原计划基线：`dev@73a1980`；本次记录更新基线：`dev@3dd751e`，`origin/dev` 同步，修改前 `git pull --ff-only origin dev` 返回 Already up to date、工作区干净。授权来源：用户明确要求仅执行 GATE、XATTN 两次正式预训练。实际执行与自检：Codex；独立审查待后续。
+计划修订：r10R3-GX1。状态：**执行中（GATE 已完整验收通过；XATTN 已单次启动，最终验收待执行）**。原计划基线：`dev@73a1980`；本次记录更新基线：`dev@90c0a2d`，`origin/dev` 同步，修改前 `git pull --ff-only origin dev` 返回 Already up to date、工作区干净。授权来源：用户明确要求仅执行 GATE、XATTN 两次正式预训练。实际执行与自检：Codex；独立审查待后续。
 
 ## 本轮问题、对照与范围
 
@@ -8,7 +8,7 @@
 - Reference：已验收的 CAT 5,000-update arm，部署包 SHA256 `eed6276565f0bc827fc1f56056a25cd8469db184b0e334d04c3dd0f3cfea0e49`。
 - Controlled change：每臂相对 CAT 仅改变配置中的 `fusion_mode`；GATE 与 XATTN 串行启动，各仅一次、最多 5,000 updates。
 - 固定预算：world=4、microbatch=84、accumulation=3、global batch=1008、BF16、AdamW lr=2e-4、warmup=2,000、scheduler=20,000、500 dense updates 后 Top-2、save_every=1,000。
-- 已消耗正式预训练预算：15,082 updates / 4 次启动；本轮余额 10,000 updates / 2 次启动。不得重试、续训、添加 pilot 或 wall-clock timeout。
+- 历史已完成正式预训练预算：15,082 updates / 4 次启动。GATE 再完成 5,000 updates / 1 次启动；XATTN 已启动 1 次、上限 5,000 updates。总预算不得超过 25,082 updates / 6 次启动；不得重试、续训、添加 pilot 或 wall-clock timeout。
 - 本轮仅执行 GATE → 独立验收 → XATTN → 独立验收。不得启动 development、P3、OOF、outer-test；不读取 outer-test，不报告预测性能排名。
 
 ## 固定输入与前置证据
@@ -35,8 +35,9 @@
 - CAT 前置验收：通过，证据见上。
 - GATE：于 2026-09-23 03:43:56 UTC 在 `Uni-Poly:mcl_ph_r10r3_gate` 启动；训练退出码文件时间戳为 05:59:27.964 UTC，内容 `0`。命令使用本计划第 1 步所列 GATE 配置和固定输入，工作目录为仓库根目录；stdout/stderr 位于 `logs/mcl_ph_20260921/p2_gate_r10r3_pretrain.log`，产物位于 `results/mcl_ph_20260921/p2/pretrain/gate_r10r3/`。runtime 为 PASS / 5000，cleanup complete、export_complete=true、main_returned=true；五组 resume/deploy 齐全。解析完整日志得到四 rank 各 5000 条记录，所有 loss、总梯度及分组梯度有限，step 500 全 rank=dense、step 501 全 rank=top2；统计 SHA、shared-new-init SHA 和 common-init SHA 均与固定输入匹配。`scripts/verify_mcl_ph_arm.py --label gate_r10r3 --arm-dir results/mcl_ph_20260921/p2/pretrain/gate_r10r3 --updates 5000 --strict-cleanup` 返回 0 / PASS。CPU `build_mcl_arm('gate', package, expected_step=5000)` strict-load PASS；deploy 元数据为 step=5000、fusion=gate、training_route=mcl_ph，deploy SHA256 `312ea6708ee1b930001c1963714dfbdee44d8de711c5293bc0378be7a73b24e8`，参数数 19,958,723。逐项验收日志：`logs/mcl_ph_20260921/p2_gate_r10r3_strictcheck.log`，真实检查退出码记录为 `.exit=0`。阶段正式预算消耗 5000 updates / 1 次启动。
 - 用户要求停止周期监控后，没有向 GATE 发送信号；2026-09-23 08:10 UTC 的单次现场核对发现 GATE 已完成。按该要求，此后不恢复 5 分钟周期监控。
-- XATTN：尚未启动；GATE 独立验收现已全部通过。下一步仍按原授权，在独立 window `Uni-Poly:mcl_ph_r10r3_xattn` 启动一次，最多 5000 updates；完成后执行同一验收门。当前阶段总预算为此前 15,082 + GATE 5,000 = 20,082 updates / 5 次正式启动；剩余上限 5,000 updates / 1 次启动。
-- 文件修改前同步：`git pull --ff-only origin dev` 成功；本次记录更新基线 `3dd751e4c7eebd4d3c745a82a3ec455dfc6e4402`。`.zcodeignore` 删除已包含在既有基线中，不属于本轮改动，本轮不恢复、不暂存。
+- XATTN：于 2026-09-23 08:17:32 UTC 在独立 window `Uni-Poly:mcl_ph_r10r3_xattn` 单次启动，配置 `configs/mts/mcl_ph_xattn.json`，输出 `results/mcl_ph_20260921/p2/pretrain/xattn_r10r3/`，日志 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.log`，真实退出码目标文件 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.exit` 当前尚未生成。08:18 UTC 点查时 pane 存活、runtime 为 RUNNING / fusion=xattn / world=4，配置为 microbatch=84、accumulation=3、global batch=1008、lr=2e-4、warmup=2000、scheduler=20000、BF16、dense 500→Top-2、stop_after_step=5000。统计、shared-new-init、common-init SHA 与固定输入匹配；trajectory cache mode=cached，路径与固定 cache 一致，位置数 5,040,000。该点查只用于启动确认；按用户要求不恢复 5 分钟周期监控。XATTN 完成后仍须独立运行完整验收，任何失败均不重试、不续训。
+- 当前预算：历史 15,082 + GATE 完成 5,000 = 20,082 个已完成 updates / 5 次正式启动；XATTN 已占用本轮最后 1 次启动，最多再执行 5,000 updates。`.zcodeignore` 删除已在既有基线提交中，不属于本轮改动，不恢复、不暂存。
+- 文件修改前同步：`git pull --ff-only origin dev` 成功；GATE 记录更新基线 `3dd751e4c7eebd4d3c745a82a3ec455dfc6e4402`，XATTN 启动记录更新基线 `90c0a2d14572db514396976c5f2129aad02a1266`。`.zcodeignore` 删除是既有提交内容，不属于本轮改动，不恢复、不暂存。
 
 ## 停止条件
 
