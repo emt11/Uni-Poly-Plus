@@ -1,6 +1,6 @@
 # MCL-PH-20260921-01 / r10R3 执行记录
 
-状态：**执行中（P0 统计重算）**。基准：`dev@29e359e`；2026-09-23 UTC 开始前 `git pull --ff-only origin dev` 成功。授权来源：用户本轮明确要求实施 r10R3 方案。规划、执行与自检：Codex；本轮没有第二执行者的独立审查。
+状态：**执行中（CAT 正式预训练已启动）**。基准：`dev@29e359e`；2026-09-23 UTC 开始前 `git pull --ff-only origin dev` 成功。授权来源：用户本轮明确要求实施 r10R3 方案。规划、执行与自检：Codex；本轮没有第二执行者的独立审查。
 
 ## 目标与边界
 
@@ -23,8 +23,12 @@
 ## 当前执行证据
 
 - 定向测试：`results/mcl_ph_20260921/r10r3_targeted_tests.log`，23 passed / exit 0。
-- P0 重算：`Uni-Poly:mcl_ph_r10r3_p0`，命令 `python scripts/audit_mcl_ph_p0.py --output results/mcl_ph_20260921/p0_r10r3 --statistics-output results/mcl_ph_20260921/p0_r10r3/statistics.npz`；日志 `p0_r10r3/audit.log`，**运行中**。
-- Cache 校验：`Uni-Poly:mcl_ph_r10r3_cache`，生产 reader 校验 51 shard SHA、完整覆盖；日志 `r10r3_cache_verify.log`，**运行中**。
+- P0 重算：`Uni-Poly:mcl_ph_r10r3_p0`，命令 `python scripts/audit_mcl_ph_p0.py --output results/mcl_ph_20260921/p0_r10r3 --statistics-output results/mcl_ph_20260921/p0_r10r3/statistics.npz`；日志 `p0_r10r3/audit.log`，exit 0、`PASS`、4096/4096、key SHA `c0402dca…341a`、各数组有限；新统计 SHA `9dc8160f…cf8b1`。修订后的 nonbond `(mu,sigma)=(1.3945351,0.1372659)`，旧统计为 `(1.3962990,0.1445435)`；旧文件保留。
+- Cache 校验：`Uni-Poly:mcl_ph_r10r3_cache`，生产 reader 对 51 shard 均校验 SHA256，完整覆盖 5,040,000 位置，exit 0；cohort、static、sample-index SHA 与 P0 来源一致。
+- 配置比对：CAT/GATE/XATTN JSON 除 `fusion_mode` 外相同，world 4、84×3×4、BF16、5000 steps、save_every 1000、warmup 2000、scheduler 20000、dense 500→Top-2 501 均未变。
+- 代码与计划预检提交：`31ff03f`，已推送并核实 `origin/dev` 同哈希。
+- CAT：`Uni-Poly:mcl_ph_r10r3_cat`，`python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrain_mcl_ph.py` 加 CAT 配置、新统计、共享初值、完整 trajectory cache、`--diagnostics --prep-workers 12 --stop-after-step 5000`；输出 `p2/pretrain/cat_r10r3/`，日志 `logs/mcl_ph_20260921/p2_cat_r10r3_pretrain.log`，退出码文件同路径 `.exit`；**已启动，结果待核验**。
+- 后续串行执行由 `scripts/run_mcl_ph_r10r3.py` 在 `Uni-Poly` 独立 window 等待 CAT 真正退出。它对每臂做退出码、runtime、五组千步文件、统计/共同初值身份、500/501 路由、有限损失/梯度及部署 strict-load 检查；失败立即记录 `STOPPED`，不启动下一臂。三臂齐全后严格读取 GLT_REF/O8_ONLY 包，30 个 unit 逐个核对退出码、unit checker、包 SHA 与 `best.pt` 身份，再运行 P2 聚合。运行状态和停止原因写入 `logs/mcl_ph_20260921/r10r3_driver_status.json`，全程不设墙钟 timeout、不自动重试。
 - 初始工作区干净；修改过程中出现非本轮的 `.zcodeignore` 删除，未恢复、未暂存、未纳入本任务。
 
 本节只记录真实进度；后续结果、提交和远端同步核实后更新。历史失败与超预算记录保留在 `MCL-PH.md`。
