@@ -1,44 +1,38 @@
-# MCL-PH-20260921-01 / r10R3 GATE→XATTN 执行记录
+# MCL-PH-20260921-01 / r10R3-DEV1：P2 development 筛查计划
 
-计划修订：r10R3-GX1。状态：**执行中（GATE 已完整验收通过；XATTN 已单次启动，最终验收待执行）**。原计划基线：`dev@73a1980`；本次记录更新基线：`dev@90c0a2d`，`origin/dev` 同步，修改前 `git pull --ff-only origin dev` 返回 Already up to date、工作区干净。授权来源：用户明确要求仅执行 GATE、XATTN 两次正式预训练。实际执行与自检：Codex；独立审查待后续。
+状态：**待授权**。日期：2026-09-23 UTC。规划、现场审查与定向测试：Codex；development 执行者待用户指定。基准：`dev@d4f31ee`，修改前 `git pull --ff-only origin dev` 成功、工作区干净。用户本轮要求制定计划与执行提示词，**没有要求现在启动微调**。前一 `r10R3-GX1` 预训练周期的执行和审查摘要已归档到 `PROJECT_HISTORY.md`；历史失败与预算仍保留在 `MCL-PH.md`。
 
-## 本轮问题、对照与范围
+## 科学问题与比较边界
 
-- Scientific question：在相同数据、统计、共同初始化、路由和训练预算下，验证 GATE 与 XATTN 融合配置的正式预训练产物能否完整生成并通过身份、清理和部署严格加载验收。
-- Reference：已验收的 CAT 5,000-update arm，部署包 SHA256 `eed6276565f0bc827fc1f56056a25cd8469db184b0e334d04c3dd0f3cfea0e49`。
-- Controlled change：每臂相对 CAT 仅改变配置中的 `fusion_mode`；GATE 与 XATTN 串行启动，各仅一次、最多 5,000 updates。
-- 固定预算：world=4、microbatch=84、accumulation=3、global batch=1008、BF16、AdamW lr=2e-4、warmup=2,000、scheduler=20,000、500 dense updates 后 Top-2、save_every=1,000。
-- 历史已完成正式预训练预算：15,082 updates / 4 次启动。GATE 再完成 5,000 updates / 1 次启动；XATTN 已启动 1 次、上限 5,000 updates。总预算不得超过 25,082 updates / 6 次启动；不得重试、续训、添加 pilot 或 wall-clock timeout。
-- 本轮仅执行 GATE → 独立验收 → XATTN → 独立验收。不得启动 development、P3、OOF、outer-test；不读取 outer-test，不报告预测性能排名。
+- 问题：在固定的 `outer5_inner20` development 划分和训练合同下，MCL-PH 的 CAT/GATE/XATTN 是否达到预登记的双 baseline 晋级门槛？
+- 参考：本轮 GLT_REF 和从同一 GLT_REF 包提取的 O8_ONLY。MCL 三臂分别使用各自的正式 5k 包。GLT_REF 与 MCL 的预训练任务、遮蔽和架构不完全相同；整体差值不能归因于 PH 或单一融合机制。
+- 控制：五臂使用同一 XC/EPS/EAT × fold0/1 划分、seed 42、train-only scaler、最多 30 epochs、相同下游调度与选择规则。MCL 三臂之间仅 `fusion_mode` 不同。
+- 结果层级：本阶段为 **development 筛查**，不是独立盲测或正式性能确认；不读取 outer-test，不自动进入 P3、OOF、refit 或更多 seed。
 
-## 固定输入与前置证据
+## 前置核对（2026-09-23 的只读审查）
 
-- 统计：`results/mcl_ph_20260921/p0_r10r3/statistics.npz`，SHA256 `9dc8160f1de5152f6c04a963c40569bac8facd21e68a700f40186363798cf8b1`。
-- 共同新参数初值：`results/mcl_ph_20260921/p2/pretrain/shared_new_init.pt`，SHA256 `499309392d578daf7a7baf1d102d7a7f5c652e5a9b42ca2904ac9d83d1fab85a`。
-- 初始 common artifact SHA256 `1c9f97cf5547dcd2f44846e83586dfb4ec593dd4a4f56df510be372f26f1951d`；CAT runtime identity 与两个源文件 SHA 一致。
-- Trajectory cache：`data/processed/mcl_ph_cache/p2_noisy_seed42_sigma003_step5000_v1`。当前 manifest 为 complete=true、51 shards、5,040,000 positions；manifest 的 seed/noise/mask/global batch/sample-index/cohort/static identity 与已验收 CAT runtime 一致。既有 `logs/mcl_ph_20260921/trajectory_cache_verify.log` 末尾记录 `FULL CACHE VERIFY OK`。
-- CAT：真实退出码文件 `logs/mcl_ph_20260921/p2_cat_r10r3_pretrain.exit=0`；runtime PASS/5000、cleanup/export/main-return 全完成；五组 resume/deploy 齐全；`scripts/verify_mcl_ph_arm.py --strict-cleanup` PASS；`deploy_05000.pt` step=5000/fusion=cat，统计和共同新初值 SHA 匹配，`build_mcl_arm('cat', ...)` strict-load PASS。
-- CAT 配置、GATE、XATTN 三配置逐字段比较仅 `fusion_mode` 不同。当前 GATE/XATTN 输出目录均不存在。
-- 当前 GPU：4 张 RTX 4090，预检时无活动训练进程、GPU 利用率 0%。CAT 旧 tmux window 保留；新臂须各用独立 window。
+| 下游臂 | 预训练部署包 | SHA256 |
+| --- | --- | --- |
+| GLT_REF、O8_ONLY | `results/mcl_ph_20260921/p2/pretrain/glt_ref_r10r1/deploy_05000.pt` | `7dc016dc422c58a6bba705a7a69c9f21051231350393a93d621b33e973883c47` |
+| M_CAT | `results/mcl_ph_20260921/p2/pretrain/cat_r10r3/deploy_05000.pt` | `eed6276565f0bc827fc1f56056a25cd8469db184b0e334d04c3dd0f3cfea0e49` |
+| M_GATE | `results/mcl_ph_20260921/p2/pretrain/gate_r10r3/deploy_05000.pt` | `312ea6708ee1b930001c1963714dfbdee44d8de711c5293bc0378be7a73b24e8` |
+| M_XATTN | `results/mcl_ph_20260921/p2/pretrain/xattn_r10r3/deploy_05000.pt` | `9f2bea298b7341eaaf02e85a84f95974334e64b5436310127d30d82ae49f206e` |
 
-## 实施顺序与验收门
+- 四条正式预训练轨迹均有真实退出码 0、`runtime PASS/5000`；三条 MCL 轨迹各有五组千步 resume/deploy，500 为 dense、501 为 Top-2，统计 SHA `9dc8160f1de5152f6c04a963c40569bac8facd21e68a700f40186363798cf8b1`、共同新初值 SHA `499309392d578daf7a7baf1d102d7a7f5c652e5a9b42ca2904ac9d83d1fab85a`、common-init SHA `1c9f97cf5547dcd2f44846e83586dfb4ec593dd4a4f56df510be372f26f1951d` 一致。CAT/GATE/XATTN 的最终包均通过对应 `build_mcl_arm` strict-load；GLT_REF 通过 strict-load，O8_ONLY 复制 83/83 个 O8 张量，512 head 初值一致。
+- XATTN 全日志中四 rank 各有 1–5000 的 5000 个 step 前缀、无非有限值标记；多 rank stdout 有行交错，故不把逐行 JSON 成功解析率当作运行步数。runner 自身在 loss 和梯度处设置非有限值硬失败，最终 runtime PASS。P2 aggregator 的针对性测试为 15 passed。
+- 三个 split manifest 均标记 `outer5_inner20`；`results/mcl_ph_20260921/p2/development_r10r3/` 不存在，未有相关训练进程。开发执行前重新核对这些易变事实和 GPU 占用。
+- 历史正式预训练累计 **25,082 updates / 6 次启动**（含失败 154 与 4928），本计划预训练新增预算为零；development 历史消耗为零。
 
-1. 在 `Uni-Poly:mcl_ph_r10r3_gate` 使用 `configs/mts/mcl_ph_gate.json` 启动一次正式 5,000-update 训练。输出 `results/mcl_ph_20260921/p2/pretrain/gate_r10r3/`，日志 `logs/mcl_ph_20260921/p2_gate_r10r3_pretrain.log`，真实退出码写入 `logs/mcl_ph_20260921/p2_gate_r10r3_pretrain.exit`。
-2. GATE 退出后、XATTN 启动前独立核验：退出码 0；runtime PASS、completed_steps=5000、cleanup=complete、export_complete=true、main_returned=true；1000/2000/3000/4000/5000 的 resume/deploy 全部存在；step 500=dense、501=top2；四 rank loss/gradient 有限；统计/初值身份一致；deploy step/fusion/source 身份正确；`build_mcl_arm('gate', ...)` strict-load PASS；运行 `scripts/verify_mcl_ph_arm.py --label gate_r10r3 --arm-dir results/mcl_ph_20260921/p2/pretrain/gate_r10r3 --updates 5000 --strict-cleanup` 并记录部署包 SHA。
-3. 只有 GATE 每项均通过后，才在 `Uni-Poly:mcl_ph_r10r3_xattn` 使用 `configs/mts/mcl_ph_xattn.json` 启动一次正式 5,000-update 训练。输出 `results/mcl_ph_20260921/p2/pretrain/xattn_r10r3/`，日志 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.log`，真实退出码写入 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.exit`。
-4. XATTN 使用与 GATE 相同的逐项验收门，build arm 使用 `build_mcl_arm('xattn', ...)`。任一项失败即保留现场并停止，不重试、不续训、不开始其他阶段。
+## 授权后的执行方案
 
-每个正式命令均由 `Uni-Poly` 独立 tmux window 承载，工作目录为仓库根目录；stdout/stderr 完整写入指定日志，命令真实退出码写入同名前缀 `.exit`。不重启 `scripts/run_mcl_ph_r10r3.py` 串行执行器。
+1. 安全同步远端并重读最新 `AGENTS.md`、本计划与 `MCL-PH.md`，检查工作区、tmux、GPU、四个包 SHA/strict-load、split、统计身份及新输出根。只读检查不得改写旧包、旧统计、cache 或失败现场。缺任一包或身份不符即阻断。
+2. 在全新根 `results/mcl_ph_20260921/p2/development_r10r3/`，按 `glt_ref, o8_only, m_cat, m_gate, m_xattn` × `xc, eps, eat` × `fold0, fold1` 的固定顺序串行执行 **30 units**。每 unit `--stage development --expected-pretrain-step 5000 --epochs 30`；共同配置 `configs/mts/mcl_ph_gate.json` 只用于相同下游超参数，MCL 模式由 arm 与包严格决定。train batch 32、eval 64、seed 42、warmup 5、patience 10、MSE、train-only scaler、full adaptation；backbone 1e-5、head 1e-4、AdamW decay 0.02（bias/LN/router 免 decay），只用 validation R² 选 epoch。
+3. 每 unit 在 `Uni-Poly` 的独立 window 保留完整命令、日志和真实退出码；先验收再启动下一个。要求 runtime PASS 且真实退出码 0，`run.json`/`metrics.json`/`best.pt`/`validation_predictions.npz` 齐全；`scripts.aggregate_mcl_ph.check_unit(..., stage='development', expected_step=5000)` 无问题；包 SHA、split、参数组、公共 512 head 初值、train-only scaler、epoch/更新数、选中 epoch 预测及 `outer_test=NOT_RUN` 一致。`best.pt` 仅是选中权重，不作为精确 resume 文件。
+4. **仅在 30/30 unit 全部通过后**运行 `scripts/aggregate_mcl_ph_p2.py --root results/mcl_ph_20260921/p2/development_r10r3 --expected-pretrain-step 5000`。独立核对 30 个 unit 的实际包 SHA、`best.pt` 身份与预测文件。聚合必须为 `status=PASS`、30 accepted/0 rejected、`outer_test=NOT_RUN`，报告五臂每折与 Macro3、相对 O8_ONLY 和 GLT_REF 的差值、全部预登记门槛与 parent。
 
-## 执行记录
+## 预算、门槛与停止
 
-- CAT 前置验收：通过，证据见上。
-- GATE：于 2026-09-23 03:43:56 UTC 在 `Uni-Poly:mcl_ph_r10r3_gate` 启动；训练退出码文件时间戳为 05:59:27.964 UTC，内容 `0`。命令使用本计划第 1 步所列 GATE 配置和固定输入，工作目录为仓库根目录；stdout/stderr 位于 `logs/mcl_ph_20260921/p2_gate_r10r3_pretrain.log`，产物位于 `results/mcl_ph_20260921/p2/pretrain/gate_r10r3/`。runtime 为 PASS / 5000，cleanup complete、export_complete=true、main_returned=true；五组 resume/deploy 齐全。解析完整日志得到四 rank 各 5000 条记录，所有 loss、总梯度及分组梯度有限，step 500 全 rank=dense、step 501 全 rank=top2；统计 SHA、shared-new-init SHA 和 common-init SHA 均与固定输入匹配。`scripts/verify_mcl_ph_arm.py --label gate_r10r3 --arm-dir results/mcl_ph_20260921/p2/pretrain/gate_r10r3 --updates 5000 --strict-cleanup` 返回 0 / PASS。CPU `build_mcl_arm('gate', package, expected_step=5000)` strict-load PASS；deploy 元数据为 step=5000、fusion=gate、training_route=mcl_ph，deploy SHA256 `312ea6708ee1b930001c1963714dfbdee44d8de711c5293bc0378be7a73b24e8`，参数数 19,958,723。逐项验收日志：`logs/mcl_ph_20260921/p2_gate_r10r3_strictcheck.log`，真实检查退出码记录为 `.exit=0`。阶段正式预算消耗 5000 updates / 1 次启动。
-- 用户要求停止周期监控后，没有向 GATE 发送信号；2026-09-23 08:10 UTC 的单次现场核对发现 GATE 已完成。按该要求，此后不恢复 5 分钟周期监控。
-- XATTN：于 2026-09-23 08:17:32 UTC 在独立 window `Uni-Poly:mcl_ph_r10r3_xattn` 单次启动，配置 `configs/mts/mcl_ph_xattn.json`，输出 `results/mcl_ph_20260921/p2/pretrain/xattn_r10r3/`，日志 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.log`，真实退出码目标文件 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.exit` 当前尚未生成。08:18 UTC 点查时 pane 存活、runtime 为 RUNNING / fusion=xattn / world=4，配置为 microbatch=84、accumulation=3、global batch=1008、lr=2e-4、warmup=2000、scheduler=20000、BF16、dense 500→Top-2、stop_after_step=5000。统计、shared-new-init、common-init SHA 与固定输入匹配；trajectory cache mode=cached，路径与固定 cache 一致，位置数 5,040,000。该点查只用于启动确认；按用户要求不恢复 5 分钟周期监控。XATTN 完成后仍须独立运行完整验收，任何失败均不重试、不续训。
-- 当前预算：历史 15,082 + GATE 完成 5,000 = 20,082 个已完成 updates / 5 次正式启动；XATTN 已占用本轮最后 1 次启动，最多再执行 5,000 updates。`.zcodeignore` 删除已在既有基线提交中，不属于本轮改动，不恢复、不暂存。
-- 文件修改前同步：`git pull --ff-only origin dev` 成功；GATE 记录更新基线 `3dd751e4c7eebd4d3c745a82a3ec455dfc6e4402`，XATTN 启动记录更新基线 `90c0a2d14572db514396976c5f2129aad02a1266`。`.zcodeignore` 删除是既有提交内容，不属于本轮改动，不恢复、不暂存。
-
-## 停止条件
-
-身份/统计/cache 不符、目标目录非空、writer 冲突、任何 rank 停滞或异常、loss/gradient 非有限、路由边界错误、checkpoint 缺失、严格加载失败、runtime/cleanup 不通过、真实退出码非零或预算超限：立即停止后续阶段并保留现场。GATE 未完整 PASS 时不启动 XATTN。整个本轮不启动 development、P3、OOF 或 outer-test。
+- development **最多 30 次 unit 启动 / 900 epochs**；patience 可以缩短单元，不把省下的 epoch 转为额外重跑。失败启动和已执行 epoch 照实计账，不自动重训、续训或增加 fold/seed。
+- 每个 MCL 候选必须同时对两个 baseline 达到 Macro3 差值 ≥ +0.005、XC 均值差值 ≥ +0.01、XC 两折差值各 > 0、任一任务均值退化不超过 0.01（含边界）。合格集为空即 STOP。若 CAT 合格，GATE/XATTN 只有在合格且相对 CAT 的 Macro3 ≥ +0.002、XC 两折均正时才能取代；距最高 Macro3 < 0.002 时按合同优先 GATE。`best_epoch=30` 标注边界风险，不自动延长。
+- 任一身份/包 SHA/split/训练数值/真实退出码/产物冲突或 `check_unit` 失败，停止后续 unit 和聚合、保留现场。不得读取 outer-test 特征、标签或预测；不得启动 P3、OOF、refit 或正式确认。
+- 阶段完成后由执行者记录真实命令、窗口、日志、产物、预算与偏差；审查者独立核对并给出通过／需返修／阻断结论。development 聚合结果只能称筛查结论，不能称盲测性能增益。

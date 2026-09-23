@@ -345,3 +345,12 @@
 - **验收与解释**：P2相对同轮GLT_REF/O8_ONLY按macro3≥0.005、XC均值≥0.01且两折为正、任务退化≤0.01筛选；高级融合需再胜CAT才取代合格简单模型。P3分别检验PH输入、样本相关路由、不同距离范围，不用整体新架构收益宣称PH单因素有效。不访问outer-test、不新增构象/seed/sweep；无收益允许STOP。
 - **实际文件/检查**：仅新增`MCL-PH.md`、追加本条。核对源码/config接口、论文网页，文档自检公式维度、预算、选择规则、smoke部署routing模式、历史N=0与原子N记号，运行`git diff --check`；未运行代码测试、模型、数据构建、GPU或训练，无第二独立审查者。提交见本轮Git历史与交付回复。
 - **下一步**：用户若采用此合同，授权ZCode先执行P0＋P1，交付后由Codex审查。当前实验状态仍为待授权，不将本条文档归档写作模型验收。
+
+### 2026-09-23 — MCL-PH-20260921-01 / r10R3-GX1：GATE、XATTN 正式预训练周期归档
+
+- **角色、授权与目标**：用户在已完成 CAT 5k 后明确要求继续 GATE 与 XATTN 两臂正式预训练，各一次、各最多 5000 updates，严格串行且逐臂验收；执行与原始自检由 Codex 完成，本次归档前另依据现场文件、日志和代码作只读核对。GATE/XATTN 周期已结束；P2 development 尚未执行，整个 MCL-PH 任务未结束。
+- **基线与修订**：本周期从 `dev@73a1980` 开始，GATE 验收记录在 `90c0a2d`，XATTN 启动记录在 `d4f31ee`。三臂配置仅 `fusion_mode` 不同；共同统计 SHA `9dc8160f…cf8b1`、新参数共同初值 SHA `49930939…83d1`、GLT common-init SHA `1c9f97cf…1951d` 均与运行身份一致。使用完整离线拓扑轨迹 cache；不重建 cache、不恢复旧 CAT、不设置墙钟 timeout。
+- **实际行为与产物**：未修改模型、数据、训练配置或预算定义。GATE 和 XATTN 分别在 `Uni-Poly:mcl_ph_r10r3_gate` 与 `Uni-Poly:mcl_ph_r10r3_xattn` 从原始初值运行到 step 5000。日志为 `logs/mcl_ph_20260921/p2_{gate,xattn}_r10r3_pretrain.log`，新产物目录为 `results/mcl_ph_20260921/p2/pretrain/{gate,xattn}_r10r3/`；旧失败现场和 CAT 产物未覆盖。
+- **验证与审查**：两臂真实退出码均为 0，runtime `PASS/5000`、cleanup/export/main-return 完成，各有五组千步 resume/deploy；step 500 dense、501 Top-2。GATE 已有生产 verifier 与 CPU strict-load 的独立日志；本轮对 XATTN 运行 `scripts/verify_mcl_ph_arm.py --strict-cleanup` 得 PASS，并对 CAT/GATE/XATTN 三包重新用 `build_mcl_arm` strict-load。XATTN 完整日志有四 rank 各 5000 个 step 前缀，且无非有限值标记；多进程 stdout 行交错使部分完整 JSON 行不可解析，不能把“解析到的完整行数”误当步数。runner 的非有限 loss/梯度硬失败机制和 PASS 退出提供额外约束。P2 聚合器针对性测试 15 passed。无 development、outer-test 或预测性能结论。
+- **最终部署包 SHA256**：CAT `eed6276565f0bc827fc1f56056a25cd8469db184b0e334d04c3dd0f3cfea0e49`；GATE `312ea6708ee1b930001c1963714dfbdee44d8de711c5293bc0378be7a73b24e8`；XATTN `9f2bea298b7341eaaf02e85a84f95974334e64b5436310127d30d82ae49f206e`；GLT_REF `7dc016dc422c58a6bba705a7a69c9f21051231350393a93d621b33e973883c47`，O8_ONLY 共用 GLT_REF 包。
+- **预算与下一步**：历史失败 154＋成功 GLT_REF 5000＋失败 CAT 4928＋成功 CAT/GATE/XATTN 各 5000＝**25,082 updates / 6 次正式启动**；development 0/30 units、0/900 epochs。GATE/XATTN 执行证据验收通过；下一计划为 `r10R3-DEV1`，只做五臂×三任务×两折的 development 筛查，状态待授权。P3、OOF、refit、outer-test 均未获本计划授权。
