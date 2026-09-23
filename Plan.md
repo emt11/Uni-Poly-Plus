@@ -1,6 +1,6 @@
 # MCL-PH-20260921-01 / r10R3-DEV1：P2 development 筛查计划
 
-状态：**待授权**。日期：2026-09-23 UTC。规划、现场审查与定向测试：Codex；development 执行者待用户指定。基准：`dev@d4f31ee`，修改前 `git pull --ff-only origin dev` 成功、工作区干净。用户本轮要求制定计划与执行提示词，**没有要求现在启动微调**。前一 `r10R3-GX1` 预训练周期的执行和审查摘要已归档到 `PROJECT_HISTORY.md`；历史失败与预算仍保留在 `MCL-PH.md`。
+状态：**阻断**。日期：2026-09-23 UTC。用户于 2026-09-23 UTC 明确授权执行本计划的 P2 development 阶段；执行者：Codex。计划创建基准为 `dev@d4f31ee`；本次执行前安全同步 `origin/dev` 后的现场基线为 `dev@2e8a5aa`，工作区干净。前一 `r10R3-GX1` 预训练周期摘要已归档到 `PROJECT_HISTORY.md`；历史失败与预算仍保留在 `MCL-PH.md`。执行在首个 unit 启动前因代码会读取 outer-test 标签而阻断，详见本文件末尾执行记录。
 
 ## 科学问题与比较边界
 
@@ -36,3 +36,11 @@
 - 每个 MCL 候选必须同时对两个 baseline 达到 Macro3 差值 ≥ +0.005、XC 均值差值 ≥ +0.01、XC 两折差值各 > 0、任一任务均值退化不超过 0.01（含边界）。合格集为空即 STOP。若 CAT 合格，GATE/XATTN 只有在合格且相对 CAT 的 Macro3 ≥ +0.002、XC 两折均正时才能取代；距最高 Macro3 < 0.002 时按合同优先 GATE。`best_epoch=30` 标注边界风险，不自动延长。
 - 任一身份/包 SHA/split/训练数值/真实退出码/产物冲突或 `check_unit` 失败，停止后续 unit 和聚合、保留现场。不得读取 outer-test 特征、标签或预测；不得启动 P3、OOF、refit 或正式确认。
 - 阶段完成后由执行者记录真实命令、窗口、日志、产物、预算与偏差；审查者独立核对并给出通过／需返修／阻断结论。development 聚合结果只能称筛查结论，不能称盲测性能增益。
+
+## 本轮执行记录与阻断（Codex；2026-09-23 UTC）
+
+- 用户明确授权本计划中的 P2 development 阶段，预算保持 30 次 unit 启动 / 最多 900 epochs；没有授权新增预训练、重跑、P3、OOF、refit 或 outer-test。执行前运行 `git pull --ff-only origin dev`，结果为 `Already up to date`；现场 `HEAD=origin/dev=2e8a5aa98921a836936d344b7cd8c8eac135e131`，工作区干净。
+- 只读预检：四个部署包 SHA 均匹配本计划表。CPU strict-load：GLT_REF PASS；O8_ONLY 从 GLT_REF strict-loaded 包复制 83/83 张量；M_CAT、M_GATE、M_XATTN 均 PASS。四个 512-wide 新 head 的共同初值 SHA256 为 `1541ef7e59e5a5857275d9e473ecf62d4ca39ea2459ba7cb8baff60143be6437`。统计文件 SHA256 匹配 `9dc8160f1de5152f6c04a963c40569bac8facd21e68a700f40186363798cf8b1`。
+- 三个 split manifest 均为 `outer5_inner20`，fold0/1 均可通过 resolver 的内部互斥与覆盖检查；resolver 输入的 cohort 行数取自 manifest 的 `sample_count`，真实 live cohort 行数本次未独立核对。development 输出根及专用日志根均不存在。`Uni-Poly` session 存在；未发现 MCL-PH 训练进程，四卡 GPU 利用率均为 0%，GPU 3 的 506 MiB 占用没有对应 compute process。未启动任何 unit；没有创建训练输出、checkpoint、unit 日志或退出码文件。
+- **阻断原因**：`scripts/finetune_mcl_ph.py:354-363` 调用 `open_source()` 构造整个 task cohort 的 `frame`，随后在建立 train/validation `Subset` 之前，对完整 `frame['label']` 调用 `to_numpy(dtype=np.float64)` 并传入 dataset。因而 outer-test 标签也被读入并存入 dataset 的 target 数组，违反本计划“不得读取 outer-test 特征、标签或预测”的约束；虽然之后的 scaler、DataLoader 和预测只选 train/validation 索引，不能消除该读取事实。当前执行授权仅覆盖运行计划，未覆盖 finetune 数据加载实现的修改，故在首个 unit 前停止，未重试、未自动修复，也未运行聚合器。
+- **下一步**：等待用户决定是否授权最小代码修改，使下游加载只接触 train/validation 标签，并在同一计划内重新审核后继续；在授权与修订前不启动任何 unit。P3、OOF、refit、outer-test 仍未授权。
