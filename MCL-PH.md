@@ -2057,3 +2057,28 @@ median 仅报告、不作 gate，本轮数据也给出直接理由：同 arm 同
 2. XATTN：仅在 GATE 的每项验收均 PASS 后启动；配置 `configs/mts/mcl_ph_xattn.json`；独立 window `Uni-Poly:mcl_ph_r10r3_xattn`；输出 `results/mcl_ph_20260921/p2/pretrain/xattn_r10r3/`；日志 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.log`；退出码 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.exit`。在启动前核对 GATE 的验收结果，并记录 XATTN 的完整实际证据。
 
 预算快照：此前 15,082 updates / 4 次正式启动；本轮最多新增 10,000 updates / 2 次启动。任一身份、有限性、路由、checkpoint、严格加载、cleanup 或退出码门槛失败，停止后续阶段，保留现场，不重试或续训。当前仅记录正式预训练执行证据，不作预测性能结论。
+
+#### GATE 阶段实际执行与验收（Codex；2026-09-23 UTC）
+
+- 训练命令在仓库根目录执行，tmux window 为 `Uni-Poly:mcl_ph_r10r3_gate`，启动时间 03:43:56 UTC：
+
+```bash
+python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrain_mcl_ph.py \
+  --config configs/mts/mcl_ph_gate.json \
+  --cohort-root data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1 \
+  --cache-root data/processed/mips_trimer_scage \
+  --dual-static-root data/processed/glt_dual_v2/pi1m/dual_static_v1 \
+  --statistics results/mcl_ph_20260921/p0_r10r3/statistics.npz \
+  --shared-new-init results/mcl_ph_20260921/p2/pretrain/shared_new_init.pt \
+  --trajectory-cache data/processed/mcl_ph_cache/p2_noisy_seed42_sigma003_step5000_v1 \
+  --diagnostics --prep-workers 12 --stop-after-step 5000 \
+  --output results/mcl_ph_20260921/p2/pretrain/gate_r10r3
+```
+
+- 工作目录：`/root/workspace/Uni-Poly-Plus-master`。输出：`results/mcl_ph_20260921/p2/pretrain/gate_r10r3/`。完整 stdout/stderr：`logs/mcl_ph_20260921/p2_gate_r10r3_pretrain.log`。真实训练退出码文件内容为 `0`，文件时间戳 05:59:27.964 UTC；runtime 为 `PASS`、`completed_steps=5000`、`cleanup=complete`、`export_complete=true`、`main_returned=true`。该训练窗口已随命令退出而关闭；没有给训练进程发送信号。
+- 运行身份：fusion=gate、world=4、microbatch=84、accumulation=3、global batch=1008、BF16、lr=2e-4、warmup=2000、scheduler total=20000、dense updates=500、其后 top-2、最大 5000 updates。runtime 中 statistics SHA 为 `9dc8160f1de5152f6c04a963c40569bac8facd21e68a700f40186363798cf8b1`，shared-new-init SHA 为 `499309392d578daf7a7baf1d102d7a7f5c652e5a9b42ca2904ac9d83d1fab85a`，common-init SHA 为 `1c9f97cf5547dcd2f44846e83586dfb4ec593dd4a4f56df510be372f26f1951d`，均匹配固定输入。
+- 五组 `resume_{01000,02000,03000,04000,05000}.pt` 与 `deploy_{01000,02000,03000,04000,05000}.pt` 均存在。完整训练日志可恢复四 rank 各 5000 条记录；loss、`grad_total_preclip` 和所有分组梯度范数均有限，step 500 四 rank 均为 dense，step 501 四 rank 均为 top2。stderr 中只有启动阶段和 DDP 的 warning；未发现 traceback、NaN/Inf 或 runtime error。
+- 最终包 `deploy_05000.pt` 大小 79,890,673 bytes，metadata 为 step=5000、fusion=gate、training_route=mcl_ph；包内 statistics/shared-new-init SHA 与固定身份一致。SHA256：`312ea6708ee1b930001c1963714dfbdee44d8de711c5293bc0378be7a73b24e8`。
+- 独立验收命令 `python3 scripts/verify_mcl_ph_arm.py --label gate_r10r3 --arm-dir results/mcl_ph_20260921/p2/pretrain/gate_r10r3 --updates 5000 --strict-cleanup` 返回退出码 0、verdict PASS；证据日志：`logs/mcl_ph_20260921/p2_gate_r10r3_acceptance.log`，退出码记录 `logs/mcl_ph_20260921/p2_gate_r10r3_acceptance.exit=0`。另在独立 tmux window `mcl_ph_r10r3_gate_strictcheck` 完成逐项日志/身份/文件检查和 CPU `build_mcl_arm('gate', package, expected_step=5000)` strict-load；其日志 `logs/mcl_ph_20260921/p2_gate_r10r3_strictcheck.log`、退出码文件 `.exit=0`，输出 verdict `GATE_ACCEPTANCE_PASS`，encoder 参数数 19,958,723。
+- 用户曾要求停止周期监控；当时没有给训练发送信号。2026-09-23 08:10 UTC 的点查确认 GATE 已结束且完整通过。按用户要求不恢复 5 分钟周期监控。GATE 消耗 5000 updates / 1 次启动；此前正式预算 15,082 updates / 4 次启动，因此累计 20,082 / 5，余额 5000 / 1 次启动。
+- 本段记录写入时，XATTN 输出目录与日志均尚不存在，XATTN 尚未启动。按已授权顺序，下一步仅启动 XATTN 一次；不启动 development、P3、OOF 或 outer-test。

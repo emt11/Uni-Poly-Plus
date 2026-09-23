@@ -1,6 +1,6 @@
 # MCL-PH-20260921-01 / r10R3 GATE→XATTN 执行记录
 
-计划修订：r10R3-GX1。状态：**执行中（CAT 已验收通过；GATE 已完成预检、尚未启动）**。基准：`dev@73a1980`，`origin/dev` 同步；本轮修改前 `git pull --ff-only origin dev` 返回 Already up to date，工作区干净。授权来源：用户本轮明确要求仅执行 GATE、XATTN 两次正式预训练。实际执行与自检：Codex；独立审查待后续。
+计划修订：r10R3-GX1。状态：**执行中（GATE 已完整验收通过；XATTN 尚未启动，是下一步）**。原计划基线：`dev@73a1980`；本次记录更新基线：`dev@3dd751e`，`origin/dev` 同步，修改前 `git pull --ff-only origin dev` 返回 Already up to date、工作区干净。授权来源：用户明确要求仅执行 GATE、XATTN 两次正式预训练。实际执行与自检：Codex；独立审查待后续。
 
 ## 本轮问题、对照与范围
 
@@ -33,9 +33,10 @@
 ## 执行记录
 
 - CAT 前置验收：通过，证据见上。
-- GATE：预检已通过，**本计划头更新时尚未启动**；实际命令、window、启动时间、产物、退出码和逐项验收在本节追加。
-- XATTN：未启动；只有 GATE 完整验收通过后才允许启动。
-- 文件修改前同步：`git pull --ff-only origin dev` 成功；基线 `73a1980f95f8b572634c89ca3d62d33420ed1990`。当前 `.zcodeignore` 删除已包含在该基线提交中，不属于本轮改动，本轮不恢复、不暂存。
+- GATE：于 2026-09-23 03:43:56 UTC 在 `Uni-Poly:mcl_ph_r10r3_gate` 启动；训练退出码文件时间戳为 05:59:27.964 UTC，内容 `0`。命令使用本计划第 1 步所列 GATE 配置和固定输入，工作目录为仓库根目录；stdout/stderr 位于 `logs/mcl_ph_20260921/p2_gate_r10r3_pretrain.log`，产物位于 `results/mcl_ph_20260921/p2/pretrain/gate_r10r3/`。runtime 为 PASS / 5000，cleanup complete、export_complete=true、main_returned=true；五组 resume/deploy 齐全。解析完整日志得到四 rank 各 5000 条记录，所有 loss、总梯度及分组梯度有限，step 500 全 rank=dense、step 501 全 rank=top2；统计 SHA、shared-new-init SHA 和 common-init SHA 均与固定输入匹配。`scripts/verify_mcl_ph_arm.py --label gate_r10r3 --arm-dir results/mcl_ph_20260921/p2/pretrain/gate_r10r3 --updates 5000 --strict-cleanup` 返回 0 / PASS。CPU `build_mcl_arm('gate', package, expected_step=5000)` strict-load PASS；deploy 元数据为 step=5000、fusion=gate、training_route=mcl_ph，deploy SHA256 `312ea6708ee1b930001c1963714dfbdee44d8de711c5293bc0378be7a73b24e8`，参数数 19,958,723。逐项验收日志：`logs/mcl_ph_20260921/p2_gate_r10r3_strictcheck.log`，真实检查退出码记录为 `.exit=0`。阶段正式预算消耗 5000 updates / 1 次启动。
+- 用户要求停止周期监控后，没有向 GATE 发送信号；2026-09-23 08:10 UTC 的单次现场核对发现 GATE 已完成。按该要求，此后不恢复 5 分钟周期监控。
+- XATTN：尚未启动；GATE 独立验收现已全部通过。下一步仍按原授权，在独立 window `Uni-Poly:mcl_ph_r10r3_xattn` 启动一次，最多 5000 updates；完成后执行同一验收门。当前阶段总预算为此前 15,082 + GATE 5,000 = 20,082 updates / 5 次正式启动；剩余上限 5,000 updates / 1 次启动。
+- 文件修改前同步：`git pull --ff-only origin dev` 成功；本次记录更新基线 `3dd751e4c7eebd4d3c745a82a3ec455dfc6e4402`。`.zcodeignore` 删除已包含在既有基线中，不属于本轮改动，本轮不恢复、不暂存。
 
 ## 停止条件
 
