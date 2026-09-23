@@ -292,6 +292,7 @@ def require_tmux():
 def open_source(cohort_root, cache_root, *, task=None, dual_static_root=None,
                 pretrain_target_root=None, selected_indices=None,
                 expected_task_rows=None, expected_split_sha256=None,
+                record_index_path=None,
                 chunk_cache_capacity=CHUNK_CACHE_CAPACITY):
     if selected_indices is None:
         full_cohort = load_dual_cohort(cohort_root, cache_root)
@@ -304,6 +305,7 @@ def open_source(cohort_root, cache_root, *, task=None, dual_static_root=None,
             cohort_root, cache_root, task=task, row_indices=selected_indices,
             expected_task_rows=expected_task_rows,
             expected_split_sha256=expected_split_sha256,
+            record_index_path=record_index_path,
         )
     static_cache = target_cache = None
     if dual_static_root is not None:

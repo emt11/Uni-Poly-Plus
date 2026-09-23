@@ -52,8 +52,10 @@ WEIGHT_DECAY = 0.02
 SCHEDULE_TOTAL_EPOCHS = 30
 SCHEDULE_WARMUP_EPOCHS = 5
 HEAD_INIT_SEED = 20260921
-TASKS = ('xc', 'eps', 'eat')
-FOLDS = (0, 1)
+TASKS = ('eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc')
+FOLDS = (0, 1, 2, 3, 4)
+DEVELOPMENT_TASKS = ('xc', 'eps', 'eat')
+DEVELOPMENT_FOLDS = (0, 1)
 SPLIT_PROTOCOL = 'outer5_inner20'
 
 
@@ -304,6 +306,18 @@ def unit_directory(output, arm, task, fold):
     return Path(output) / str(arm) / str(task) / f'fold{int(fold)}'
 
 
+def validate_stage_scope(stage, task, fold, epochs, cohort_index):
+    if stage == 'smoke' and epochs != 1:
+        raise ValueError('smoke units run exactly one epoch')
+    if stage in ('development', 'full8x5') and not 1 <= epochs <= SCHEDULE_TOTAL_EPOCHS:
+        raise ValueError(f'{stage} units allow 1..{SCHEDULE_TOTAL_EPOCHS} epochs')
+    if stage == 'development' and (task not in DEVELOPMENT_TASKS or
+                                   fold not in DEVELOPMENT_FOLDS):
+        raise ValueError('development permits only XC/EPS/EAT and folds 0/1')
+    if stage in ('development', 'full8x5') and not cohort_index:
+        raise ValueError('a trusted cohort index is required for label-isolated stages')
+
+
 def compact_train_validation_indices(train_indices, validation_indices):
     """Return only train/validation task rows and their compact dataset indices."""
     train_indices = [int(index) for index in train_indices]
@@ -378,7 +392,8 @@ def run_unit(args, folder, started, statistics, config, manifest):
         args.cohort_root, args.cache_root, task=args.task,
         dual_static_root=args.dual_static_root, selected_indices=selected_indices,
         expected_task_rows=int(manifest['sample_count']),
-        expected_split_sha256=sha256_file(split_path))
+        expected_split_sha256=sha256_file(split_path),
+        record_index_path=args.cohort_index)
     try:
         if frame['original_row'].astype(int).tolist() != selected_indices:
             raise ValueError('selected downstream rows differ from train/validation indices')
@@ -474,7 +489,7 @@ def failure_record(error, args, started):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arm', required=True, choices=ARMS)
-    parser.add_argument('--stage', required=True, choices=('smoke', 'development'))
+    parser.add_argument('--stage', required=True, choices=('smoke', 'development', 'full8x5'))
     parser.add_argument('--config', required=True)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--expected-pretrain-step', type=int, required=True)
@@ -482,16 +497,15 @@ def main():
     parser.add_argument('--cache-root', required=True)
     parser.add_argument('--dual-static-root', required=True)
     parser.add_argument('--split-root', required=True)
+    parser.add_argument('--cohort-index', help='trusted byte-offset index; required for label-isolated stages')
     parser.add_argument('--statistics')
     parser.add_argument('--task', default='xc', choices=TASKS)
     parser.add_argument('--fold', type=int, default=0, choices=FOLDS)
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
-    if args.stage == 'smoke' and not 1 <= args.epochs <= 1:
-        raise ValueError('smoke units run exactly one epoch')
-    if args.stage == 'development' and not 1 <= args.epochs <= SCHEDULE_TOTAL_EPOCHS:
-        raise ValueError(f'development units allow 1..{SCHEDULE_TOTAL_EPOCHS} epochs')
+    validate_stage_scope(args.stage, args.task, args.fold, args.epochs,
+                         args.cohort_index)
     if args.arm in MCL_FUSION and not args.statistics:
         raise ValueError('the MCL-PH downstream arms require the shared statistics artifact')
     require_tmux()

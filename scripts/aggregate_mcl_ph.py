@@ -24,7 +24,8 @@ from scripts.finetune_mcl_ph import (ARMS, FOLDS, MCL_FUSION, SCHEDULE_TOTAL_EPO
 
 REQUIRED_FILES = ('run.json', 'runtime.json', 'metrics.json', 'best.pt',
                   'validation_predictions.npz')
-STAGE_EPOCH_LIMIT = {'smoke': 1, 'development': SCHEDULE_TOTAL_EPOCHS}
+STAGE_EPOCH_LIMIT = {'smoke': 1, 'development': SCHEDULE_TOTAL_EPOCHS,
+                     'full8x5': SCHEDULE_TOTAL_EPOCHS}
 # The declared P1 smoke scope; anything smaller can be verified but is PARTIAL.
 ACCEPTANCE_ARMS = tuple(ARMS)
 ACCEPTANCE_TASKS = ('xc',)

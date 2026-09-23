@@ -1,7 +1,9 @@
 import json
 import hashlib
+from pathlib import Path
 
 import numpy as np
+import pytest
 
 from scripts.finetune_mcl_ph import compact_train_validation_indices
 import src.dataset.glt_dual_cache as dual_cache
@@ -87,6 +89,39 @@ def _frozen_cohort_with_opaque_outer_test(tmp_path, monkeypatch):
 def test_open_source_decodes_only_train_validation_labels(tmp_path, monkeypatch):
     cohort_root, split_hash, keys = _frozen_cohort_with_opaque_outer_test(
         tmp_path, monkeypatch)
+    index_path = tmp_path / 'cohort_offsets.json'
+    index = dual_cache.build_dual_cohort_record_index(cohort_root, index_path)
+    assert len(index['offsets']) == 4
+    records_path = cohort_root / 'records.jsonl'
+    permitted_offsets = {index['offsets'][row] for row in (0, 2, 3)}
+    original_open = Path.open
+
+    class _SelectedReadsOnly:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+        def seek(self, offset):
+            assert offset in permitted_offsets
+            return self.handle.seek(offset)
+
+        def read(self, length):
+            assert self.handle.tell() in permitted_offsets
+            assert length == index['lengths'][index['offsets'].index(self.handle.tell())]
+            return self.handle.read(length)
+
+    def guarded_open(path, *args, **kwargs):
+        handle = original_open(path, *args, **kwargs)
+        if path == records_path:
+            return _SelectedReadsOnly(handle)
+        return handle
+
+    monkeypatch.setattr(Path, 'open', guarded_open)
     class _Source:
         def __init__(self, _cache_root, cohort, **_kwargs):
             self.samples = [(bytes.fromhex(row['sample_key']), row['source_smiles'])
@@ -108,7 +143,8 @@ def test_open_source_decodes_only_train_validation_labels(tmp_path, monkeypatch)
         train_indices=[0, 3], validation_indices=[2])
     source, frame = dual_runtime.open_source(
         cohort_root, tmp_path / 'cache', task='xc', selected_indices=selected,
-        expected_task_rows=4, expected_split_sha256=split_hash)
+        expected_task_rows=4, expected_split_sha256=split_hash,
+        record_index_path=index_path)
     assert len(source) == 3
     assert frame['original_row'].tolist() == selected
     assert frame['sample_key'].tolist() == [keys[index].hex() for index in selected]
@@ -129,3 +165,16 @@ def test_train_only_scaler_uses_compact_training_indices():
     assert validation_local == [1]
     assert scaler.scaler.mean_[0] == 12.0
     np.testing.assert_allclose(targets.targets, [-1.0, 4.0, 1.0])
+
+
+def test_record_index_refuses_changed_source_without_scanning_labels(tmp_path, monkeypatch):
+    cohort_root, _, _ = _frozen_cohort_with_opaque_outer_test(tmp_path, monkeypatch)
+    index_path = tmp_path / 'cohort_offsets.json'
+    dual_cache.build_dual_cohort_record_index(cohort_root, index_path)
+    with (cohort_root / 'records.jsonl').open('ab') as handle:
+        handle.write(b'changed')
+    manifest = json.loads((cohort_root / 'manifest.json').read_text())
+    with pytest.raises(dual_cache.CacheLifecycleError,
+                       match='index/source identity mismatch'):
+        dual_cache._load_record_index(index_path, cohort_root / 'records.jsonl',
+                                      manifest, 4)

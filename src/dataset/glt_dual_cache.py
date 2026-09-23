@@ -216,7 +216,82 @@ def load_dual_cohort(cohort_root, cache_root, *, verify_files=True) -> dict:
     }
 
 
-def _load_selected_jsonl_records(records_path, selected_indices, expected_count):
+def build_dual_cohort_record_index(cohort_root, output_path):
+    """Index frozen JSONL byte ranges once, before any label-isolated run.
+
+    This preparation necessarily scans the original bytes, including test-row
+    bytes. It never decodes records or labels. The indexed training reader does
+    not scan those bytes again.
+    """
+    cohort_root = Path(cohort_root).resolve()
+    output_path = Path(output_path)
+    manifest = json.loads((cohort_root / "manifest.json").read_text(encoding="utf-8"))
+    records_path = cohort_root / "records.jsonl"
+    before = records_path.stat()
+    digest = hashlib.sha256()
+    offsets, lengths = [], []
+    with records_path.open("rb") as handle:
+        while True:
+            offset = handle.tell()
+            line = handle.readline()
+            if not line:
+                break
+            offsets.append(offset)
+            lengths.append(len(line))
+            digest.update(line)
+    after = records_path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != \
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise CacheLifecycleError("cohort records changed while indexing")
+    if digest.hexdigest() != manifest.get("records_file_sha256"):
+        raise CacheLifecycleError("cohort records digest differs from frozen manifest")
+    if len(offsets) != int(manifest.get("sample_count", -1)):
+        raise CacheLifecycleError("cohort record index row count differs from manifest")
+    payload = {
+        "schema": "dual-cohort-jsonl-offsets-v1",
+        "cohort_manifest_hash": json_hash(manifest),
+        "records_file_sha256": digest.hexdigest(),
+        "source_device": after.st_dev, "source_inode": after.st_ino,
+        "source_size": after.st_size, "source_mtime_ns": after.st_mtime_ns,
+        "offsets": offsets, "lengths": lengths,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("x", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+    return payload
+
+
+def _load_record_index(path, records_path, manifest, expected_count):
+    index = json.loads(Path(path).read_text(encoding="utf-8"))
+    source_stat = Path(records_path).stat()
+    expected = {
+        "schema": "dual-cohort-jsonl-offsets-v1",
+        "cohort_manifest_hash": json_hash(manifest),
+        "records_file_sha256": manifest.get("records_file_sha256"),
+        "source_device": source_stat.st_dev,
+        "source_inode": source_stat.st_ino,
+        "source_size": source_stat.st_size,
+        "source_mtime_ns": source_stat.st_mtime_ns,
+    }
+    if any(index.get(key) != value for key, value in expected.items()):
+        raise CacheLifecycleError("cohort record index/source identity mismatch")
+    offsets, lengths = index.get("offsets"), index.get("lengths")
+    if not isinstance(offsets, list) or not isinstance(lengths, list) or \
+            len(offsets) != int(expected_count) or len(lengths) != int(expected_count):
+        raise CacheLifecycleError("cohort record index has incorrect row count")
+    previous_end = 0
+    for offset, length in zip(offsets, lengths):
+        if type(offset) is not int or type(length) is not int or \
+                offset != previous_end or length <= 0:
+            raise CacheLifecycleError("cohort record index has invalid byte ranges")
+        previous_end = offset + length
+    if previous_end != source_stat.st_size:
+        raise CacheLifecycleError("cohort record index does not cover source bytes")
+    return index
+
+
+def _load_selected_jsonl_records(records_path, selected_indices, expected_count,
+                                 record_index=None):
     """Decode only selected JSONL records; leave every other line opaque.
 
     The file is binary-read so skipped rows, including their serialized labels,
@@ -231,6 +306,31 @@ def _load_selected_jsonl_records(records_path, selected_indices, expected_count)
         raise CacheLifecycleError("selected cohort indices must be sorted and unique")
     if any(value < 0 or value >= int(expected_count) for value in selected_indices):
         raise CacheLifecycleError("selected cohort index is out of range")
+
+    if record_index is not None:
+        selected = {}
+        before = Path(records_path).stat()
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != \
+                (record_index["source_device"], record_index["source_inode"],
+                 record_index["source_size"], record_index["source_mtime_ns"]):
+            raise CacheLifecycleError("cohort records changed before selected read")
+        with Path(records_path).open("rb", buffering=0) as handle:
+            for index in selected_indices:
+                handle.seek(record_index["offsets"][index])
+                line = handle.read(record_index["lengths"][index])
+                if len(line) != record_index["lengths"][index] or not line.endswith(b"\n"):
+                    raise CacheLifecycleError("indexed cohort record is truncated")
+                try:
+                    selected[index] = json.loads(line)
+                except (UnicodeDecodeError, ValueError) as error:
+                    raise CacheLifecycleError(
+                        f"selected dual cohort record {index} is invalid JSON"
+                    ) from error
+        after = Path(records_path).stat()
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != \
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise CacheLifecycleError("cohort records changed during selected read")
+        return selected
 
     wanted = set(selected_indices)
     selected = {}
@@ -262,6 +362,7 @@ def load_dual_cohort_task_rows(
     row_indices,
     expected_task_rows,
     expected_split_sha256,
+    record_index_path=None,
 ):
     """Load labels and records only for explicitly selected task row indices.
 
@@ -347,7 +448,9 @@ def load_dual_cohort_task_rows(
 
     if sha256_file(keys_path) != manifest.get("keys_file_sha256"):
         raise CacheLifecycleError("dual cohort keys file hash mismatch")
-    if sha256_file(records_path) != manifest.get("records_file_sha256"):
+    record_index = (_load_record_index(record_index_path, records_path, manifest,
+                                       sample_count) if record_index_path is not None else None)
+    if record_index is None and sha256_file(records_path) != manifest.get("records_file_sha256"):
         raise CacheLifecycleError("dual cohort records file hash mismatch")
     keys = np.load(keys_path, mmap_mode="r")
     if keys.dtype != np.uint8 or keys.ndim != 2 or keys.shape[1] != 32:
@@ -363,7 +466,8 @@ def load_dual_cohort_task_rows(
     task_offset = sum(int(task_counts[name]) for name in task_order[:task_order.index(task)])
     global_indices = tuple(task_offset + index for index in selected_task_indices)
     selected_records = _load_selected_jsonl_records(
-        records_path, global_indices, expected_count=sample_count)
+        records_path, global_indices, expected_count=sample_count,
+        record_index=record_index)
     rows = []
     for local_index, global_index in zip(selected_task_indices, global_indices):
         row = selected_records[global_index]
