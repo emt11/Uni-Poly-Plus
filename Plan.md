@@ -1,6 +1,6 @@
 # MCL-PH-20260921-01 / r10R3-FULL8X5-1：五臂 8×5 内部验证微调
 
-状态：**待执行**（五臂 8×5 内部验证微调，启动前）。日期：2026-09-23 UTC。用户已明确授权五臂全部、8 任务×5 折、仅微调与内部验证，预算最多 **200 次 unit 启动 / 6,000 epochs**；执行者：Codex。用户要求跳过与本次运行无关的重复测试，必要身份、标签隔离和防覆盖检查保留。原 P2 development 30-unit 计划未启动，本轮新范围不把其 30 次额度另加到 200 次。执行基线 `dev@ca9d0f9`，修改前 `git pull --ff-only origin dev` 成功、工作区干净。既往阻断与修复记录保留在文末，不追改当时结论。
+状态：**执行中**（五臂 8×5 内部验证微调）。日期：2026-09-23 UTC。用户已明确授权五臂全部、8 任务×5 折、仅微调与内部验证，预算最多 **200 次 unit 启动 / 6,000 epochs**；执行者：Codex。用户要求跳过与本次运行无关的重复测试，必要身份、标签隔离和防覆盖检查保留。原 P2 development 30-unit 计划未启动，本轮新范围不把其 30 次额度另加到 200 次。执行基线 `dev@ca9d0f9`，修改前 `git pull --ff-only origin dev` 成功、工作区干净。既往阻断与修复记录保留在文末，不追改当时结论。
 
 ## 当前授权的启动范围
 
@@ -67,6 +67,13 @@
 **恢复原 P2 development 的条件**：使用上述索引路径、原四个包和现有配置，在首个 unit 前重新核对索引/源身份、无冲突进程及输出目录；原 30 次 unit / 900 epochs 授权仍有效，失败即 STOP，不自动重跑。**8×5 运行仍待独立方案及明确预算授权**：必须指定臂集合、输出根、40/臂次 unit 与最多 1,200/臂 epochs、是否需要外层测试及其读取时机。若要外层测试结果，须另行实现锁定 epoch 后的测试评价协议；当前 `full8x5` 仅完成 train/inner-validation 微调，不读取 outer-test 标签或预测。
 
 8×5 运行接口为 `scripts/run_mcl_ph_8x5.py --arms <明确臂列表> --package <arm=deploy_05000.pt> ... --config configs/mts/mcl_ph_gate.json --cohort-root data/processed/glt_dual_v2/downstream/cohort_1545eda5a8f6a1 --cache-root data/processed/mips_trimer_scage_downstream --dual-static-root data/processed/glt_dual_v2/downstream/dual_static_v1 --split-root data/splits/mips_outer5_inner20 --statistics results/mcl_ph_20260921/p0_r10r3/statistics.npz --cohort-index results/mcl_ph_20260921/p2/cohort_record_index.json --output <全新目录> --log-root <全新日志目录>`。此处是可执行接口说明，不是启动命令或预算授权；运行时须在 `Uni-Poly` 独立 window 内。
+
+## FULL8X5-1 启动记录（Codex；2026-09-23 UTC）
+
+- 用户本轮明确选择五臂全部、只做内部验证；不要求 outer-test。修改文档前 `git pull --ff-only origin dev` 返回 Already up to date，现场 `dev@ca9d0f9` 工作区干净。四包及统计 SHA 与本计划相符，cohort 行索引绑定 6,265 行当前源文件，无同任务进程；四卡在启动前空闲。
+- 不删除模型/标签/包/产物身份和防覆盖检查；跳过无关旧预训练 launcher fixture 与全仓测试。现有 `run_mcl_ph_8x5.py` 已支持本轮 200 units，无必要代码修改，直接使用已验证代码。授权计划提交 `0d79714` 已推送 `dev`。
+- 实际启动 window：`Uni-Poly:96:mcl_ph_full8x5`；命令完整保存在 `logs/mcl_ph_20260921/full8x5_r10r3_1_launch.sh`，launcher 日志和最终退出码分别为 `logs/mcl_ph_20260921/full8x5_r10r3_1_launcher.log`、`.exit`。输出根 `results/mcl_ph_20260921/p2/full8x5_r10r3_1/`，逐 unit 日志/退出码根 `logs/mcl_ph_20260921/full8x5_r10r3_1/`。无 wall-clock timeout，按显式五臂顺序串行。
+- 首个 `glt_ref/eat/fold0` 已完成真实退出码 0、`runtime PASS`、30 epochs、best_epoch 23，五件必需产物齐全，`outer_test=NOT_RUN`；启动器已通过其 unit 检查并开始下一 unit。**当前只是执行中，不是 200/200 完成、P2 合格或性能增益结论。** 后续每 unit 的实际结果以各 `.exit`/`runtime.json`/聚合产物为准；失败即停止，保留现场。
 
 ## 标签隔离修订审查与阻断（Codex；2026-09-23 UTC）
 
