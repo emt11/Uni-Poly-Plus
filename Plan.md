@@ -1,6 +1,14 @@
-# MCL-PH-20260921-01 / r10R3-DEV2：P2 development 与 8×5 能力修订
+# MCL-PH-20260921-01 / r10R3-FULL8X5-1：五臂 8×5 内部验证微调
 
-状态：**待执行**（原 P2 development 30-unit 授权）；**待授权**（新增 8×5 正式运行）。日期：2026-09-23 UTC。用户已授权 P2 development、最小标签隔离修复及 8×5 执行能力实现；未授权增加正式训练预算。执行者：Codex。原始计划基准 `dev@d4f31ee`；本次修复基准 `dev@98c0e08`，修改前 `git pull --ff-only origin dev` 成功、工作区干净。前一 `r10R3-GX1` 预训练周期摘要已归档到 `PROJECT_HISTORY.md`；历史失败与预算保留在 `MCL-PH.md`。DEV1 的阻断和候选修复记录保留在文末；本次修订不追改当时结论。
+状态：**待执行**（五臂 8×5 内部验证微调，启动前）。日期：2026-09-23 UTC。用户已明确授权五臂全部、8 任务×5 折、仅微调与内部验证，预算最多 **200 次 unit 启动 / 6,000 epochs**；执行者：Codex。用户要求跳过与本次运行无关的重复测试，必要身份、标签隔离和防覆盖检查保留。原 P2 development 30-unit 计划未启动，本轮新范围不把其 30 次额度另加到 200 次。执行基线 `dev@ca9d0f9`，修改前 `git pull --ff-only origin dev` 成功、工作区干净。既往阻断与修复记录保留在文末，不追改当时结论。
+
+## 当前授权的启动范围
+
+- 五臂固定顺序 `glt_ref, o8_only, m_cat, m_gate, m_xattn`；任务固定 `eat, eea, egb, egc, ei, eps, nc, xc`，每任务 fold0–4，共 **200 units**。每 unit 最多 30 epochs，warmup 5、patience 10、seed 42 加 fold、train-only scaler、原超参数与各自 5k 包；不额外启动 30-unit P2 development。
+- 使用 `scripts/run_mcl_ph_8x5.py`，全新输出根 `results/mcl_ph_20260921/p2/full8x5_r10r3_1/`，全新日志根 `logs/mcl_ph_20260921/full8x5_r10r3_1/`，`Uni-Poly` 独立 window，串行、无 wall-clock timeout。每 unit 留 `.log`、真实 `.exit` 和五件产物；退出非零或 `check_unit` 失败即停止，保留现场，不自动恢复、重训或扩大预算。
+- 冻结 cohort 索引为 `results/mcl_ph_20260921/p2/cohort_record_index.json`；训练路径只读取当前折 train/validation 行。索引准备阶段曾扫描整份原始 JSONL 字节，这一事实继续如实记录。四个部署包及统计文件须匹配本计划下表 SHA，索引 source 身份及 split 行数一致；输出/日志根必须不存在，无冲突进程。
+- 完成 200/200 后只聚合内部验证 R² 与 Macro8，`outer_test=NOT_RUN`。**不读取或评估 outer-test，不运行 OOF、P3、refit、新预训练或额外 seed；内部验证汇总不宣称独立盲测增益。**
+- 启动前不重跑无关旧预训练 launcher fixture 或全仓测试。前轮 20 项针对性测试及真实 indexed loader 检查已通过；本轮只做动态身份与进程核对。代码已具备该 8×5 运行接口，无必要的代码改动不为形式重复修改。
 
 ## 科学问题与比较边界
 
