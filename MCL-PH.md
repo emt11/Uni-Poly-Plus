@@ -2156,3 +2156,11 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrai
 用户明确授权五臂全部（`glt_ref/o8_only/m_cat/m_gate/m_xattn`）×8 任务×5 折，最多 **200 次 unit 启动 / 6,000 epochs**，只做 train/inner-validation，不读取 outer-test；不追加原 30-unit development 额度。执行前 `dev@ca9d0f9` 与远端同步、工作区干净，四部署包及统计 SHA 与 Plan.md 相符，cohort 索引 source 身份通过，GPU 无相关训练进程。无需改动现有 8×5 代码；按用户要求跳过无关旧预训练 launcher 测试，保留必要身份和防覆盖检查。
 
 计划/授权记录提交 `0d79714` 已推送 `dev`。实际任务在 `Uni-Poly:96:mcl_ph_full8x5` 启动，完整命令记录于 `logs/mcl_ph_20260921/full8x5_r10r3_1_launch.sh`；launcher 日志/最终退出码分别为同前缀 `.log`/`.exit`，逐 unit 日志和真实退出码在 `logs/mcl_ph_20260921/full8x5_r10r3_1/`，模型产物在 `results/mcl_ph_20260921/p2/full8x5_r10r3_1/`。首个 `glt_ref/eat/fold0` 已真实退出 0、`runtime PASS`、30 epochs、best_epoch 23、五件产物齐全，`outer_test=NOT_RUN`；随后下一 unit 已启动。**阶段状态为执行中**，不把启动或首个 unit PASS 写成 200/200 完成，也不作预测性能增益结论。任何 unit 失败后 launcher 应立即停止，禁止自动重试或恢复；最终完成度以真实退出码和独立验收为准。
+
+### 13.24 FULL8X5-2 几何回退修复与续跑（Codex；2026-09-23 UTC）
+
+首轮正式 8×5 launcher 在第 91 次 unit 启动、`m_cat/egb/fold0` 的首 epoch 因 `frozen Trimer atomic_number length disagrees with coordinates` 真实退出 1，并依约停止；此前 90 个 unit 通过、后续 109 个未启动。失败现场位于 `logs/mcl_ph_20260921/full8x5_r10r3_1/` 和 `results/mcl_ph_20260921/p2/full8x5_r10r3_1/`，未删除或覆盖。真实 train 行 557 标记无有效几何，Trimer 坐标 `[0,3]`，结构原子 107；MCL 视图错误地以坐标行数校验结构身份，未到预定的 O8 回退分支即抛错。
+
+用户明确要求 Codex 修复并完成全量，授权范围据此修订为 200 个目标 unit、累计最多 201 次启动（含前轮这一次失败）。修复后的无几何路径先验证结构 carrier，用原子表建立身份与索引，零坐标只承担无几何样本的张量形状；`geometry_valid=false` 仍禁止几何边、描述符和几何目标，并回退 O8。有效几何样本的严格坐标长度检查不变。合成 fixture PASS，真实 EGB 行 557 的选择性加载、样本构造及 collate PASS。对旧根全部 90 个通过 unit 的退出码和 `check_unit` 逐个复核，四包 SHA 与旧 launch 记录一致。修改和计划见 `dev@dcdfbb2`，已推送。
+
+续跑在 `Uni-Poly:96:mcl_ph_full8x5_resume` 串行启动；实际命令为 `logs/mcl_ph_20260921/full8x5_r10r3_2_launch.sh`。全新产物根为 `results/mcl_ph_20260921/p2/full8x5_r10r3_2/`，日志根为 `logs/mcl_ph_20260921/full8x5_r10r3_2/`。通过的旧 unit 只读链接到新根；失败 unit 重新开始，其余 109 个尚未启动 unit 依序运行。最终必须在真实 launcher 退出 0、200/200 unit 通过聚合、包及 split 身份一致后，才能称全量完成；目前状态为**执行中**。不读取 outer-test、不执行 OOF、P3 或 refit，不据当前部分折预测宣称性能增益。

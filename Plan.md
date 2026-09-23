@@ -8,6 +8,7 @@
 - 根因：真实 `egb` train 行 557 的冻结 Trimer 标记 `trimer_geometry_valid=False`，坐标为 `[0,3]`，但结构原子表有 107 行。`build_trimer_view()` 和 `centre_mapping()` 错把坐标行数当作结构原子数，先于已存在的 geometry fallback 发生错误。修复限定为无有效几何样本：先验证结构 carrier，再按原子表构造索引及仅供张量形状使用的零坐标；`mcl_geometry_valid=False` 继续禁止空间边、拓扑描述符及几何目标，模型读出回退到 O8。有效几何样本维持原严格坐标长度检查。
 - 局部验证：新增无几何合成 fixture，PASS；对真实 `egb` 行 557 的选择性加载、MCL sample 和 collate 检查 PASS，空间边为空、geometry/readout 标志均为 false。旧 campaign 的 90 个通过 unit 经真实退出码和 `check_unit` 逐个复核，候选复用数 90，明确失败单元 1；四个包 SHA 与首轮启动身份一致。
 - 续跑使用全新输出根 `results/mcl_ph_20260921/p2/full8x5_r10r3_2/`、全新日志根 `logs/mcl_ph_20260921/full8x5_r10r3_2/`。启动器要求显式 prior 输出/日志根及 `--retry-unit m_cat_egb_fold0`，逐一验收通过单元后将它们只读链接到新根；失败单元不得复用，旧根保持不变。新启动上限 110 次，首轮加本轮总上限 201 次。每个新 unit 真实退出码和 `check_unit` 通过后才继续；全部 200 个目标通过后才聚合内部验证。失败即停止，不自动恢复、重试其他 unit、读 outer-test、启动 P3/OOF/refit。
+- 实际代码和计划 commit `dcdfbb2` 已推送 `dev`。启动前确认 `Uni-Poly` 可用、无同任务进程，四卡无计算进程，新产物根不存在。实际命令为 `logs/mcl_ph_20260921/full8x5_r10r3_2_launch.sh`，运行于 `Uni-Poly:96:mcl_ph_full8x5_resume`；launcher 日志为同前缀 `_launcher.log`，最终真实退出码写入 `_launcher.exit`，逐 unit 日志与退出码在新日志根。当前 launcher 已验收并链接旧轨迹的 90 个通过 unit；`m_cat/egb/fold0` 已开始训练，尚未完成。此时状态只能称执行中，不能称全量通过。
 
 ## 当前授权的启动范围
 
