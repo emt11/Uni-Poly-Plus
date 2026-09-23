@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.aggregate_mcl_ph import check_unit
 from scripts.aggregate_mcl_ph_8x5 import aggregate
-from scripts.finetune_mcl_ph import ARMS, FOLDS, TASKS
+from scripts.finetune_mcl_ph import ARMS, FOLDS, TASKS, unit_directory
 from src.training.glt_dual_runtime import require_tmux, sha256_file
 
 
@@ -43,6 +43,35 @@ def unit_list(arms):
     return [(arm, task, fold) for arm in arms for task in TASKS for fold in FOLDS]
 
 
+def accepted_from_prior(root, log_root, units, packages, hashes, retry_unit):
+    """Accept completed units from an immutable prior campaign before any writes."""
+    launch = json.loads((log_root / 'launch.json').read_text(encoding='utf-8'))
+    if launch.get('arms') != list(dict.fromkeys(arm for arm, _, _ in units)):
+        raise ValueError('prior campaign arm list differs')
+    for arm, package in packages.items():
+        record = launch.get('packages', {}).get(arm, {})
+        if record.get('sha256') != hashes[arm] or Path(record.get('path', '')).resolve() != package:
+            raise ValueError(f'prior campaign package identity differs for {arm}')
+    accepted, failed = {}, []
+    for arm, task, fold in units:
+        name = f'{arm}_{task}_fold{fold}'
+        directory = unit_directory(root, arm, task, fold)
+        if not directory.exists():
+            continue
+        _, problems = check_unit(root, arm, task, fold, stage='full8x5',
+                                 expected_step=5000)
+        exit_file = log_root / f'{name}.exit'
+        if not problems and exit_file.is_file() and exit_file.read_text().strip() == '0':
+            accepted[name] = directory.resolve()
+        elif name == retry_unit and exit_file.is_file() and exit_file.read_text().strip() != '0':
+            failed.append(name)
+        else:
+            raise ValueError(f'prior unit {name} is incomplete: {problems}')
+    if retry_unit and failed != [retry_unit]:
+        raise ValueError(f'authorized failed unit is missing: {retry_unit}')
+    return accepted
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arms', nargs='+', choices=ARMS, required=True)
@@ -57,6 +86,9 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--log-root', required=True)
     parser.add_argument('--expected-pretrain-step', type=int, default=5000)
+    parser.add_argument('--reuse-root', help='immutable prior output root with accepted units')
+    parser.add_argument('--reuse-log-root', help='prior per-unit exit records')
+    parser.add_argument('--retry-unit', help='one explicit failed unit, arm_task_foldN')
     args = parser.parse_args()
     units = unit_list(args.arms)
     if int(args.expected_pretrain_step) != 5000:
@@ -70,6 +102,15 @@ def main():
         if not Path(path).is_file():
             raise FileNotFoundError(path)
     package_hashes = {arm: sha256_file(path) for arm, path in packages.items()}
+    if bool(args.reuse_root) != bool(args.reuse_log_root):
+        raise ValueError('reuse root and reuse log root must be supplied together')
+    if args.retry_unit and not args.reuse_root:
+        raise ValueError('retry unit requires a prior campaign')
+    prior_root = Path(args.reuse_root).resolve() if args.reuse_root else None
+    prior_logs = Path(args.reuse_log_root).resolve() if args.reuse_log_root else None
+    accepted = (accepted_from_prior(prior_root, prior_logs, units, packages,
+                                    package_hashes, args.retry_unit)
+                if prior_root else {})
     output.mkdir(parents=True, exist_ok=False)
     log_root.mkdir(parents=True, exist_ok=False)
     (log_root / 'launch.json').write_text(json.dumps({
@@ -78,9 +119,20 @@ def main():
         'packages': {arm: {'path': str(path), 'sha256': package_hashes[arm]}
                      for arm, path in packages.items()},
         'cohort_index': str(Path(args.cohort_index).resolve()),
+        'reuse_root': str(prior_root) if prior_root else None,
+        'reuse_log_root': str(prior_logs) if prior_logs else None,
+        'reused_units': sorted(accepted),
+        'retry_unit': args.retry_unit,
     }, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     for arm, task, fold in units:
         unit = f'{arm}_{task}_fold{fold}'
+        if unit in accepted:
+            target = unit_directory(output, arm, task, fold)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(accepted[unit], target_is_directory=True)
+            print(json.dumps({'unit': unit, 'status': 'REUSED',
+                              'source': str(accepted[unit])}), flush=True)
+            continue
         command = [sys.executable, 'scripts/finetune_mcl_ph.py',
                    '--arm', arm, '--stage', 'full8x5', '--config', args.config,
                    '--checkpoint', str(packages[arm]),
@@ -106,6 +158,7 @@ def main():
                 json.dumps({'status': 'FAILED', 'problems': problems}, indent=2) + '\n',
                 encoding='utf-8')
             raise SystemExit(4)
+        print(json.dumps({'unit': unit, 'status': 'PASS'}), flush=True)
     payload = aggregate(output, arms=args.arms, expected_step=5000)
     (output / 'full8x5_validation.json').write_text(
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + '\n',

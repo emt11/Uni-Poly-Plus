@@ -129,6 +129,26 @@ def test_heavy_view_enumerates_every_real_heavy_atom_once():
     assert int(heavy.aromatic.sum()) == REPEATS
 
 
+def test_invalid_geometry_keeps_structural_indices_without_geometry():
+    trimer = make_trimer()
+    trimer.trimer_pos = torch.zeros((0, 3), dtype=torch.float32)
+    trimer.trimer_geometry_valid = False
+    topology = make_topology()
+    view.validate_geometry_carrier(topology, trimer)
+    heavy = view.build_trimer_view(trimer)
+    central, image, missing = view.centre_mapping(topology, trimer, heavy)
+    assert heavy.count == ATOM_COUNT
+    assert heavy.positions.shape == (ATOM_COUNT, 3)
+    assert torch.count_nonzero(heavy.positions) == 0
+    assert central.tolist() == [0, 1, 2]
+    assert image[:3].tolist() == [0, 1, 2]
+    assert missing == 0
+
+    trimer.trimer_atomic_number = trimer.trimer_atomic_number[:-1]
+    with pytest.raises(ValueError, match='identity|length'):
+        view.validate_geometry_carrier(topology, trimer)
+
+
 def test_physical_bonds_are_undirected_and_counted_once():
     trimer = make_trimer()
     heavy = make_view(trimer)

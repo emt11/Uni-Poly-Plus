@@ -293,6 +293,7 @@ def build_trimer_view(trimer):
     cross-RU synchronous mask uses.
     """
     positions = torch.as_tensor(trimer.trimer_pos)
+    geometry_valid = bool(getattr(trimer, 'trimer_geometry_valid', False))
     numbers = torch.as_tensor(trimer.trimer_atomic_number).long().reshape(-1)
     charge = torch.as_tensor(trimer.trimer_formal_charge).long().reshape(-1)
     aromatic = torch.as_tensor(trimer.trimer_is_aromatic).bool().reshape(-1)
@@ -300,11 +301,20 @@ def build_trimer_view(trimer):
     offset = torch.as_tensor(trimer.trimer_ru_offset).long().reshape(-1)
     if positions.ndim != 2 or positions.size(1) != 3:
         raise ValueError('frozen Trimer coordinates are malformed')
+    atom_count = int(numbers.numel())
+    if geometry_valid:
+        if int(positions.size(0)) != atom_count:
+            raise ValueError('frozen Trimer atomic_number length disagrees with coordinates')
+    else:
+        # The frozen fallback carries structural identity but may have no
+        # coordinates.  These zero rows only keep tensor shapes aligned; the
+        # geometry_valid gate below excludes all geometric relations/targets.
+        positions = torch.zeros((atom_count, 3), dtype=torch.float32)
     for name, value in (('atomic_number', numbers), ('formal_charge', charge),
                         ('is_aromatic', aromatic), ('base_ru_atom_id', base_id),
                         ('ru_offset', offset)):
-        if int(value.numel()) != int(positions.size(0)):
-            raise ValueError(f'frozen Trimer {name} length disagrees with coordinates')
+        if int(value.numel()) != atom_count:
+            raise ValueError(f'frozen Trimer {name} length disagrees with atomic_number')
     heavy = getattr(trimer, 'trimer_heavy_indices', None)
     if heavy is None:
         indices = torch.arange(positions.size(0), dtype=torch.long)[numbers > 1]
@@ -365,7 +375,7 @@ def centre_mapping(topology, trimer, view):
     if sorted(canonical_to_base.tolist()) != list(range(int(canonical_to_base.numel()))):
         raise ValueError('canonical-to-normalized mapping is not a permutation')
     raw = torch.as_tensor(trimer.mips_to_trimer_central_index, dtype=torch.long).reshape(-1)
-    all_atoms = int(torch.as_tensor(trimer.trimer_pos).size(0))
+    all_atoms = int(torch.as_tensor(trimer.trimer_atomic_number).numel())
     if int(raw.numel()) != count:
         raise ValueError('canonical-to-Trimer mapping length differs from the O8 atom count')
     if int(torch.unique(raw).numel()) != int(raw.numel()):
@@ -750,6 +760,7 @@ def build_mcl_ph_view(topology, trimer, smiles, *, seed, key, position, sigma=0.
         raise ValueError('the masking ratio must lie strictly inside (0,1)')
     if str(view) not in {'noisy', 'clean'}:
         raise ValueError('view must be noisy or clean')
+    validate_geometry_carrier(topology, trimer)
     generator = sample_generator(seed, key, position)
     mask, fallback = None, False
     if ratio is not None:

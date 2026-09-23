@@ -1,6 +1,13 @@
 # MCL-PH-20260921-01 / r10R3-FULL8X5-1：五臂 8×5 内部验证微调
 
-状态：**执行中**（五臂 8×5 内部验证微调）。日期：2026-09-23 UTC。用户已明确授权五臂全部、8 任务×5 折、仅微调与内部验证，预算最多 **200 次 unit 启动 / 6,000 epochs**；执行者：Codex。用户要求跳过与本次运行无关的重复测试，必要身份、标签隔离和防覆盖检查保留。原 P2 development 30-unit 计划未启动，本轮新范围不把其 30 次额度另加到 200 次。执行基线 `dev@ca9d0f9`，修改前 `git pull --ff-only origin dev` 成功、工作区干净。既往阻断与修复记录保留在文末，不追改当时结论。
+状态：**执行中**（五臂 8×5 内部验证微调）。日期：2026-09-23 UTC。用户已明确授权五臂全部、8 任务×5 折、仅微调与内部验证；执行者：Codex。首轮在 91 次启动后因无有效几何样本的 MCL 视图错误停止，90 个 unit 通过、1 个失败、109 个未启动。用户本轮明确要求直接修复并完成全量；本修订只重跑失败的 `m_cat/egb/fold0`，复用 90 个通过的 unit，再运行 109 个未启动 unit。故累计启动上限由 200 修订为 **201 次**，仍为 200 个目标 unit、每个最多 30 epochs；失败已消耗的首批更新照实计账。原 P2 development 30-unit 计划未启动，不另加其预算。既往记录保留在文末，不追改当时结论。
+
+## FULL8X5-2 阻断修复与续跑（Codex；2026-09-23 UTC）
+
+- 首轮现场：`results/mcl_ph_20260921/p2/full8x5_r10r3_1/`、`logs/mcl_ph_20260921/full8x5_r10r3_1/`；launcher 真实退出码 1。前 90 个 unit 的五件产物与退出码通过启动器验收；第 91 个 `m_cat/egb/fold0` 在首 epoch 报 `frozen Trimer atomic_number length disagrees with coordinates`，之后 109 个没有启动。失败产物保留，不作原地续训。
+- 根因：真实 `egb` train 行 557 的冻结 Trimer 标记 `trimer_geometry_valid=False`，坐标为 `[0,3]`，但结构原子表有 107 行。`build_trimer_view()` 和 `centre_mapping()` 错把坐标行数当作结构原子数，先于已存在的 geometry fallback 发生错误。修复限定为无有效几何样本：先验证结构 carrier，再按原子表构造索引及仅供张量形状使用的零坐标；`mcl_geometry_valid=False` 继续禁止空间边、拓扑描述符及几何目标，模型读出回退到 O8。有效几何样本维持原严格坐标长度检查。
+- 局部验证：新增无几何合成 fixture，PASS；对真实 `egb` 行 557 的选择性加载、MCL sample 和 collate 检查 PASS，空间边为空、geometry/readout 标志均为 false。旧 campaign 的 90 个通过 unit 经真实退出码和 `check_unit` 逐个复核，候选复用数 90，明确失败单元 1；四个包 SHA 与首轮启动身份一致。
+- 续跑使用全新输出根 `results/mcl_ph_20260921/p2/full8x5_r10r3_2/`、全新日志根 `logs/mcl_ph_20260921/full8x5_r10r3_2/`。启动器要求显式 prior 输出/日志根及 `--retry-unit m_cat_egb_fold0`，逐一验收通过单元后将它们只读链接到新根；失败单元不得复用，旧根保持不变。新启动上限 110 次，首轮加本轮总上限 201 次。每个新 unit 真实退出码和 `check_unit` 通过后才继续；全部 200 个目标通过后才聚合内部验证。失败即停止，不自动恢复、重试其他 unit、读 outer-test、启动 P3/OOF/refit。
 
 ## 当前授权的启动范围
 
