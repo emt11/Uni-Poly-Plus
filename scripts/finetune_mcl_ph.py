@@ -12,8 +12,10 @@ was pre-trained:
 | ``m_gate``   | this contract, ``F_GATE``          | MCL-PH | the new 512-wide head |
 | ``m_xattn``  | this contract, ``F_XATTN``         | MCL-PH | the new 512-wide head |
 
-Only train and validation rows of the requested task/fold are ever materialised;
-the outer-test indices are read for the split-coverage check and nothing else.
+Only train and validation records and label values of the requested task/fold
+are decoded/materialised; the outer-test indices are read for split coverage.
+The current frozen JSONL still needs a raw-byte scan for file integrity and row
+location, so it does not provide byte-level isolation from unselected labels.
 """
 import argparse
 import json
@@ -302,6 +304,21 @@ def unit_directory(output, arm, task, fold):
     return Path(output) / str(arm) / str(task) / f'fold{int(fold)}'
 
 
+def compact_train_validation_indices(train_indices, validation_indices):
+    """Return only train/validation task rows and their compact dataset indices."""
+    train_indices = [int(index) for index in train_indices]
+    validation_indices = [int(index) for index in validation_indices]
+    if set(train_indices) & set(validation_indices):
+        raise ValueError('train and validation indices overlap')
+    selected = sorted(set(train_indices) | set(validation_indices))
+    if not selected:
+        raise ValueError('the selected train/validation rows are empty')
+    compact = {original: index for index, original in enumerate(selected)}
+    return (selected,
+            [compact[index] for index in train_indices],
+            [compact[index] for index in validation_indices])
+
+
 def mcl_ph_downstream_collate(records):
     """Pack one downstream batch: a single ``Data``, no supervision targets.
 
@@ -351,25 +368,32 @@ def run_unit(args, folder, started, statistics, config, manifest):
     model.to(device)
     optimizer, group_evidence = parameter_groups(model, args.arm)
 
-    source, frame = open_source(args.cohort_root, args.cache_root, task=args.task,
-                               dual_static_root=args.dual_static_root)
+    train_indices, validation_indices, split_evidence = resolve_fold(
+        manifest, args.task, args.fold,
+        cohort_rows=int(manifest.get('sample_count', -1)))
+    selected_indices, train_local_indices, validation_local_indices = \
+        compact_train_validation_indices(train_indices, validation_indices)
+    split_path = Path(args.split_root) / f'{args.task}.json'
+    source, frame = open_source(
+        args.cohort_root, args.cache_root, task=args.task,
+        dual_static_root=args.dual_static_root, selected_indices=selected_indices,
+        expected_task_rows=int(manifest['sample_count']),
+        expected_split_sha256=sha256_file(split_path))
     try:
-        train_indices, validation_indices, split_evidence = resolve_fold(
-            manifest, args.task, args.fold, cohort_rows=len(frame))
-        if frame['original_row'].astype(int).tolist() != list(range(len(frame))):
-            raise ValueError('downstream cohort task row order differs from the property CSV')
+        if frame['original_row'].astype(int).tolist() != selected_indices:
+            raise ValueError('selected downstream rows differ from train/validation indices')
         dataset = (dataset_class(source, frame['label'].to_numpy(dtype=np.float64), statistics)
                    if args.arm in MCL_FUSION else
                    dataset_class(source, frame['label'].to_numpy(dtype=np.float64)))
         set_global_seed(int(config['seed']) + int(args.fold))
-        scaler = scale_targets(dataset, args.task, train_indices=train_indices,
+        scaler = scale_targets(dataset, args.task, train_indices=train_local_indices,
                                transform_mode='standard')
         train_loader = DataLoader(
-            Subset(dataset, train_indices), batch_size=int(config['finetune_batch']),
+            Subset(dataset, train_local_indices), batch_size=int(config['finetune_batch']),
             shuffle=True, num_workers=0, collate_fn=collate,
             generator=torch.Generator().manual_seed(int(config['seed']) + int(args.fold)))
         validation_loader = DataLoader(
-            Subset(dataset, validation_indices), batch_size=int(config['eval_batch']),
+            Subset(dataset, validation_local_indices), batch_size=int(config['eval_batch']),
             shuffle=False, num_workers=0, collate_fn=collate)
         schedule_total = SCHEDULE_TOTAL_EPOCHS * len(train_loader)
         schedule_warmup = SCHEDULE_WARMUP_EPOCHS * len(train_loader)
@@ -383,7 +407,8 @@ def run_unit(args, folder, started, statistics, config, manifest):
         model.load_state_dict(best, strict=True)
         reload_check = model.load_state_dict(best, strict=True)
         executed_epochs = len(result['history'])
-        validation_keys = [source.samples[index][0].hex() for index in validation_indices]
+        validation_keys = [source.samples[index][0].hex()
+                           for index in validation_local_indices]
         targets, predictions = result['predictions']
         np.savez(folder / 'validation_predictions.npz',
                  sample_keys=np.asarray(validation_keys),

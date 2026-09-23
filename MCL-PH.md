@@ -2129,3 +2129,15 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrai
 **阻断证据**：`scripts/finetune_mcl_ph.py:354-363` 先从 `open_source()` 获得整个 task cohort 的 `frame`，再对完整 `frame['label']` 调用 `to_numpy(dtype=np.float64)` 并构造 dataset，随后才按 train/validation 索引建立 `Subset`。这会读取并在 dataset target 数组中保存 outer-test 标签，与计划禁止读取 outer-test 标签的边界冲突；后续 scaler、训练和预测只使用 train/validation 索引，不会撤销前述读取。当前用户授权的是执行计划，没有授权修改 finetune 数据加载实现，因此在首个 unit 启动前停止。没有自动修复、重试、续训或聚合；development 预算实际消耗 **0/30 starts、0/900 epochs**。
 
 **结论：阻断，未执行 development unit，未形成筛查结果或 parent。** 下一步需用户决定是否授权最小实现修改，使下游只加载 train/validation 标签；修订后的代码与执行边界独立审核后，才可继续同一 `r10R3-DEV1` 预算。P3、OOF、refit 与 outer-test 仍未启动。
+
+### 13.21 r10R3-DEV1 标签隔离修订审查与阻断（Codex；2026-09-23 UTC）
+
+用户授权对下游标签加载做最小修复及必要局部测试；只有修复满足“完全不读取 outer-test 标签”且全部前置核对通过后，原 development 授权才继续有效。本节是对 §13.20 阻断的后续核查，不改写当时记录。
+
+- 基线 `dev@8fe58759e08ea71dc20e823314a31ea1491e4060`；`git fetch origin dev` 后本地与远端一致。候选修改文件：`scripts/finetune_mcl_ph.py`、`src/training/glt_dual_runtime.py`、`src/dataset/glt_dual_cache.py`、新增 `tests/test_mcl_ph_label_isolation.py`。
+- 候选路径先依据固定 split 解析索引，再以 train+validation 行调用选择性 cohort loader；dataset 只接收所选标签，scaler 以 compact train indices 拟合，validation 预测只关联 validation 行。未选中的 JSONL 行不做 UTF-8/JSON 解码或标签数值转换。针对性命令 `pytest -q tests/test_mcl_ph_label_isolation.py` 结果：**2 passed, 1 warning**（PyG deprecation warning；4.62 s）。该测试证明值级隔离及 train-only scaler，不构成真实训练或真实 outer-test 数据读取。
+- live 前置身份核对：统计 SHA `9dc8160f1de5152f6c04a963c40569bac8facd21e68a700f40186363798cf8b1`；四部署包 SHA 分别为 GLT_REF `7dc016dc422c58a6bba705a7a69c9f21051231350393a93d621b33e973883c47`、CAT `eed6276565f0bc827fc1f56056a25cd8469db184b0e334d04c3dd0f3cfea0e49`、GATE `312ea6708ee1b930001c1963714dfbdee44d8de711c5293bc0378be7a73b24e8`、XATTN `9f2bea298b7341eaaf02e85a84f95974334e64b5436310127d30d82ae49f206e`。四个包 CPU strict-load PASS；O8_ONLY 从 GLT_REF 包复制 83/83 张量；O8_ONLY 与 CAT/GATE/XATTN 的新 head SHA 一致为 `8fde47d5b69ad5c5215abfa902726005c88dcb260b858f0339eda30edc77ae2d`。
+- 只读 cohort/split 核对：frozen manifest 及 `keys.npy` 为 6,265 行，union 为 6,265 行；task counts 为 XC 432、EPS 382、EAT 390。fold0/1 分别为 XC 276/69/87、EPS 244/61/77、EAT 249/63/78（train/validation/test）；split 文件 SHA 同时匹配 cohort 与 union manifest，resolver 索引互斥/覆盖检查通过。未读取 live `records.jsonl`，也未读取 outer-test 标签。
+- **合同阻断仍在**：现有 frozen cohort 只有混合字段的 `records.jsonl` 与 sample-key 矩阵，没有行偏移或标签隔离索引。候选 loader 为按行号定位并检查完整 records SHA/行数而遍历全部原始行字节；虽然 outer-test 行未解析为标签值，但它们的标签序列化字节被扫描且包含在整文件 SHA 中。不能把“不解码/不物化”自行放宽成用户要求的“完全不读取”。必须维持阻断，不能启动 unit 或聚合。
+- `Uni-Poly` tmux session 可用（现存窗口 96 个）；无 MCL-PH 训练进程；四卡 GPU 利用率均 0%，GPU3 使用 444 MiB 且无 compute process。`results/mcl_ph_20260921/p2/development_r10r3/` 不存在；`logs/mcl_ph_20260921/` 下预期的 30 组 unit `.log`/`.exit` 文件共 60 个，当前全部不存在。预算仍为 **0/30 starts、0/900 epochs**；没有运行 outer-test、P3、OOF、refit、预训练或 development。
+- 阻断解除需已有可信 row-offset/标签隔离索引及不扫描标签字节的完整性验证，或用户明确修订对 opaque checksum/行定位扫描的定义。本轮不创建 sidecar、不修改旧 cohort；修复与执行授权尚未获最终验收。

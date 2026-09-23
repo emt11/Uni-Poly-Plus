@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.dataset.glt_dual import FrozenDualLayerSource, build_dual_sample
-from src.dataset.glt_dual_cache import load_dual_cohort
+from src.dataset.glt_dual_cache import load_dual_cohort, load_dual_cohort_task_rows
 from src.dataset.glt_dual_static import CHUNK_CACHE_CAPACITY
 
 
@@ -290,9 +290,21 @@ def require_tmux():
 
 
 def open_source(cohort_root, cache_root, *, task=None, dual_static_root=None,
-                pretrain_target_root=None,
+                pretrain_target_root=None, selected_indices=None,
+                expected_task_rows=None, expected_split_sha256=None,
                 chunk_cache_capacity=CHUNK_CACHE_CAPACITY):
-    full_cohort = load_dual_cohort(cohort_root, cache_root)
+    if selected_indices is None:
+        full_cohort = load_dual_cohort(cohort_root, cache_root)
+    else:
+        if task is None or expected_task_rows is None or expected_split_sha256 is None:
+            raise ValueError(
+                "selected cohort loading requires task, expected_task_rows and split SHA256"
+            )
+        full_cohort = load_dual_cohort_task_rows(
+            cohort_root, cache_root, task=task, row_indices=selected_indices,
+            expected_task_rows=expected_task_rows,
+            expected_split_sha256=expected_split_sha256,
+        )
     static_cache = target_cache = None
     if dual_static_root is not None:
         from src.dataset.glt_dual_static import CHUNK_CACHE_CAPACITY, load_static_caches
@@ -318,7 +330,7 @@ def open_source(cohort_root, cache_root, *, task=None, dual_static_root=None,
                 raise ValueError('static cache cohort ordered-key binding mismatch')
     records = full_cohort["records"]
     cohort = full_cohort
-    if task is not None:
+    if task is not None and selected_indices is None:
         records = [row for row in records if row.get("task") == str(task)]
         if not records:
             if static_cache is not None:
