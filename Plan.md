@@ -1,35 +1,42 @@
-# MCL-PH-20260921-01 / r10R3 执行记录
+# MCL-PH-20260921-01 / r10R3 GATE→XATTN 执行记录
 
-状态：**执行中（CAT 正式预训练运行中；监控已交接）**。基准：`dev@29e359e`；2026-09-23 UTC 开始前 `git pull --ff-only origin dev` 成功。授权来源：用户本轮明确要求实施 r10R3 方案。规划、执行与自检：Codex；本轮没有第二执行者的独立审查。
+计划修订：r10R3-GX1。状态：**执行中（CAT 已验收通过；GATE 已完成预检、尚未启动）**。基准：`dev@73a1980`，`origin/dev` 同步；本轮修改前 `git pull --ff-only origin dev` 返回 Already up to date，工作区干净。授权来源：用户本轮明确要求仅执行 GATE、XATTN 两次正式预训练。实际执行与自检：Codex；独立审查待后续。
 
-## 目标与边界
+## 本轮问题、对照与范围
 
-修复非键 clean target 的重原子索引、千步 checkpoint、备用分母导入和 O8_ONLY 重复 LayerNorm；重算固定 P_train 4096 样本统计。前置检查通过后，顺序完成 CAT、GATE、XATTN 各一次 5000-update 正式预训练，随后完成五臂 × XC/EPS/EAT × fold0/1 的 30 个 development units，最后运行 P2 聚合。GLT_REF 使用已验收的 `glt_ref_r10r1/deploy_05000.pt`，O8_ONLY 从同一包提取 O8。P3、OOF、outer-test 均不在授权内。
+- Scientific question：在相同数据、统计、共同初始化、路由和训练预算下，验证 GATE 与 XATTN 融合配置的正式预训练产物能否完整生成并通过身份、清理和部署严格加载验收。
+- Reference：已验收的 CAT 5,000-update arm，部署包 SHA256 `eed6276565f0bc827fc1f56056a25cd8469db184b0e334d04c3dd0f3cfea0e49`。
+- Controlled change：每臂相对 CAT 仅改变配置中的 `fusion_mode`；GATE 与 XATTN 串行启动，各仅一次、最多 5,000 updates。
+- 固定预算：world=4、microbatch=84、accumulation=3、global batch=1008、BF16、AdamW lr=2e-4、warmup=2,000、scheduler=20,000、500 dense updates 后 Top-2、save_every=1,000。
+- 已消耗正式预训练预算：15,082 updates / 4 次启动；本轮余额 10,000 updates / 2 次启动。不得重试、续训、添加 pilot 或 wall-clock timeout。
+- 本轮仅执行 GATE → 独立验收 → XATTN → 独立验收。不得启动 development、P3、OOF、outer-test；不读取 outer-test，不报告预测性能排名。
 
-## 预算与停止条件
+## 固定输入与前置证据
 
-- 历史正式预训练：10,082 updates / 3 次启动；本轮新增上限：15,000 updates / 3 次启动；累计上限：25,082 updates / 6 次启动。
-- Development 上限：30 units / 900 epochs。每 unit 最多 30 epochs，warmup 5、patience 10、seed 42，train-only scaler，仅 validation R² 选 epoch。
-- 任一身份、统计、目标数值、cache 覆盖、checkpoint、非有限值、writer 冲突、退出码或预算检查失败，停止依赖的后续阶段。不中断后自动恢复，不重启同一臂，不覆盖旧目录。
+- 统计：`results/mcl_ph_20260921/p0_r10r3/statistics.npz`，SHA256 `9dc8160f1de5152f6c04a963c40569bac8facd21e68a700f40186363798cf8b1`。
+- 共同新参数初值：`results/mcl_ph_20260921/p2/pretrain/shared_new_init.pt`，SHA256 `499309392d578daf7a7baf1d102d7a7f5c652e5a9b42ca2904ac9d83d1fab85a`。
+- 初始 common artifact SHA256 `1c9f97cf5547dcd2f44846e83586dfb4ec593dd4a4f56df510be372f26f1951d`；CAT runtime identity 与两个源文件 SHA 一致。
+- Trajectory cache：`data/processed/mcl_ph_cache/p2_noisy_seed42_sigma003_step5000_v1`。当前 manifest 为 complete=true、51 shards、5,040,000 positions；manifest 的 seed/noise/mask/global batch/sample-index/cohort/static identity 与已验收 CAT runtime 一致。既有 `logs/mcl_ph_20260921/trajectory_cache_verify.log` 末尾记录 `FULL CACHE VERIFY OK`。
+- CAT：真实退出码文件 `logs/mcl_ph_20260921/p2_cat_r10r3_pretrain.exit=0`；runtime PASS/5000、cleanup/export/main-return 全完成；五组 resume/deploy 齐全；`scripts/verify_mcl_ph_arm.py --strict-cleanup` PASS；`deploy_05000.pt` step=5000/fusion=cat，统计和共同新初值 SHA 匹配，`build_mcl_arm('cat', ...)` strict-load PASS。
+- CAT 配置、GATE、XATTN 三配置逐字段比较仅 `fusion_mode` 不同。当前 GATE/XATTN 输出目录均不存在。
+- 当前 GPU：4 张 RTX 4090，预检时无活动训练进程、GPU 利用率 0%。CAT 旧 tmux window 保留；新臂须各用独立 window。
 
-## 执行顺序与验收
+## 实施顺序与验收门
 
-1. 修复代码并运行针对性无模型及局部测试；核对三臂仅 `fusion_mode` 不同，配置仍为 world 4、microbatch 84、accumulation 3、global batch 1008、BF16、5000 updates、500→501 切换。
-2. 在 `results/mcl_ph_20260921/p0_r10r3/` 重算并核对 4096 样本的统计、key SHA、有限性和目标修订；核对完整 trajectory cache 的身份、51 shards 和 5,040,000 位置覆盖。
-3. 在新目录 `p2/pretrain/{cat,gate,xattn}_r10r3/` 逐臂启动。每臂核对退出码、runtime、五个千步 resume/deploy、step/fusion 身份、strict-load、有限损失与梯度、路由 500/501 及实际预算。
-4. 五臂部署包齐全且验证后，在 `p2/development_r10r3/` 串行运行 30 units。逐 unit 核对包 SHA、split、head 初值、参数组、`best.pt`、选中 epoch 预测与退出码。
-5. 30/30 通过后运行 `scripts/aggregate_mcl_ph_p2.py`，核对双 baseline 门槛和 parent。只给 development 筛查结论。
+1. 在 `Uni-Poly:mcl_ph_r10r3_gate` 使用 `configs/mts/mcl_ph_gate.json` 启动一次正式 5,000-update 训练。输出 `results/mcl_ph_20260921/p2/pretrain/gate_r10r3/`，日志 `logs/mcl_ph_20260921/p2_gate_r10r3_pretrain.log`，真实退出码写入 `logs/mcl_ph_20260921/p2_gate_r10r3_pretrain.exit`。
+2. GATE 退出后、XATTN 启动前独立核验：退出码 0；runtime PASS、completed_steps=5000、cleanup=complete、export_complete=true、main_returned=true；1000/2000/3000/4000/5000 的 resume/deploy 全部存在；step 500=dense、501=top2；四 rank loss/gradient 有限；统计/初值身份一致；deploy step/fusion/source 身份正确；`build_mcl_arm('gate', ...)` strict-load PASS；运行 `scripts/verify_mcl_ph_arm.py --label gate_r10r3 --arm-dir results/mcl_ph_20260921/p2/pretrain/gate_r10r3 --updates 5000 --strict-cleanup` 并记录部署包 SHA。
+3. 只有 GATE 每项均通过后，才在 `Uni-Poly:mcl_ph_r10r3_xattn` 使用 `configs/mts/mcl_ph_xattn.json` 启动一次正式 5,000-update 训练。输出 `results/mcl_ph_20260921/p2/pretrain/xattn_r10r3/`，日志 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.log`，真实退出码写入 `logs/mcl_ph_20260921/p2_xattn_r10r3_pretrain.exit`。
+4. XATTN 使用与 GATE 相同的逐项验收门，build arm 使用 `build_mcl_arm('xattn', ...)`。任一项失败即保留现场并停止，不重试、不续训、不开始其他阶段。
 
-## 当前执行证据
+每个正式命令均由 `Uni-Poly` 独立 tmux window 承载，工作目录为仓库根目录；stdout/stderr 完整写入指定日志，命令真实退出码写入同名前缀 `.exit`。不重启 `scripts/run_mcl_ph_r10r3.py` 串行执行器。
 
-- 定向测试：`results/mcl_ph_20260921/r10r3_targeted_tests.log`，23 passed / exit 0。
-- P0 重算：`Uni-Poly:mcl_ph_r10r3_p0`，命令 `python scripts/audit_mcl_ph_p0.py --output results/mcl_ph_20260921/p0_r10r3 --statistics-output results/mcl_ph_20260921/p0_r10r3/statistics.npz`；日志 `p0_r10r3/audit.log`，exit 0、`PASS`、4096/4096、key SHA `c0402dca…341a`、各数组有限；新统计 SHA `9dc8160f…cf8b1`。修订后的 nonbond `(mu,sigma)=(1.3945351,0.1372659)`，旧统计为 `(1.3962990,0.1445435)`；旧文件保留。
-- Cache 校验：`Uni-Poly:mcl_ph_r10r3_cache`，生产 reader 对 51 shard 均校验 SHA256，完整覆盖 5,040,000 位置，exit 0；cohort、static、sample-index SHA 与 P0 来源一致。
-- 配置比对：CAT/GATE/XATTN JSON 除 `fusion_mode` 外相同，world 4、84×3×4、BF16、5000 steps、save_every 1000、warmup 2000、scheduler 20000、dense 500→Top-2 501 均未变。
-- 代码与计划预检提交：`31ff03f`，已推送并核实 `origin/dev` 同哈希。
-- CAT：`Uni-Poly:mcl_ph_r10r3_cat`，`python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrain_mcl_ph.py` 加 CAT 配置、新统计、共享初值、完整 trajectory cache、`--diagnostics --prep-workers 12 --stop-after-step 5000`；输出 `p2/pretrain/cat_r10r3/`，日志 `logs/mcl_ph_20260921/p2_cat_r10r3_pretrain.log`，退出码文件同路径 `.exit`；**已启动，结果待核验**。
-- `scripts/run_mcl_ph_r10r3.py` 原计划在独立 window 等待 CAT 退出，并按退出码、runtime、五组千步文件、统计/共同初值身份、500/501 路由、有限损失/梯度及部署 strict-load 等门槛串行执行后续阶段。用户于 2026-09-23 01:06 UTC 要求停止当前监控并交给其他模型；该执行器在 `WAIT_CAT` 时以 Ctrl-C **有意停止**，`r10r3_driver_status.json` 为 `STOPPED/KeyboardInterrupt`，进程已退出，未启动 GATE/XATTN 或 development。CAT 训练进程未中断。接手者应先核对实际产物和进程，再决定是否使用执行器；不得把其 `STOPPED` 当作 CAT 失败，也不得在已有输出目录重启 CAT。
-- 交接时 CAT 日志最近完整记录为四 rank 的 step 301、dense、损失及梯度有限；`runtime.json=RUNNING`，CAT 退出码尚未写出。此为瞬时观察，不代表 CAT 已完成。
-- 初始工作区干净；修改过程中出现非本轮的 `.zcodeignore` 删除，未恢复、未暂存、未纳入本任务。
+## 执行记录
 
-本节只记录真实进度；后续结果、提交和远端同步核实后更新。历史失败与超预算记录保留在 `MCL-PH.md`。
+- CAT 前置验收：通过，证据见上。
+- GATE：预检已通过，**本计划头更新时尚未启动**；实际命令、window、启动时间、产物、退出码和逐项验收在本节追加。
+- XATTN：未启动；只有 GATE 完整验收通过后才允许启动。
+- 文件修改前同步：`git pull --ff-only origin dev` 成功；基线 `73a1980f95f8b572634c89ca3d62d33420ed1990`。当前 `.zcodeignore` 删除已包含在该基线提交中，不属于本轮改动，本轮不恢复、不暂存。
+
+## 停止条件
+
+身份/统计/cache 不符、目标目录非空、writer 冲突、任何 rank 停滞或异常、loss/gradient 非有限、路由边界错误、checkpoint 缺失、严格加载失败、runtime/cleanup 不通过、真实退出码非零或预算超限：立即停止后续阶段并保留现场。GATE 未完整 PASS 时不启动 XATTN。整个本轮不启动 development、P3、OOF 或 outer-test。
