@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .mcl_ph import MCLPHEncoder, xavier_
+from .mcl_ph import MCLPHEncoder, global_sum, xavier_
 
 ATOM_CLASSES = 101
 BALANCE_WEIGHT = 1e-3

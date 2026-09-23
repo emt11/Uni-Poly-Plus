@@ -45,6 +45,23 @@ SAVED_STEPS = (1, 2, 500, 501, 1000, 2000, 3000, 4000, 5000)
 FORMAL_WORLD_SIZE = 4
 
 
+def checkpoint_due(step, stop, every):
+    """Save each configured milestone and the final step exactly once."""
+    if int(every) <= 0:
+        raise ValueError('save_every must be positive')
+    return int(step) == int(stop) or int(step) % int(every) == 0
+
+
+def checkpoint_rng_states(world):
+    """Every rank calls this collective before rank 0 writes a checkpoint."""
+    states = [None] * int(world)
+    if int(world) > 1:
+        dist.all_gather_object(states, rng_state())
+    else:
+        states[0] = rng_state()
+    return states
+
+
 def _gradient_groups(model):
     """Gradient norm per declared module group, measured before clipping."""
 
@@ -441,6 +458,9 @@ def main():
         raise ValueError('the MCL-PH route has no MD200 and no fingerprint objective')
     if config['amp_dtype'] not in ('fp32', 'bf16'):
         raise ValueError('precision must be fp32 or bf16')
+    save_every = int(config['save_every'])
+    if save_every <= 0:
+        raise ValueError('save_every must be positive')
     cutoffs = tuple(float(value) for value in config.get('cutoffs', (2.0, 3.0, 4.0)))
     if cutoffs != (2.0, 3.0, 4.0):
         raise ValueError('the contract fixes the three expert cutoffs at 2/3/4 A')
@@ -733,15 +753,11 @@ def main():
             if rank == 0 and (step_number in SAVED_STEPS or step_number in (start + 1, stop)):
                 with (output / 'steps.jsonl').open('a', encoding='utf-8') as handle:
                     handle.write(json.dumps(record, sort_keys=True, default=str) + '\n')
-            if step_number == stop:
+            if checkpoint_due(step_number, stop, save_every):
                 # The RNG gather is a collective: every rank must reach it, so it
                 # stays outside the rank-0 guard that owns the file writes.
                 stages.mark('rng_gather', 'enter', step=step_number)
-                states = [None] * world
-                if world > 1:
-                    dist.all_gather_object(states, rng_state())
-                else:
-                    states[0] = rng_state()
+                states = checkpoint_rng_states(world)
                 stages.mark('rng_gather', 'complete', step=step_number)
                 if rank == 0:
                     stages.mark('resume_save', 'enter', step=step_number)

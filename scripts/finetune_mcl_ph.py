@@ -101,13 +101,12 @@ class O8OnlyArm(nn.Module):
     def __init__(self, dropout=0.1):
         super().__init__()
         self.o8 = BondPathO8(dropout)
-        self.norm = nn.LayerNorm(512)
         self.head = build_head(dropout=dropout)
 
     def forward(self, batch):
         atoms, _ = self.o8(batch, atom_mask=None)
         pooled = mean_pool(atoms, batch.canonical_graph_index, batch.graph_available.numel())
-        return self.head(self.norm(pooled))
+        return self.head(pooled)
 
 
 class GLTReferenceArm(nn.Module):

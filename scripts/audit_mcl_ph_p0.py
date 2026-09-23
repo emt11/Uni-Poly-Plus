@@ -470,9 +470,7 @@ def statistics_audit(source, positions, *, sigma, seed, limit_seconds):
         sampled, slots = view.sample_nonbond_pairs(
             pairs, distance, view.view_generator(seed, key, int(position), view.PAIR_SUBSTREAM))
         if int(sampled.size(0)):
-            clean = torch.linalg.vector_norm(
-                torch.as_tensor(trimer.trimer_pos)[sampled[:, 0]]
-                - torch.as_tensor(trimer.trimer_pos)[sampled[:, 1]], dim=-1)
+            clean = view.clean_nonbond_distances(trimer, base.indices, sampled)
             nonbond_values.append(clean)
             bin_counts['nonbond_pairs'] += int(sampled.size(0))
             bin_counts['nonbond_graphs'] += 1

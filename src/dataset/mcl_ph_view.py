@@ -612,6 +612,12 @@ def nonbond_candidates(positions, view, central_index, bond_ends):
     return pairs, distance[keep]
 
 
+def clean_nonbond_distances(trimer, heavy_indices, pairs):
+    """Measure heavy-view pairs in the same compact index space as the experts."""
+    clean = torch.as_tensor(trimer.trimer_pos)[torch.as_tensor(heavy_indices).long()]
+    return torch.linalg.vector_norm(clean[pairs[:, 0]] - clean[pairs[:, 1]], dim=-1)
+
+
 def sample_nonbond_pairs(pairs, distance, generator, *, bins=NONBOND_BINS,
                          maximum=NONBOND_MAX_PAIRS):
     """Up to ``maximum`` uniformly drawn pairs per distance bin, without replacement."""
@@ -909,8 +915,7 @@ def _sample_targets(topology, trimer, static, field_view, central_index, bond_in
         view_distance = torch.zeros(0)
     sampled, slots = sample_nonbond_pairs(
         pairs, view_distance, view_generator(seed, key, position, PAIR_SUBSTREAM))
-    clean_distance = (torch.linalg.vector_norm(clean_positions[sampled[:, 0]]
-                                               - clean_positions[sampled[:, 1]], dim=-1)
+    clean_distance = (clean_nonbond_distances(trimer, field_view.indices, sampled)
                       if int(sampled.size(0)) else torch.zeros(0))
     applied = statistics is not None
     length_target = (normalise_geometric(length_raw, statistics['length']) if applied
