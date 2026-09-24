@@ -2184,3 +2184,5 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrai
 ### r11 五折正式重跑授权与启动前核对（2026-09-24）
 
 用户现已明确要求重跑全量微调，新增预算为五臂 × 8 任务 × fold0–4，共 200 starts / 最多 13,750 epochs；每 arm/task/fold 从对应原始 5k 部署包开始，不复用旧 `legacy` 微调结果。范围仍为 train/inner-validation，`outer_test=NOT_RUN`。远端 `dev@dd23be2` 同步，四部署包及统计 SHA 匹配，cohort index 绑定的源文件 stat 身份匹配，四张 GPU 可见且无同任务进程，新输出/日志根不存在。此段只记录授权和预检；实际启动及结果另见 `Plan.md` 的运行记录。
+
+实际启动命令在 `logs/mcl_ph_20260921/full8x5_ptdl_r11_1_launch.sh`，tmux 为 `Uni-Poly:96:mcl_ph_ptdl_4gpu`，结果根 `results/mcl_ph_20260921/p2/full8x5_ptdl_r11_1/`，日志根 `logs/mcl_ph_20260921/full8x5_ptdl_r11_1/`。`launch.json` 记录四卡各 50 个新 unit、零复用；首四个 `glt_ref/eat/fold0–3` 已开始并各输出有限的 head 阶段指标。此时无 launcher 最终退出码或 200/200 聚合，只能标记执行中。

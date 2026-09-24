@@ -1,6 +1,6 @@
 # MCL-PH-20260921-01 / r11-PTDL5：五折 Periodic-TDL 训练协议适配
 
-**状态：待执行（本轮用户已明确授权五臂全量重跑）。** 实现基线 `dev@dd23be2`；本轮开始工作区干净，`git pull --ff-only origin dev` 无更新。用户先要求调整微调策略和对应的五折处理，本轮再明确要求“重跑全量微调”；执行者 Codex。授权范围为下面的五臂 × 8 任务 × 5 折、仅 train/inner-validation，最多 200 starts / 13,750 epochs；此前禁止 outer-test 的边界保持。旧 r10R3 轨迹已归档到 `PROJECT_HISTORY.md`，原结果目录不覆盖。以下为当前唯一活动计划；下方 r10R3 内容只作历史记录，不授权重复执行。
+**状态：执行中（本轮用户已明确授权五臂全量重跑）。** 实现基线 `dev@dd23be2`，运行授权记录 `dev@5f22794`；本轮开始工作区干净，`git pull --ff-only origin dev` 无更新。用户先要求调整微调策略和对应的五折处理，本轮再明确要求“重跑全量微调”；执行者 Codex。授权范围为下面的五臂 × 8 任务 × 5 折、仅 train/inner-validation，最多 200 starts / 13,750 epochs；此前禁止 outer-test 的边界保持。旧 r10R3 轨迹已归档到 `PROJECT_HISTORY.md`，原结果目录不覆盖。以下为当前唯一活动计划；下方 r10R3 内容只作历史记录，不授权重复执行。
 
 ## 科学问题与协议边界
 
@@ -22,6 +22,8 @@
 3. 每 unit 核对真实退出码、阶段 history、最佳 RMSE、checkpoint/预测/split/package 身份。全部 200/200 通过才汇总内部验证 R²；保持 `outer_test=NOT_RUN`。禁止将旧协议已完成 unit 混入新根。P3、OOF、refit、outer-test 仍未纳入此待授权预算。
 
 **本轮启动前核对**：远端 `dev` 已同步；四个部署包与修订统计文件 SHA 均与旧冻结计划匹配。可信 cohort index 所绑定的 `records.jsonl` device/inode/size/mtime_ns 与现场相同；GPU 0–3 均可见且无同任务计算进程。新结果根 `results/mcl_ph_20260921/p2/full8x5_ptdl_r11_1/` 与日志根 `logs/mcl_ph_20260921/full8x5_ptdl_r11_1/` 均不存在。运行使用 `Uni-Poly` 独立 window 和四个独立 GPU worker，不设 wall-clock timeout。真实启动/运行状态须另据 launcher 命令、日志与退出码记录，不能从本段预检推断已启动或完成。
+
+**启动记录**：命令原样保存在 `logs/mcl_ph_20260921/full8x5_ptdl_r11_1_launch.sh`，在 `Uni-Poly:96:mcl_ph_ptdl_4gpu` 启动；launcher 日志及退出码为同前缀 `_launcher.log`、`_launcher.exit`。`launch.json` 记录 `finetune_strategy=periodic_tdl`、200 个新 unit、零复用、GPU 0–3 各分配 50 个、`outer_test=NOT_RUN`。初始四个 `glt_ref/eat/fold0–3` 进程均启动，四卡有对应计算占用；四个日志均已记录有限的 head 阶段 epoch 2 指标。此时 launcher 尚无 `.exit`，200/200 聚合尚不存在，状态只能称**执行中**。任何失败按 launcher 规则停止后续调度并保留现场，不自动重试或扩大预算。
 
 ## 已归档的 r10R3 历史记录（不再是活动计划）
 
