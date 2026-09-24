@@ -113,3 +113,25 @@ def test_periodic_tdl_acceptance_uses_rmse_and_complete_five_fold_unit(tmp_path)
     _, problems = check_unit(tmp_path, 'm_cat', 'egc', 4,
                              stage='full8x5', expected_step=5000)
     assert 'the selected epoch is not the minimum validation RMSE' in problems
+    common.update(best_validation_rmse=0.1, stage='full8x5_outer',
+                  protocol='mcl_ph_full8x5_outer', outer_test='RUN', test_r2=0.99,
+                  test_sample_count=2)
+    common['split'].update(outer_test='RUN', test_rows=2)
+    (folder / 'metrics.json').write_text(json.dumps(common))
+    (folder / 'run.json').write_text(json.dumps(common))
+    np.savez(folder / 'validation_predictions.npz', y_true=np.array([1.0]),
+             y_pred=np.array([1.1]), sample_keys=np.array(['a']),
+             validation_indices=np.array([10]), best_epoch=np.array(1),
+             outer_test=np.array('NOT_RUN'))
+    np.savez(folder / 'test_predictions.npz', y_true=np.array([0., 1.]),
+             y_pred=np.array([0.05, .95]), sample_keys=np.array(['b', 'c']),
+             test_indices=np.array([11, 12]), best_epoch=np.array(1),
+             split_protocol=np.array('outer5_inner20'), outer_test=np.array('RUN'))
+    record, problems = check_unit(tmp_path, 'm_cat', 'egc', 4,
+                                  stage='full8x5_outer', expected_step=5000)
+    assert problems == [] and record['test_r2'] == .99
+    common['test_r2'] = .5
+    (folder / 'metrics.json').write_text(json.dumps(common))
+    _, problems = check_unit(tmp_path, 'm_cat', 'egc', 4,
+                             stage='full8x5_outer', expected_step=5000)
+    assert 'outer-test R2 disagrees with predictions' in problems

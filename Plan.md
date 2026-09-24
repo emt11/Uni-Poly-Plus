@@ -1,3 +1,24 @@
+# MCL-PH-20260921-01 / r12-PTDL-OUTER5：五折 outer-test R² 正式重跑
+
+**状态：待启动（用户明确授权停止 r11 并重新运行五臂全量测试）。** 执行者 Codex；基线 `dev@878ac4f`，修改前已 `git pull --ff-only origin dev`，工作区干净。r11 的 `full8x5_ptdl_r11_1` 已按用户要求在 `Uni-Poly:96` 收到 Ctrl-C 并停止：launcher `.exit=1`，122 个 unit `.exit=0`、4 个中断 `.exit=-2`，共 126 次启动；无相关进程。旧日志和产物全部保留，旧结果不可混入新阶段。
+
+## 当前授权与科学边界
+
+- 五臂 `glt_ref/o8_only/m_cat/m_gate/m_xattn` × 8 任务 × fold0–4，共 **200 个全新 unit**，每个 Egc 最多 60 epochs，其余最多 70，共最多 **13,750 epochs**。复用四个原 5k 预训练包；四 GPU 各串行 50 unit，失败即停止后续调度，不自动恢复或重试。新根为 `results/mcl_ph_20260921/p2/full8x5_ptdl_outer_r12_1/` 和 `logs/mcl_ph_20260921/full8x5_ptdl_outer_r12_1/`。
+- 保持 r11 两阶段 Periodic-TDL 微调和本项目冻结 `outer5_inner20` 五折。每 fold 使用 train 训练、inner-validation RMSE 在全部 epoch 中选 checkpoint；锁定 checkpoint 后才选择性读取该 fold outer-test 标签并只评价一次，保存 test 预测、各折 R²、五折均值与总体标准差。outer-test 结果不用于选模、调参或重新训练。仅在 200/200、真实退出码和聚合验收通过后报告完整五折测试结果。
+- 这是论文的**评估顺序**适配：[Periodic-TDL Methods](https://arxiv.org/pdf/2605.26833) 对每折保留 20% 外层 test、外层训练部分取 20% validation，按最低 validation RMSE 选模后才评价 test。本项目沿用自身 cohort、五折索引、MCL/GLT 架构、原有预训练包，`eat` 使用 Eea 超参，因此不是论文数据集和模型的逐项复现；项目测试分数也不是独立盲测。
+- 新 `full8x5_outer` 阶段与旧 `full8x5` 隔离，独立要求 `test_predictions.npz`、test R² 和 `outer_test=RUN`；聚合仅从全部 200 个通过的单元计算五折均值与总体标准差。只改 `finetune_mcl_ph.py`、相关验收/聚合、四 GPU launcher 和定向测试，不动预训练、cohort、split、旧训练目录。P3、OOF、refit 不在本次授权内。
+
+## 验证与启动门槛
+
+1. 针对性 `py_compile`、局部 pytest、`git diff --check`；检查四包及统计 SHA、可信索引身份、GPU/进程与新输出根。失败即停止，不以训练试错。
+2. 在 `Uni-Poly` 全新 window 启动四 GPU launcher，保留真实命令、每 unit 日志和退出码。运行中只称“已启动/执行中”；完成须 launcher 退出 0、200/200 `check_unit` 与 `full8x5_test.json` PASS。
+3. 结果只列项目五折 outer-test R²，明确与论文官方 cohort/split 的差异，不将性能差值归因于单一架构。
+
+**启动前已完成**：定向 `pytest -q tests/test_mcl_ph_periodic_tdl_strategy.py tests/test_mcl_ph_8x5_scope.py` 为 **7 passed**；`py_compile` 和 `git diff --check` 通过。四个预训练包与统计 SHA 与冻结记录一致；可信索引的 device/inode/size/mtime 和 6,265 行覆盖与源文件一致。四 GPU 可见且无相关训练进程，新输出/日志目录不存在。此项只证实局部代码与启动门槛，尚无新的模型运行或正式结果。
+
+## r11 终止归档后的历史计划
+
 # MCL-PH-20260921-01 / r11-PTDL5：五折 Periodic-TDL 训练协议适配
 
 **状态：执行中（本轮用户已明确授权五臂全量重跑）。** 实现基线 `dev@dd23be2`，运行授权记录 `dev@5f22794`；本轮开始工作区干净，`git pull --ff-only origin dev` 无更新。用户先要求调整微调策略和对应的五折处理，本轮再明确要求“重跑全量微调”；执行者 Codex。授权范围为下面的五臂 × 8 任务 × 5 折、仅 train/inner-validation，最多 200 starts / 13,750 epochs；此前禁止 outer-test 的边界保持。旧 r10R3 轨迹已归档到 `PROJECT_HISTORY.md`，原结果目录不覆盖。以下为当前唯一活动计划；下方 r10R3 内容只作历史记录，不授权重复执行。

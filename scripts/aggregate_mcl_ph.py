@@ -26,7 +26,8 @@ from scripts.finetune_mcl_ph import (ARMS, FOLDS, MCL_FUSION, SCHEDULE_TOTAL_EPO
 REQUIRED_FILES = ('run.json', 'runtime.json', 'metrics.json', 'best.pt',
                   'validation_predictions.npz')
 STAGE_EPOCH_LIMIT = {'smoke': 1, 'development': SCHEDULE_TOTAL_EPOCHS,
-                     'full8x5': SCHEDULE_TOTAL_EPOCHS}
+                     'full8x5': SCHEDULE_TOTAL_EPOCHS,
+                     'full8x5_outer': SCHEDULE_TOTAL_EPOCHS}
 # The declared P1 smoke scope; anything smaller can be verified but is PARTIAL.
 ACCEPTANCE_ARMS = tuple(ARMS)
 ACCEPTANCE_TASKS = ('xc',)
@@ -41,7 +42,8 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
     """Validate one unit; returns (record, problems)."""
     problems = []
     directory = unit_directory(root, arm, task, fold)
-    missing = [name for name in REQUIRED_FILES if not (directory / name).is_file()]
+    required = REQUIRED_FILES + (('test_predictions.npz',) if stage == 'full8x5_outer' else ())
+    missing = [name for name in required if not (directory / name).is_file()]
     if missing:
         return None, [f'missing artifacts: {",".join(missing)}']
     try:
@@ -63,7 +65,7 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
             problems.append(f"{name} stage is {record.get('stage')!r}, not {stage!r}")
         if record.get('protocol') != f'mcl_ph_{stage}':
             problems.append(f"{name} protocol is {record.get('protocol')!r}")
-        if record.get('outer_test') != 'NOT_RUN':
+        if record.get('outer_test') != ('RUN' if stage == 'full8x5_outer' else 'NOT_RUN'):
             problems.append(f"{name} outer_test is {record.get('outer_test')!r}")
     if metrics.get('pretrain_step') != int(expected_step):
         problems.append(f"pretrain_step is {metrics.get('pretrain_step')!r}, "
@@ -77,6 +79,8 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
         problems.append('fine-tuning strategy differs between run and metrics')
     if strategy not in ('legacy', 'periodic_tdl'):
         problems.append(f'unknown fine-tuning strategy {strategy!r}')
+    if stage == 'full8x5_outer' and strategy != 'periodic_tdl':
+        problems.append('outer-test evaluation requires periodic_tdl')
     requested = metrics.get('requested_epochs')
     limit = (10 + PERIODIC_TDL_EPOCHS.get(task, 60)
              if strategy == 'periodic_tdl' else STAGE_EPOCH_LIMIT[stage])
@@ -138,13 +142,15 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
         problems.append(f"split protocol is {split.get('protocol')!r}")
     if split.get('validation_is_test') is not False:
         problems.append('the split does not declare validation_is_test=false')
-    if split.get('outer_test') != 'NOT_RUN':
-        problems.append('the split record does not keep outer_test NOT_RUN')
+    expected_outer = 'RUN' if stage == 'full8x5_outer' else 'NOT_RUN'
+    if split.get('outer_test') != expected_outer:
+        problems.append(f'the split record does not keep outer_test {expected_outer}')
     for name in ('sets_disjoint', 'union_equals_full_cohort'):
         if split.get(name) is not True:
             problems.append(f'the split record does not assert {name}')
     if int(split.get('validation_rows', 0)) <= 0 or int(split.get('train_rows', 0)) <= 0:
         problems.append('the split record has an empty train or validation set')
+    validation_rows = set()
     try:
         with np.load(directory / 'validation_predictions.npz', allow_pickle=False) as payload:
             truth = np.asarray(payload['y_true'], dtype=np.float64).reshape(-1)
@@ -160,8 +166,39 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
                 problems.append('the saved predictions are not from the selected epoch')
             if str(payload['outer_test']) != 'NOT_RUN':
                 problems.append('the saved predictions do not keep outer_test NOT_RUN')
+            if stage == 'full8x5_outer':
+                validation_rows = set(np.asarray(payload['validation_indices'],
+                                                 dtype=np.int64).tolist())
     except (OSError, ValueError, KeyError) as error:
         problems.append(f'unreadable validation predictions: {type(error).__name__}: {error}')
+    if stage == 'full8x5_outer':
+        try:
+            with np.load(directory / 'test_predictions.npz', allow_pickle=False) as payload:
+                truth = np.asarray(payload['y_true'], dtype=np.float64).reshape(-1)
+                prediction = np.asarray(payload['y_pred'], dtype=np.float64).reshape(-1)
+                indices = np.asarray(payload['test_indices'], dtype=np.int64).reshape(-1)
+                keys = np.asarray(payload['sample_keys'])
+                if truth.size < 2 or any(len(item) != truth.size for item in
+                                         (prediction, indices, keys)):
+                    problems.append('outer-test predictions have inconsistent sizes')
+                elif (not np.isfinite(truth).all() or not np.isfinite(prediction).all()
+                      or len(set(indices.tolist())) != len(indices)
+                      or set(indices.tolist()) & validation_rows
+                      or len(indices) != int(split.get('test_rows', -1))
+                      or len(indices) != int(metrics.get('test_sample_count', -1))):
+                    problems.append('outer-test predictions are non-finite or split rows disagree')
+                else:
+                    total = float(np.sum((truth - truth.mean()) ** 2))
+                    calculated = 1.0 - float(np.sum((truth - prediction) ** 2)) / total if total > 0 else float('nan')
+                    if not math.isclose(calculated, float(metrics.get('test_r2', float('nan'))),
+                                        rel_tol=1e-5, abs_tol=1e-5):
+                        problems.append('outer-test R2 disagrees with predictions')
+                if int(payload['best_epoch']) != best_epoch or str(payload['outer_test']) != 'RUN':
+                    problems.append('outer-test predictions differ from selected checkpoint')
+                if str(payload['split_protocol']) != SPLIT_PROTOCOL:
+                    problems.append('outer-test prediction split protocol differs')
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            problems.append(f'unreadable outer-test predictions: {type(error).__name__}: {error}')
     groups = metrics.get('optimizer_groups')
     if not isinstance(groups, list) or not groups:
         problems.append('the parameter groups were not recorded')
@@ -174,6 +211,7 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
               'finetune_strategy': strategy,
               'executed_epochs': executed, 'optimizer_updates': metrics.get('optimizer_updates'),
               'best_epoch': best_epoch, 'best_validation_r2': metrics.get('best_validation_r2'),
+              'test_r2': metrics.get('test_r2') if stage == 'full8x5_outer' else None,
               'pretrain_step': metrics.get('pretrain_step'),
               'pretrain_package_sha256': metrics.get('pretrain_package_sha256')}
     return record, problems

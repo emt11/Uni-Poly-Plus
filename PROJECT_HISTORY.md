@@ -1,5 +1,9 @@
 # Uni-Poly 项目变更周期归档
 
+## 2026-09-24 — MCL-PH-20260921-01 / r11-PTDL5：用户要求停止并替换
+
+用户原授权五臂 × 八任务 × 五折 Periodic-TDL 两阶段内部验证，从四个 5k 预训练包全新训练，最多 200 starts / 13,750 epochs，只报告 inner-validation。Codex 在 `dev@878ac4f` 运行于 `Uni-Poly:96:mcl_ph_ptdl_4gpu`，目录 `results/mcl_ph_20260921/p2/full8x5_ptdl_r11_1/` 与同名 logs。用户随后明确要求改成五折 outer-test R² 并停止旧任务；Codex 发送一次 Ctrl-C，核实 launcher `.exit=1`、122 个成功 unit、4 个 `.exit=-2` 中断 unit（共 126 starts）、无相关进程。旧现场保留，未达到 200/200，无正式五折结论。本周期以“已取消／被 r12 替换”关闭，取消不改变实际历史消耗。后续计划为 `r12-PTDL-OUTER5`，见当前 `Plan.md`；新旧阶段产物不得混用。
+
 ## DOCS-20260916-04｜GLT-V2 专项清理计划（仅规划）
 
 用户授权编写 Plan_Delete.md，未授权实际删除。Codex 先 pull，保留用户已有空白未跟踪文件，再只读核对本地依赖、远端 store/manifest/run.json、du 尺寸和活动进程，形成清理专项计划。

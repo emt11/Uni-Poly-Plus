@@ -43,7 +43,7 @@ from src.modules.glt_adaptation import AdaptationAdapter
 from src.training.glt_dual_runtime import (open_source, require_tmux, save_checkpoint,
                                            sha256_file, write_json)
 from src.utils import _cosine_scheduler, evaluate, scale_targets, set_global_seed, train_epoch
-from scripts.finetune_glt_3d_gain_d2 import resolve_fold
+from scripts.finetune_glt_3d_gain_d2 import resolve_fold, split_indices
 
 ARMS = ('glt_ref', 'o8_only', 'm_cat', 'm_gate', 'm_xattn')
 MCL_FUSION = {'m_cat': 'cat', 'm_gate': 'gate', 'm_xattn': 'xattn'}
@@ -438,6 +438,8 @@ def unit_directory(output, arm, task, fold):
 
 
 def validate_stage_scope(stage, task, fold, epochs, cohort_index, strategy='legacy'):
+    if stage == 'full8x5_outer' and strategy != 'periodic_tdl':
+        raise ValueError('outer-test five-fold evaluation requires periodic_tdl')
     if strategy == 'periodic_tdl' and stage == 'smoke':
         raise ValueError('Periodic-TDL full-trajectory strategy requires development or full8x5')
     if stage == 'smoke' and epochs != 1:
@@ -446,12 +448,12 @@ def validate_stage_scope(stage, task, fold, epochs, cohort_index, strategy='lega
         expected = 10 + PERIODIC_TDL_EPOCHS.get(task, 60)
         if epochs != expected:
             raise ValueError(f'Periodic-TDL adaptation for {task} requires {expected} epochs')
-    elif stage in ('development', 'full8x5') and not 1 <= epochs <= SCHEDULE_TOTAL_EPOCHS:
+    elif stage in ('development', 'full8x5', 'full8x5_outer') and not 1 <= epochs <= SCHEDULE_TOTAL_EPOCHS:
         raise ValueError(f'{stage} units allow 1..{SCHEDULE_TOTAL_EPOCHS} epochs')
     if stage == 'development' and (task not in DEVELOPMENT_TASKS or
                                    fold not in DEVELOPMENT_FOLDS):
         raise ValueError('development permits only XC/EPS/EAT and folds 0/1')
-    if stage in ('development', 'full8x5') and not cohort_index:
+    if stage in ('development', 'full8x5', 'full8x5_outer') and not cohort_index:
         raise ValueError('a trusted cohort index is required for label-isolated stages')
 
 
@@ -584,11 +586,56 @@ def run_unit(args, folder, started, statistics, config, manifest):
             split_protocol=np.asarray(SPLIT_PROTOCOL),
             finetune_strategy=np.asarray(args.finetune_strategy),
                  outer_test=np.asarray('NOT_RUN'))
+        test_result = {}
+        if args.stage == 'full8x5_outer':
+            # The test source is opened only after the validation-selected state
+            # has been restored. No subsequent optimizer or selection step occurs.
+            fold_entry = next(item for item in manifest['folds']
+                              if int(item['fold']) == int(args.fold))
+            test_indices = sorted(split_indices(fold_entry, 'test',
+                                                int(manifest['sample_count'])))
+            test_source, test_frame = open_source(
+                args.cohort_root, args.cache_root, task=args.task,
+                dual_static_root=args.dual_static_root, selected_indices=test_indices,
+                expected_task_rows=int(manifest['sample_count']),
+                expected_split_sha256=sha256_file(split_path),
+                record_index_path=args.cohort_index)
+            try:
+                if test_frame['original_row'].astype(int).tolist() != test_indices:
+                    raise ValueError('selected downstream rows differ from outer-test indices')
+                raw_targets = test_frame['label'].to_numpy(dtype=np.float64)
+                test_dataset = (dataset_class(test_source, raw_targets, statistics)
+                                if args.arm in MCL_FUSION else dataset_class(test_source, raw_targets))
+                if not isinstance(scaler, IdentityTargetScaler):
+                    test_dataset.set_target_override(scaler.transform(raw_targets).reshape(-1))
+                test_loader = DataLoader(test_dataset, batch_size=24, shuffle=False,
+                                         num_workers=0, collate_fn=collate)
+                _, test_r2, test_truth, test_prediction = evaluate(
+                    AdaptationAdapter(model), test_loader, criterion, device, scaler=scaler)
+                test_truth = np.asarray(test_truth, dtype=np.float64).reshape(-1)
+                test_prediction = np.asarray(test_prediction, dtype=np.float64).reshape(-1)
+                if not (np.isfinite(test_truth).all() and np.isfinite(test_prediction).all()
+                        and np.isfinite(test_r2)):
+                    raise ValueError('outer-test predictions or R2 are non-finite')
+                test_result = dict(test_r2=float(test_r2),
+                                   test_rmse=float(np.sqrt(np.mean((test_prediction-test_truth)**2))),
+                                   test_mae=float(np.mean(np.abs(test_prediction-test_truth))),
+                                   test_sample_count=len(test_indices))
+                np.savez(folder / 'test_predictions.npz',
+                         sample_keys=np.asarray([sample[0].hex() for sample in test_source.samples]),
+                         test_indices=np.asarray(test_indices, dtype=np.int64),
+                         y_true=test_truth, y_pred=test_prediction,
+                         best_epoch=np.asarray(int(result['best_epoch']), dtype=np.int64),
+                         split_protocol=np.asarray(SPLIT_PROTOCOL),
+                         outer_test=np.asarray('RUN'))
+            finally:
+                test_source.close()
         common = dict(
             arm=args.arm, task=args.task, fold=int(args.fold), stage=args.stage,
             finetune_strategy=args.finetune_strategy,
             selection_metric=('validation_rmse' if periodic else 'validation_r2'),
-            protocol=f'mcl_ph_{args.stage}', outer_test='NOT_RUN',
+            protocol=f'mcl_ph_{args.stage}',
+            outer_test=('RUN' if args.stage == 'full8x5_outer' else 'NOT_RUN'),
             pretrained_route=('dual_glt' if args.arm in ('glt_ref', 'o8_only') else 'mcl_ph'),
             requested_epochs=int(args.epochs), executed_epochs=int(executed_epochs),
             optimizer_updates=int(result['optimizer_updates']),
@@ -601,7 +648,9 @@ def run_unit(args, folder, started, statistics, config, manifest):
             train_sample_count=len(train_indices),
             validation_sample_count=len(validation_indices),
             scaler_fit_split=('none' if periodic and args.task == 'xc' else 'train'),
-            split=split_evidence,
+            split=dict(split_evidence, outer_test=('RUN' if args.stage == 'full8x5_outer'
+                                                   else 'NOT_RUN')),
+            **test_result,
             learning_rate_table=({'head_stage1': 3e-4,
                                   'backbone_stage2': (2e-4 if args.task == 'xc' else 1e-4),
                                   'head_stage2': 1e-3} if periodic else
@@ -627,7 +676,8 @@ def run_unit(args, folder, started, statistics, config, manifest):
             requested_epochs=int(args.epochs), executed_epochs=int(executed_epochs),
             optimizer_updates=int(result['optimizer_updates']),
             scaler_mean=scaler.scaler.mean_.tolist(), scaler_scale=scaler.scaler.scale_.tolist(),
-            optimizer_groups=group_evidence, split=split_evidence))
+            optimizer_groups=group_evidence, split=common['split'],
+            outer_test=common['outer_test']))
     finally:
         source.close()
     summary = build_summary(common, config=config, device=device, command=sys.argv)
@@ -655,7 +705,7 @@ def failure_record(error, args, started):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arm', required=True, choices=ARMS)
-    parser.add_argument('--stage', required=True, choices=('smoke', 'development', 'full8x5'))
+    parser.add_argument('--stage', required=True, choices=('smoke', 'development', 'full8x5', 'full8x5_outer'))
     parser.add_argument('--config', required=True)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--expected-pretrain-step', type=int, required=True)

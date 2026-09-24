@@ -51,3 +51,21 @@ def test_four_gpu_assignment_covers_each_remaining_unit_once():
     assert set(assigned) == {0, 1, 2, 3}
     assert sorted(row for rows in assigned.values() for row in rows) == sorted(remaining)
     assert max(map(len, assigned.values())) - min(map(len, assigned.values())) <= 1
+
+
+def test_outer_test_aggregate_reports_five_fold_mean_and_std(monkeypatch, tmp_path):
+    def check(_root, arm, task, fold, *, stage, expected_step):
+        assert stage == 'full8x5_outer' and expected_step == 5000
+        return {'arm': arm, 'task': task, 'fold': fold,
+                'finetune_strategy': 'periodic_tdl',
+                'best_validation_r2': 0.8, 'test_r2': fold / 10,
+                'pretrain_package_sha256': 'a' * 64}, []
+
+    monkeypatch.setattr(full_aggregate, 'check_unit', check)
+    result = full_aggregate.aggregate(tmp_path, arms=('m_cat',), expected_step=5000,
+                                      stage='full8x5_outer')
+    assert result['status'] == 'PASS' and result['outer_test'] == 'RUN'
+    assert result['units_accepted'] == 40
+    assert result['test_r2']['m_cat']['tasks']['egc']['folds'] == [0, .1, .2, .3, .4]
+    assert result['test_r2']['m_cat']['tasks']['egc']['mean'] == pytest.approx(.2)
+    assert result['test_r2']['m_cat']['tasks']['egc']['std'] == pytest.approx(2**.5 / 10)

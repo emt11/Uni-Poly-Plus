@@ -30,13 +30,14 @@ def distribute(units, devices=(0, 1, 2, 3)):
 
 
 def run_worker(device, units, args, output, log_root, packages, stopped):
+    stage = 'full8x5_outer' if args.evaluation == 'outer_test' else 'full8x5'
     try:
         for arm, task, fold in units:
             if stopped.is_set():
                 return
             name = f'{arm}_{task}_fold{fold}'
             command = [sys.executable, 'scripts/finetune_mcl_ph.py',
-                       '--arm', arm, '--stage', 'full8x5', '--config', args.config,
+                       '--arm', arm, '--stage', stage, '--config', args.config,
                        '--checkpoint', str(packages[arm]), '--expected-pretrain-step', '5000',
                        '--cohort-root', args.cohort_root, '--cache-root', args.cache_root,
                        '--dual-static-root', args.dual_static_root,
@@ -59,7 +60,7 @@ def run_worker(device, units, args, output, log_root, packages, stopped):
             if result.returncode != 0:
                 stopped.set()
                 raise RuntimeError(f'{name} on GPU {device} exited {result.returncode}')
-            _, problems = check_unit(output, arm, task, fold, stage='full8x5',
+            _, problems = check_unit(output, arm, task, fold, stage=stage,
                                      expected_step=5000)
             if problems:
                 (log_root / f'{name}.acceptance.json').write_text(
@@ -86,8 +87,13 @@ def main():
     parser.add_argument('--retry-unit')
     parser.add_argument('--finetune-strategy', choices=('legacy', 'periodic_tdl'),
                         default='legacy')
+    parser.add_argument('--evaluation', choices=('internal', 'outer_test'), default='internal')
     args = parser.parse_args()
     require_tmux()
+    if args.evaluation == 'outer_test' and args.finetune_strategy != 'periodic_tdl':
+        raise ValueError('outer-test evaluation requires periodic_tdl')
+    if args.evaluation == 'outer_test' and (args.reuse_root or args.reuse_log_root):
+        raise ValueError('outer-test campaign must train all units in a fresh root')
     units = unit_list(args.arms)
     packages = parse_packages(args.package, args.arms)
     output, log_root = Path(args.output).resolve(), Path(args.log_root).resolve()
@@ -115,7 +121,8 @@ def main():
         'arms': args.arms, 'units_expected': len(units),
         'epochs_per_unit_max': (70 if args.finetune_strategy == 'periodic_tdl' else 30),
         'finetune_strategy': args.finetune_strategy,
-        'outer_test': 'NOT_RUN', 'worker_count': 4,
+        'outer_test': 'RUN' if args.evaluation == 'outer_test' else 'NOT_RUN',
+        'evaluation': args.evaluation, 'worker_count': 4,
         'packages': {arm: {'path': str(path), 'sha256': hashes[arm]}
                      for arm, path in packages.items()},
         'cohort_index': str(Path(args.cohort_index).resolve()),
@@ -147,14 +154,16 @@ def main():
                 failures.append(str(error))
     if failures:
         raise RuntimeError('full8x5 workers stopped: ' + '; '.join(failures))
-    payload = aggregate(output, arms=args.arms, expected_step=5000)
-    (output / 'full8x5_validation.json').write_text(
+    stage = 'full8x5_outer' if args.evaluation == 'outer_test' else 'full8x5'
+    payload = aggregate(output, arms=args.arms, expected_step=5000, stage=stage)
+    filename = 'full8x5_test.json' if args.evaluation == 'outer_test' else 'full8x5_validation.json'
+    (output / filename).write_text(
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + '\n',
         encoding='utf-8')
     if payload['status'] != 'PASS':
         raise SystemExit(4)
     print(json.dumps({'status': 'PASS', 'units_accepted': payload['units_accepted'],
-                      'outer_test': 'NOT_RUN'}), flush=True)
+                      'outer_test': payload['outer_test']}), flush=True)
 
 
 if __name__ == '__main__':
