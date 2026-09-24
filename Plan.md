@@ -1,4 +1,13 @@
-# MCL-PH-20260921-01 / r10R3-FULL8X5-1：五臂 8×5 内部验证微调
+# MCL-PH-20260921-01 / r10R3-FULL8X5-3：五臂 8×5 内部验证微调
+
+## FULL8X5-3 四 GPU 并行续跑（Codex；2026-09-24 UTC）
+
+用户明确要求停止单 GPU 串行微调并使用四 GPU 重启。当前调整为 **GPU 0–3 各自串行运行 26 个互不重叠的 unit，四个 unit 同时训练**；单个 unit 仍保持原 batch、seed、30-epoch 上限、预训练包、split 与内部验证规则，不改成数据并行或改变 global batch。已完成 unit 只读复用；只在全新结果目录写入剩余 unit。
+
+- 串行轨迹 `full8x5_r10r3_2` 停止前有 6 个新 unit 真实退出 0，加上复用的 90 个，共 **96/200** 已验收。停止时 `m_cat/egc/fold1` 正在运行；对 `Uni-Poly:96` 发送一次 Ctrl-C 后两个相关 Python 进程均已退出。该 unit 仅留 `runtime.json` 和截断日志、没有 `.exit`；launcher 的 `_launcher.exit` 也未写出，因此不得把它记成正常退出或完成。所有旧现场保留。
+- 本轮新增 `scripts/run_mcl_ph_8x5_4gpu.py`，从 `full8x5_r10r3_2` 逐 unit 复核真实退出码与 `check_unit`，明确排除被中断的 `m_cat/egc/fold1`，把 104 个剩余 unit 以 round-robin 分至四张物理 GPU。每个子进程以专属 `CUDA_VISIBLE_DEVICES` 启动，unit 输出和日志路径互斥；某个 unit 失败即不再调度新 unit，其余已启动 unit 完成后停止并保留现场。全部完成才聚合 `outer_test=NOT_RUN`。
+- 首轮 91 次启动，第二轮 7 次启动（6 通过、1 被用户要求中断），累计已 **98 次启动**。第三轮最多 104 次新启动；累计上限修订为 **202 次启动**、目标仍为 200 个通过 unit。被中断的部分 epoch 照实计账，不恢复其模型状态，不覆盖旧产物。新目录为 `results/mcl_ph_20260921/p2/full8x5_r10r3_3/` 和 `logs/mcl_ph_20260921/full8x5_r10r3_3/`。
+- 局部验证：`pytest -q tests/test_mcl_ph_8x5_scope.py` 为 3 passed；对真实旧根只读预检为 96 accepted、104 remaining，分配 {0:26, 1:26, 2:26, 3:26}；`py_compile` 和 `git diff --check` 通过。启动前仍须核对四卡、无旧进程、目录不存在及远端同步。只做 train/inner-validation，禁止 outer-test、OOF、P3、refit、新预训练及额外 seed。完成条件仍为 launcher 真实退出 0、200/200 unit 验收及最终聚合 PASS。
 
 状态：**执行中**（五臂 8×5 内部验证微调）。日期：2026-09-23 UTC。用户已明确授权五臂全部、8 任务×5 折、仅微调与内部验证；执行者：Codex。首轮在 91 次启动后因无有效几何样本的 MCL 视图错误停止，90 个 unit 通过、1 个失败、109 个未启动。用户本轮明确要求直接修复并完成全量；本修订只重跑失败的 `m_cat/egb/fold0`，复用 90 个通过的 unit，再运行 109 个未启动 unit。故累计启动上限由 200 修订为 **201 次**，仍为 200 个目标 unit、每个最多 30 epochs；失败已消耗的首批更新照实计账。原 P2 development 30-unit 计划未启动，不另加其预算。既往记录保留在文末，不追改当时结论。
 

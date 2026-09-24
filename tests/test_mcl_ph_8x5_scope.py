@@ -2,6 +2,7 @@ import pytest
 
 import scripts.aggregate_mcl_ph_8x5 as full_aggregate
 from scripts.run_mcl_ph_8x5 import unit_list
+from scripts.run_mcl_ph_8x5_4gpu import distribute
 from scripts.finetune_mcl_ph import (FOLDS, TASKS, unit_directory,
                                      validate_stage_scope)
 
@@ -42,3 +43,11 @@ def test_full8x5_aggregate_requires_all_forty_units(monkeypatch, tmp_path):
     assert result['status'] == 'PASS' and result['units_accepted'] == 40
     assert result['validation_r2']['m_cat']['macro8'] == 0.25
     assert result['outer_test'] == 'NOT_RUN'
+
+
+def test_four_gpu_assignment_covers_each_remaining_unit_once():
+    remaining = unit_list(('m_cat', 'm_gate'))[7:]
+    assigned = distribute(remaining)
+    assert set(assigned) == {0, 1, 2, 3}
+    assert sorted(row for rows in assigned.values() for row in rows) == sorted(remaining)
+    assert max(map(len, assigned.values())) - min(map(len, assigned.values())) <= 1

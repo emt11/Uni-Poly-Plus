@@ -2166,3 +2166,9 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrai
 续跑在 `Uni-Poly:96:mcl_ph_full8x5_resume` 串行启动；实际命令为 `logs/mcl_ph_20260921/full8x5_r10r3_2_launch.sh`。全新产物根为 `results/mcl_ph_20260921/p2/full8x5_r10r3_2/`，日志根为 `logs/mcl_ph_20260921/full8x5_r10r3_2/`。通过的旧 unit 只读链接到新根；失败 unit 重新开始，其余 109 个尚未启动 unit 依序运行。最终必须在真实 launcher 退出 0、200/200 unit 通过聚合、包及 split 身份一致后，才能称全量完成；目前状态为**执行中**。不读取 outer-test、不执行 OOF、P3 或 refit，不据当前部分折预测宣称性能增益。
 
 修复后的原失败 unit `m_cat/egb/fold0` 已完成：真实退出码 0、30 epochs、360 optimizer updates、best_epoch 25，独立调用 `check_unit(..., stage='full8x5', expected_step=5000)` 为 PASS；训练包 SHA 与 CAT 正式包一致。launcher 记录该 unit PASS 后开始 `m_cat/egb/fold1`，当前共 **91/200 个目标 unit 通过**（90 个旧 unit + 1 个新 unit），实际累计 **92/201 次启动**。用户要求在修复完成后交接只读监控；本轮不发送信号、不停止运行中的串行 launcher。全量结果仍待真实 launcher 退出、200/200 验收及聚合，不提前宣称完成。
+
+### 13.25 FULL8X5-3 用户要求停止串行并使用四 GPU（Codex；2026-09-24 UTC）
+
+用户明确要求停止当前微调并使用四张 GPU 重启。停止前 `full8x5_r10r3_2` 新增 6 个真实退出 0 且验收通过的 unit，连同复用旧轨迹的 90 个，合计 **96/200**。当时 `m_cat/egc/fold1` 正运行；向对应 tmux window 发送一次 Ctrl-C 后相关 Python 进程退出。该 unit 和 launcher 都没有真实退出码文件，当前 unit 只有失败 `runtime.json` 和中断日志，不称完成或正常退出；旧结果与日志完整保留。
+
+四 GPU 续跑按 **四个独立 unit 并行、每 GPU 一进程** 实现，单 unit 的模型、batch、seed、split、epoch 上限和包不变。只读复核 `full8x5_r10r3_2` 中 96 个已通过 unit；剩余 104 个（包括被中断的一个）均匀分配 GPU 0–3，每卡 26 个，在全新 `full8x5_r10r3_3` 结果及日志根运行。累计启动预算由 201 修订为 **202 次**：此前 91 + 7 = 98 次，后续最多 104 次。局部三项测试通过，真实旧根预检和四卡划分通过，启动与最终状态以 `Plan.md` 及新轨迹的真实日志、退出码为准。仍只做内部验证，不读取 outer-test、不做 OOF/P3/refit，也不以未完成折推断性能。

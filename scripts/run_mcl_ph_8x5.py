@@ -61,9 +61,12 @@ def accepted_from_prior(root, log_root, units, packages, hashes, retry_unit):
         _, problems = check_unit(root, arm, task, fold, stage='full8x5',
                                  expected_step=5000)
         exit_file = log_root / f'{name}.exit'
+        if not exit_file.is_file() and name in launch.get('reused_units', []):
+            exit_file = Path(launch['reuse_log_root']) / f'{name}.exit'
         if not problems and exit_file.is_file() and exit_file.read_text().strip() == '0':
             accepted[name] = directory.resolve()
-        elif name == retry_unit and exit_file.is_file() and exit_file.read_text().strip() != '0':
+        elif name == retry_unit and (not exit_file.is_file()
+                                     or exit_file.read_text().strip() != '0'):
             failed.append(name)
         else:
             raise ValueError(f'prior unit {name} is incomplete: {problems}')
