@@ -2179,4 +2179,8 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrai
 
 在 `r10R3` 旧协议五臂 × 八任务 × 五折内部验证 200/200 完成后，用户要求调整为 Periodic-TDL 论文的微调训练策略，并明确要求五折处理。新代码以 `--finetune-strategy periodic_tdl` 显式进入：先冻结编码器、head-only 10 epochs；再联合训练 Egc 50 或其他任务 60 epochs；每折跨两阶段按**最低 validation RMSE**选 checkpoint。batch 24，MSE，grad clip 5，阶段学习率/余弦调度、任务 weight decay 与 head dropout 按论文 Methods；Xc 原尺度，其余任务仅 train 拟合标准化器。项目 `eat` 不在论文九任务内，采用 Eea 正则参数作为明确的项目适配。五臂保持项目原架构、head 及既有 5k 预训练包，故此变更是论文**训练协议适配**，不称 HSMP 模型复现。
 
-五折仍使用项目冻结 `outer5_inner20` manifest 的 fold0–4；原论文 release 使用其自身数据与 `<dataset>_folds.pkl`，逐样本折身份未宣称一致。当前仅 train/inner-validation，`outer_test=NOT_RUN`；论文测试分数不可由本项目内部验证直接替代。新策略每个 Egc 单元 60 epochs、其他任务 70；五臂完整 8×5 共 200 starts、最多 13,750 epochs，**尚未授权或启动**。旧 `r10R3` 产物保留并标记 `legacy`，不可复用为新策略单元；新运行须新目录与独立预算。实现、测试、当前计划与下一步见根目录 `Plan.md`。
+五折仍使用项目冻结 `outer5_inner20` manifest 的 fold0–4；原论文 release 使用其自身数据与 `<dataset>_folds.pkl`，逐样本折身份未宣称一致。当前仅 train/inner-validation，`outer_test=NOT_RUN`；论文测试分数不可由本项目内部验证直接替代。新策略每个 Egc 单元 60 epochs、其他任务 70；五臂完整 8×5 共 200 starts、最多 13,750 epochs，**截至本节创建时尚未授权或启动**。旧 `r10R3` 产物保留并标记 `legacy`，不可复用为新策略单元；新运行须新目录与独立预算。实现、测试、当前计划与下一步见根目录 `Plan.md`。
+
+### r11 五折正式重跑授权与启动前核对（2026-09-24）
+
+用户现已明确要求重跑全量微调，新增预算为五臂 × 8 任务 × fold0–4，共 200 starts / 最多 13,750 epochs；每 arm/task/fold 从对应原始 5k 部署包开始，不复用旧 `legacy` 微调结果。范围仍为 train/inner-validation，`outer_test=NOT_RUN`。远端 `dev@dd23be2` 同步，四部署包及统计 SHA 匹配，cohort index 绑定的源文件 stat 身份匹配，四张 GPU 可见且无同任务进程，新输出/日志根不存在。此段只记录授权和预检；实际启动及结果另见 `Plan.md` 的运行记录。
