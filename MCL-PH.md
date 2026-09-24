@@ -2164,3 +2164,5 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrai
 用户明确要求 Codex 修复并完成全量，授权范围据此修订为 200 个目标 unit、累计最多 201 次启动（含前轮这一次失败）。修复后的无几何路径先验证结构 carrier，用原子表建立身份与索引，零坐标只承担无几何样本的张量形状；`geometry_valid=false` 仍禁止几何边、描述符和几何目标，并回退 O8。有效几何样本的严格坐标长度检查不变。合成 fixture PASS，真实 EGB 行 557 的选择性加载、样本构造及 collate PASS。对旧根全部 90 个通过 unit 的退出码和 `check_unit` 逐个复核，四包 SHA 与旧 launch 记录一致。修改和计划见 `dev@dcdfbb2`，已推送。
 
 续跑在 `Uni-Poly:96:mcl_ph_full8x5_resume` 串行启动；实际命令为 `logs/mcl_ph_20260921/full8x5_r10r3_2_launch.sh`。全新产物根为 `results/mcl_ph_20260921/p2/full8x5_r10r3_2/`，日志根为 `logs/mcl_ph_20260921/full8x5_r10r3_2/`。通过的旧 unit 只读链接到新根；失败 unit 重新开始，其余 109 个尚未启动 unit 依序运行。最终必须在真实 launcher 退出 0、200/200 unit 通过聚合、包及 split 身份一致后，才能称全量完成；目前状态为**执行中**。不读取 outer-test、不执行 OOF、P3 或 refit，不据当前部分折预测宣称性能增益。
+
+修复后的原失败 unit `m_cat/egb/fold0` 已完成：真实退出码 0、30 epochs、360 optimizer updates、best_epoch 25，独立调用 `check_unit(..., stage='full8x5', expected_step=5000)` 为 PASS；训练包 SHA 与 CAT 正式包一致。launcher 记录该 unit PASS 后开始 `m_cat/egb/fold1`，当前共 **91/200 个目标 unit 通过**（90 个旧 unit + 1 个新 unit），实际累计 **92/201 次启动**。用户要求在修复完成后交接只读监控；本轮不发送信号、不停止运行中的串行 launcher。全量结果仍待真实 launcher 退出、200/200 验收及聚合，不提前宣称完成。

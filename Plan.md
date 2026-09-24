@@ -9,6 +9,7 @@
 - 局部验证：新增无几何合成 fixture，PASS；对真实 `egb` 行 557 的选择性加载、MCL sample 和 collate 检查 PASS，空间边为空、geometry/readout 标志均为 false。旧 campaign 的 90 个通过 unit 经真实退出码和 `check_unit` 逐个复核，候选复用数 90，明确失败单元 1；四个包 SHA 与首轮启动身份一致。
 - 续跑使用全新输出根 `results/mcl_ph_20260921/p2/full8x5_r10r3_2/`、全新日志根 `logs/mcl_ph_20260921/full8x5_r10r3_2/`。启动器要求显式 prior 输出/日志根及 `--retry-unit m_cat_egb_fold0`，逐一验收通过单元后将它们只读链接到新根；失败单元不得复用，旧根保持不变。新启动上限 110 次，首轮加本轮总上限 201 次。每个新 unit 真实退出码和 `check_unit` 通过后才继续；全部 200 个目标通过后才聚合内部验证。失败即停止，不自动恢复、重试其他 unit、读 outer-test、启动 P3/OOF/refit。
 - 实际代码和计划 commit `dcdfbb2` 已推送 `dev`。启动前确认 `Uni-Poly` 可用、无同任务进程，四卡无计算进程，新产物根不存在。实际命令为 `logs/mcl_ph_20260921/full8x5_r10r3_2_launch.sh`，运行于 `Uni-Poly:96:mcl_ph_full8x5_resume`；launcher 日志为同前缀 `_launcher.log`，最终真实退出码写入 `_launcher.exit`，逐 unit 日志与退出码在新日志根。当前 launcher 已验收并链接旧轨迹的 90 个通过 unit；`m_cat/egb/fold0` 已开始训练，尚未完成。此时状态只能称执行中，不能称全量通过。
+- 修复验收更新：`m_cat/egb/fold0` 真实 `.exit=0`，30 epochs、360 optimizer updates，`best_epoch=25`，`check_unit(..., stage='full8x5', expected_step=5000)` 为 PASS，部署包 SHA 为 `eed62765…e0e49`；launcher 已记录该 unit PASS 并开始 `m_cat/egb/fold1`。当前合计 **91/200 个目标 unit 通过**（旧 90 + 新 1）；首轮 91 次启动加续跑 1 次，实际累计 **92/201 次启动**。新根剩余 109 个目标 unit 待执行，最终 launcher 退出码和 200/200 聚合尚未产生。用户要求在修复确认后交接监控；本轮不发送信号、不停止训练进程，后续由其他模型只读监控。
 
 ## 当前授权的启动范围
 
