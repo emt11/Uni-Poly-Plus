@@ -10,7 +10,7 @@
 - 局部验证：`pytest -q tests/test_mcl_ph_8x5_scope.py` 为 3 passed；对真实旧根只读预检为 96 accepted、104 remaining，分配 {0:26, 1:26, 2:26, 3:26}；`py_compile` 和 `git diff --check` 通过。启动前仍须核对四卡、无旧进程、目录不存在及远端同步。只做 train/inner-validation，禁止 outer-test、OOF、P3、refit、新预训练及额外 seed。完成条件仍为 launcher 真实退出 0、200/200 unit 验收及最终聚合 PASS。
 - 实际启动：代码与修订计划提交 `db8c06d` 已推送 `dev`；命令完整记录于 `logs/mcl_ph_20260921/full8x5_r10r3_3_launch.sh`，运行窗口 `Uni-Poly:96:mcl_ph_full8x5_4gpu`，launcher 日志及最终退出码为相同前缀 `_launcher.log`、`_launcher.exit`。启动后 `launch.json` 记录复用 96、待运行 104、四 worker；GPU 0–3 各有一个微调计算进程，分别先运行 `m_cat/egc/fold1`、`fold2`、`fold3`、`fold4`。此时 launcher 仍在运行，最终退出码与 200/200 聚合尚未产生。
 
-状态：**执行中**（五臂 8×5 内部验证微调）。日期：2026-09-23 UTC。用户已明确授权五臂全部、8 任务×5 折、仅微调与内部验证；执行者：Codex。首轮在 91 次启动后因无有效几何样本的 MCL 视图错误停止，90 个 unit 通过、1 个失败、109 个未启动。用户本轮明确要求直接修复并完成全量；本修订只重跑失败的 `m_cat/egb/fold0`，复用 90 个通过的 unit，再运行 109 个未启动 unit。故累计启动上限由 200 修订为 **201 次**，仍为 200 个目标 unit、每个最多 30 epochs；失败已消耗的首批更新照实计账。原 P2 development 30-unit 计划未启动，不另加其预算。既往记录保留在文末，不追改当时结论。
+状态：**执行中**（五臂 8×5 内部验证微调，四 GPU 并行续跑）。日期：2026-09-24 UTC。用户已明确授权五臂全部、8 任务×5 折、仅微调与内部验证，并在本轮要求停止串行任务、改用四张 GPU 重启；执行者：Codex。目标为 200 个通过的 unit、每个最多 30 epochs；两条先前轨迹累计 98 次启动、96 个 unit 通过、1 个失败和 1 个按用户要求中断，本轮最多再启动 104 个 unit，故累计上限为 **202 次启动**。原 P2 development 30-unit 计划未启动，不另加其预算。既往记录保留在下文，不追改当时结论。
 
 ## FULL8X5-2 阻断修复与续跑（Codex；2026-09-23 UTC）
 
