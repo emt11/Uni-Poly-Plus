@@ -17,6 +17,8 @@
 
 **启动前已完成**：定向 `pytest -q tests/test_mcl_ph_periodic_tdl_strategy.py tests/test_mcl_ph_8x5_scope.py` 为 **7 passed**；`py_compile` 和 `git diff --check` 通过。四个预训练包与统计 SHA 与冻结记录一致；可信索引的 device/inode/size/mtime 和 6,265 行覆盖与源文件一致。四 GPU 可见且无相关训练进程，新输出/日志目录不存在。此项只证实局部代码与启动门槛，尚无新的模型运行或正式结果。
 
+**启动记录**：实现与计划提交 `d38fad8` 已推送 `origin/dev`。真实命令保存在 `logs/mcl_ph_20260921/full8x5_ptdl_outer_r12_1_launch.sh`，工作目录 `/root/workspace/Uni-Poly-Plus-master`，tmux `Uni-Poly:96:mcl_ph_ptdl_outer_4gpu`。launcher 日志和最终退出码路径为 `logs/mcl_ph_20260921/full8x5_ptdl_outer_r12_1_launcher.log`、`.exit`，unit 日志与 `.exit` 在同名子目录。`launch.json` 显示 `evaluation=outer_test`、`reused=0`、`new=200`，四个独立 GPU worker 已启动 `glt_ref/eat/fold0–3`。记录时 launcher 尚无 `.exit`，全量结果为**执行中，未完成**；后续须按真实产物与退出码更新状态。
+
 ## r11 终止归档后的历史计划
 
 # MCL-PH-20260921-01 / r11-PTDL5：五折 Periodic-TDL 训练协议适配
