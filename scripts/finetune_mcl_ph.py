@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
 from torch import nn
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from src.dataset.glt_dual import dual_glt_collate
@@ -57,6 +58,136 @@ FOLDS = (0, 1, 2, 3, 4)
 DEVELOPMENT_TASKS = ('xc', 'eps', 'eat')
 DEVELOPMENT_FOLDS = (0, 1)
 SPLIT_PROTOCOL = 'outer5_inner20'
+PERIODIC_TDL_EPOCHS = {'egc': 50}
+# EAT is absent from the paper's nine tasks. Its entries below are an explicit
+# project adaptation using the Eea settings, not a published Periodic-TDL value.
+PERIODIC_TDL_WEIGHT_DECAY = {'egc': 0.0, 'eea': 0.02, 'egb': 0.02,
+                             'ei': 0.02, 'eps': 0.02, 'nc': 0.02,
+                             'xc': 1e-4, 'eat': 0.02}
+PERIODIC_TDL_HEAD_DROPOUT = {'egc': 0.0, 'eea': 0.1, 'egb': 0.1,
+                             'ei': 0.1, 'eps': 0.1, 'nc': 0.1,
+                             'xc': 0.3, 'eat': 0.1}
+
+
+class IdentityTargetScaler:
+    """Keep Xc labels in their original units, as in Periodic-TDL."""
+
+    def __init__(self):
+        self.scaler = self
+        self.mean_ = np.array([0.0])
+        self.scale_ = np.array([1.0])
+
+    def inverse_transform(self, values):
+        return np.asarray(values)
+
+
+def periodic_tdl_head(model):
+    return model.head if hasattr(model, 'head') else model.model.predictor
+
+
+def periodic_tdl_trainability(model, *, head_only):
+    head_ids = {id(parameter) for parameter in periodic_tdl_head(model).parameters()}
+    for parameter in model.parameters():
+        parameter.requires_grad_(not head_only or id(parameter) in head_ids)
+
+
+def periodic_tdl_optimizer(model, task, *, head_only):
+    """Paper learning rates and per-task weight decay on all trainable tensors."""
+    decay = PERIODIC_TDL_WEIGHT_DECAY[task]
+    head_ids = {id(parameter) for parameter in periodic_tdl_head(model).parameters()}
+    groups = []
+    if not head_only:
+        backbone = [parameter for parameter in model.parameters()
+                    if id(parameter) not in head_ids]
+        groups.append({'params': backbone, 'lr': 2e-4 if task == 'xc' else 1e-4,
+                       'weight_decay': decay, 'name': 'backbone'})
+    head = [parameter for parameter in model.parameters() if id(parameter) in head_ids]
+    groups.append({'params': head, 'lr': 3e-4 if head_only else 1e-3,
+                   'weight_decay': decay, 'name': 'head'})
+    evidence = [{'name': group['name'], 'lr': group['lr'],
+                 'weight_decay': decay, 'num_tensors': len(group['params']),
+                 'num_parameters': sum(p.numel() for p in group['params'])}
+                for group in groups]
+    return torch.optim.AdamW(groups), evidence
+
+
+def configure_periodic_tdl_dropout(model, task):
+    """Use paper task-specific head dropout; disable encoder module dropout."""
+    head = periodic_tdl_head(model)
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.p = 0.0
+    for module in head.modules():
+        if isinstance(module, nn.Dropout):
+            module.p = PERIODIC_TDL_HEAD_DROPOUT[task]
+
+
+def run_periodic_tdl_epochs(model, train_loader, validation_loader, criterion,
+                            device, *, task, scaler, progress=None):
+    """Ten frozen-head epochs, then 50/60 joint epochs; select minimum raw RMSE."""
+    class HeadOnlyAdapter(AdaptationAdapter):
+        def train(self, mode=True):
+            super().train(mode)
+            if mode:
+                model.eval()
+                periodic_tdl_head(model).train()
+            return self
+
+    class EpochSchedulerProxy:
+        def step(self):
+            pass
+
+    best_state, best_epoch, best_rmse, best_r2 = None, -1, float('inf'), None
+    best_predictions = None
+    history, updates, group_evidence = [], 0, {}
+    for stage, stage_epochs in (('head', 10),
+                                ('joint', PERIODIC_TDL_EPOCHS.get(task, 60))):
+        wrapped = HeadOnlyAdapter(model) if stage == 'head' else AdaptationAdapter(model)
+        periodic_tdl_trainability(model, head_only=(stage == 'head'))
+        optimizer, group_evidence[stage] = periodic_tdl_optimizer(
+            model, task, head_only=(stage == 'head'))
+        if stage == 'head':
+            scheduler = CosineAnnealingLR(optimizer, T_max=10,
+                                          eta_min=3e-5)
+        else:
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer, T_0=10, T_mult=1, eta_min=1e-6)
+        for stage_epoch in range(1, stage_epochs + 1):
+            result = train_epoch(wrapped, train_loader, criterion, optimizer,
+                                 EpochSchedulerProxy(),
+                                 device, epoch=len(history) + 1, amp_dtype='fp32',
+                                 max_grad_norm=5.0, fail_nonfinite=True,
+                                 return_timing=True)
+            scheduler.step()
+            updates += int(result[-1]['training_steps'])
+            validation_loss, r2, targets, predictions = evaluate(
+                wrapped, validation_loader, criterion, device, scaler=scaler,
+                amp_dtype='fp32')
+            targets = np.asarray(targets, dtype=np.float64).reshape(-1)
+            predictions = np.asarray(predictions, dtype=np.float64).reshape(-1)
+            rmse = float(np.sqrt(np.mean((targets - predictions) ** 2)))
+            if not all(np.isfinite([validation_loss, r2, rmse])):
+                raise FloatingPointError('nonfinite validation metrics')
+            record = {'epoch': len(history) + 1, 'stage': stage,
+                      'stage_epoch': stage_epoch, 'train_loss': float(result[0]),
+                      'validation_loss': float(validation_loss),
+                      'validation_r2': float(r2), 'validation_rmse': rmse,
+                      'learning_rates': [group['lr'] for group in optimizer.param_groups],
+                      'training_steps': int(result[-1]['training_steps'])}
+            history.append(record)
+            if progress is not None:
+                progress(record)
+            if rmse < best_rmse:
+                best_state = {key: value.detach().cpu().clone()
+                              for key, value in model.state_dict().items()}
+                best_predictions = (targets.copy(), predictions.copy())
+                best_rmse, best_r2, best_epoch = rmse, float(r2), len(history)
+    if best_state is None:
+        raise RuntimeError('no finite validation-selected checkpoint')
+    return {'history': history, 'state': best_state, 'best_r2': best_r2,
+            'best_rmse': best_rmse, 'best_epoch': best_epoch,
+            'optimizer_updates': updates, 'predictions': best_predictions,
+            'optimizer_groups_by_stage': group_evidence}
 
 
 class DownstreamHead(nn.Module):
@@ -306,10 +437,16 @@ def unit_directory(output, arm, task, fold):
     return Path(output) / str(arm) / str(task) / f'fold{int(fold)}'
 
 
-def validate_stage_scope(stage, task, fold, epochs, cohort_index):
+def validate_stage_scope(stage, task, fold, epochs, cohort_index, strategy='legacy'):
+    if strategy == 'periodic_tdl' and stage == 'smoke':
+        raise ValueError('Periodic-TDL full-trajectory strategy requires development or full8x5')
     if stage == 'smoke' and epochs != 1:
         raise ValueError('smoke units run exactly one epoch')
-    if stage in ('development', 'full8x5') and not 1 <= epochs <= SCHEDULE_TOTAL_EPOCHS:
+    if strategy == 'periodic_tdl' and stage != 'smoke':
+        expected = 10 + PERIODIC_TDL_EPOCHS.get(task, 60)
+        if epochs != expected:
+            raise ValueError(f'Periodic-TDL adaptation for {task} requires {expected} epochs')
+    elif stage in ('development', 'full8x5') and not 1 <= epochs <= SCHEDULE_TOTAL_EPOCHS:
         raise ValueError(f'{stage} units allow 1..{SCHEDULE_TOTAL_EPOCHS} epochs')
     if stage == 'development' and (task not in DEVELOPMENT_TASKS or
                                    fold not in DEVELOPMENT_FOLDS):
@@ -380,7 +517,12 @@ def run_unit(args, folder, started, statistics, config, manifest):
         dataset_class = MCLPHCleanDataset
         copied = None
     model.to(device)
-    optimizer, group_evidence = parameter_groups(model, args.arm)
+    periodic = args.finetune_strategy == 'periodic_tdl'
+    if periodic:
+        configure_periodic_tdl_dropout(model, args.task)
+        optimizer, group_evidence = None, None
+    else:
+        optimizer, group_evidence = parameter_groups(model, args.arm)
 
     train_indices, validation_indices, split_evidence = resolve_fold(
         manifest, args.task, args.fold,
@@ -401,23 +543,32 @@ def run_unit(args, folder, started, statistics, config, manifest):
                    if args.arm in MCL_FUSION else
                    dataset_class(source, frame['label'].to_numpy(dtype=np.float64)))
         set_global_seed(int(config['seed']) + int(args.fold))
-        scaler = scale_targets(dataset, args.task, train_indices=train_local_indices,
-                               transform_mode='standard')
+        scaler = (IdentityTargetScaler() if periodic and args.task == 'xc' else
+                  scale_targets(dataset, args.task, train_indices=train_local_indices,
+                                transform_mode='standard'))
+        batch_size = 24 if periodic else int(config['finetune_batch'])
         train_loader = DataLoader(
-            Subset(dataset, train_local_indices), batch_size=int(config['finetune_batch']),
+            Subset(dataset, train_local_indices), batch_size=batch_size,
             shuffle=True, num_workers=0, collate_fn=collate,
             generator=torch.Generator().manual_seed(int(config['seed']) + int(args.fold)))
         validation_loader = DataLoader(
-            Subset(dataset, validation_local_indices), batch_size=int(config['eval_batch']),
+            Subset(dataset, validation_local_indices), batch_size=(24 if periodic else int(config['eval_batch'])),
             shuffle=False, num_workers=0, collate_fn=collate)
-        schedule_total = SCHEDULE_TOTAL_EPOCHS * len(train_loader)
-        schedule_warmup = SCHEDULE_WARMUP_EPOCHS * len(train_loader)
-        scheduler = _cosine_scheduler(optimizer, schedule_total, schedule_warmup)
         criterion = nn.MSELoss()
-        result = run_selection_epochs(
-            model, train_loader, validation_loader, criterion, optimizer, scheduler, device,
-            epochs=int(args.epochs), patience=int(config['patience']), scaler=scaler,
-            progress=lambda record: print(json.dumps({'arm': args.arm, **record}), flush=True))
+        if periodic:
+            result = run_periodic_tdl_epochs(
+                model, train_loader, validation_loader, criterion, device,
+                task=args.task, scaler=scaler,
+                progress=lambda record: print(json.dumps({'arm': args.arm, **record}), flush=True))
+            group_evidence = result['optimizer_groups_by_stage']['joint']
+        else:
+            schedule_total = SCHEDULE_TOTAL_EPOCHS * len(train_loader)
+            schedule_warmup = SCHEDULE_WARMUP_EPOCHS * len(train_loader)
+            scheduler = _cosine_scheduler(optimizer, schedule_total, schedule_warmup)
+            result = run_selection_epochs(
+                model, train_loader, validation_loader, criterion, optimizer, scheduler, device,
+                epochs=int(args.epochs), patience=int(config['patience']), scaler=scaler,
+                progress=lambda record: print(json.dumps({'arm': args.arm, **record}), flush=True))
         best = result['state']
         model.load_state_dict(best, strict=True)
         reload_check = model.load_state_dict(best, strict=True)
@@ -430,24 +581,36 @@ def run_unit(args, folder, started, statistics, config, manifest):
                  validation_indices=np.asarray(validation_indices, dtype=np.int64),
                  y_true=targets, y_pred=predictions,
                  best_epoch=np.asarray(int(result['best_epoch']), dtype=np.int64),
-                 split_protocol=np.asarray(SPLIT_PROTOCOL),
+            split_protocol=np.asarray(SPLIT_PROTOCOL),
+            finetune_strategy=np.asarray(args.finetune_strategy),
                  outer_test=np.asarray('NOT_RUN'))
         common = dict(
             arm=args.arm, task=args.task, fold=int(args.fold), stage=args.stage,
+            finetune_strategy=args.finetune_strategy,
+            selection_metric=('validation_rmse' if periodic else 'validation_r2'),
             protocol=f'mcl_ph_{args.stage}', outer_test='NOT_RUN',
             pretrained_route=('dual_glt' if args.arm in ('glt_ref', 'o8_only') else 'mcl_ph'),
             requested_epochs=int(args.epochs), executed_epochs=int(executed_epochs),
             optimizer_updates=int(result['optimizer_updates']),
-            schedule_total_epochs=SCHEDULE_TOTAL_EPOCHS,
-            schedule_warmup_epochs=SCHEDULE_WARMUP_EPOCHS,
+            schedule_total_epochs=(int(args.epochs) if periodic else SCHEDULE_TOTAL_EPOCHS),
+            schedule_warmup_epochs=(10 if periodic else SCHEDULE_WARMUP_EPOCHS),
             best_validation_r2=float(result['best_r2']), best_epoch=int(result['best_epoch']),
-            stalled_epochs=int(result['stalled_epochs']), history=result['history'],
+            best_validation_rmse=(float(result['best_rmse']) if periodic else None),
+            stalled_epochs=(None if periodic else int(result['stalled_epochs'])),
+            history=result['history'],
             train_sample_count=len(train_indices),
-            validation_sample_count=len(validation_indices), scaler_fit_split='train',
-            split=split_evidence, learning_rate_table={'backbone': BACKBONE_LR, 'head': HEAD_LR},
-            weight_decay=WEIGHT_DECAY, adaptation='full',
+            validation_sample_count=len(validation_indices),
+            scaler_fit_split=('none' if periodic and args.task == 'xc' else 'train'),
+            split=split_evidence,
+            learning_rate_table=({'head_stage1': 3e-4,
+                                  'backbone_stage2': (2e-4 if args.task == 'xc' else 1e-4),
+                                  'head_stage2': 1e-3} if periodic else
+                                 {'backbone': BACKBONE_LR, 'head': HEAD_LR}),
+            weight_decay=(PERIODIC_TDL_WEIGHT_DECAY[args.task] if periodic else WEIGHT_DECAY),
+            adaptation=('head10_then_joint' if periodic else 'full'),
             pretrain_step=expected, pretrain_package_sha256=sha256_file(args.checkpoint),
             optimizer_groups=group_evidence,
+            optimizer_groups_by_stage=(result['optimizer_groups_by_stage'] if periodic else None),
             copied_o8_tensors=(len(copied) if copied else None),
             load_state_dict_result={'missing_keys': list(reload_check.missing_keys),
                                     'unexpected_keys': list(reload_check.unexpected_keys)},
@@ -457,7 +620,10 @@ def run_unit(args, folder, started, statistics, config, manifest):
             state_dict=best, arm=args.arm, task=args.task, fold=int(args.fold),
             architecture=model.__class__.__name__,
             protocol=f'mcl_ph_{args.stage}', config=config, stage=args.stage,
-            best_validation_r2=float(result['best_r2']), best_epoch=int(result['best_epoch']),
+            best_validation_r2=float(result['best_r2']),
+            best_validation_rmse=(float(result['best_rmse']) if periodic else None),
+            finetune_strategy=args.finetune_strategy,
+            best_epoch=int(result['best_epoch']),
             requested_epochs=int(args.epochs), executed_epochs=int(executed_epochs),
             optimizer_updates=int(result['optimizer_updates']),
             scaler_mean=scaler.scaler.mean_.tolist(), scaler_scale=scaler.scaler.scale_.tolist(),
@@ -502,10 +668,12 @@ def main():
     parser.add_argument('--task', default='xc', choices=TASKS)
     parser.add_argument('--fold', type=int, default=0, choices=FOLDS)
     parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--finetune-strategy', choices=('legacy', 'periodic_tdl'),
+                        default='legacy')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     validate_stage_scope(args.stage, args.task, args.fold, args.epochs,
-                         args.cohort_index)
+                         args.cohort_index, args.finetune_strategy)
     if args.arm in MCL_FUSION and not args.statistics:
         raise ValueError('the MCL-PH downstream arms require the shared statistics artifact')
     require_tmux()

@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.aggregate_mcl_ph import check_unit
 from scripts.aggregate_mcl_ph_8x5 import aggregate
-from scripts.finetune_mcl_ph import ARMS, unit_directory
+from scripts.finetune_mcl_ph import ARMS, PERIODIC_TDL_EPOCHS, unit_directory
 from scripts.run_mcl_ph_8x5 import accepted_from_prior, parse_packages, unit_list
 from src.training.glt_dual_runtime import require_tmux, sha256_file
 
@@ -42,7 +42,11 @@ def run_worker(device, units, args, output, log_root, packages, stopped):
                        '--dual-static-root', args.dual_static_root,
                        '--split-root', args.split_root, '--statistics', args.statistics,
                        '--cohort-index', args.cohort_index, '--task', task,
-                       '--fold', str(fold), '--epochs', '30', '--output', str(output)]
+                       '--fold', str(fold),
+                       '--epochs', str(10 + PERIODIC_TDL_EPOCHS.get(task, 60)
+                                       if args.finetune_strategy == 'periodic_tdl' else 30),
+                       '--finetune-strategy', args.finetune_strategy,
+                       '--output', str(output)]
             environment = os.environ.copy()
             environment['CUDA_VISIBLE_DEVICES'] = str(device)
             with (log_root / f'{name}.log').open('x', encoding='utf-8') as stream:
@@ -75,35 +79,48 @@ def main():
     parser.add_argument('--arms', nargs='+', choices=ARMS, required=True)
     parser.add_argument('--package', action='append', required=True)
     for name in ('config', 'cohort-root', 'cache-root', 'dual-static-root', 'split-root',
-                 'statistics', 'cohort-index', 'output', 'log-root', 'reuse-root',
-                 'reuse-log-root', 'retry-unit'):
+                 'statistics', 'cohort-index', 'output', 'log-root'):
         parser.add_argument(f'--{name}', required=True)
+    parser.add_argument('--reuse-root')
+    parser.add_argument('--reuse-log-root')
+    parser.add_argument('--retry-unit')
+    parser.add_argument('--finetune-strategy', choices=('legacy', 'periodic_tdl'),
+                        default='legacy')
     args = parser.parse_args()
     require_tmux()
     units = unit_list(args.arms)
     packages = parse_packages(args.package, args.arms)
     output, log_root = Path(args.output).resolve(), Path(args.log_root).resolve()
-    old_root, old_logs = Path(args.reuse_root).resolve(), Path(args.reuse_log_root).resolve()
+    if bool(args.reuse_root) != bool(args.reuse_log_root):
+        raise ValueError('reuse root and reuse log root must be supplied together')
+    if args.retry_unit and not args.reuse_root:
+        raise ValueError('retry unit requires a prior campaign')
+    old_root = Path(args.reuse_root).resolve() if args.reuse_root else None
+    old_logs = Path(args.reuse_log_root).resolve() if args.reuse_log_root else None
     if output.exists() or log_root.exists():
         raise FileExistsError('full8x5 output and log roots must both be new')
     for path in (args.config, args.statistics, args.cohort_index):
         if not Path(path).is_file():
             raise FileNotFoundError(path)
     hashes = {arm: sha256_file(path) for arm, path in packages.items()}
-    accepted = accepted_from_prior(old_root, old_logs, units, packages, hashes,
-                                   args.retry_unit)
+    accepted = (accepted_from_prior(old_root, old_logs, units, packages, hashes,
+                                    args.retry_unit, args.finetune_strategy)
+                if old_root else {})
     remaining = [(arm, task, fold) for arm, task, fold in units
                  if f'{arm}_{task}_fold{fold}' not in accepted]
     assignment = distribute(remaining)
     output.mkdir(parents=True, exist_ok=False)
     log_root.mkdir(parents=True, exist_ok=False)
     (log_root / 'launch.json').write_text(json.dumps({
-        'arms': args.arms, 'units_expected': len(units), 'epochs_per_unit_max': 30,
+        'arms': args.arms, 'units_expected': len(units),
+        'epochs_per_unit_max': (70 if args.finetune_strategy == 'periodic_tdl' else 30),
+        'finetune_strategy': args.finetune_strategy,
         'outer_test': 'NOT_RUN', 'worker_count': 4,
         'packages': {arm: {'path': str(path), 'sha256': hashes[arm]}
                      for arm, path in packages.items()},
         'cohort_index': str(Path(args.cohort_index).resolve()),
-        'reuse_root': str(old_root), 'reuse_log_root': str(old_logs),
+        'reuse_root': str(old_root) if old_root else None,
+        'reuse_log_root': str(old_logs) if old_logs else None,
         'reused_units': sorted(accepted), 'retry_unit': args.retry_unit,
         'gpu_assignments': {str(device): [f'{a}_{t}_fold{f}' for a, t, f in rows]
                             for device, rows in assignment.items()},

@@ -42,6 +42,13 @@ def aggregate(root, *, arms, expected_step):
     }
     if rejected:
         return payload
+    strategies = {record.get('finetune_strategy', 'legacy') for record in accepted}
+    if len(strategies) != 1:
+        payload['status'] = 'INCOMPLETE'
+        payload['rejected'].append({'problems': ['mixed fine-tuning strategies']})
+        payload['units_rejected'] += 1
+        return payload
+    payload['finetune_strategy'] = strategies.pop()
     table = {}
     for arm in arms:
         packages = {record['pretrain_package_sha256'] for record in accepted

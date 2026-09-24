@@ -2173,4 +2173,10 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=4 scripts/pretrai
 
 四 GPU 续跑按 **四个独立 unit 并行、每 GPU 一进程** 实现，单 unit 的模型、batch、seed、split、epoch 上限和包不变。只读复核 `full8x5_r10r3_2` 中 96 个已通过 unit；剩余 104 个（包括被中断的一个）均匀分配 GPU 0–3，每卡 26 个，在全新 `full8x5_r10r3_3` 结果及日志根运行。累计启动预算由 201 修订为 **202 次**：此前 91 + 7 = 98 次，后续最多 104 次。局部三项测试通过，真实旧根预检和四卡划分通过，启动与最终状态以 `Plan.md` 及新轨迹的真实日志、退出码为准。仍只做内部验证，不读取 outer-test、不做 OOF/P3/refit，也不以未完成折推断性能。
 
-四卡入口提交 `db8c06d` 已推送 `dev`，实际命令见 `logs/mcl_ph_20260921/full8x5_r10r3_3_launch.sh`，窗口为 `Uni-Poly:96:mcl_ph_full8x5_4gpu`。启动后四张 GPU 均有独立微调计算进程，初始分别处理 `m_cat/egc/fold1` 至 `fold4`；`launch.json` 记录 96 个复用、104 个待运行。此时只是启动与四卡占用已核实，真实最终退出码和 200/200 聚合仍待产生。
+四卡入口提交 `db8c06d` 已推送 `dev`，实际命令见 `logs/mcl_ph_20260921/full8x5_r10r3_3_launch.sh`，窗口为 `Uni-Poly:96:mcl_ph_full8x5_4gpu`。启动后四张 GPU 均有独立微调计算进程，初始分别处理 `m_cat/egc/fold1` 至 `fold4`；`launch.json` 记录 96 个复用、104 个待运行。此时只是启动与四卡占用已核实，真实最终退出码和 200/200 聚合尚未产生。
+
+## r11 五折 Periodic-TDL 训练协议适配（2026-09-24；未启动新正式运行）
+
+在 `r10R3` 旧协议五臂 × 八任务 × 五折内部验证 200/200 完成后，用户要求调整为 Periodic-TDL 论文的微调训练策略，并明确要求五折处理。新代码以 `--finetune-strategy periodic_tdl` 显式进入：先冻结编码器、head-only 10 epochs；再联合训练 Egc 50 或其他任务 60 epochs；每折跨两阶段按**最低 validation RMSE**选 checkpoint。batch 24，MSE，grad clip 5，阶段学习率/余弦调度、任务 weight decay 与 head dropout 按论文 Methods；Xc 原尺度，其余任务仅 train 拟合标准化器。项目 `eat` 不在论文九任务内，采用 Eea 正则参数作为明确的项目适配。五臂保持项目原架构、head 及既有 5k 预训练包，故此变更是论文**训练协议适配**，不称 HSMP 模型复现。
+
+五折仍使用项目冻结 `outer5_inner20` manifest 的 fold0–4；原论文 release 使用其自身数据与 `<dataset>_folds.pkl`，逐样本折身份未宣称一致。当前仅 train/inner-validation，`outer_test=NOT_RUN`；论文测试分数不可由本项目内部验证直接替代。新策略每个 Egc 单元 60 epochs、其他任务 70；五臂完整 8×5 共 200 starts、最多 13,750 epochs，**尚未授权或启动**。旧 `r10R3` 产物保留并标记 `legacy`，不可复用为新策略单元；新运行须新目录与独立预算。实现、测试、当前计划与下一步见根目录 `Plan.md`。

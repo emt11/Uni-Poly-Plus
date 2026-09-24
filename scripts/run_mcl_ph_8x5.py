@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.aggregate_mcl_ph import check_unit
 from scripts.aggregate_mcl_ph_8x5 import aggregate
-from scripts.finetune_mcl_ph import ARMS, FOLDS, TASKS, unit_directory
+from scripts.finetune_mcl_ph import (ARMS, FOLDS, PERIODIC_TDL_EPOCHS, TASKS,
+                                     unit_directory)
 from src.training.glt_dual_runtime import require_tmux, sha256_file
 
 
@@ -43,11 +44,14 @@ def unit_list(arms):
     return [(arm, task, fold) for arm in arms for task in TASKS for fold in FOLDS]
 
 
-def accepted_from_prior(root, log_root, units, packages, hashes, retry_unit):
+def accepted_from_prior(root, log_root, units, packages, hashes, retry_unit,
+                        strategy='legacy'):
     """Accept completed units from an immutable prior campaign before any writes."""
     launch = json.loads((log_root / 'launch.json').read_text(encoding='utf-8'))
     if launch.get('arms') != list(dict.fromkeys(arm for arm, _, _ in units)):
         raise ValueError('prior campaign arm list differs')
+    if launch.get('finetune_strategy', 'legacy') != strategy:
+        raise ValueError('prior campaign fine-tuning strategy differs')
     for arm, package in packages.items():
         record = launch.get('packages', {}).get(arm, {})
         if record.get('sha256') != hashes[arm] or Path(record.get('path', '')).resolve() != package:
@@ -63,7 +67,9 @@ def accepted_from_prior(root, log_root, units, packages, hashes, retry_unit):
         exit_file = log_root / f'{name}.exit'
         if not exit_file.is_file() and name in launch.get('reused_units', []):
             exit_file = Path(launch['reuse_log_root']) / f'{name}.exit'
-        if not problems and exit_file.is_file() and exit_file.read_text().strip() == '0':
+        if not problems and exit_file.is_file() and exit_file.read_text().strip() == '0' \
+                and json.loads((directory / 'metrics.json').read_text()).get(
+                    'finetune_strategy', 'legacy') == strategy:
             accepted[name] = directory.resolve()
         elif name == retry_unit and (not exit_file.is_file()
                                      or exit_file.read_text().strip() != '0'):
@@ -89,6 +95,8 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--log-root', required=True)
     parser.add_argument('--expected-pretrain-step', type=int, default=5000)
+    parser.add_argument('--finetune-strategy', choices=('legacy', 'periodic_tdl'),
+                        default='legacy')
     parser.add_argument('--reuse-root', help='immutable prior output root with accepted units')
     parser.add_argument('--reuse-log-root', help='prior per-unit exit records')
     parser.add_argument('--retry-unit', help='one explicit failed unit, arm_task_foldN')
@@ -112,12 +120,15 @@ def main():
     prior_root = Path(args.reuse_root).resolve() if args.reuse_root else None
     prior_logs = Path(args.reuse_log_root).resolve() if args.reuse_log_root else None
     accepted = (accepted_from_prior(prior_root, prior_logs, units, packages,
-                                    package_hashes, args.retry_unit)
+                                    package_hashes, args.retry_unit,
+                                    args.finetune_strategy)
                 if prior_root else {})
     output.mkdir(parents=True, exist_ok=False)
     log_root.mkdir(parents=True, exist_ok=False)
     (log_root / 'launch.json').write_text(json.dumps({
-        'arms': args.arms, 'units_expected': len(units), 'epochs_per_unit_max': 30,
+        'arms': args.arms, 'units_expected': len(units),
+        'epochs_per_unit_max': (70 if args.finetune_strategy == 'periodic_tdl' else 30),
+        'finetune_strategy': args.finetune_strategy,
         'outer_test': 'NOT_RUN',
         'packages': {arm: {'path': str(path), 'sha256': package_hashes[arm]}
                      for arm, path in packages.items()},
@@ -144,7 +155,10 @@ def main():
                    '--dual-static-root', args.dual_static_root,
                    '--split-root', args.split_root,
                    '--statistics', args.statistics, '--cohort-index', args.cohort_index,
-                   '--task', task, '--fold', str(fold), '--epochs', '30',
+                   '--task', task, '--fold', str(fold),
+                   '--epochs', str(10 + PERIODIC_TDL_EPOCHS.get(task, 60)
+                                   if args.finetune_strategy == 'periodic_tdl' else 30),
+                   '--finetune-strategy', args.finetune_strategy,
                    '--output', str(output)]
         with (log_root / f'{unit}.log').open('x', encoding='utf-8') as stream:
             stream.write(json.dumps({'command': command}) + '\n')

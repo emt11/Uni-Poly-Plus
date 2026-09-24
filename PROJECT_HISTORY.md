@@ -354,3 +354,10 @@
 - **验证与审查**：两臂真实退出码均为 0，runtime `PASS/5000`、cleanup/export/main-return 完成，各有五组千步 resume/deploy；step 500 dense、501 Top-2。GATE 已有生产 verifier 与 CPU strict-load 的独立日志；本轮对 XATTN 运行 `scripts/verify_mcl_ph_arm.py --strict-cleanup` 得 PASS，并对 CAT/GATE/XATTN 三包重新用 `build_mcl_arm` strict-load。XATTN 完整日志有四 rank 各 5000 个 step 前缀，且无非有限值标记；多进程 stdout 行交错使部分完整 JSON 行不可解析，不能把“解析到的完整行数”误当步数。runner 的非有限 loss/梯度硬失败机制和 PASS 退出提供额外约束。P2 聚合器针对性测试 15 passed。无 development、outer-test 或预测性能结论。
 - **最终部署包 SHA256**：CAT `eed6276565f0bc827fc1f56056a25cd8469db184b0e334d04c3dd0f3cfea0e49`；GATE `312ea6708ee1b930001c1963714dfbdee44d8de711c5293bc0378be7a73b24e8`；XATTN `9f2bea298b7341eaaf02e85a84f95974334e64b5436310127d30d82ae49f206e`；GLT_REF `7dc016dc422c58a6bba705a7a69c9f21051231350393a93d621b33e973883c47`，O8_ONLY 共用 GLT_REF 包。
 - **预算与下一步**：历史失败 154＋成功 GLT_REF 5000＋失败 CAT 4928＋成功 CAT/GATE/XATTN 各 5000＝**25,082 updates / 6 次正式启动**；development 0/30 units、0/900 epochs。GATE/XATTN 执行证据验收通过；下一计划为 `r10R3-DEV1`，只做五臂×三任务×两折的 development 筛查，状态待授权。P3、OOF、refit、outer-test 均未获本计划授权。
+
+### 2026-09-24 — MCL-PH-20260921-01 / r10R3-FULL8X5：旧微调协议五臂全量周期归档
+
+- **授权与角色**：用户授权五臂 × 8 任务 × 5 个 outer fold、仅 train/inner-validation，并随后要求四张 GPU 并行。Codex 实施、运行和自检；本条依据最终现场作只读复核，不把同一主体自检称为独立外部审查。
+- **协议与执行**：`outer5_inner20` 固定 manifest；每 unit 最多 30 epochs、单阶段 full adaptation、batch 32、backbone/head 学习率 1e-5/1e-4、warmup 5、patience 10、按最高验证 R² 选 checkpoint。首轮第 91 个 unit 因无效几何回退缺陷失败；修复后续跑，后按用户指令停止串行 unit、改四卡各跑互不重叠的 unit。历史失败和中断现场均保留，未从中断模型状态恢复。
+- **最终证据**：`logs/mcl_ph_20260921/full8x5_r10r3_3_launcher.exit` 为真实 `0`；`results/mcl_ph_20260921/p2/full8x5_r10r3_3/full8x5_validation.json` 为 `PASS`、200/200 accepted、0 rejected、`outer_test=NOT_RUN`。本轮再次只读运行 `aggregate(...)`，同样返回 200/200 PASS，策略为 legacy；无活动的相关训练进程。运行入口与四卡分配见 `scripts/run_mcl_ph_8x5_4gpu.py`、命令见 `logs/mcl_ph_20260921/full8x5_r10r3_3_launch.sh`。三个轨迹的实际产物与日志保留在同名 `_1/_2/_3` 目录；相关提交包括 `3147f2a`、`3fbcb85`、`db8c06d`、`f445a8c`、`cc487dc`。
+- **结论与界限**：全量旧协议内部验证运行已结束且验收通过；这不是 outer-test 五折成绩，也不能与 Periodic-TDL 论文的测试 R² 直接等同。新训练协议改变冻结阶段、学习率、调度、批量、目标处理及选模指标，旧权重和预测无法后处理成新协议结果。新协议全量重跑属于新增正式预算，须独立授权；原产物不覆盖。

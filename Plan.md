@@ -1,4 +1,31 @@
-# MCL-PH-20260921-01 / r10R3-FULL8X5-3：五臂 8×5 内部验证微调
+# MCL-PH-20260921-01 / r11-PTDL5：五折 Periodic-TDL 训练协议适配
+
+**状态：新协议实现与局部验证已完成；五臂全量重跑待授权。** 基准 `dev@cc487dc`，开始修改前工作区干净、`git pull --ff-only origin dev` 成功且无更新。用户本轮要求调整当前微调策略，并补充“对应的 5 fold 处理”；执行者 Codex。旧 r10R3 轨迹已归档到 `PROJECT_HISTORY.md`，原结果目录不覆盖。以下为当前唯一待运行计划；下方 r10R3 内容只作历史记录，不授权重复执行。
+
+## 科学问题与协议边界
+
+- 问题：在同一冻结预训练包、同一项目 cohort 和固定五个 `outer5_inner20` outer fold 上，五臂若统一使用 Periodic-TDL 论文的两阶段训练策略，内部验证结果是否改变？参考为已完成的旧协议 200/200 内部验证；同时改变多项微调超参数，不能把差值归因于单项机制。
+- 论文 Methods 的训练协议：head-only 10 epochs；Egc 再 joint 50 epochs，其余对应任务再 joint 60；MSE、batch 24、global grad clip 5、第一阶段 head LR 3e-4 与 cosine 降至 3e-5；第二阶段 encoder LR 1e-4（Xc 2e-4）、head LR 1e-3、10-epoch cosine warm restarts、最低 LR 1e-6；全程最低验证 RMSE 选 checkpoint。按任务设置 weight decay、head dropout；Xc 保留原目标尺度，其余目标用 train-only 标准化。依据：[论文 Methods](https://arxiv.org/pdf/2605.26833)。
+- 项目适配：五臂保留现有 GLT/O8/MCL 架构和预训练包，head 的宽度及结构仍与论文 HSMP head 不同。项目 `eat` 不是论文九任务之一，暂明确借用 Eea 的正则参数；这不构成论文原值。复用现有项目 outer 五折；论文官方 release 提供自己的 `<dataset>_folds.pkl`，本项目 cohort、样本顺序及 inner seed 与之不能宣称逐样本相同。五折训练入口会对每臂每任务运行 fold0–4。当前沿用用户此前限定的 **仅训练和内部验证**，`outer_test=NOT_RUN`，不把结果当论文五折测试分数。若本轮的“五 fold”意指读取五个 outer-test，须先修订该数据/评价边界。
+
+## 已实施与自检
+
+- `scripts/finetune_mcl_ph.py` 增加显式 `--finetune-strategy periodic_tdl`：两阶段 trainability/optimizer/scheduler、任务超参数、原尺度 RMSE 选模、Xc 不标准化、论文 batch/dropout/clip、阶段身份与选模指标记录。原 `legacy` 入口保留，用于解释已有产物。
+- 五折串行及四 GPU launcher 接受该策略并为 Egc 指定 60、其余任务指定 70 总 epochs；禁止混合策略复用旧 unit。验收器要求新协议完整阶段序列、RMSE 最优选择及两阶段参数组；旧协议产物仍通过原验收。全量聚合拒绝混合新旧策略。
+- 局部无模型测试 `tests/test_mcl_ph_periodic_tdl_strategy.py` 覆盖冻结/解冻、任务参数、10+50 阶段、跨阶段 RMSE 选模、学习率周期及新协议单元验收；与既有 8×5/聚合测试合计 **21 passed**。`py_compile` 与 `git diff --check` 通过。无新 GPU 运行、无训练更新、无新 checkpoint。
+- 旧轨迹 `full8x5_r10r3_3` 的 launcher 真实退出 0；本轮只读重验旧聚合 **200/200 PASS**、0 rejected、`finetune_strategy=legacy`、`outer_test=NOT_RUN`。旧权重不能后处理为新两阶段轨迹，若要得到新协议的五臂完整比较，须从四个原预训练包重新训练全部 **200 units**。
+
+## 下一步待授权的正式运行
+
+1. 保留旧产物，使用全新结果/日志根；先核对四包 SHA、split/cohort 索引身份、四 GPU/进程和无覆盖风险。原 5k 预训练不重跑。
+2. 按五臂 × 8 任务 × fold0–4 运行 200 units；每 task/fold/arm 均从对应原始 5k 包重新开始。每 unit Egc 最多 60、其他任务最多 70 epochs，共最多 **13,750 epochs / 200 starts**；四张 GPU 可各承载独立 unit。失败即停新调度，保留现场，不自动重试、恢复或增加预算。
+3. 每 unit 核对真实退出码、阶段 history、最佳 RMSE、checkpoint/预测/split/package 身份。全部 200/200 通过才汇总内部验证 R²；保持 `outer_test=NOT_RUN`。禁止将旧协议已完成 unit 混入新根。P3、OOF、refit、outer-test 仍未纳入此待授权预算。
+
+**授权边界**：本轮用户授权代码调整与重跑必要性分析，未授权新增 200-unit 正式重跑。新协议全量运行须单独明确授权；在此之前状态为待授权。
+
+## 已归档的 r10R3 历史记录（不再是活动计划）
+
+### MCL-PH-20260921-01 / r10R3-FULL8X5-3：五臂 8×5 内部验证微调
 
 ## FULL8X5-3 四 GPU 并行续跑（Codex；2026-09-24 UTC）
 

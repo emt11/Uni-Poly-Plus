@@ -20,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from scripts.finetune_mcl_ph import (ARMS, FOLDS, MCL_FUSION, SCHEDULE_TOTAL_EPOCHS,
-                                     SPLIT_PROTOCOL, TASKS, unit_directory)
+                                     PERIODIC_TDL_EPOCHS, SPLIT_PROTOCOL, TASKS,
+                                     unit_directory)
 
 REQUIRED_FILES = ('run.json', 'runtime.json', 'metrics.json', 'best.pt',
                   'validation_predictions.npz')
@@ -71,11 +72,17 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
         problems.append('an MCL-PH arm must record the mcl_ph pre-training route')
     if arm in ('glt_ref', 'o8_only') and metrics.get('pretrained_route') != 'dual_glt':
         problems.append('a reference arm must record the dual_glt pre-training route')
+    strategy = metrics.get('finetune_strategy', 'legacy')
+    if run.get('finetune_strategy', 'legacy') != strategy:
+        problems.append('fine-tuning strategy differs between run and metrics')
+    if strategy not in ('legacy', 'periodic_tdl'):
+        problems.append(f'unknown fine-tuning strategy {strategy!r}')
     requested = metrics.get('requested_epochs')
-    limit = STAGE_EPOCH_LIMIT[stage]
-    if not isinstance(requested, int) or isinstance(requested, bool) \
-            or not 1 <= requested <= limit:
-        problems.append(f'requested_epochs {requested!r} is outside 1..{limit}')
+    limit = (10 + PERIODIC_TDL_EPOCHS.get(task, 60)
+             if strategy == 'periodic_tdl' else STAGE_EPOCH_LIMIT[stage])
+    if not isinstance(requested, int) or isinstance(requested, bool) or \
+            (requested != limit if strategy == 'periodic_tdl' else not 1 <= requested <= limit):
+        problems.append(f'requested_epochs {requested!r} disagrees with strategy limit {limit}')
     history = metrics.get('history')
     if not isinstance(history, list) or not history:
         problems.append('history is empty or not a list')
@@ -93,6 +100,19 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
     values = [record.get('train_loss') for record in history] + \
              [record.get('validation_loss') for record in history] + \
              [record.get('validation_r2') for record in history]
+    if strategy == 'periodic_tdl':
+        values += [record.get('validation_rmse') for record in history]
+        expected_stages = ['head'] * 10 + ['joint'] * (limit - 10)
+        if [record.get('stage') for record in history] != expected_stages:
+            problems.append('Periodic-TDL stage sequence or epoch count differs')
+        if metrics.get('selection_metric') != 'validation_rmse':
+            problems.append('Periodic-TDL must select by validation RMSE')
+        groups_by_stage = metrics.get('optimizer_groups_by_stage') or {}
+        if {group.get('name') for group in groups_by_stage.get('head', [])} != {'head'}:
+            problems.append('Periodic-TDL head stage must optimize only the head')
+        if {group.get('name') for group in groups_by_stage.get('joint', [])} != \
+                {'head', 'backbone'}:
+            problems.append('Periodic-TDL joint stage must optimize head and backbone')
     if not all(_finite(value) for value in values):
         problems.append('a history entry is not finite')
     best_epoch = metrics.get('best_epoch')
@@ -102,7 +122,15 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
     elif not math.isclose(float(metrics.get('best_validation_r2', float('nan'))),
                           float(history[best_epoch - 1]['validation_r2']), rel_tol=0, abs_tol=1e-12):
         problems.append('best_validation_r2 disagrees with the selected epoch')
-    elif history and abs(max(record['validation_r2'] for record in history)
+    elif strategy == 'periodic_tdl' and all(_finite(record.get('validation_rmse'))
+                                            for record in history) and (not math.isclose(
+            float(metrics.get('best_validation_rmse', float('nan'))),
+            float(history[best_epoch - 1].get('validation_rmse', float('nan'))),
+            rel_tol=0, abs_tol=1e-12) or
+            abs(min(record['validation_rmse'] for record in history)
+                - float(metrics['best_validation_rmse'])) > 1e-12):
+        problems.append('the selected epoch is not the minimum validation RMSE')
+    elif strategy != 'periodic_tdl' and history and abs(max(record['validation_r2'] for record in history)
                          - float(metrics['best_validation_r2'])) > 1e-12:
         problems.append('the selected epoch is not the best validation epoch')
     split = metrics.get('split') or {}
@@ -143,6 +171,7 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
                                                     'head', 'head_no_decay'}:
         problems.append('the parameter groups use an undeclared name')
     record = {'arm': arm, 'task': task, 'fold': int(fold), 'stage': stage,
+              'finetune_strategy': strategy,
               'executed_epochs': executed, 'optimizer_updates': metrics.get('optimizer_updates'),
               'best_epoch': best_epoch, 'best_validation_r2': metrics.get('best_validation_r2'),
               'pretrain_step': metrics.get('pretrain_step'),
