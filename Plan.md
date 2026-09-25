@@ -1,6 +1,6 @@
 # MCL-PH-20260921-01 / r12-PTDL-OUTER5：五折 outer-test R² 正式重跑
 
-**状态：待启动（用户明确授权停止 r11 并重新运行五臂全量测试）。** 执行者 Codex；基线 `dev@878ac4f`，修改前已 `git pull --ff-only origin dev`，工作区干净。r11 的 `full8x5_ptdl_r11_1` 已按用户要求在 `Uni-Poly:96` 收到 Ctrl-C 并停止：launcher `.exit=1`，122 个 unit `.exit=0`、4 个中断 `.exit=-2`，共 126 次启动；无相关进程。旧日志和产物全部保留，旧结果不可混入新阶段。
+**状态：阻断（r12 初次启动的四个 unit 均失败；修复局部验证通过，追加预算待授权）。** 执行者 Codex；基线 `dev@878ac4f`，修改前已 `git pull --ff-only origin dev`，工作区干净。r11 的 `full8x5_ptdl_r11_1` 已按用户要求在 `Uni-Poly:96` 收到 Ctrl-C 并停止：launcher `.exit=1`，122 个 unit `.exit=0`、4 个中断 `.exit=-2`，共 126 次启动；无相关进程。旧日志和产物全部保留，旧结果不可混入新阶段。
 
 ## 当前授权与科学边界
 
@@ -18,6 +18,10 @@
 **启动前已完成**：定向 `pytest -q tests/test_mcl_ph_periodic_tdl_strategy.py tests/test_mcl_ph_8x5_scope.py` 为 **7 passed**；`py_compile` 和 `git diff --check` 通过。四个预训练包与统计 SHA 与冻结记录一致；可信索引的 device/inode/size/mtime 和 6,265 行覆盖与源文件一致。四 GPU 可见且无相关训练进程，新输出/日志目录不存在。此项只证实局部代码与启动门槛，尚无新的模型运行或正式结果。
 
 **启动记录**：实现与计划提交 `d38fad8` 已推送 `origin/dev`。真实命令保存在 `logs/mcl_ph_20260921/full8x5_ptdl_outer_r12_1_launch.sh`，工作目录 `/root/workspace/Uni-Poly-Plus-master`，tmux `Uni-Poly:96:mcl_ph_ptdl_outer_4gpu`。launcher 日志和最终退出码路径为 `logs/mcl_ph_20260921/full8x5_ptdl_outer_r12_1_launcher.log`、`.exit`，unit 日志与 `.exit` 在同名子目录。`launch.json` 显示 `evaluation=outer_test`、`reused=0`、`new=200`，四个独立 GPU worker 已启动 `glt_ref/eat/fold0–3`。记录时 launcher 尚无 `.exit`，全量结果为**执行中，未完成**；后续须按真实产物与退出码更新状态。
+
+**r12 首轮失败与返修（2026-09-25 UTC）**：首批四个 `glt_ref/eat/fold0–3` 均完成 70 epochs，但在首次 outer-test 源打开处遇到 `lmdb.Error: environment .../topology/data.lmdb is already open in this process`；四个 unit `.exit=1`、launcher `.exit=1`，无后续调度。每个失败目录仅有 `runtime.json` 和验证预测，没有 `best.pt` 或测试预测；不能恢复已退出进程中的最优权重。Codex 最小修复为锁定并保存验证选模结果后关闭 train/validation source，再打开 outer-test source；真实 cohort 的单行 train→close→test 顺序加载检查 `SEQUENTIAL_SOURCE_PASS`。首轮已消耗 **4 starts / 280 epochs**，原 200 starts 上限仅余 196，无法完成 200 个全新 unit。完整重跑须在新结果根额外授权 **4 starts / 280 epochs**，将本 r12 累计上限改为 **204 starts / 14,030 epochs**；在获得明确授权前不再启动正式微调。旧失败现场保留，不覆盖、不自动恢复。
+
+返修后的定向测试 `pytest -q tests/test_mcl_ph_periodic_tdl_strategy.py tests/test_mcl_ph_8x5_scope.py` 为 **7 passed**，`py_compile` 与 `git diff --check` 通过；真实源的先关闭后打开测试亦通过。批准额外预算后，新命令已备于 `logs/mcl_ph_20260921/full8x5_ptdl_outer_r12_2_launch.sh`，只使用全新 `_r12_2` 结果和日志根，仍为四 GPU、200 个新 unit、零复用；批准前不得执行该脚本。
 
 ## r11 终止归档后的历史计划
 

@@ -589,7 +589,11 @@ def run_unit(args, folder, started, statistics, config, manifest):
         test_result = {}
         if args.stage == 'full8x5_outer':
             # The test source is opened only after the validation-selected state
-            # has been restored. No subsequent optimizer or selection step occurs.
+            # has been restored. LMDB allows one open handle per environment in
+            # this process, so release the training source before opening test.
+            # No subsequent optimizer or selection step occurs.
+            source.close()
+            source = None
             fold_entry = next(item for item in manifest['folds']
                               if int(item['fold']) == int(args.fold))
             test_indices = sorted(split_indices(fold_entry, 'test',
@@ -679,7 +683,8 @@ def run_unit(args, folder, started, statistics, config, manifest):
             optimizer_groups=group_evidence, split=common['split'],
             outer_test=common['outer_test']))
     finally:
-        source.close()
+        if source is not None:
+            source.close()
     summary = build_summary(common, config=config, device=device, command=sys.argv)
     write_json(folder / 'run.json', dict(summary, history=common['history']))
     write_json(folder / 'runtime.json', dict(
