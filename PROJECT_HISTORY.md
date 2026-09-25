@@ -1,5 +1,11 @@
 # Uni-Poly 项目变更周期归档
 
+## 2026-09-25 — MCL-PH-20260921-01 / r12-PTDL-OUTER5：用户取消并替换评估折
+
+用户原授权五臂 × 八任务 × 五折、按验证 RMSE 选 checkpoint 后评价项目 `outer5_inner20` outer-test；Codex 在 `dev@878ac4f` 实现 `full8x5_outer`、逐 unit 测试预测与五折聚合，并提交 `d38fad8`，启动记录提交 `6100c08`。初次四 GPU 运行在 `Uni-Poly:96:mcl_ph_ptdl_outer_4gpu`，命令 `logs/mcl_ph_20260921/full8x5_ptdl_outer_r12_1_launch.sh`，结果及日志根均为 `full8x5_ptdl_outer_r12_1`。首四个 GLT_REF/EAT/fold0–3 分别完成 70 epochs 后，因同进程 train source 的 LMDB 未关闭而无法打开 test source；四个 unit 和 launcher 均退出 1，未继续调度。失败目录没有 `best.pt` 或测试预测；**消耗 4 starts / 280 epochs，0 outer-test 结果**。随后 Codex 修复为训练源关闭后再开 test 源，并以真实 cohort 顺序打开、定向 7 项测试和语法检查验证；`25b081d` 推送 `dev`。未重新启动，追加 4 starts / 280 epochs 的预算请求未获授权。
+
+用户现明确要求停止当前任务并改为与论文官方五折一致；Codex 核实无 MCL 微调进程、r12 launcher `.exit=1`，保留全部失败产物和历史。r12 状态为**已取消／被 r13 替换**，不宣称完成全量实验或获得测试 R²。旧 r11 取消记录在本文件上一条。后续 `r13-PAPER5` 在 `Plan.md`：只对样本和官方折可逐项匹配的五任务建立论文可比入口，正式 125-unit 运行另待明确授权。旧 r12 的详细命令、限制与修复见 commit `25b081d:Plan.md` 及本条，不用旧项目折结果充当官方折结果。
+
 ## 2026-09-24 — MCL-PH-20260921-01 / r11-PTDL5：用户要求停止并替换
 
 用户原授权五臂 × 八任务 × 五折 Periodic-TDL 两阶段内部验证，从四个 5k 预训练包全新训练，最多 200 starts / 13,750 epochs，只报告 inner-validation。Codex 在 `dev@878ac4f` 运行于 `Uni-Poly:96:mcl_ph_ptdl_4gpu`，目录 `results/mcl_ph_20260921/p2/full8x5_ptdl_r11_1/` 与同名 logs。用户随后明确要求改成五折 outer-test R² 并停止旧任务；Codex 发送一次 Ctrl-C，核实 launcher `.exit=1`、122 个成功 unit、4 个 `.exit=-2` 中断 unit（共 126 starts）、无相关进程。旧现场保留，未达到 200/200，无正式五折结论。本周期以“已取消／被 r12 替换”关闭，取消不改变实际历史消耗。后续计划为 `r12-PTDL-OUTER5`，见当前 `Plan.md`；新旧阶段产物不得混用。

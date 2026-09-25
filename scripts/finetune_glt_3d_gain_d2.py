@@ -322,7 +322,7 @@ def split_indices(entry, name, sample_count):
     return indices
 
 
-def resolve_fold(manifest, task, fold, *, cohort_rows):
+def resolve_fold(manifest, task, fold, *, cohort_rows, expected_protocol=SPLIT_PROTOCOL):
     """Train/validation rows of one fold, after checking the whole split contract.
 
     The manifest is only read: the fixed ``outer5_inner20`` split is validated
@@ -331,9 +331,9 @@ def resolve_fold(manifest, task, fold, *, cohort_rows):
     exactly.  The outer-test rows appear only in that coverage check; the runner
     never materialises them, so no outer-test label or prediction is ever read.
     """
-    if str(manifest.get('protocol')) != SPLIT_PROTOCOL:
+    if str(manifest.get('protocol')) != expected_protocol:
         raise ValueError(f'split manifest protocol {manifest.get("protocol")!r} '
-                         f'!= {SPLIT_PROTOCOL!r}')
+                         f'!= {expected_protocol!r}')
     if manifest.get('validation_is_test') is not False:
         raise ValueError('split manifest does not declare validation_is_test=false')
     if str(manifest.get('task')) != str(task):

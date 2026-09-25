@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.aggregate_mcl_ph import check_unit
 from scripts.aggregate_mcl_ph_8x5 import aggregate
-from scripts.finetune_mcl_ph import ARMS, PERIODIC_TDL_EPOCHS, unit_directory
+from scripts.finetune_mcl_ph import ARMS, PAPER_TASKS, PERIODIC_TDL_EPOCHS, TASKS, unit_directory
 from scripts.run_mcl_ph_8x5 import accepted_from_prior, parse_packages, unit_list
 from src.training.glt_dual_runtime import require_tmux, sha256_file
 
@@ -30,7 +30,8 @@ def distribute(units, devices=(0, 1, 2, 3)):
 
 
 def run_worker(device, units, args, output, log_root, packages, stopped):
-    stage = 'full8x5_outer' if args.evaluation == 'outer_test' else 'full8x5'
+    stage = ('paper5_outer' if args.evaluation == 'official_outer_test' else
+             'full8x5_outer' if args.evaluation == 'outer_test' else 'full8x5')
     try:
         for arm, task, fold in units:
             if stopped.is_set():
@@ -48,6 +49,8 @@ def run_worker(device, units, args, output, log_root, packages, stopped):
                                        if args.finetune_strategy == 'periodic_tdl' else 30),
                        '--finetune-strategy', args.finetune_strategy,
                        '--output', str(output)]
+            if args.evaluation == 'official_outer_test':
+                command += ['--cohort-split-root', args.cohort_split_root]
             environment = os.environ.copy()
             environment['CUDA_VISIBLE_DEVICES'] = str(device)
             with (log_root / f'{name}.log').open('x', encoding='utf-8') as stream:
@@ -82,19 +85,27 @@ def main():
     for name in ('config', 'cohort-root', 'cache-root', 'dual-static-root', 'split-root',
                  'statistics', 'cohort-index', 'output', 'log-root'):
         parser.add_argument(f'--{name}', required=True)
+    parser.add_argument('--cohort-split-root')
     parser.add_argument('--reuse-root')
     parser.add_argument('--reuse-log-root')
     parser.add_argument('--retry-unit')
     parser.add_argument('--finetune-strategy', choices=('legacy', 'periodic_tdl'),
                         default='legacy')
-    parser.add_argument('--evaluation', choices=('internal', 'outer_test'), default='internal')
+    parser.add_argument('--evaluation', choices=('internal', 'outer_test', 'official_outer_test'),
+                        default='internal')
     args = parser.parse_args()
     require_tmux()
-    if args.evaluation == 'outer_test' and args.finetune_strategy != 'periodic_tdl':
+    if args.evaluation in ('outer_test', 'official_outer_test') and args.finetune_strategy != 'periodic_tdl':
         raise ValueError('outer-test evaluation requires periodic_tdl')
-    if args.evaluation == 'outer_test' and (args.reuse_root or args.reuse_log_root):
+    if args.evaluation in ('outer_test', 'official_outer_test') and (args.reuse_root or args.reuse_log_root):
         raise ValueError('outer-test campaign must train all units in a fresh root')
-    units = unit_list(args.arms)
+    if args.evaluation == 'official_outer_test':
+        if not args.cohort_split_root:
+            raise ValueError('official folds require the frozen cohort split root')
+        if Path(args.split_root).resolve() == Path(args.cohort_split_root).resolve():
+            raise ValueError('official evaluation folds must differ from cohort-bound folds')
+    tasks = PAPER_TASKS if args.evaluation == 'official_outer_test' else TASKS
+    units = unit_list(args.arms, tasks)
     packages = parse_packages(args.package, args.arms)
     output, log_root = Path(args.output).resolve(), Path(args.log_root).resolve()
     if bool(args.reuse_root) != bool(args.reuse_log_root):
@@ -118,11 +129,14 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     log_root.mkdir(parents=True, exist_ok=False)
     (log_root / 'launch.json').write_text(json.dumps({
-        'arms': args.arms, 'units_expected': len(units),
+        'arms': args.arms, 'tasks': tasks, 'units_expected': len(units),
         'epochs_per_unit_max': (70 if args.finetune_strategy == 'periodic_tdl' else 30),
         'finetune_strategy': args.finetune_strategy,
-        'outer_test': 'RUN' if args.evaluation == 'outer_test' else 'NOT_RUN',
+        'outer_test': 'RUN' if args.evaluation in ('outer_test', 'official_outer_test') else 'NOT_RUN',
         'evaluation': args.evaluation, 'worker_count': 4,
+        'split_root': str(Path(args.split_root).resolve()),
+        'cohort_split_root': (str(Path(args.cohort_split_root).resolve())
+                              if args.cohort_split_root else None),
         'packages': {arm: {'path': str(path), 'sha256': hashes[arm]}
                      for arm, path in packages.items()},
         'cohort_index': str(Path(args.cohort_index).resolve()),
@@ -154,9 +168,12 @@ def main():
                 failures.append(str(error))
     if failures:
         raise RuntimeError('full8x5 workers stopped: ' + '; '.join(failures))
-    stage = 'full8x5_outer' if args.evaluation == 'outer_test' else 'full8x5'
+    stage = ('paper5_outer' if args.evaluation == 'official_outer_test' else
+             'full8x5_outer' if args.evaluation == 'outer_test' else 'full8x5')
     payload = aggregate(output, arms=args.arms, expected_step=5000, stage=stage)
-    filename = 'full8x5_test.json' if args.evaluation == 'outer_test' else 'full8x5_validation.json'
+    filename = ('paper5_test.json' if args.evaluation == 'official_outer_test' else
+                'full8x5_test.json' if args.evaluation == 'outer_test' else
+                'full8x5_validation.json')
     (output / filename).write_text(
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + '\n',
         encoding='utf-8')

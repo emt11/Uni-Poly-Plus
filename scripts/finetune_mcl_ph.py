@@ -12,8 +12,8 @@ was pre-trained:
 | ``m_gate``   | this contract, ``F_GATE``          | MCL-PH | the new 512-wide head |
 | ``m_xattn``  | this contract, ``F_XATTN``         | MCL-PH | the new 512-wide head |
 
-Only train and validation records and label values of the requested task/fold
-are decoded/materialised; the outer-test indices are read for split coverage.
+Training decodes only train and validation records. Explicit outer-test stages
+decode test records after the validation-selected checkpoint is restored.
 The current frozen JSONL still needs a raw-byte scan for file integrity and row
 location, so it does not provide byte-level isolation from unselected labels.
 """
@@ -54,10 +54,12 @@ SCHEDULE_TOTAL_EPOCHS = 30
 SCHEDULE_WARMUP_EPOCHS = 5
 HEAD_INIT_SEED = 20260921
 TASKS = ('eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc')
+PAPER_TASKS = ('eea', 'egb', 'ei', 'eps', 'nc')
 FOLDS = (0, 1, 2, 3, 4)
 DEVELOPMENT_TASKS = ('xc', 'eps', 'eat')
 DEVELOPMENT_FOLDS = (0, 1)
 SPLIT_PROTOCOL = 'outer5_inner20'
+PAPER_SPLIT_PROTOCOL = 'periodic_tdl_official5'
 PERIODIC_TDL_EPOCHS = {'egc': 50}
 # EAT is absent from the paper's nine tasks. Its entries below are an explicit
 # project adaptation using the Eea settings, not a published Periodic-TDL value.
@@ -438,8 +440,10 @@ def unit_directory(output, arm, task, fold):
 
 
 def validate_stage_scope(stage, task, fold, epochs, cohort_index, strategy='legacy'):
-    if stage == 'full8x5_outer' and strategy != 'periodic_tdl':
+    if stage in ('full8x5_outer', 'paper5_outer') and strategy != 'periodic_tdl':
         raise ValueError('outer-test five-fold evaluation requires periodic_tdl')
+    if stage == 'paper5_outer' and task not in PAPER_TASKS:
+        raise ValueError('official Periodic-TDL folds are verified only for Eea/Egb/Ei/EPS/Nc')
     if strategy == 'periodic_tdl' and stage == 'smoke':
         raise ValueError('Periodic-TDL full-trajectory strategy requires development or full8x5')
     if stage == 'smoke' and epochs != 1:
@@ -448,12 +452,12 @@ def validate_stage_scope(stage, task, fold, epochs, cohort_index, strategy='lega
         expected = 10 + PERIODIC_TDL_EPOCHS.get(task, 60)
         if epochs != expected:
             raise ValueError(f'Periodic-TDL adaptation for {task} requires {expected} epochs')
-    elif stage in ('development', 'full8x5', 'full8x5_outer') and not 1 <= epochs <= SCHEDULE_TOTAL_EPOCHS:
+    elif stage in ('development', 'full8x5', 'full8x5_outer', 'paper5_outer') and not 1 <= epochs <= SCHEDULE_TOTAL_EPOCHS:
         raise ValueError(f'{stage} units allow 1..{SCHEDULE_TOTAL_EPOCHS} epochs')
     if stage == 'development' and (task not in DEVELOPMENT_TASKS or
                                    fold not in DEVELOPMENT_FOLDS):
         raise ValueError('development permits only XC/EPS/EAT and folds 0/1')
-    if stage in ('development', 'full8x5', 'full8x5_outer') and not cohort_index:
+    if stage in ('development', 'full8x5', 'full8x5_outer', 'paper5_outer') and not cohort_index:
         raise ValueError('a trusted cohort index is required for label-isolated stages')
 
 
@@ -498,6 +502,10 @@ def build_summary(common, *, config, device, command):
 
 
 def run_unit(args, folder, started, statistics, config, manifest):
+    paper = args.stage == 'paper5_outer'
+    split_protocol = PAPER_SPLIT_PROTOCOL if paper else SPLIT_PROTOCOL
+    if paper and not args.cohort_split_root:
+        raise ValueError('official-fold evaluation requires the frozen cohort split root')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     package = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     expected = int(args.expected_pretrain_step)
@@ -528,15 +536,24 @@ def run_unit(args, folder, started, statistics, config, manifest):
 
     train_indices, validation_indices, split_evidence = resolve_fold(
         manifest, args.task, args.fold,
-        cohort_rows=int(manifest.get('sample_count', -1)))
+        cohort_rows=int(manifest.get('sample_count', -1)),
+        expected_protocol=split_protocol)
     selected_indices, train_local_indices, validation_local_indices = \
         compact_train_validation_indices(train_indices, validation_indices)
     split_path = Path(args.split_root) / f'{args.task}.json'
+    cohort_split_path = (Path(args.cohort_split_root) / f'{args.task}.json'
+                         if paper else split_path)
+    cohort_split_sha256 = sha256_file(cohort_split_path)
+    if paper:
+        original_split = json.loads(cohort_split_path.read_text(encoding='utf-8'))
+        if (original_split.get('sample_order_sha256') != manifest.get('sample_order_sha256')
+                or int(original_split.get('sample_count', -1)) != int(manifest['sample_count'])):
+            raise ValueError('official folds do not match the frozen cohort row identity')
     source, frame = open_source(
         args.cohort_root, args.cache_root, task=args.task,
         dual_static_root=args.dual_static_root, selected_indices=selected_indices,
         expected_task_rows=int(manifest['sample_count']),
-        expected_split_sha256=sha256_file(split_path),
+        expected_split_sha256=cohort_split_sha256,
         record_index_path=args.cohort_index)
     try:
         if frame['original_row'].astype(int).tolist() != selected_indices:
@@ -583,11 +600,11 @@ def run_unit(args, folder, started, statistics, config, manifest):
                  validation_indices=np.asarray(validation_indices, dtype=np.int64),
                  y_true=targets, y_pred=predictions,
                  best_epoch=np.asarray(int(result['best_epoch']), dtype=np.int64),
-            split_protocol=np.asarray(SPLIT_PROTOCOL),
+            split_protocol=np.asarray(split_protocol),
             finetune_strategy=np.asarray(args.finetune_strategy),
                  outer_test=np.asarray('NOT_RUN'))
         test_result = {}
-        if args.stage == 'full8x5_outer':
+        if args.stage in ('full8x5_outer', 'paper5_outer'):
             # The test source is opened only after the validation-selected state
             # has been restored. LMDB allows one open handle per environment in
             # this process, so release the training source before opening test.
@@ -602,7 +619,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
                 args.cohort_root, args.cache_root, task=args.task,
                 dual_static_root=args.dual_static_root, selected_indices=test_indices,
                 expected_task_rows=int(manifest['sample_count']),
-                expected_split_sha256=sha256_file(split_path),
+                expected_split_sha256=cohort_split_sha256,
                 record_index_path=args.cohort_index)
             try:
                 if test_frame['original_row'].astype(int).tolist() != test_indices:
@@ -630,7 +647,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
                          test_indices=np.asarray(test_indices, dtype=np.int64),
                          y_true=test_truth, y_pred=test_prediction,
                          best_epoch=np.asarray(int(result['best_epoch']), dtype=np.int64),
-                         split_protocol=np.asarray(SPLIT_PROTOCOL),
+                         split_protocol=np.asarray(split_protocol),
                          outer_test=np.asarray('RUN'))
             finally:
                 test_source.close()
@@ -639,7 +656,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
             finetune_strategy=args.finetune_strategy,
             selection_metric=('validation_rmse' if periodic else 'validation_r2'),
             protocol=f'mcl_ph_{args.stage}',
-            outer_test=('RUN' if args.stage == 'full8x5_outer' else 'NOT_RUN'),
+            outer_test=('RUN' if args.stage in ('full8x5_outer', 'paper5_outer') else 'NOT_RUN'),
             pretrained_route=('dual_glt' if args.arm in ('glt_ref', 'o8_only') else 'mcl_ph'),
             requested_epochs=int(args.epochs), executed_epochs=int(executed_epochs),
             optimizer_updates=int(result['optimizer_updates']),
@@ -652,8 +669,12 @@ def run_unit(args, folder, started, statistics, config, manifest):
             train_sample_count=len(train_indices),
             validation_sample_count=len(validation_indices),
             scaler_fit_split=('none' if periodic and args.task == 'xc' else 'train'),
-            split=dict(split_evidence, outer_test=('RUN' if args.stage == 'full8x5_outer'
+            split=dict(split_evidence, outer_test=('RUN' if args.stage in ('full8x5_outer', 'paper5_outer')
                                                    else 'NOT_RUN')),
+            evaluation_split_sha256=sha256_file(split_path),
+            evaluation_split_path=str(split_path.resolve()),
+            cohort_split_sha256=cohort_split_sha256,
+            official_source=(manifest.get('official_source') if paper else None),
             **test_result,
             learning_rate_table=({'head_stage1': 3e-4,
                                   'backbone_stage2': (2e-4 if args.task == 'xc' else 1e-4),
@@ -710,7 +731,7 @@ def failure_record(error, args, started):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arm', required=True, choices=ARMS)
-    parser.add_argument('--stage', required=True, choices=('smoke', 'development', 'full8x5', 'full8x5_outer'))
+    parser.add_argument('--stage', required=True, choices=('smoke', 'development', 'full8x5', 'full8x5_outer', 'paper5_outer'))
     parser.add_argument('--config', required=True)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--expected-pretrain-step', type=int, required=True)
@@ -718,6 +739,7 @@ def main():
     parser.add_argument('--cache-root', required=True)
     parser.add_argument('--dual-static-root', required=True)
     parser.add_argument('--split-root', required=True)
+    parser.add_argument('--cohort-split-root', help='frozen cohort split binding for paper5_outer')
     parser.add_argument('--cohort-index', help='trusted byte-offset index; required for label-isolated stages')
     parser.add_argument('--statistics')
     parser.add_argument('--task', default='xc', choices=TASKS)
@@ -735,8 +757,9 @@ def main():
     started = time.perf_counter()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
     manifest = json.loads((Path(args.split_root) / f'{args.task}.json').read_text(encoding='utf-8'))
-    if str(manifest.get('protocol')) != SPLIT_PROTOCOL:
-        raise ValueError('the fixed outer5_inner20 split is required')
+    expected_protocol = PAPER_SPLIT_PROTOCOL if args.stage == 'paper5_outer' else SPLIT_PROTOCOL
+    if str(manifest.get('protocol')) != expected_protocol:
+        raise ValueError(f'the fixed {expected_protocol} split is required')
     statistics = (load_geometric_statistics(args.statistics)
                   if args.arm in MCL_FUSION else None)
     folder = unit_directory(args.output, args.arm, args.task, args.fold)

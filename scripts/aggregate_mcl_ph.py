@@ -5,8 +5,8 @@ A unit counts as complete only when every record it owns passes every check
 below.  An existing directory, a trailing DONE line in a log, or a
 ``best.pt`` without its identity records is never accepted as evidence.
 Partial products, non-finite metrics, a wrong stage/protocol/step, a smoke unit
-reused as a development unit, and any unit whose ``outer_test`` is not
-``NOT_RUN`` are rejected.  An incomplete set is reported as ``INCOMPLETE`` and
+reused as a development unit, and any unit whose ``outer_test`` disagrees with
+its stage are rejected. An incomplete set is reported as ``INCOMPLETE`` and
 the process exits non-zero.
 """
 import argparse
@@ -18,16 +18,19 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
+from src.training.glt_dual_runtime import sha256_file
 
 from scripts.finetune_mcl_ph import (ARMS, FOLDS, MCL_FUSION, SCHEDULE_TOTAL_EPOCHS,
-                                     PERIODIC_TDL_EPOCHS, SPLIT_PROTOCOL, TASKS,
+                                     PERIODIC_TDL_EPOCHS, SPLIT_PROTOCOL, PAPER_SPLIT_PROTOCOL,
+                                     PAPER_TASKS, TASKS,
                                      unit_directory)
 
 REQUIRED_FILES = ('run.json', 'runtime.json', 'metrics.json', 'best.pt',
                   'validation_predictions.npz')
 STAGE_EPOCH_LIMIT = {'smoke': 1, 'development': SCHEDULE_TOTAL_EPOCHS,
                      'full8x5': SCHEDULE_TOTAL_EPOCHS,
-                     'full8x5_outer': SCHEDULE_TOTAL_EPOCHS}
+                     'full8x5_outer': SCHEDULE_TOTAL_EPOCHS,
+                     'paper5_outer': SCHEDULE_TOTAL_EPOCHS}
 # The declared P1 smoke scope; anything smaller can be verified but is PARTIAL.
 ACCEPTANCE_ARMS = tuple(ARMS)
 ACCEPTANCE_TASKS = ('xc',)
@@ -41,8 +44,13 @@ def _finite(value):
 def check_unit(root, arm, task, fold, *, stage, expected_step):
     """Validate one unit; returns (record, problems)."""
     problems = []
+    paper = stage == 'paper5_outer'
+    if paper and task not in PAPER_TASKS:
+        return None, [f'{task} is not verified against official Periodic-TDL folds']
+    split_protocol = PAPER_SPLIT_PROTOCOL if paper else SPLIT_PROTOCOL
+    outer_stage = stage in ('full8x5_outer', 'paper5_outer')
     directory = unit_directory(root, arm, task, fold)
-    required = REQUIRED_FILES + (('test_predictions.npz',) if stage == 'full8x5_outer' else ())
+    required = REQUIRED_FILES + (('test_predictions.npz',) if outer_stage else ())
     missing = [name for name in required if not (directory / name).is_file()]
     if missing:
         return None, [f'missing artifacts: {",".join(missing)}']
@@ -65,7 +73,7 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
             problems.append(f"{name} stage is {record.get('stage')!r}, not {stage!r}")
         if record.get('protocol') != f'mcl_ph_{stage}':
             problems.append(f"{name} protocol is {record.get('protocol')!r}")
-        if record.get('outer_test') != ('RUN' if stage == 'full8x5_outer' else 'NOT_RUN'):
+        if record.get('outer_test') != ('RUN' if outer_stage else 'NOT_RUN'):
             problems.append(f"{name} outer_test is {record.get('outer_test')!r}")
     if metrics.get('pretrain_step') != int(expected_step):
         problems.append(f"pretrain_step is {metrics.get('pretrain_step')!r}, "
@@ -79,7 +87,7 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
         problems.append('fine-tuning strategy differs between run and metrics')
     if strategy not in ('legacy', 'periodic_tdl'):
         problems.append(f'unknown fine-tuning strategy {strategy!r}')
-    if stage == 'full8x5_outer' and strategy != 'periodic_tdl':
+    if outer_stage and strategy != 'periodic_tdl':
         problems.append('outer-test evaluation requires periodic_tdl')
     requested = metrics.get('requested_epochs')
     limit = (10 + PERIODIC_TDL_EPOCHS.get(task, 60)
@@ -138,11 +146,25 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
                          - float(metrics['best_validation_r2'])) > 1e-12:
         problems.append('the selected epoch is not the best validation epoch')
     split = metrics.get('split') or {}
-    if split.get('protocol') != SPLIT_PROTOCOL:
+    if split.get('protocol') != split_protocol:
         problems.append(f"split protocol is {split.get('protocol')!r}")
+    if paper and (not isinstance(metrics.get('evaluation_split_sha256'), str)
+                  or len(metrics['evaluation_split_sha256']) != 64
+                  or metrics.get('evaluation_split_sha256') == metrics.get('cohort_split_sha256')
+                  or run.get('evaluation_split_sha256') != metrics.get('evaluation_split_sha256')):
+        problems.append('official evaluation split identity is missing or equals cohort split')
+    if paper:
+        official_path = Path(metrics.get('evaluation_split_path', ''))
+        if (not official_path.is_file()
+                or sha256_file(official_path) != metrics.get('evaluation_split_sha256')):
+            problems.append('official evaluation split file does not match unit identity')
+        source = metrics.get('official_source') or {}
+        if (source.get('commit') != 'f3ba6dff6f0d065accdd235dfba160324714f30b'
+                or not source.get('folds_pkl_sha256') or not source.get('cleaned_csv_sha256')):
+            problems.append('official fold provenance is missing')
     if split.get('validation_is_test') is not False:
         problems.append('the split does not declare validation_is_test=false')
-    expected_outer = 'RUN' if stage == 'full8x5_outer' else 'NOT_RUN'
+    expected_outer = 'RUN' if outer_stage else 'NOT_RUN'
     if split.get('outer_test') != expected_outer:
         problems.append(f'the split record does not keep outer_test {expected_outer}')
     for name in ('sets_disjoint', 'union_equals_full_cohort'):
@@ -166,12 +188,14 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
                 problems.append('the saved predictions are not from the selected epoch')
             if str(payload['outer_test']) != 'NOT_RUN':
                 problems.append('the saved predictions do not keep outer_test NOT_RUN')
-            if stage == 'full8x5_outer':
+            if outer_stage:
                 validation_rows = set(np.asarray(payload['validation_indices'],
                                                  dtype=np.int64).tolist())
+                if str(payload['split_protocol']) != split_protocol:
+                    problems.append('validation prediction split protocol differs')
     except (OSError, ValueError, KeyError) as error:
         problems.append(f'unreadable validation predictions: {type(error).__name__}: {error}')
-    if stage == 'full8x5_outer':
+    if outer_stage:
         try:
             with np.load(directory / 'test_predictions.npz', allow_pickle=False) as payload:
                 truth = np.asarray(payload['y_true'], dtype=np.float64).reshape(-1)
@@ -195,7 +219,7 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
                         problems.append('outer-test R2 disagrees with predictions')
                 if int(payload['best_epoch']) != best_epoch or str(payload['outer_test']) != 'RUN':
                     problems.append('outer-test predictions differ from selected checkpoint')
-                if str(payload['split_protocol']) != SPLIT_PROTOCOL:
+                if str(payload['split_protocol']) != split_protocol:
                     problems.append('outer-test prediction split protocol differs')
         except (OSError, ValueError, KeyError, TypeError) as error:
             problems.append(f'unreadable outer-test predictions: {type(error).__name__}: {error}')
@@ -211,9 +235,10 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
               'finetune_strategy': strategy,
               'executed_epochs': executed, 'optimizer_updates': metrics.get('optimizer_updates'),
               'best_epoch': best_epoch, 'best_validation_r2': metrics.get('best_validation_r2'),
-              'test_r2': metrics.get('test_r2') if stage == 'full8x5_outer' else None,
+              'test_r2': metrics.get('test_r2') if outer_stage else None,
               'pretrain_step': metrics.get('pretrain_step'),
-              'pretrain_package_sha256': metrics.get('pretrain_package_sha256')}
+              'pretrain_package_sha256': metrics.get('pretrain_package_sha256'),
+              'evaluation_split_sha256': metrics.get('evaluation_split_sha256')}
     return record, problems
 
 

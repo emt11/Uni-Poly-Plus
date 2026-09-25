@@ -37,11 +37,13 @@ def parse_packages(specs, arms):
     return packages
 
 
-def unit_list(arms):
+def unit_list(arms, tasks=TASKS):
     arms = tuple(arms)
     if not arms or len(set(arms)) != len(arms) or any(arm not in ARMS for arm in arms):
         raise ValueError('requested arms must be a nonempty unique subset')
-    return [(arm, task, fold) for arm in arms for task in TASKS for fold in FOLDS]
+    if not tasks or len(set(tasks)) != len(tasks) or any(task not in TASKS for task in tasks):
+        raise ValueError('requested tasks must be a nonempty unique subset')
+    return [(arm, task, fold) for arm in arms for task in tasks for fold in FOLDS]
 
 
 def accepted_from_prior(root, log_root, units, packages, hashes, retry_unit,

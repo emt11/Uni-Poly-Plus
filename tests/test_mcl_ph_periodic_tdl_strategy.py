@@ -122,6 +122,7 @@ def test_periodic_tdl_acceptance_uses_rmse_and_complete_five_fold_unit(tmp_path)
     np.savez(folder / 'validation_predictions.npz', y_true=np.array([1.0]),
              y_pred=np.array([1.1]), sample_keys=np.array(['a']),
              validation_indices=np.array([10]), best_epoch=np.array(1),
+             split_protocol=np.array('outer5_inner20'),
              outer_test=np.array('NOT_RUN'))
     np.savez(folder / 'test_predictions.npz', y_true=np.array([0., 1.]),
              y_pred=np.array([0.05, .95]), sample_keys=np.array(['b', 'c']),
