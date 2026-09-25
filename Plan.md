@@ -1,6 +1,6 @@
 # MCL-PH-20260921-01 / r13-PAPER5：论文官方五折可比评估
 
-**状态：正式运行已获授权，代码收敛与启动中；尚未声称训练完成。** 用户本轮要求把当前五折改为与 Periodic-TDL 论文一致，并停止当前任务。执行者 Codex；修改前基线 `dev@25b081d`，工作区干净，`git pull --ff-only origin dev` 无更新。原 r12 四 GPU launcher 已退出 1，没有相关微调进程；r12 已取消并归档至 `PROJECT_HISTORY.md`，其 4 starts / 280 epochs 与失败现场均保留，尚无 outer-test R²。本轮用户随后明确要求以 `paper5_outer` 重跑，并删除旧微调逻辑；正式范围为五臂 × 五个官方可比任务 × 五折，共 125 个全新 unit，最多 8,750 epochs。
+**状态：正式运行中；125 units 尚未完成。** 用户本轮要求把当前五折改为与 Periodic-TDL 论文一致，并停止当前任务。执行者 Codex；修改前基线 `dev@25b081d`，工作区干净，`git pull --ff-only origin dev` 无更新。原 r12 四 GPU launcher 已退出 1，没有相关微调进程；r12 已取消并归档至 `PROJECT_HISTORY.md`，其 4 starts / 280 epochs 与失败现场均保留，尚无 outer-test R²。本轮用户随后明确要求以 `paper5_outer` 重跑，并删除旧微调逻辑；正式范围为五臂 × 五个官方可比任务 × 五折，共 125 个全新 unit，最多 8,750 epochs。
 
 ## 科学问题与可比边界
 
@@ -20,4 +20,4 @@
 
 - 用户已明确授权：四 GPU、五臂 × Eea/Egb/Ei/EPS/Nc × 五个官方 outer fold，**125 个全新 unit**；每 unit 10 个 head-only + 60 个 joint epochs，上限 **8,750 epochs / 125 starts**。使用全新 `results/mcl_ph_20260921/p2/paper5_official_r13_1/` 与 `logs/mcl_ph_20260921/paper5_official_r13_1/`。沿用四个原始 5k 预训练包，不从 r12 失败轨迹恢复。r12 的 4 starts / 280 epochs 单独记账。
 - 启动前核对五个官方清单和来源 SHA、cohort 绑定、预训练包身份、GPU/进程及新目录。每 unit 退出 0 且 `check_unit` 无问题；125/125 后 `paper5_test.json` PASS 才称完整。任何身份差异、非有限值、测试失败、writer 冲突或预算耗尽立即停止并保留现场；不自动加试或启动 P3/OOF/refit。
-- 本轮执行证据以实际 tmux window、日志、退出码、runtime 和聚合产物为准；启动后更新记录。旧策略代码路径移除不改变历史实验结论。
+- 本轮于 2026-09-25 UTC 在 `Uni-Poly:96:mcl_ph_paper5_4gpu` 启动；工作目录 `/root/workspace/Uni-Poly-Plus-master`，实际命令留存 `logs/mcl_ph_20260921/paper5_official_r13_1_launch.sh`，launcher 日志和真实退出码为同前缀 `_launcher.log`、`_launcher.exit`，unit 日志在 `logs/mcl_ph_20260921/paper5_official_r13_1/`，产物在对应 `results/.../paper5_official_r13_1/`。启动记录为 `reused=0,new=125,workers=4`，首批 Eea fold0–3 四进程已启动；此时没有 launcher 退出码，不能称完成。本轮执行证据以后续退出码、runtime 和聚合产物为准。旧策略代码路径移除不改变历史实验结论。
