@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCL-PH downstream arms (MCL-PH-20260921-01/r1).
+"""MCL-PH official Periodic-TDL five-fold downstream arms.
 
 Five arms that share one protocol and differ only in the encoder family that
 was pre-trained:
@@ -12,8 +12,8 @@ was pre-trained:
 | ``m_gate``   | this contract, ``F_GATE``          | MCL-PH | the new 512-wide head |
 | ``m_xattn``  | this contract, ``F_XATTN``         | MCL-PH | the new 512-wide head |
 
-Training decodes only train and validation records. Explicit outer-test stages
-decode test records after the validation-selected checkpoint is restored.
+Training decodes only train and validation records. The paper5_outer stage
+decodes test records after the validation-selected checkpoint is restored.
 The current frozen JSONL still needs a raw-byte scan for file integrity and row
 location, so it does not provide byte-level isolation from unselected labels.
 """
@@ -42,22 +42,16 @@ from src.modules.mcl_ph import load_deployment as load_mcl_deployment
 from src.modules.glt_adaptation import AdaptationAdapter
 from src.training.glt_dual_runtime import (open_source, require_tmux, save_checkpoint,
                                            sha256_file, write_json)
-from src.utils import _cosine_scheduler, evaluate, scale_targets, set_global_seed, train_epoch
+from src.utils import evaluate, scale_targets, set_global_seed, train_epoch
 from scripts.finetune_glt_3d_gain_d2 import resolve_fold, split_indices
 
 ARMS = ('glt_ref', 'o8_only', 'm_cat', 'm_gate', 'm_xattn')
 MCL_FUSION = {'m_cat': 'cat', 'm_gate': 'gate', 'm_xattn': 'xattn'}
-BACKBONE_LR = 1e-5
-HEAD_LR = 1e-4
-WEIGHT_DECAY = 0.02
 SCHEDULE_TOTAL_EPOCHS = 30
-SCHEDULE_WARMUP_EPOCHS = 5
 HEAD_INIT_SEED = 20260921
 TASKS = ('eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc')
 PAPER_TASKS = ('eea', 'egb', 'ei', 'eps', 'nc')
 FOLDS = (0, 1, 2, 3, 4)
-DEVELOPMENT_TASKS = ('xc', 'eps', 'eat')
-DEVELOPMENT_FOLDS = (0, 1)
 SPLIT_PROTOCOL = 'outer5_inner20'
 PAPER_SPLIT_PROTOCOL = 'periodic_tdl_official5'
 PERIODIC_TDL_EPOCHS = {'egc': 50}
@@ -69,18 +63,6 @@ PERIODIC_TDL_WEIGHT_DECAY = {'egc': 0.0, 'eea': 0.02, 'egb': 0.02,
 PERIODIC_TDL_HEAD_DROPOUT = {'egc': 0.0, 'eea': 0.1, 'egb': 0.1,
                              'ei': 0.1, 'eps': 0.1, 'nc': 0.1,
                              'xc': 0.3, 'eat': 0.1}
-
-
-class IdentityTargetScaler:
-    """Keep Xc labels in their original units, as in Periodic-TDL."""
-
-    def __init__(self):
-        self.scaler = self
-        self.mean_ = np.array([0.0])
-        self.scale_ = np.array([1.0])
-
-    def inverse_transform(self, values):
-        return np.asarray(values)
 
 
 def periodic_tdl_head(model):
@@ -345,90 +327,6 @@ def build_o8_only(package, *, dropout=0.1, expected_step, torsion=False):
     return arm, copied
 
 
-def parameter_groups(model, arm):
-    """Two learning rates with weight decay disabled for bias, LN and router."""
-    head = model.head if hasattr(model, 'head') else model.model.predictor
-    groups = {'backbone': [], 'backbone_no_decay': [], 'head': [], 'head_no_decay': []}
-
-    def decay_free(name):
-        return (name.endswith('.bias') or 'norm' in name.lower() or 'router' in name.lower()
-                or name.endswith('.gate.weight'))
-
-    head_ids = {id(parameter) for parameter in head.parameters()}
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        if id(parameter) in head_ids:
-            groups['head_no_decay' if decay_free(name) else 'head'].append(parameter)
-        else:
-            groups['backbone_no_decay' if decay_free(name) else 'backbone'].append(parameter)
-    entries, evidence = [], []
-    for key, lr in (('backbone', BACKBONE_LR), ('backbone_no_decay', BACKBONE_LR),
-                    ('head', HEAD_LR), ('head_no_decay', HEAD_LR)):
-        if not groups[key]:
-            continue
-        decay = 0.0 if key.endswith('no_decay') else WEIGHT_DECAY
-        entries.append({'params': groups[key], 'lr': lr, 'weight_decay': decay, 'name': key})
-        evidence.append({'name': key, 'lr': lr, 'weight_decay': decay,
-                         'num_tensors': len(groups[key]),
-                         'num_parameters': int(sum(p.numel() for p in groups[key]))})
-    optimizer = torch.optim.AdamW(entries)
-    grouped = {id(p) for group in entries for p in group['params']}
-    missing = [name for name, parameter in model.named_parameters()
-               if parameter.requires_grad and id(parameter) not in grouped]
-    if missing:
-        raise ValueError('trainable tensors outside every group: ' + ','.join(missing[:5]))
-    return optimizer, evidence
-
-
-def run_selection_epochs(model, train_loader, validation_loader, criterion, optimizer,
-                         scheduler, device, *, epochs, patience, scaler, progress=None):
-    """Train at most ``epochs`` epochs and select on validation R2 only.
-
-    The validation predictions of the selected epoch are kept exactly as they
-    were computed for that epoch; no refit and no outer-test read exists here.
-    """
-    wrapped = AdaptationAdapter(model)
-    best_state, best_r2, best_epoch, stalled = None, -float('inf'), -1, 0
-    best_predictions = None
-    history, updates = [], 0
-    for epoch in range(int(epochs)):
-        train_result = train_epoch(wrapped, train_loader, criterion, optimizer, scheduler,
-                                   device, epoch=epoch + 1, amp_dtype='fp32',
-                                   max_grad_norm=1.0, fail_nonfinite=True,
-                                   return_timing=True)
-        updates += int(train_result[-1]['training_steps'])
-        validation_loss, validation_r2, targets, predictions = evaluate(
-            wrapped, validation_loader, criterion, device, scaler=scaler, amp_dtype='fp32')
-        if not all(np.isfinite([validation_loss, validation_r2])):
-            raise FloatingPointError('nonfinite validation metrics')
-        if not np.isfinite(predictions).all():
-            raise FloatingPointError('nonfinite validation predictions')
-        record = {'epoch': epoch + 1, 'train_loss': float(train_result[0]),
-                  'validation_loss': float(validation_loss),
-                  'validation_r2': float(validation_r2),
-                  'learning_rates': [group['lr'] for group in optimizer.param_groups],
-                  'training_steps': int(train_result[-1]['training_steps'])}
-        history.append(record)
-        if progress is not None:
-            progress(record)
-        if validation_r2 > best_r2:
-            best_state = {key: value.detach().cpu().clone()
-                          for key, value in model.state_dict().items()}
-            best_predictions = (np.asarray(targets, dtype=np.float64).reshape(-1),
-                                np.asarray(predictions, dtype=np.float64).reshape(-1))
-            best_r2, best_epoch, stalled = validation_r2, epoch + 1, 0
-        else:
-            stalled += 1
-        if stalled >= int(patience):
-            break
-    if best_state is None:
-        raise RuntimeError('no finite validation-selected checkpoint')
-    return {'history': history, 'state': best_state, 'best_r2': float(best_r2),
-            'best_epoch': int(best_epoch), 'stalled_epochs': int(stalled),
-            'optimizer_updates': int(updates), 'predictions': best_predictions}
-
-
 def unit_directory(output, arm, task, fold):
     if arm not in ARMS:
         raise ValueError(f'unknown arm: {arm}')
@@ -439,26 +337,15 @@ def unit_directory(output, arm, task, fold):
     return Path(output) / str(arm) / str(task) / f'fold{int(fold)}'
 
 
-def validate_stage_scope(stage, task, fold, epochs, cohort_index, strategy='legacy'):
-    if stage in ('full8x5_outer', 'paper5_outer') and strategy != 'periodic_tdl':
-        raise ValueError('outer-test five-fold evaluation requires periodic_tdl')
-    if stage == 'paper5_outer' and task not in PAPER_TASKS:
+def validate_stage_scope(stage, task, fold, epochs, cohort_index, strategy='periodic_tdl'):
+    if stage != 'paper5_outer' or strategy != 'periodic_tdl':
+        raise ValueError('only official paper5_outer Periodic-TDL fine-tuning is active')
+    if task not in PAPER_TASKS or fold not in FOLDS:
         raise ValueError('official Periodic-TDL folds are verified only for Eea/Egb/Ei/EPS/Nc')
-    if strategy == 'periodic_tdl' and stage == 'smoke':
-        raise ValueError('Periodic-TDL full-trajectory strategy requires development or full8x5')
-    if stage == 'smoke' and epochs != 1:
-        raise ValueError('smoke units run exactly one epoch')
-    if strategy == 'periodic_tdl' and stage != 'smoke':
-        expected = 10 + PERIODIC_TDL_EPOCHS.get(task, 60)
-        if epochs != expected:
-            raise ValueError(f'Periodic-TDL adaptation for {task} requires {expected} epochs')
-    elif stage in ('development', 'full8x5', 'full8x5_outer', 'paper5_outer') and not 1 <= epochs <= SCHEDULE_TOTAL_EPOCHS:
-        raise ValueError(f'{stage} units allow 1..{SCHEDULE_TOTAL_EPOCHS} epochs')
-    if stage == 'development' and (task not in DEVELOPMENT_TASKS or
-                                   fold not in DEVELOPMENT_FOLDS):
-        raise ValueError('development permits only XC/EPS/EAT and folds 0/1')
-    if stage in ('development', 'full8x5', 'full8x5_outer', 'paper5_outer') and not cohort_index:
-        raise ValueError('a trusted cohort index is required for label-isolated stages')
+    if epochs != 70:
+        raise ValueError('official Periodic-TDL tasks require 70 epochs')
+    if not cohort_index:
+        raise ValueError('a trusted cohort index is required')
 
 
 def compact_train_validation_indices(train_indices, validation_indices):
@@ -502,9 +389,8 @@ def build_summary(common, *, config, device, command):
 
 
 def run_unit(args, folder, started, statistics, config, manifest):
-    paper = args.stage == 'paper5_outer'
-    split_protocol = PAPER_SPLIT_PROTOCOL if paper else SPLIT_PROTOCOL
-    if paper and not args.cohort_split_root:
+    split_protocol = PAPER_SPLIT_PROTOCOL
+    if not args.cohort_split_root:
         raise ValueError('official-fold evaluation requires the frozen cohort split root')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     package = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
@@ -527,12 +413,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
         dataset_class = MCLPHCleanDataset
         copied = None
     model.to(device)
-    periodic = args.finetune_strategy == 'periodic_tdl'
-    if periodic:
-        configure_periodic_tdl_dropout(model, args.task)
-        optimizer, group_evidence = None, None
-    else:
-        optimizer, group_evidence = parameter_groups(model, args.arm)
+    configure_periodic_tdl_dropout(model, args.task)
 
     train_indices, validation_indices, split_evidence = resolve_fold(
         manifest, args.task, args.fold,
@@ -541,14 +422,12 @@ def run_unit(args, folder, started, statistics, config, manifest):
     selected_indices, train_local_indices, validation_local_indices = \
         compact_train_validation_indices(train_indices, validation_indices)
     split_path = Path(args.split_root) / f'{args.task}.json'
-    cohort_split_path = (Path(args.cohort_split_root) / f'{args.task}.json'
-                         if paper else split_path)
+    cohort_split_path = Path(args.cohort_split_root) / f'{args.task}.json'
     cohort_split_sha256 = sha256_file(cohort_split_path)
-    if paper:
-        original_split = json.loads(cohort_split_path.read_text(encoding='utf-8'))
-        if (original_split.get('sample_order_sha256') != manifest.get('sample_order_sha256')
-                or int(original_split.get('sample_count', -1)) != int(manifest['sample_count'])):
-            raise ValueError('official folds do not match the frozen cohort row identity')
+    original_split = json.loads(cohort_split_path.read_text(encoding='utf-8'))
+    if (original_split.get('sample_order_sha256') != manifest.get('sample_order_sha256')
+            or int(original_split.get('sample_count', -1)) != int(manifest['sample_count'])):
+        raise ValueError('official folds do not match the frozen cohort row identity')
     source, frame = open_source(
         args.cohort_root, args.cache_root, task=args.task,
         dual_static_root=args.dual_static_root, selected_indices=selected_indices,
@@ -562,32 +441,22 @@ def run_unit(args, folder, started, statistics, config, manifest):
                    if args.arm in MCL_FUSION else
                    dataset_class(source, frame['label'].to_numpy(dtype=np.float64)))
         set_global_seed(int(config['seed']) + int(args.fold))
-        scaler = (IdentityTargetScaler() if periodic and args.task == 'xc' else
-                  scale_targets(dataset, args.task, train_indices=train_local_indices,
-                                transform_mode='standard'))
-        batch_size = 24 if periodic else int(config['finetune_batch'])
+        scaler = scale_targets(dataset, args.task, train_indices=train_local_indices,
+                               transform_mode='standard')
+        batch_size = 24
         train_loader = DataLoader(
             Subset(dataset, train_local_indices), batch_size=batch_size,
             shuffle=True, num_workers=0, collate_fn=collate,
             generator=torch.Generator().manual_seed(int(config['seed']) + int(args.fold)))
         validation_loader = DataLoader(
-            Subset(dataset, validation_local_indices), batch_size=(24 if periodic else int(config['eval_batch'])),
+            Subset(dataset, validation_local_indices), batch_size=24,
             shuffle=False, num_workers=0, collate_fn=collate)
         criterion = nn.MSELoss()
-        if periodic:
-            result = run_periodic_tdl_epochs(
-                model, train_loader, validation_loader, criterion, device,
-                task=args.task, scaler=scaler,
-                progress=lambda record: print(json.dumps({'arm': args.arm, **record}), flush=True))
-            group_evidence = result['optimizer_groups_by_stage']['joint']
-        else:
-            schedule_total = SCHEDULE_TOTAL_EPOCHS * len(train_loader)
-            schedule_warmup = SCHEDULE_WARMUP_EPOCHS * len(train_loader)
-            scheduler = _cosine_scheduler(optimizer, schedule_total, schedule_warmup)
-            result = run_selection_epochs(
-                model, train_loader, validation_loader, criterion, optimizer, scheduler, device,
-                epochs=int(args.epochs), patience=int(config['patience']), scaler=scaler,
-                progress=lambda record: print(json.dumps({'arm': args.arm, **record}), flush=True))
+        result = run_periodic_tdl_epochs(
+            model, train_loader, validation_loader, criterion, device,
+            task=args.task, scaler=scaler,
+            progress=lambda record: print(json.dumps({'arm': args.arm, **record}), flush=True))
+        group_evidence = result['optimizer_groups_by_stage']['joint']
         best = result['state']
         model.load_state_dict(best, strict=True)
         reload_check = model.load_state_dict(best, strict=True)
@@ -604,7 +473,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
             finetune_strategy=np.asarray(args.finetune_strategy),
                  outer_test=np.asarray('NOT_RUN'))
         test_result = {}
-        if args.stage in ('full8x5_outer', 'paper5_outer'):
+        if args.stage == 'paper5_outer':
             # The test source is opened only after the validation-selected state
             # has been restored. LMDB allows one open handle per environment in
             # this process, so release the training source before opening test.
@@ -627,8 +496,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
                 raw_targets = test_frame['label'].to_numpy(dtype=np.float64)
                 test_dataset = (dataset_class(test_source, raw_targets, statistics)
                                 if args.arm in MCL_FUSION else dataset_class(test_source, raw_targets))
-                if not isinstance(scaler, IdentityTargetScaler):
-                    test_dataset.set_target_override(scaler.transform(raw_targets).reshape(-1))
+                test_dataset.set_target_override(scaler.transform(raw_targets).reshape(-1))
                 test_loader = DataLoader(test_dataset, batch_size=24, shuffle=False,
                                          num_workers=0, collate_fn=collate)
                 _, test_r2, test_truth, test_prediction = evaluate(
@@ -654,37 +522,32 @@ def run_unit(args, folder, started, statistics, config, manifest):
         common = dict(
             arm=args.arm, task=args.task, fold=int(args.fold), stage=args.stage,
             finetune_strategy=args.finetune_strategy,
-            selection_metric=('validation_rmse' if periodic else 'validation_r2'),
+            selection_metric='validation_rmse',
             protocol=f'mcl_ph_{args.stage}',
-            outer_test=('RUN' if args.stage in ('full8x5_outer', 'paper5_outer') else 'NOT_RUN'),
+            outer_test='RUN',
             pretrained_route=('dual_glt' if args.arm in ('glt_ref', 'o8_only') else 'mcl_ph'),
             requested_epochs=int(args.epochs), executed_epochs=int(executed_epochs),
             optimizer_updates=int(result['optimizer_updates']),
-            schedule_total_epochs=(int(args.epochs) if periodic else SCHEDULE_TOTAL_EPOCHS),
-            schedule_warmup_epochs=(10 if periodic else SCHEDULE_WARMUP_EPOCHS),
+            schedule_total_epochs=int(args.epochs), schedule_warmup_epochs=10,
             best_validation_r2=float(result['best_r2']), best_epoch=int(result['best_epoch']),
-            best_validation_rmse=(float(result['best_rmse']) if periodic else None),
-            stalled_epochs=(None if periodic else int(result['stalled_epochs'])),
+            best_validation_rmse=float(result['best_rmse']), stalled_epochs=None,
             history=result['history'],
             train_sample_count=len(train_indices),
             validation_sample_count=len(validation_indices),
-            scaler_fit_split=('none' if periodic and args.task == 'xc' else 'train'),
-            split=dict(split_evidence, outer_test=('RUN' if args.stage in ('full8x5_outer', 'paper5_outer')
-                                                   else 'NOT_RUN')),
+            scaler_fit_split='train',
+            split=dict(split_evidence, outer_test='RUN'),
             evaluation_split_sha256=sha256_file(split_path),
             evaluation_split_path=str(split_path.resolve()),
             cohort_split_sha256=cohort_split_sha256,
-            official_source=(manifest.get('official_source') if paper else None),
+            official_source=manifest.get('official_source'),
             **test_result,
-            learning_rate_table=({'head_stage1': 3e-4,
-                                  'backbone_stage2': (2e-4 if args.task == 'xc' else 1e-4),
-                                  'head_stage2': 1e-3} if periodic else
-                                 {'backbone': BACKBONE_LR, 'head': HEAD_LR}),
-            weight_decay=(PERIODIC_TDL_WEIGHT_DECAY[args.task] if periodic else WEIGHT_DECAY),
-            adaptation=('head10_then_joint' if periodic else 'full'),
+            learning_rate_table={'head_stage1': 3e-4, 'backbone_stage2': 1e-4,
+                                 'head_stage2': 1e-3},
+            weight_decay=PERIODIC_TDL_WEIGHT_DECAY[args.task],
+            adaptation='head10_then_joint',
             pretrain_step=expected, pretrain_package_sha256=sha256_file(args.checkpoint),
             optimizer_groups=group_evidence,
-            optimizer_groups_by_stage=(result['optimizer_groups_by_stage'] if periodic else None),
+            optimizer_groups_by_stage=result['optimizer_groups_by_stage'],
             copied_o8_tensors=(len(copied) if copied else None),
             load_state_dict_result={'missing_keys': list(reload_check.missing_keys),
                                     'unexpected_keys': list(reload_check.unexpected_keys)},
@@ -695,7 +558,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
             architecture=model.__class__.__name__,
             protocol=f'mcl_ph_{args.stage}', config=config, stage=args.stage,
             best_validation_r2=float(result['best_r2']),
-            best_validation_rmse=(float(result['best_rmse']) if periodic else None),
+            best_validation_rmse=float(result['best_rmse']),
             finetune_strategy=args.finetune_strategy,
             best_epoch=int(result['best_epoch']),
             requested_epochs=int(args.epochs), executed_epochs=int(executed_epochs),
@@ -731,7 +594,7 @@ def failure_record(error, args, started):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arm', required=True, choices=ARMS)
-    parser.add_argument('--stage', required=True, choices=('smoke', 'development', 'full8x5', 'full8x5_outer', 'paper5_outer'))
+    parser.add_argument('--stage', required=True, choices=('paper5_outer',))
     parser.add_argument('--config', required=True)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--expected-pretrain-step', type=int, required=True)
@@ -742,11 +605,11 @@ def main():
     parser.add_argument('--cohort-split-root', help='frozen cohort split binding for paper5_outer')
     parser.add_argument('--cohort-index', help='trusted byte-offset index; required for label-isolated stages')
     parser.add_argument('--statistics')
-    parser.add_argument('--task', default='xc', choices=TASKS)
+    parser.add_argument('--task', required=True, choices=PAPER_TASKS)
     parser.add_argument('--fold', type=int, default=0, choices=FOLDS)
     parser.add_argument('--epochs', type=int, default=1)
-    parser.add_argument('--finetune-strategy', choices=('legacy', 'periodic_tdl'),
-                        default='legacy')
+    parser.add_argument('--finetune-strategy', choices=('periodic_tdl',),
+                        default='periodic_tdl')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     validate_stage_scope(args.stage, args.task, args.fold, args.epochs,
@@ -757,9 +620,8 @@ def main():
     started = time.perf_counter()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
     manifest = json.loads((Path(args.split_root) / f'{args.task}.json').read_text(encoding='utf-8'))
-    expected_protocol = PAPER_SPLIT_PROTOCOL if args.stage == 'paper5_outer' else SPLIT_PROTOCOL
-    if str(manifest.get('protocol')) != expected_protocol:
-        raise ValueError(f'the fixed {expected_protocol} split is required')
+    if str(manifest.get('protocol')) != PAPER_SPLIT_PROTOCOL:
+        raise ValueError(f'the fixed {PAPER_SPLIT_PROTOCOL} split is required')
     statistics = (load_geometric_statistics(args.statistics)
                   if args.arm in MCL_FUSION else None)
     folder = unit_directory(args.output, args.arm, args.task, args.fold)

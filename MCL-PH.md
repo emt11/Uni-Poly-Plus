@@ -1,6 +1,6 @@
 # MCL-PH：多尺度距离专家与 PH 路由替换 GLT 3D 通道
 
-> 2026-09-25 当前修订为 [Plan.md](Plan.md) 的 `r13-PAPER5`。用户取消 r12 项目自建五折 outer-test 运行并要求改用 Periodic-TDL 论文官方五折；r12 首批四个 unit 失败后 launcher 已退出，当前无微调进程。官方发布样本与冻结 cohort 逐行一致的任务只有 Eea/Egb/Ei/EPS/Nc，五任务官方 outer/inner 索引已生成并局部验证；EAT、Egc、Xc 不纳入同折可比结果。r13 尚无模型训练和 outer-test R²，正式 125-unit 运行待独立授权。下文 r10–r12 状态为历史记录，不授权自动重启。
+> 2026-09-25 当前修订为 [Plan.md](Plan.md) 的 `r13-PAPER5`。用户取消 r12 项目自建五折 outer-test 运行并要求改用 Periodic-TDL 论文官方五折；r12 首批四个 unit 失败后 launcher 已退出，当前无微调进程。官方发布样本与冻结 cohort 逐行一致的任务只有 Eea/Egb/Ei/EPS/Nc，五任务官方 outer/inner 索引已生成并局部验证；EAT、Egc、Xc 不纳入同折可比结果。用户现已明确授权以 `paper5_outer` 全新重跑五臂 × 五任务 × 五折，共 125 units / 最多 8,750 epochs；旧活动微调路径将移除，训练完成与 outer-test R² 以本轮实际日志和产物为准。下文 r10–r12 状态为历史记录，不授权自动重启。
 
 > 2026-09-24 当前执行修订见 [Plan.md](Plan.md) 的 `r12-PTDL-OUTER5`。用户已要求停止 r11 内部验证任务，转为五臂 × 八任务 × 五折、选定验证最优 checkpoint 后评价各折 outer-test R²。r11 已停止于 122 个通过、4 个中断 unit，未完成 200/200；旧目录保留。当前合同下方关于 `outer_test=NOT_RUN`、执行中和禁止外层测试的文字属于此前历史阶段，不描述 r12 的授权边界。r12 从新目录全量重训并仅在完整验收后报告五折测试结果。
 

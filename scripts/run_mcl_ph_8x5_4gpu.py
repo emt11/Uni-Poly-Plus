@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Four independent GPU workers for the authorized MCL-PH 8x5 units.
-
-Each unit keeps its original single-GPU training contract.  Workers own
-disjoint units and output paths; any failure stops scheduling further units.
-"""
+"""Run only the paper-aligned MCL-PH five-task, five-fold campaign on four GPUs."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -18,9 +14,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.aggregate_mcl_ph import check_unit
 from scripts.aggregate_mcl_ph_8x5 import aggregate
-from scripts.finetune_mcl_ph import ARMS, PAPER_TASKS, PERIODIC_TDL_EPOCHS, TASKS, unit_directory
-from scripts.run_mcl_ph_8x5 import accepted_from_prior, parse_packages, unit_list
+from scripts.finetune_mcl_ph import (ARMS, FOLDS, PAPER_SPLIT_PROTOCOL,
+                                     PAPER_TASKS, unit_directory)
 from src.training.glt_dual_runtime import require_tmux, sha256_file
+
+
+def parse_packages(specs):
+    packages = {}
+    for spec in specs:
+        if '=' not in spec:
+            raise ValueError('each --package must be arm=path')
+        arm, path = spec.split('=', 1)
+        if arm not in ARMS or arm in packages or not path:
+            raise ValueError(f'undeclared or duplicate package arm: {arm}')
+        packages[arm] = Path(path).resolve()
+    if set(packages) != set(ARMS):
+        raise ValueError('provide exactly one package for each of the five arms')
+    for arm, path in packages.items():
+        if not path.is_file():
+            raise FileNotFoundError(f'{arm} package is missing: {path}')
+    return packages
+
+
+def unit_list():
+    return [(arm, task, fold) for arm in ARMS for task in PAPER_TASKS for fold in FOLDS]
 
 
 def distribute(units, devices=(0, 1, 2, 3)):
@@ -29,33 +46,44 @@ def distribute(units, devices=(0, 1, 2, 3)):
     return {device: units[index::4] for index, device in enumerate(devices)}
 
 
+def verify_splits(split_root, cohort_split_root):
+    for task in PAPER_TASKS:
+        path = Path(split_root) / f'{task}.json'
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        if manifest.get('protocol') != PAPER_SPLIT_PROTOCOL or manifest.get('task') != task:
+            raise ValueError(f'{task}: not the official paper5 fold manifest')
+        source = manifest['official_source']
+        name = 'EPS' if task == 'eps' else task.capitalize()
+        for filename, key in ((f'{name}_cleaned.csv', 'cleaned_csv_sha256'),
+                              (f'{name}_folds.pkl', 'folds_pkl_sha256')):
+            if sha256_file(Path(split_root) / 'source' / filename) != source[key]:
+                raise ValueError(f'{task}: official source identity changed')
+        old = json.loads((Path(cohort_split_root) / f'{task}.json').read_text())
+        if (old.get('sample_order_sha256') != manifest.get('sample_order_sha256')
+                or old.get('sample_count') != manifest.get('sample_count')):
+            raise ValueError(f'{task}: official rows differ from frozen cohort rows')
+
+
 def run_worker(device, units, args, output, log_root, packages, stopped):
-    stage = ('paper5_outer' if args.evaluation == 'official_outer_test' else
-             'full8x5_outer' if args.evaluation == 'outer_test' else 'full8x5')
     try:
         for arm, task, fold in units:
             if stopped.is_set():
                 return
             name = f'{arm}_{task}_fold{fold}'
             command = [sys.executable, 'scripts/finetune_mcl_ph.py',
-                       '--arm', arm, '--stage', stage, '--config', args.config,
+                       '--arm', arm, '--stage', 'paper5_outer', '--config', args.config,
                        '--checkpoint', str(packages[arm]), '--expected-pretrain-step', '5000',
                        '--cohort-root', args.cohort_root, '--cache-root', args.cache_root,
                        '--dual-static-root', args.dual_static_root,
-                       '--split-root', args.split_root, '--statistics', args.statistics,
-                       '--cohort-index', args.cohort_index, '--task', task,
-                       '--fold', str(fold),
-                       '--epochs', str(10 + PERIODIC_TDL_EPOCHS.get(task, 60)
-                                       if args.finetune_strategy == 'periodic_tdl' else 30),
-                       '--finetune-strategy', args.finetune_strategy,
-                       '--output', str(output)]
-            if args.evaluation == 'official_outer_test':
-                command += ['--cohort-split-root', args.cohort_split_root]
+                       '--split-root', args.split_root,
+                       '--cohort-split-root', args.cohort_split_root,
+                       '--statistics', args.statistics, '--cohort-index', args.cohort_index,
+                       '--task', task, '--fold', str(fold), '--epochs', '70',
+                       '--finetune-strategy', 'periodic_tdl', '--output', str(output)]
             environment = os.environ.copy()
             environment['CUDA_VISIBLE_DEVICES'] = str(device)
             with (log_root / f'{name}.log').open('x', encoding='utf-8') as stream:
-                stream.write(json.dumps({'command': command, 'physical_gpu': device,
-                                         'CUDA_VISIBLE_DEVICES': str(device)}) + '\n')
+                stream.write(json.dumps({'command': command, 'physical_gpu': device}) + '\n')
                 stream.flush()
                 result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
                                         env=environment, check=False)
@@ -63,12 +91,11 @@ def run_worker(device, units, args, output, log_root, packages, stopped):
             if result.returncode != 0:
                 stopped.set()
                 raise RuntimeError(f'{name} on GPU {device} exited {result.returncode}')
-            _, problems = check_unit(output, arm, task, fold, stage=stage,
+            _, problems = check_unit(output, arm, task, fold, stage='paper5_outer',
                                      expected_step=5000)
             if problems:
                 (log_root / f'{name}.acceptance.json').write_text(
-                    json.dumps({'status': 'FAILED', 'problems': problems}, indent=2) + '\n',
-                    encoding='utf-8')
+                    json.dumps({'status': 'FAILED', 'problems': problems}, indent=2) + '\n')
                 stopped.set()
                 raise RuntimeError(f'{name} on GPU {device} failed acceptance: {problems}')
             print(json.dumps({'unit': name, 'physical_gpu': device, 'status': 'PASS'}),
@@ -80,85 +107,44 @@ def run_worker(device, units, args, output, log_root, packages, stopped):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--arms', nargs='+', choices=ARMS, required=True)
     parser.add_argument('--package', action='append', required=True)
     for name in ('config', 'cohort-root', 'cache-root', 'dual-static-root', 'split-root',
-                 'statistics', 'cohort-index', 'output', 'log-root'):
+                 'cohort-split-root', 'statistics', 'cohort-index', 'output', 'log-root'):
         parser.add_argument(f'--{name}', required=True)
-    parser.add_argument('--cohort-split-root')
-    parser.add_argument('--reuse-root')
-    parser.add_argument('--reuse-log-root')
-    parser.add_argument('--retry-unit')
-    parser.add_argument('--finetune-strategy', choices=('legacy', 'periodic_tdl'),
-                        default='legacy')
-    parser.add_argument('--evaluation', choices=('internal', 'outer_test', 'official_outer_test'),
-                        default='internal')
     args = parser.parse_args()
     require_tmux()
-    if args.evaluation in ('outer_test', 'official_outer_test') and args.finetune_strategy != 'periodic_tdl':
-        raise ValueError('outer-test evaluation requires periodic_tdl')
-    if args.evaluation in ('outer_test', 'official_outer_test') and (args.reuse_root or args.reuse_log_root):
-        raise ValueError('outer-test campaign must train all units in a fresh root')
-    if args.evaluation == 'official_outer_test':
-        if not args.cohort_split_root:
-            raise ValueError('official folds require the frozen cohort split root')
-        if Path(args.split_root).resolve() == Path(args.cohort_split_root).resolve():
-            raise ValueError('official evaluation folds must differ from cohort-bound folds')
-    tasks = PAPER_TASKS if args.evaluation == 'official_outer_test' else TASKS
-    units = unit_list(args.arms, tasks)
-    packages = parse_packages(args.package, args.arms)
     output, log_root = Path(args.output).resolve(), Path(args.log_root).resolve()
-    if bool(args.reuse_root) != bool(args.reuse_log_root):
-        raise ValueError('reuse root and reuse log root must be supplied together')
-    if args.retry_unit and not args.reuse_root:
-        raise ValueError('retry unit requires a prior campaign')
-    old_root = Path(args.reuse_root).resolve() if args.reuse_root else None
-    old_logs = Path(args.reuse_log_root).resolve() if args.reuse_log_root else None
     if output.exists() or log_root.exists():
-        raise FileExistsError('full8x5 output and log roots must both be new')
+        raise FileExistsError('paper5 output and log roots must both be new')
     for path in (args.config, args.statistics, args.cohort_index):
         if not Path(path).is_file():
             raise FileNotFoundError(path)
+    verify_splits(args.split_root, args.cohort_split_root)
+    packages = parse_packages(args.package)
     hashes = {arm: sha256_file(path) for arm, path in packages.items()}
-    accepted = (accepted_from_prior(old_root, old_logs, units, packages, hashes,
-                                    args.retry_unit, args.finetune_strategy)
-                if old_root else {})
-    remaining = [(arm, task, fold) for arm, task, fold in units
-                 if f'{arm}_{task}_fold{fold}' not in accepted]
-    assignment = distribute(remaining)
+    units = unit_list()
+    assignment = distribute(units)
     output.mkdir(parents=True, exist_ok=False)
     log_root.mkdir(parents=True, exist_ok=False)
     (log_root / 'launch.json').write_text(json.dumps({
-        'arms': args.arms, 'tasks': tasks, 'units_expected': len(units),
-        'epochs_per_unit_max': (70 if args.finetune_strategy == 'periodic_tdl' else 30),
-        'finetune_strategy': args.finetune_strategy,
-        'outer_test': 'RUN' if args.evaluation in ('outer_test', 'official_outer_test') else 'NOT_RUN',
-        'evaluation': args.evaluation, 'worker_count': 4,
-        'split_root': str(Path(args.split_root).resolve()),
-        'cohort_split_root': (str(Path(args.cohort_split_root).resolve())
-                              if args.cohort_split_root else None),
+        'arms': ARMS, 'tasks': PAPER_TASKS, 'folds': FOLDS,
+        'units_expected': len(units), 'epochs_per_unit_max': 70,
+        'finetune_strategy': 'periodic_tdl', 'stage': 'paper5_outer',
+        'outer_test': 'RUN', 'worker_count': 4,
         'packages': {arm: {'path': str(path), 'sha256': hashes[arm]}
                      for arm, path in packages.items()},
+        'split_root': str(Path(args.split_root).resolve()),
+        'cohort_split_root': str(Path(args.cohort_split_root).resolve()),
         'cohort_index': str(Path(args.cohort_index).resolve()),
-        'reuse_root': str(old_root) if old_root else None,
-        'reuse_log_root': str(old_logs) if old_logs else None,
-        'reused_units': sorted(accepted), 'retry_unit': args.retry_unit,
+        'reused_units': [],
         'gpu_assignments': {str(device): [f'{a}_{t}_fold{f}' for a, t, f in rows]
                             for device, rows in assignment.items()},
     }, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-    for arm, task, fold in units:
-        name = f'{arm}_{task}_fold{fold}'
-        if name in accepted:
-            target = unit_directory(output, arm, task, fold)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.symlink_to(accepted[name], target_is_directory=True)
-    print(json.dumps({'reused': len(accepted), 'new': len(remaining),
-                      'workers': 4}), flush=True)
+    print(json.dumps({'reused': 0, 'new': len(units), 'workers': 4}), flush=True)
     stopped = Event()
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(run_worker, device, rows, args, output, log_root,
-                               packages, stopped)
-                   for device, rows in assignment.items()]
+                               packages, stopped) for device, rows in assignment.items()]
         failures = []
         for future in futures:
             try:
@@ -167,20 +153,15 @@ def main():
                 stopped.set()
                 failures.append(str(error))
     if failures:
-        raise RuntimeError('full8x5 workers stopped: ' + '; '.join(failures))
-    stage = ('paper5_outer' if args.evaluation == 'official_outer_test' else
-             'full8x5_outer' if args.evaluation == 'outer_test' else 'full8x5')
-    payload = aggregate(output, arms=args.arms, expected_step=5000, stage=stage)
-    filename = ('paper5_test.json' if args.evaluation == 'official_outer_test' else
-                'full8x5_test.json' if args.evaluation == 'outer_test' else
-                'full8x5_validation.json')
-    (output / filename).write_text(
+        raise RuntimeError('paper5 workers stopped: ' + '; '.join(failures))
+    payload = aggregate(output, arms=ARMS, expected_step=5000, stage='paper5_outer')
+    (output / 'paper5_test.json').write_text(
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + '\n',
         encoding='utf-8')
     if payload['status'] != 'PASS':
         raise SystemExit(4)
     print(json.dumps({'status': 'PASS', 'units_accepted': payload['units_accepted'],
-                      'outer_test': payload['outer_test']}), flush=True)
+                      'outer_test': 'RUN'}), flush=True)
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 # MCL-PH-20260921-01 / r13-PAPER5：论文官方五折可比评估
 
-**状态：待授权正式运行；代码与折清单已实现，未启动训练。** 用户本轮要求把当前五折改为与 Periodic-TDL 论文一致，并停止当前任务。执行者 Codex；修改前基线 `dev@25b081d`，工作区干净，`git pull --ff-only origin dev` 无更新。原 r12 四 GPU launcher 已退出 1，没有相关微调进程；r12 已取消并归档至 `PROJECT_HISTORY.md`，其 4 starts / 280 epochs 与失败现场均保留，尚无 outer-test R²。本轮授权代码、折清单、局部验证及停止旧任务，不把“修改评估”解释为新正式训练授权。
+**状态：正式运行已获授权，代码收敛与启动中；尚未声称训练完成。** 用户本轮要求把当前五折改为与 Periodic-TDL 论文一致，并停止当前任务。执行者 Codex；修改前基线 `dev@25b081d`，工作区干净，`git pull --ff-only origin dev` 无更新。原 r12 四 GPU launcher 已退出 1，没有相关微调进程；r12 已取消并归档至 `PROJECT_HISTORY.md`，其 4 starts / 280 epochs 与失败现场均保留，尚无 outer-test R²。本轮用户随后明确要求以 `paper5_outer` 重跑，并删除旧微调逻辑；正式范围为五臂 × 五个官方可比任务 × 五折，共 125 个全新 unit，最多 8,750 epochs。
 
 ## 科学问题与可比边界
 
@@ -13,11 +13,11 @@
 ## 实施与验证状态
 
 - `scripts/finetune_glt_3d_gain_d2.py` 的 `resolve_fold` 增加可选预期协议，原入口默认 `outer5_inner20` 不变。`scripts/finetune_mcl_ph.py` 新增 `paper5_outer`，只允许五个已核实任务和 Periodic-TDL 微调策略；选模后才读官方 outer-test。新清单 SHA 与旧 cohort split SHA 分别记录，读取冻结数据仍用其原 split 身份绑定；样本顺序不符即失败。
-- 四 GPU launcher 的 `official_outer_test` 显式选择上述五任务 × 五折，禁止旧 unit 复用；验收和聚合要求官方协议、来源、split SHA、测试预测与 R²，输出 `paper5_test.json`。原 `full8x5`、`full8x5_outer` 代码路径和产物目录保留历史用途，不被重新启动。
-- 局部验证：`pytest -q tests/test_mcl_ph_official_folds.py tests/test_mcl_ph_periodic_tdl_strategy.py tests/test_mcl_ph_8x5_scope.py` 为 11 passed；真实冻结 source 对五任务 fold0 的 train/validation/test 单行选择性加载为 `OFFICIAL_FOLD_SOURCE_PASS`；`py_compile`、`git diff --check` 通过。尚未运行任何 r13 模型 forward、训练、outer-test 或聚合。具体提交与推送结果见本轮交付。
+- 四 GPU launcher 现在只提供 `paper5_outer` 五任务 × 五折，禁止旧 unit 复用；验收和聚合要求官方协议、来源、split SHA、测试预测与 R²，输出 `paper5_test.json`。原 `full8x5`、`full8x5_outer` 的活动微调分支及旧串行 launcher 已移除；历史产物、文档及只读验收兼容保留。
+- 局部验证：`pytest -q tests/test_mcl_ph_official_folds.py tests/test_mcl_ph_periodic_tdl_strategy.py tests/test_mcl_ph_8x5_scope.py` 上一轮为 11 passed；本轮收敛后为 **10 passed**。真实冻结 source 对五任务 fold0 的 train/validation/test 单行选择性加载为 `OFFICIAL_FOLD_SOURCE_PASS`；`py_compile`、`git diff --check` 通过。截至启动前，尚未运行任何 r13 模型 forward、训练、outer-test 或聚合。本轮真实 manifest 来源 SHA、旧 cohort 行身份、125 unit 分配、四个部署包与统计 SHA 均已复核通过。具体提交与推送结果见本轮交付。
 
-## 后续正式运行范围（待另行授权）
+## 本轮正式运行范围与停止条件
 
-- 若用户授权，以四 GPU、五臂 × 五任务 × 五折 **125 个全新 unit** 运行；每 unit 10 个 head-only + 60 个 joint epochs，上限 **8,750 epochs / 125 starts**，不计已消费的 r12 4 starts / 280 epochs，也不混用其权重。使用全新 `results/mcl_ph_20260921/p2/paper5_official_r13_1/` 与 `logs/mcl_ph_20260921/paper5_official_r13_1/`。沿用四个原始 5k 预训练包、其他已核实超参数，不从旧中断任务恢复。
-- 启动前重新核对五个官方清单及来源 SHA、cohort 索引绑定、包身份、GPU/进程和新目录。每 unit 退出 0、`check_unit` 无问题，125/125 后 `paper5_test.json` PASS，才称完整。任何身份差异、非有限值、测试失败、writer 冲突或预算耗尽立即停止并保留现场；不自动加试或启动 P3/OOF/refit。
-- 当前没有正式运行授权；此段是可审查的后续方案，不产生启动许可。用户若要求新正式实验，须明确确认五任务范围与 125 starts / 8,750 epochs 预算。
+- 用户已明确授权：四 GPU、五臂 × Eea/Egb/Ei/EPS/Nc × 五个官方 outer fold，**125 个全新 unit**；每 unit 10 个 head-only + 60 个 joint epochs，上限 **8,750 epochs / 125 starts**。使用全新 `results/mcl_ph_20260921/p2/paper5_official_r13_1/` 与 `logs/mcl_ph_20260921/paper5_official_r13_1/`。沿用四个原始 5k 预训练包，不从 r12 失败轨迹恢复。r12 的 4 starts / 280 epochs 单独记账。
+- 启动前核对五个官方清单和来源 SHA、cohort 绑定、预训练包身份、GPU/进程及新目录。每 unit 退出 0 且 `check_unit` 无问题；125/125 后 `paper5_test.json` PASS 才称完整。任何身份差异、非有限值、测试失败、writer 冲突或预算耗尽立即停止并保留现场；不自动加试或启动 P3/OOF/refit。
+- 本轮执行证据以实际 tmux window、日志、退出码、runtime 和聚合产物为准；启动后更新记录。旧策略代码路径移除不改变历史实验结论。

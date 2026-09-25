@@ -18,24 +18,25 @@ class TinyArm(nn.Module):
 
 
 def test_periodic_tdl_scope_and_task_hyperparameters():
-    runner.validate_stage_scope('full8x5', 'egc', 4, 60, 'index', 'periodic_tdl')
-    runner.validate_stage_scope('full8x5', 'xc', 4, 70, 'index', 'periodic_tdl')
-    with pytest.raises(ValueError, match='requires 60 epochs'):
-        runner.validate_stage_scope('full8x5', 'egc', 4, 70, 'index', 'periodic_tdl')
+    runner.validate_stage_scope('paper5_outer', 'eea', 4, 70, 'index', 'periodic_tdl')
+    with pytest.raises(ValueError, match='only official paper5_outer'):
+        runner.validate_stage_scope('full8x5', 'eea', 4, 70, 'index', 'periodic_tdl')
+    with pytest.raises(ValueError, match='verified only'):
+        runner.validate_stage_scope('paper5_outer', 'egc', 4, 70, 'index', 'periodic_tdl')
     arm = TinyArm()
-    runner.configure_periodic_tdl_dropout(arm, 'xc')
+    runner.configure_periodic_tdl_dropout(arm, 'eea')
     assert arm.encoder[1].p == 0.0
-    assert arm.head[1].p == 0.3
+    assert arm.head[1].p == 0.1
     runner.periodic_tdl_trainability(arm, head_only=True)
     assert not arm.encoder[0].weight.requires_grad
     assert arm.head[0].weight.requires_grad
-    optimizer, groups = runner.periodic_tdl_optimizer(arm, 'xc', head_only=True)
+    optimizer, groups = runner.periodic_tdl_optimizer(arm, 'eea', head_only=True)
     assert [group['name'] for group in groups] == ['head']
     assert optimizer.param_groups[0]['lr'] == 3e-4
     runner.periodic_tdl_trainability(arm, head_only=False)
-    _, groups = runner.periodic_tdl_optimizer(arm, 'xc', head_only=False)
+    _, groups = runner.periodic_tdl_optimizer(arm, 'eea', head_only=False)
     assert [(group['name'], group['lr']) for group in groups] == [
-        ('backbone', 2e-4), ('head', 1e-3)]
+        ('backbone', 1e-4), ('head', 1e-3)]
 
 
 def test_periodic_tdl_selects_rmse_across_both_stages(monkeypatch):
@@ -62,12 +63,12 @@ def test_periodic_tdl_selects_rmse_across_both_stages(monkeypatch):
     monkeypatch.setattr(runner, 'evaluate', fake_evaluate)
     result = runner.run_periodic_tdl_epochs(
         arm, [None], [None], nn.MSELoss(), torch.device('cpu'),
-        task='egc', scaler=runner.IdentityTargetScaler())
-    assert seen == ['head'] * 10 + ['joint'] * 50
+        task='eea', scaler=None)
+    assert seen == ['head'] * 10 + ['joint'] * 60
     assert result['best_epoch'] == 1
     assert result['best_rmse'] == pytest.approx(0.1)
     assert result['best_r2'] == 0.1
-    assert result['optimizer_updates'] == 60
+    assert result['optimizer_updates'] == 70
     assert result['history'][9]['learning_rates'][0] == pytest.approx(3e-5)
     assert result['history'][19]['learning_rates'][0] == pytest.approx(1e-4)
 

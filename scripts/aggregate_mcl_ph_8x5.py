@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate MCL-PH project or official-paper five-fold downstream units.
-
-Official-paper mode is limited to five tasks with identical released rows and
-folds; it does not reproduce the paper's HSMP model or add blind-test data.
-"""
+"""Aggregate the five tasks aligned to Periodic-TDL's released five folds."""
 
 import argparse
 import json
@@ -13,95 +9,80 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.aggregate_mcl_ph import check_unit
-from scripts.finetune_mcl_ph import ARMS, FOLDS, PAPER_TASKS, TASKS
+from scripts.finetune_mcl_ph import ARMS, FOLDS, PAPER_TASKS
 
 
-def aggregate(root, *, arms, expected_step, stage='full8x5'):
-    if stage not in ('full8x5', 'full8x5_outer', 'paper5_outer'):
-        raise ValueError('unknown five-fold aggregation stage')
-    tasks = PAPER_TASKS if stage == 'paper5_outer' else TASKS
-    outer_stage = stage in ('full8x5_outer', 'paper5_outer')
+def aggregate(root, *, arms, expected_step, stage='paper5_outer'):
+    if stage != 'paper5_outer':
+        raise ValueError('only paper5_outer aggregation is active')
     arms = tuple(arms)
     if not arms or len(set(arms)) != len(arms) or any(arm not in ARMS for arm in arms):
         raise ValueError('arms must be a nonempty unique subset of MCL-PH arms')
     accepted, rejected = [], []
     for arm in arms:
-        for task in tasks:
+        for task in PAPER_TASKS:
             for fold in FOLDS:
                 record, problems = check_unit(root, arm, task, fold,
-                                              stage=stage, expected_step=expected_step)
+                                              stage='paper5_outer', expected_step=expected_step)
                 if problems:
                     rejected.append({'arm': arm, 'task': task, 'fold': fold,
                                      'problems': problems})
                 else:
                     accepted.append(record)
-    status = 'PASS' if not rejected else 'INCOMPLETE'
     payload = {
-        'stage': stage, 'status': status, 'root': str(Path(root).resolve()),
-        'arms': list(arms), 'tasks': list(tasks), 'folds': list(FOLDS),
-        'units_expected': len(arms) * len(tasks) * len(FOLDS),
+        'stage': 'paper5_outer', 'status': 'PASS' if not rejected else 'INCOMPLETE',
+        'root': str(Path(root).resolve()), 'arms': list(arms),
+        'tasks': list(PAPER_TASKS), 'folds': list(FOLDS),
+        'units_expected': len(arms) * len(PAPER_TASKS) * len(FOLDS),
         'units_accepted': len(accepted), 'units_rejected': len(rejected),
-        'accepted': accepted, 'rejected': rejected,
-        'outer_test': 'RUN' if outer_stage else 'NOT_RUN',
+        'accepted': accepted, 'rejected': rejected, 'outer_test': 'RUN',
         'validation_r2': None, 'test_r2': None,
+        'comparability_scope': ('released Periodic-TDL row identity, official outer folds, '
+                                'released-code inner split; project model and geometry'),
     }
     if rejected:
         return payload
-    strategies = {record.get('finetune_strategy', 'legacy') for record in accepted}
-    if len(strategies) != 1:
+    if {record['finetune_strategy'] for record in accepted} != {'periodic_tdl'}:
         payload['status'] = 'INCOMPLETE'
-        payload['rejected'].append({'problems': ['mixed fine-tuning strategies']})
+        payload['rejected'].append({'problems': ['fine-tuning strategy differs']})
         payload['units_rejected'] += 1
         return payload
-    payload['finetune_strategy'] = strategies.pop()
-    if outer_stage and payload['finetune_strategy'] != 'periodic_tdl':
-        payload['status'] = 'INCOMPLETE'
-        payload['rejected'].append({'problems': ['outer-test requires periodic_tdl']})
-        payload['units_rejected'] += 1
-        return payload
-    table = {}
-    test_table = {}
+    payload['finetune_strategy'] = 'periodic_tdl'
+    validation_table, test_table = {}, {}
     for arm in arms:
-        packages = {record['pretrain_package_sha256'] for record in accepted
-                    if record['arm'] == arm}
+        arm_rows = [row for row in accepted if row['arm'] == arm]
+        packages = {row['pretrain_package_sha256'] for row in arm_rows}
         if len(packages) != 1:
             payload['status'] = 'INCOMPLETE'
             payload['rejected'].append({'arm': arm, 'problems': ['pretrain package SHA varies']})
             payload['units_rejected'] += 1
             return payload
-        task_rows = {}
-        for task in tasks:
-            folds = [next(record['best_validation_r2'] for record in accepted
-                          if record['arm'] == arm and record['task'] == task
-                          and record['fold'] == fold) for fold in FOLDS]
-            task_rows[task] = {'folds': folds, 'mean': sum(folds) / len(folds)}
-        table[arm] = {
-            'tasks': task_rows,
-            'macro5' if stage == 'paper5_outer' else 'macro8':
-                sum(row['mean'] for row in task_rows.values()) / len(tasks),
-            'pretrain_package_sha256': packages.pop(),
+        validation_tasks, test_tasks = {}, {}
+        for task in PAPER_TASKS:
+            rows = [next(row for row in arm_rows if row['task'] == task and
+                         row['fold'] == fold) for fold in FOLDS]
+            validation = [row['best_validation_r2'] for row in rows]
+            tests = [row['test_r2'] for row in rows]
+            mean = sum(tests) / len(tests)
+            validation_tasks[task] = {'folds': validation,
+                                      'mean': sum(validation) / len(validation)}
+            test_tasks[task] = {'folds': tests, 'mean': mean,
+                                'std': (sum((value - mean)**2 for value in tests)
+                                        / len(tests))**.5}
+        package_sha = packages.pop()
+        validation_table[arm] = {
+            'tasks': validation_tasks,
+            'macro5': sum(row['mean'] for row in validation_tasks.values()) / len(PAPER_TASKS),
+            'pretrain_package_sha256': package_sha,
         }
-        if outer_stage:
-            test_rows = {}
-            for task in tasks:
-                folds = [next(record['test_r2'] for record in accepted
-                              if record['arm'] == arm and record['task'] == task
-                              and record['fold'] == fold) for fold in FOLDS]
-                mean = sum(folds) / len(folds)
-                test_rows[task] = {'folds': folds, 'mean': mean,
-                                   'std': (sum((value - mean) ** 2 for value in folds)
-                                           / len(folds)) ** 0.5}
-            test_table[arm] = {'tasks': test_rows,
-                               'macro5' if stage == 'paper5_outer' else 'macro8':
-                                   sum(row['mean'] for row in test_rows.values()) / len(tasks),
-                               'pretrain_package_sha256': table[arm]['pretrain_package_sha256']}
-    payload['validation_r2'] = table
-    if outer_stage:
-        payload['test_r2'] = test_table
-        payload['std_definition'] = 'population standard deviation over five fold R2 values'
-    if stage == 'paper5_outer':
-        payload['comparability_scope'] = ('released Periodic-TDL row identity, official outer folds, '
-                                           'released-code inner split; project model and geometry')
+        test_table[arm] = {
+            'tasks': test_tasks,
+            'macro5': sum(row['mean'] for row in test_tasks.values()) / len(PAPER_TASKS),
+            'pretrain_package_sha256': package_sha,
+        }
+    payload['validation_r2'] = validation_table
+    payload['test_r2'] = test_table
+    payload['std_definition'] = 'population standard deviation over five fold R2 values'
     return payload
 
 
@@ -110,15 +91,11 @@ def main():
     parser.add_argument('--root', required=True)
     parser.add_argument('--arms', nargs='+', choices=ARMS, required=True)
     parser.add_argument('--expected-pretrain-step', type=int, required=True)
-    parser.add_argument('--stage', choices=('full8x5', 'full8x5_outer', 'paper5_outer'), default='full8x5')
     parser.add_argument('--output')
     args = parser.parse_args()
     payload = aggregate(args.root, arms=args.arms,
-                        expected_step=args.expected_pretrain_step, stage=args.stage)
-    filename = ('paper5_test.json' if args.stage == 'paper5_outer' else
-                'full8x5_test.json' if args.stage == 'full8x5_outer' else
-                'full8x5_validation.json')
-    destination = Path(args.output) if args.output else Path(args.root) / filename
+                        expected_step=args.expected_pretrain_step)
+    destination = Path(args.output) if args.output else Path(args.root) / 'paper5_test.json'
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(payload, indent=2, sort_keys=True,
                                       allow_nan=False) + '\n', encoding='utf-8')
