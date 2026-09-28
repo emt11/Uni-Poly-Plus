@@ -395,3 +395,14 @@
 - **验证**：`py_compile`（finetune、paper aggregator、四 GPU launcher）通过；保留预训练 launcher `bash -n` 通过；`git diff --check` 通过；`tests/test_mcl_ph_official_folds.py` 与 `tests/test_mcl_ph_periodic_tdl_strategy.py` 为 **7 passed, 1 warning**。初次运行旧 protocol 测试得到 7 项旧契约失败，确认其引用已退役 stage/入口后删除；不作为新实现回归。
 - **产物与科学边界**：未启动 GPU、worker、训练、模型 smoke、缓存构建、outer-test、OOF、refit 或额外 seed。r13 聚合仍为 125/125 PASS、0 rejected；正式 paper5 结果、四个 5k 部署包、split、数据和日志未修改。
 - **审查结论**：工程收口通过，`MCL-PH.md` 已标记最终关闭，STOP 追加正式训练；当前计划完成，暂无后续执行。未来 MCL-PH 科学实验须新建计划并重新授权。
+
+## 2026-09-28 — REPO-CLEANUP-20260928-02 / r1：Atomic-PC 退役与结果合同收口
+
+- **授权与基线**：用户明确要求直接执行清理，并确认 `Atomic-PC W-CAMR-v2` 可直接删除。修改前已在 `dev` 执行 `git pull --ff-only origin dev`，基线为 `df2d000`，工作树干净。
+- **实际删除**：删除 Atomic-PC 专属配置、W-CAMR 入口、dataset/collator、Atomic-PC encoder/model、joint pretrainer、`w_camr_v2_support/`、专属测试；删除物理结果目录 `results/original_mips_atomic_pc_v1/` 与 `results/original_mips_atomic_pc_w_camr_v2/`。共享的 `original_mips_knowledge_fusion.py`、`original_mips_md200.py`、`md200_sidecar.py` 因 GLT-V2 仍使用而保留。
+- **日志清理**：按 SHA256 对 tracked 日志分组，删除 16 个完全重复副本，每组保留一个文件；未删除正式 MCL-PH、GLT-V2 或事故摘要日志。
+- **结果合同**：新增 `src/result_contract.py`，提供 manifest、unit、runtime、aggregate 的原子写入接口；`scripts/run_mts_finetune_scheduler.py` 为新结果根写入 manifest，并在调度完成后写入 runtime。历史结果不迁移、不重算、不改写。
+- **文档**：更新 `AGENTS.md`、`PIPELINE.md`、`RESULTS.md` 和 `Plan.md`，当前保留路线收敛为 GLT-V2 revision-2，Atomic-PC 只保留历史结果文字记录。
+- **边界**：未启动训练、GPU、worker、模型 smoke、缓存构建或结果重算；MCL-PH 正式产物未修改。
+- **验证**：`git diff --check`、变更 Python 文件 `py_compile`、Atomic-PC 代码引用扫描、结果合同临时 manifest/unit/runtime/aggregate smoke，以及 GLT-V2 共享 import 均通过。未运行训练、GPU、worker、模型 smoke、缓存构建、结果重算或全仓测试。
+- **下一步**：校验通过后提交并推送本轮变更；暂无新的科学实验。

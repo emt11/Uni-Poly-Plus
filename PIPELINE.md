@@ -1,19 +1,16 @@
 # Uni-Poly-Plus 当前基线流程
 
-本文描述当前保留的两条路线：`GLT-V2 revision-2`（2D O8 学生及其 N+1/N+2 蒸馏与 C0/C1/C2 对照）和 `Atomic-PC W-CAMR-v2`；已退役的 `MTS-GLT-v2-Base-5k` 与 `MTS-GLT-v3-Galformer-20k` 只保留历史记录和下列明确列出的依赖产物。结果索引见 [`RESULTS.md`](RESULTS.md)。
+本文描述当前保留路线：`GLT-V2 revision-2`（2D O8 学生及其 N+1/N+2 蒸馏与 C0/C1/C2 对照）。`Atomic-PC W-CAMR-v2`、`MTS-GLT-v2-Base-5k` 与 `MTS-GLT-v3-Galformer-20k` 已退役；历史结果只在 [`RESULTS.md`](RESULTS.md) 和项目归档中保留。
 
-**路线范围（2026-09-10 清理后）**
+**路线范围（2026-09-28 清理后）**
 
 保留：
 
 - `GLT-V2 revision-2`：`src/modules/{mips_local_graph,mts_glt_distill,periodic_line_glt_v3,uni_encoder}.py`、`src/training/finetune/`、`src/training/pretrain/glt_distill_engine.py`、`src/training/c0_transfer.py`，配置 `configs/mts/glt_distill_{n_plus_1,n_plus_2,repair_c0,repair_c1,repair_c2}.json`。
-- `Atomic-PC W-CAMR-v2`：`src/modules/{original_mips_atomic_pc,original_mips_knowledge_fusion,original_mips_md200,atomic_point_encoder}.py`、`src/training/w_camr_v2_support/`、`src/training/pretrain/original_mips_atomic_pc_joint.py`，配置 `configs/atomic_point_*.json`。
-
-已删除：`MTS-GLT-v2-Base-5k` 与 `MTS-GLT-v3-Galformer-20k` 的模型、预训练、下游、配置、测试、`results/`、`logs/` 与 `pretrained_models/` 产物。
+- 已删除：`MTS-GLT-v2-Base-5k` 与 `MTS-GLT-v3-Galformer-20k` 的模型、预训练、下游、配置、测试、`results/`、`logs/` 与 `pretrained_models/` 产物。
 
 保留的跨路线依赖（不得删除）：
 
-- `results/mts_glt_v2/formal/a6_h_w1_20k/mts_glt_v2_probe_005k.pth`：`src/training/w_camr_v2_support/cohort_runtime.py` 与 `center_runtime.py` 运行时读取，缺失即报错。
 - `results/mts_glt_v2/downstream/formal/a6_h_w1_20k_probe_005k/paired_summary.json`：`scripts/report_mts_glt_distill.py` 读取的历史对照。
 - `src/modules/periodic_line_glt_v3.py`、`scripts/build_mts_glt_v3_sidecars.py`、`data/processed/mips_trimer_scage/periodic_line_glt_image_v1`：`mts_glt_distill.py`、`scripts/build_mts_glt_distill_repair_sidecars.py` 与 `tests/test_mts_glt_distill.py` 的依赖，文件名带 v3 但服务保留路线。
 - `data/processed/mips_trimer_scage/periodic_line_glt_v1`：`tests/test_mts_glt_distill.py` 的对齐 fixture。
@@ -50,8 +47,8 @@ results/mts_glt_v2/formal/a6_h_w1_20k/mts_glt_v2_probe_005k.pth
 `glt_v2_objectives.py`、`configs/mts/glt_v2_*.json`、`scripts/run_mts_glt_v2_finetune.py`、
 `scripts/report_mts_glt_v2_*.py`、`scripts/build_glt_v2_label_counts.py`、
 `tests/test_mts_finetune_v2.py`、`tests/test_mts_periodic_line_glt.py`，以及其
-`results/`、`logs/`、`pretrained_models/` 产物）。仅保留上面那个 checkpoint，因为
-保留路线 Atomic-PC W-CAMR-v2 在运行时读取它。因此本节描述的架构与下游合同自此
+`results/`、`logs/`、`pretrained_models/` 产物）。该 checkpoint 作为历史正式证据保留，
+不再被当前路线读取。因此本节描述的架构与下游合同自此
 只是历史记录：该基线已无法重新预训练、重新微调或重新评估。
 
 ## 2. 数据与缓存
@@ -177,7 +174,6 @@ seed                    42
 - GLT-V2 revision-2 预训练：`scripts/pretrain_mts_glt_distill.py --stage teacher|student` → `src.training.pretrain.glt_distill_engine.run_stage`；配置 `configs/mts/glt_distill_repair_c{0,1,2}.json`。
 - GLT-V2 revision-2 分词蒸馏侧车：`scripts/build_mts_glt_distill_repair_sidecars_parallel.py`。
 - 下游单 fold：`scripts/train.py` → `src.training.finetune.engine`；调度：`scripts/run_mts_finetune_scheduler.py`。
-- Atomic-PC W-CAMR-v2：`scripts/run_original_mips_atomic_pc_w_camr_v2.py`。
 - line sidecar：`scripts/build_periodic_line_glt_sidecar.py`、`scripts/audit_periodic_line_glt_sidecar.py`、`scripts/build_mts_glt_v3_sidecars.py`（同时服务保留路线的 image sidecar）。
 - cache 合同：`scripts/audit_mips_trimer_cache.py`、`scripts/validate_mts_cache.py`。
 - 已随 v2 基线删除：`scripts/run.sh`、`scripts/run_mts.sh`、`scripts/run_mips_trimer_scage.sh`、`scripts/run_train.sh`、`scripts/run_pretrain.sh`、`scripts/resolve_mips_trimer_scage.py`、`scripts/resolve_mts.py`（它们只解析 `schema=mts-glt-v2` 配置，已无有效输入）。
@@ -186,13 +182,30 @@ seed                    42
 
 正式结果、resolved input、训练日志和 checkpoint 的索引集中在 [`RESULTS.md`](RESULTS.md)。所有新产物必须使用独立目录，不覆盖保留产物。
 
-## 9. 保留实验路线：Atomic-PC W-CAMR-v2
+### 8.1 统一结果生成合同（2026-09-28 起）
 
-`Atomic-PC W-CAMR-v2` 是唯一保留的非生产实验路线。其下游结构为当前 O8、Original-MIPS MD200/KFuse 和 Center-RU Atomic-PC；完整 Trimer 参加 `kNN=24` 的四层消息传递，最终只池化 `ru_offset == 0` 的中心 RU 原子。
+当前 GLT-V2 新实验使用一个不可覆盖的 `experiment_id` 作为结果根目录：
 
-W-CAMR 预训练只更新 Atomic-PC encoder、learned mask embedding 和临时 atom head。它在固定 50K cohort 的 48,101 个合格样本上执行 1,504 optimizer updates，对中心 RU 重原子做 15% weighted masking；权重只控制 mask 抽样，loss 是普通 masked-position mean CE。下游只迁移 `atomic_point_encoder`，不加载临时 mask/head。
+```text
+results/<experiment_id>/
+├── manifest.json
+├── runtime.json
+├── units/<arm>/<task>/fold<k>/
+│   ├── run.json
+│   ├── metrics.json
+│   ├── predictions.npz
+│   └── checkpoint/
+├── aggregate.json
+└── report.md
+```
 
-入口为 `scripts/run_original_mips_atomic_pc_w_camr_v2.py`，结果位于 `results/original_mips_atomic_pc_w_camr_v2/`。Center-RU 数据构造、50K cohort 解析和历史 matched-reference 读取代码集中在 `src/training/w_camr_v2_support/`；参考产物集中在该结果目录的 `references/`。它们仅作为 W-CAMR-v2 的内部实现与 provenance 依赖保留，不是独立路线。该实验同样使用 `historical_shared5`，不是独立盲测，也不替代正式生产基线。
+`manifest.json` 在启动前写入 Git commit、配置路径及 SHA256、数据和 split identity、checkpoint identity、arm/task/fold/seed、预算和实际命令。每个 unit 独立写入 `run.json` 与 `metrics.json`；临时文件完成后使用原子 rename。`aggregate.json` 只在 manifest 声明的全部 unit 通过 identity、有限值、退出码和产物存在性检查后生成；失败 unit 保留失败原因但不进入成功聚合。
+
+对应日志根目录为 `logs/<experiment_id>/`，周期关闭后至少保留 `summary.json`、`launcher.exit` 和精简 `events.jsonl`。逐 step 原始日志、重复 retry 日志和临时 benchmark 日志按 `AGENTS.md` 的周期清理规则删除或压缩。历史结果不迁移、不重算、不改写数字；旧入口只读兼容，新实验不得直接向根级 `results/` 或 `logs/` 写临时文件。
+
+## 9. 已退役路线：Atomic-PC W-CAMR-v2
+
+该路线已于 2026-09-28 按用户授权退役。Atomic-PC 专属模型、数据 collator、训练支持、配置、结果目录、测试与入口已删除；`RESULTS.md` 仅保留历史指标和不可复现声明。共享的 `original_mips_knowledge_fusion.py`、`original_mips_md200.py` 与 `md200_sidecar.py` 继续服务 GLT-V2，因此保留。
 
 ## 10. 已退役路线：MTS-GLT-v3-Galformer-20k
 

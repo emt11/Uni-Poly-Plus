@@ -8,7 +8,6 @@ from .periodic_line_glt_v3 import (
     CompleteTrimerGLTRegressor,
 )
 from .uni_encoder import SUPPORTED_MODALITIES, UniEncoderAttention
-from .atomic_point_encoder import AtomicPointEncoder, PackedAtomicPointCloud
 from .glt_dual import DualGLTModel, build_dual_glt_model
 
 __all__ = [
@@ -21,6 +20,4 @@ __all__ = [
     "CompleteTrimerGLTRegressor",
     "SUPPORTED_MODALITIES",
     "UniEncoderAttention",
-    "AtomicPointEncoder",
-    "PackedAtomicPointCloud",
 ]

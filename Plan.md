@@ -1,47 +1,71 @@
-# MCL-PH-POSTR13-ENG-01 / r1：MCL-PH 最终工程收口
+# REPO-CLEANUP-20260928-02 / r1：Atomic-PC 退役与结果合同收口
 
-**状态：已完成。** 授权来源：用户 2026-09-28 要求制定下一步计划并执行，彻底结束 `MCL-PH.md`。规划、执行、自检与审查：Codex（同一主体自检，不称外部独立审查）。基线：`dev@ae227fd`，工作树干净；修改前已核对 remote 为 `emt11/Uni-Poly-Plus`，`git pull --ff-only origin dev` 成功（Already up to date）。上轮 `REPO-CLEANUP-20260928-01` 已归档于 `PROJECT_HISTORY.md`。
+**状态：已完成。** 授权来源：用户明确要求直接执行本轮清理，并确认 `Atomic-PC W-CAMR-v2` 可直接删除。执行者：Codex。基线：已在修改前执行 `git pull --ff-only origin dev`，基线 `dev@df2d000`，工作树此前干净。
 
 ## 目标与范围
 
-1. 补齐 MCL-PH 实际使用的 `gudhi` 依赖声明。
-2. 移除不能调用当前 `paper5_outer` 微调入口的旧 downstream smoke launcher 及其专属过时断言；历史执行事实保留在 Git 与 `MCL-PH.md`。
-3. 在今后的 MCL-PH unit metadata 中明确实际 arm、模型 fusion mode 和所传配置路径；现有 r13 正式产物保持逐字节不变，历史 `config` 字段仍按当时实际传入值解释。
-4. 将结果、工程限制和 STOP 决定写入 `MCL-PH.md`，归档本轮后关闭当前计划。
+1. 完整退役并删除 Atomic-PC W-CAMR-v2 专属代码、配置、测试和结果目录。
+2. 删除日志中 SHA256 完全重复的副本，保留每组一个证据文件。
+3. 删除不再被当前路线使用的 Atomic-PC 专属脚本和测试。
+4. 将当前保留路线收敛为 GLT-V2 revision-2；共享的 MD200、knowledge fusion 和 sidecar 依赖继续保留。
+5. 为新 GLT-V2 实验建立 manifest/unit/aggregate/runtime 结果合同。
+6. 在 AGENTS.md 写入完整周期结束后的依赖审查和清理规则。
 
-本轮仅为工程与文档收口，不改变模型、科学定义、样本、split、训练策略、评估指标或预算。`RESULTS.md` 与 `PIPELINE.md` 的现有正式结论无需改写。
+## 已执行修改
 
-## 允许与禁止
+- 删除 Atomic-PC 专属 tracked 文件：
+  - `configs/atomic_point_center_ru_v1.json`
+  - `configs/atomic_point_v1.json`
+  - `scripts/run_original_mips_atomic_pc_w_camr_v2.py`
+  - `src/dataset/original_mips_atomic_pc.py`
+  - `src/dataset/original_mips_atomic_pc_joint.py`
+  - `src/modules/atomic_point_encoder.py`
+  - `src/modules/original_mips_atomic_pc.py`
+  - `src/training/pretrain/original_mips_atomic_pc_joint.py`
+  - `src/training/w_camr_v2_support/`
+  - `tests/test_original_mips_atomic_pc_collator.py`
+- 删除物理结果目录：`results/original_mips_atomic_pc_v1/`、`results/original_mips_atomic_pc_w_camr_v2/`。
+- 删除 16 个 SHA256 完全重复的历史日志副本；每组保留一个副本。
+- 从 `src/modules/__init__.py` 移除 Atomic-PC 导出。
+- 从预训练 dispatcher 文档中移除已退役 Atomic-PC 入口描述。
+- 新增 `src/result_contract.py`，提供 manifest、unit、runtime 和 aggregate 的原子写入接口。
+- `scripts/run_mts_finetune_scheduler.py` 在新结果根创建 manifest，并在完成后写入 runtime 状态。
+- 更新 `PIPELINE.md`、`RESULTS.md`、`AGENTS.md`。
 
-- 允许修改 `requirements.txt`、`scripts/finetune_mcl_ph.py`、`MCL-PH.md`、`Plan.md`、`PROJECT_HISTORY.md`，并删除已退役的 `scripts/run_mcl_ph_finetune_smoke.sh` 与其旧契约测试 `tests/test_mcl_ph_protocol.py`。
-- 不改写 `paper5_official_r13_1`、正式 5k 部署包、官方 split、训练/预测数据或历史事故现场；不恢复已清理的旧 checkpoint。
-- 0 GPU、0 worker、0 starts、0 epochs；不启动训练、模型 smoke、P3、OOF、refit、额外 seed、新 outer-test 或缓存构建。
+## 保留边界
 
-## 最小验证与停止条件
+- `src/modules/original_mips_knowledge_fusion.py`、`src/modules/original_mips_md200.py`、`src/dataset/md200_sidecar.py` 仍被 GLT-V2 使用，不能删除。
+- MTS-GLT-v2 历史 checkpoint 作为正式历史证据保留，不再作为 Atomic-PC 运行时依赖。
+- MCL-PH 正式结果和历史事故证据未修改。
+- 未启动训练、GPU、worker、模型 smoke、缓存构建或结果重算。
 
-1. `git diff --check`，Python AST/导入与少量受影响的无模型测试。
-2. 只读核对 r13 聚合 JSON SHA、125/125 PASS、125 个正式 checkpoint/测试预测和四个 5k 部署包 SHA 未变化。
-3. 若发现元数据改动触及训练数值路径，或正式产物身份与既有记录不符，停止受影响修改，保留现场并报告。
+## 最小校验
+
+- `git diff --check`
+- 变更 Python 文件 `py_compile`
+- 搜索已删除 Atomic-PC 路径的残留引用
+- 新结果合同临时目录的 manifest/unit/runtime/aggregate 小 smoke
+- 检查当前 GLT-V2 共享 import 不再导入已删除 Atomic-PC 模块
+
+## 停止条件与验收标准
+
+- 若当前 GLT-V2 入口仍依赖被删除文件，停止删除并恢复该共享文件；本轮已确认 knowledge fusion、MD200 和 md200 sidecar 仍有 GLT-V2 引用，因此保留。
+- `aggregate.json` 不得在 unit 未全部 PASS 时生成。
+- 删除后无当前入口、配置、测试或结果文件引用已删除路径。
+- `git diff --check` 和最小校验通过后停止，不追加全仓测试。
 
 ## 执行记录
 
-- 2026-09-28 UTC：修改前 `git pull --ff-only origin dev` 成功，基线 `dev@ae227fd`，工作树干净；未发现 MCL-PH 训练进程。
-- `requirements.txt` 新增 `gudhi>=3.8,<4`；当前环境版本为 `gudhi 3.8.0`。
-- `scripts/finetune_mcl_ph.py` 为未来 unit metadata 增加 `model_variant`、`config_path`、`config_sha256`，并同步写入未来 `best.pt`；不回写 r13 产物。
-- 删除已退役的 `scripts/run_mcl_ph_finetune_smoke.sh` 与其旧契约测试 `tests/test_mcl_ph_protocol.py`。该测试初次执行暴露 7 项旧 `smoke/development` 或旧 launcher 断言，未视为新代码回归；删除后由现行 paper5 定向测试覆盖。
-- 未修改正式结果、部署包、split、数据、缓存或日志产物；未启动 GPU、worker、训练、模型 smoke、缓存构建或 outer-test。
+- 已完成 Atomic-PC 专属代码、配置、测试和两个结果根的删除。
+- 已删除 16 个 SHA256 完全重复日志副本，每组保留一个文件。
+- `git diff --check`：PASS。
+- `python -m py_compile src/result_contract.py scripts/run_mts_finetune_scheduler.py src/modules/__init__.py src/training/pretrain/engine.py`：PASS。
+- 结果合同临时 manifest/unit/runtime/aggregate smoke：PASS。
+- Atomic-PC 代码引用扫描：PASS（历史文档中的删除路径说明保留）。
+- GLT-V2 共享 import（`src.modules.glt_dual`、`src.dataset.md200_sidecar`）：PASS。
+- 未运行训练、GPU、worker、模型 smoke、缓存构建、结果重算或全仓测试。
 
-实际验证：
-
-```text
-python3 -m py_compile scripts/finetune_mcl_ph.py scripts/aggregate_mcl_ph_8x5.py scripts/run_mcl_ph_8x5_4gpu.py  PASS
-bash -n scripts/run_mcl_ph_pretrain_smoke.sh                                      PASS
-git diff --check                                                               PASS
-pytest -q tests/test_mcl_ph_official_folds.py tests/test_mcl_ph_periodic_tdl_strategy.py  7 passed, 1 warning
-```
 
 ## 审查与下一步
 
-- `MCL-PH.md` 已标记最终关闭；r13 的 `paper5_test.json` 仍为 `PASS`、125/125、0 rejected，正式 5k 包和 125 个 unit 预测/权重未被修改。
-- 旧 smoke/development 入口及对应过时测试已退役；当前 paper5 入口和定向测试保持可用。
-- 本计划审查结论：**通过，已完成，暂无后续执行**。任何未来 MCL-PH 科学实验必须新建计划并重新授权。
+最小校验通过，当前周期可归档并推送 `dev`。暂无新的科学实验计划。

@@ -133,9 +133,8 @@ def _joint_masked_atom_terms(data, node_rep, prediction_head, atom_mask):
 def run_pretrain(args=None):
     """Reject the retired v2 baseline and v3 Galformer pretraining schemas.
 
-    The two routes this dispatcher used to own were retired; the retained
-    GLT-V2 route pretrains through ``glt_distill_engine.run_stage`` and the
-    retained Atomic-PC route through its own joint entry point.
+    The retained GLT-V2 route pretrains through
+    ``glt_distill_engine.run_stage``.
     """
     args = parse_arguments() if args is None else args
     schema = str(getattr(args, "config_schema", ""))

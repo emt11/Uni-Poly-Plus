@@ -22,6 +22,7 @@ from src.training.finetune.scheduler import (  # noqa: E402
     run_subprocess_scheduler,
 )
 from src.training.finetune.config import parse_arguments as parse_finetune_arguments  # noqa: E402
+from src.result_contract import create_manifest, write_runtime  # noqa: E402
 
 
 SCIENTIFIC_FLAGS = {
@@ -289,6 +290,21 @@ def main(argv=None):
     provenance = _git_provenance()
     checkpoint_sha256 = _sha256_file(checkpoint)
 
+    manifest_path = results_root / "manifest.json"
+    if not manifest_path.exists():
+        create_manifest(results_root, {
+            "schema": "uni-poly-experiment-manifest-v1",
+            "experiment_id": results_root.name,
+            "results_root": str(results_root),
+            "logs_root": str(logs_root),
+            "units": [unit.label for unit in units],
+            "evaluation_protocol": args.evaluation_protocol,
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": checkpoint_sha256,
+            "train_script": args.train_script,
+            "provenance": provenance,
+        })
+
     fixed = list(args.train_args)
     # argparse.REMAINDER may receive the separator itself from a caller.
     if fixed and fixed[0] == "--":
@@ -384,6 +400,11 @@ def main(argv=None):
     (logs_root / "scheduler_report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    write_runtime(results_root, {
+        "schema": "uni-poly-runtime-v1",
+        "status": "COMPLETED" if not report.get("pending") else "INCOMPLETE",
+        "report": report,
+    })
     print(json.dumps(report, sort_keys=True))
 
 

@@ -1,10 +1,10 @@
 # Uni-Poly-Plus 基线结果索引
 
-本文件索引保留路线 `GLT-V2 revision-2`（含旧 N+1/N+2 蒸馏与使用独立 validation 的 C0/C1/C2 对照）和 `Atomic-PC W-CAMR-v2`，并保留已退役路线 `MTS-GLT-v2-Base-5k` 的历史结果记录。完整合同与路线范围见 [`PIPELINE.md`](PIPELINE.md)。
+本文件索引当前保留路线 `GLT-V2 revision-2`（含旧 N+1/N+2 蒸馏与使用独立 validation 的 C0/C1/C2 对照），并保留已退役路线 `Atomic-PC W-CAMR-v2` 与 `MTS-GLT-v2-Base-5k` 的历史结果记录。完整合同与路线范围见 [`PIPELINE.md`](PIPELINE.md)。
 
 ## 已退役基线：MTS-GLT-v2-Base-5k（历史记录）
 
-该路线的模型、预训练、下游代码及 `results/`、`logs/`、`pretrained_models/` 产物已于 2026-09-10 删除，下表为删除前的正式结果，不再可复现或重新评估。唯一保留的产物是 checkpoint，因为 Atomic-PC W-CAMR-v2 运行时读取它。
+该路线的模型、预训练、下游代码及 `results/`、`logs/`、`pretrained_models/` 产物已于 2026-09-10 删除，下表为删除前的正式结果，不再可复现或重新评估。checkpoint 作为历史正式证据保留；当前路线不再读取它。
 
 ```text
 name        MTS-GLT-v2-Base-5k
@@ -39,30 +39,30 @@ independent blind test     false
 ## 证据文件
 
 - 成对下游汇总：[`results/mts_glt_v2/downstream/formal/a6_h_w1_20k_probe_005k/paired_summary.json`](results/mts_glt_v2/downstream/formal/a6_h_w1_20k_probe_005k/paired_summary.json)（保留）。
-- checkpoint：[`results/mts_glt_v2/formal/a6_h_w1_20k/mts_glt_v2_probe_005k.pth`](results/mts_glt_v2/formal/a6_h_w1_20k/mts_glt_v2_probe_005k.pth)（保留，W-CAMR 依赖）。
+- checkpoint：[`results/mts_glt_v2/formal/a6_h_w1_20k/mts_glt_v2_probe_005k.pth`](results/mts_glt_v2/formal/a6_h_w1_20k/mts_glt_v2_probe_005k.pth)（保留为历史正式证据）。
 - 已删除：基线与预训练配置、DDP smoke 配置、`baseline_manifest.json`、预训练 `resolved_input.json` 与 `final_report.{json,md}`。
 
 ## 运行边界
 
-- 保留路线为 graph-only `GLT-V2 revision-2` 与 `Atomic-PC W-CAMR-v2`；已退役基线的数字只作历史对照。
+- 当前保留路线为 graph-only `GLT-V2 revision-2`；Atomic-PC 与旧 MTS 基线的数字只作历史对照。
 - validation 与 test 共用 fold，结果不能当作 independent blind test。
 - 本次仓库整理没有重新训练、重跑消融或扩大评估范围。
 - 后续默认只做必要的局部测试和 smoke；新实验须使用独立配置与输出目录，并由用户明确授权。
 
-## 保留实验路线：Atomic-PC W-CAMR-v2
+## 已退役路线：Atomic-PC W-CAMR-v2
+
+该路线已于 2026-09-28 按用户授权退役。其代码、配置、测试、日志和结果目录已删除，历史结果不再可复现或重新评估。以下数值仅保留为历史记录：
 
 ```text
 name             Atomic-PC W-CAMR-v2
-status           retained_experimental_route
-checkpoint       results/original_mips_atomic_pc_w_camr_v2/pretraining/w_camr_checkpoint.pt
+status           retired
 optimizer steps  1504
 seed             42
 protocol         historical_shared5 (非独立盲测)
-loaded downstream component  atomic_point_encoder only
 macro8 R²        0.8432478932
 ```
 
-证据为 `results/original_mips_atomic_pc_w_camr_v2/summary.json` 和 `results/original_mips_atomic_pc_w_camr_v2/downstream/aggregate_summary.json`。该路线是保留的实验路线，不是生产基线；`MTS-GLT-v2-Base-5k` 已于 2026-09-10 退役，只保留历史数字。
+原始结果目录 `results/original_mips_atomic_pc_w_camr_v2/` 已删除。
 
 ## N+1 / N+2 两阶段蒸馏正式结果
 
