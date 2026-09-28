@@ -532,3 +532,17 @@ XC 在三条路线中均为最低（0.279/0.226/0.309），与既有记录一致
 * 公共随机流的末态摘要因各臂早停长度不同而不同，**不作跨臂相等要求**；`best.pt` 只是 validation 最佳权重，**不是完整训练 resume 状态**。
 
 **产物与提交**：`results/glt_3d_gain_20260921/d2_development/{schedule.json,grid_runtime.json,aggregate.json,report.md,<arm>/<task>/fold<k>/}`；日志 `logs/glt_3d_gain_20260921/d2_development*/`；tmux window `glt3d_r6_dev`。提交链 `95e3185`（r1 D0/D1）→ `563668f`（r2）→ `eae7b81`（r3）→ `4d9f302`（r4）→ `751a35b`（r5）→ `6aba976`／`1981466`（r6 与记录补记），全部推送至 `origin/dev`。**本周期以该限定负结果结束，不追加 sweep、D3、PH 或额外 seed。**
+
+## MCL-PH r13 官方五折五臂 outer-test（2026-09-25 完成；2026-09-28 复核）
+
+`paper5_outer` 使用 Periodic-TDL 发布的 Eea/Egb/Ei/EPS/Nc 行身份、五个 outer-test 折与官方代码方式重建的 inner-validation。五臂各 25 个 unit，均训练 10 个冻结 head 阶段与 60 个联合阶段 epochs；按最低 validation RMSE 选择 checkpoint 后评价 outer-test。实际 **125/125 unit、8,750 epochs**；launcher 退出 0，聚合与本轮只读复算均 `PASS`、0 rejected。来源：`results/mcl_ph_20260921/p2/paper5_official_r13_1/paper5_test.json`，日志：`logs/mcl_ph_20260921/paper5_official_r13_1/`。
+
+| 臂 | Eea | Egb | Ei | EPS | Nc | macro5 | 相对 GLT_REF |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| GLT_REF | 0.920842 | 0.930224 | 0.796972 | 0.734678 | 0.800615 | 0.836666 | 0 |
+| O8_ONLY | 0.916881 | 0.918312 | 0.795711 | 0.730104 | 0.817827 | 0.835767 | −0.000899 |
+| M_CAT | 0.922142 | 0.916171 | 0.780291 | 0.725974 | 0.802372 | 0.829390 | −0.007276 |
+| M_GATE | 0.919346 | 0.926856 | 0.790685 | 0.719682 | 0.790711 | 0.829456 | −0.007210 |
+| M_XATTN | 0.924071 | 0.928568 | 0.791783 | 0.733418 | 0.805572 | 0.836682 | +0.000016 |
+
+数值为逐任务五个 outer-test R² 的算术均值，macro5 为五个任务均值的等权平均；逐折 R² 和总体标准差见原聚合 JSON。XATTN 的宏差约 1.6×10⁻⁵，25 个配对折中 12 个高于 GLT_REF，**未建立可靠预测增益**；CAT/GATE 当前配方低于 GLT_REF 和 O8_ONLY。无新增正式训练计划。论文同折只支持描述性横向对照：项目架构与论文不同，测试折已参与项目路线开发，非独立盲测；不能将路线差异解释为 PH 单因素作用或统计显著性。

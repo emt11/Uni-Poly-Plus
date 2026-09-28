@@ -1,5 +1,13 @@
 # Uni-Poly 项目变更周期归档
 
+## 2026-09-28 — MCL-PH-20260921-01 / r13-PAPER5：官方五折五臂正式评估收口
+
+- **授权、角色与目标**：用户要求改用 Periodic-TDL 发布的官方五折 `paper5_outer`，删除旧活动微调路径并全新重跑 GLT_REF、O8_ONLY、M_CAT、M_GATE、M_XATTN 五臂。Codex 实施、运行与本轮只读复核；同一执行者的复核不称外部独立审查。基线为 `322881b`，入口收敛提交 `4dfb05c`、启动记录 `89c1b2e`，均在 `dev`。旧 r11/r12 失败与取消轨迹未复用、未覆盖。
+- **最终计划与范围**：仅 Eea/Egb/Ei/EPS/Nc 五个与官方 CSV 行身份、外层折、内部划分可逐项匹配的任务；每臂五折，共 125 个新 unit，10 个 head-only + 60 个 joint epochs/unit，上限 8,750 epochs，最低 inner-validation RMSE 选 checkpoint，再评价 outer-test 一次。四 GPU 并行，每个 unit 使用对应已验收 5k 部署包；O8_ONLY 与 GLT_REF 共用 GLT 包。旧串行 launcher 删除，活动 MCL 微调与聚合入口只接受 `paper5_outer`；历史产物和只读验收兼容保留。EAT、Egc、Xc、Eib、Tg 不计入论文同折比较。
+- **实际运行与验证**：`Uni-Poly:96:mcl_ph_paper5_4gpu` 中执行 `logs/mcl_ph_20260921/paper5_official_r13_1_launch.sh`；unit 日志和退出码在同名日志目录，产物在 `results/mcl_ph_20260921/p2/paper5_official_r13_1/`。launcher `.exit=0`，五臂各 25 个 `.exit=0`，`paper5_test.json` 为 `PASS`、125/125 accepted、0 rejected、`outer_test=RUN`。本轮只读重新调用正式 `aggregate(...)` 再得 125/125 PASS，身份唯一、总执行 8,750 epochs、best_epoch 3–69。无活动 MCL 微调进程。局部代码测试 10 passed（入口收敛时）；本轮只读复核未启动新的训练、模型测试或恢复，也未改动模型产物。结果属于已完成的正式项目评估；复核依赖既有 `check_unit` 实现，未逐一重新 strict-load 125 个 best.pt。
+- **五任务宏平均 outer-test R²**：GLT_REF 0.8366660、O8_ONLY 0.8357672、M_CAT 0.8293899、M_GATE 0.8294561、M_XATTN 0.8366823。相对 GLT_REF：O8_ONLY −0.0008988、CAT −0.0072761、GATE −0.0072099、XATTN +0.0000162。XATTN 在 25 个同任务同折配对中有 12 个高于 GLT_REF；该微小宏差不构成稳定增益或显著性结论。CAT/GATE 在当前配方下未优于两个匹配对照；XATTN 与 GLT_REF 实质接近。
+- **解释边界与决定**：这是论文发布样本和折上的项目五臂对照，模型、几何、预训练、架构及其他细节不同于 Periodic-TDL，不能称原论文完整复现；这些折已用于项目开发，不是独立盲测。三条 MCL 结果不能归因于 PH 单一机制；P3/OOF/refit、额外 seed、独立新数据和重训均未执行。当前证据不支持以预测增益推进 MCL-PH 候选，**STOP 追加正式训练**。下一步仅保留结果归档与发表前来源核对；任何新实验需要新假设、匹配控制、独立评估和用户授权。本周期结束，暂无后续执行。
+
 ## 2026-09-25 — MCL-PH-20260921-01 / r12-PTDL-OUTER5：用户取消并替换评估折
 
 用户原授权五臂 × 八任务 × 五折、按验证 RMSE 选 checkpoint 后评价项目 `outer5_inner20` outer-test；Codex 在 `dev@878ac4f` 实现 `full8x5_outer`、逐 unit 测试预测与五折聚合，并提交 `d38fad8`，启动记录提交 `6100c08`。初次四 GPU 运行在 `Uni-Poly:96:mcl_ph_ptdl_outer_4gpu`，命令 `logs/mcl_ph_20260921/full8x5_ptdl_outer_r12_1_launch.sh`，结果及日志根均为 `full8x5_ptdl_outer_r12_1`。首四个 GLT_REF/EAT/fold0–3 分别完成 70 epochs 后，因同进程 train source 的 LMDB 未关闭而无法打开 test source；四个 unit 和 launcher 均退出 1，未继续调度。失败目录没有 `best.pt` 或测试预测；**消耗 4 starts / 280 epochs，0 outer-test 结果**。随后 Codex 修复为训练源关闭后再开 test 源，并以真实 cohort 顺序打开、定向 7 项测试和语法检查验证；`25b081d` 推送 `dev`。未重新启动，追加 4 starts / 280 epochs 的预算请求未获授权。
