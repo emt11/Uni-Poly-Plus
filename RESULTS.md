@@ -2,6 +2,10 @@
 
 本文件索引当前保留路线 `GLT-V2 revision-2`（含旧 N+1/N+2 蒸馏与使用独立 validation 的 C0/C1/C2 对照），并保留已退役路线 `Atomic-PC W-CAMR-v2` 与 `MTS-GLT-v2-Base-5k` 的历史结果记录。完整合同与路线范围见 [`PIPELINE.md`](PIPELINE.md)。
 
+## 2026-09-28 结果归档精简
+
+本轮只保留正式汇总、报告、指标、预测、最终部署包和仍被入口读取的身份工件。已删除退役路线的逐 fold checkpoint、预训练中间快照、smoke payload、重复/逐步日志和失败重试 payload；数字未重算、未改写。`results/` 从约 138 GiB 降至约 35 GiB，`logs/` 从约 127 MiB 降至约 38 MiB。保留下来的文件才是当前可读取的结果证据；被删除的原始 payload 不再支持恢复运行。
+
 ## 已退役基线：MTS-GLT-v2-Base-5k（历史记录）
 
 该路线的模型、预训练、下游代码及 `results/`、`logs/`、`pretrained_models/` 产物已于 2026-09-10 删除，下表为删除前的正式结果，不再可复现或重新评估。checkpoint 作为历史正式证据保留；当前路线不再读取它。
@@ -387,7 +391,7 @@ kfuse 对应为 0.9777、0.9001、0.8927、0.8817、0.7504、0.7210、0.8073、0
 
 从 `resume_02000.pt` 恢复、四卡／microbatch 84／global batch 1008／BF16，`--diagnostics
 --stop-after-step 2800`，输出 `results/glt_v2_diag_b3_concat_replay_20260916`，日志
-`logs/glt_v2_diag_b3_concat_replay_20260916/replay.log`。回放与正式运行在 800 个共同 step 上
+`results/glt_v2_diag_b3_concat_replay_20260916/diagnostics_steps.jsonl`（逐步日志已清理）。回放与正式运行在 800 个共同 step 上
 chem/geo/FP 三项 `max|replay-ref| = 0`，`66.9968@2676` 的峰值精确重现。
 
 窗口按 step 定义、同 step 取首次出现的全局值（各 rank 打印相同全局量）：基线 `2401–2600` 中位

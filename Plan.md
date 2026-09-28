@@ -1,3 +1,41 @@
+# REPO-CLEANUP-20260928-03 / r2：退役产物与内部探针精简
+
+**状态：已完成。** 授权来源：用户明确要求继续删除无意义的日志、result、scripts 与 tests，并要求直接执行；执行者：Codex。基线：上一轮已推送 `e7ace5c`；本轮未启动训练、GPU、worker、缓存构建、结果重算或全仓测试。
+
+## 实施计划
+
+1. 删除不再被当前 GLT-V2/MCL-PH 入口、正式报告或结果合同读取的脚本、内部探针和历史测试。
+2. 删除退役路线的逐步日志、smoke/重试 payload、中间 checkpoint 和历史 rerun checkpoint；保留正式摘要、报告、指标、预测、最终部署包，以及 MCL-PH 当前入口读取的 `common_init_v1.pt`、`pretrain_split_v1.json`。
+3. 保持正式下游 `best.pt`，因为报告脚本会重新加载并核验它们；不改变科学数字，不迁移、不重算结果。
+4. 更新 `PIPELINE.md`、`RESULTS.md` 和 `PROJECT_HISTORY.md`，记录新的产物边界。
+
+**禁止操作**：训练、GPU/worker 启动、缓存构建、结果重算、全仓测试、`git clean`、`git reset --hard`、force push。
+
+**验收标准**：当前入口不再引用删除的 scripts/tests；正式结果所需摘要、预测、部署包和身份工件仍存在；`git diff --check`、变更 Python `py_compile`、共享 import 与结果合同临时 smoke 通过。
+
+## 执行记录
+
+- 删除已退役 Trimer/GLT-Galph/GLT-O8-DND/旧 GLT-Dual 诊断入口，以及内部 MCL-PH r3–r5 探针和对应历史测试。
+- 结果清理删除 834 个文件、约 94.79 GiB：包括 GLT-PRED 非必要训练 payload、蒸馏 smoke 和中间快照、历史 rerun checkpoint、MCL-PH 非终态部署快照；保留最终部署、正式 best checkpoint、汇总与身份文件。
+- 日志清理删除 430 个文件、约 88.1 MiB：包括 GLT-PRED 逐步日志、已删除 smoke 日志、无引用的顶层 retry/diagnostic 日志。
+- 目录概况：`results/` 约 35 GiB，`logs/` 约 38 MiB。
+
+## 最小验证与审查
+
+- `git diff --check`：PASS。
+- 变更 Python `py_compile`：PASS。
+- 当前共享入口 import（`src.modules.glt_dual`、`src.dataset.md200_sidecar`）：PASS。
+- 结果合同临时 manifest/unit/runtime/aggregate smoke：PASS。
+- 已删除入口引用扫描：PASS。
+- 未执行：训练、模型、GPU、worker、缓存构建、结果重算、全仓测试。
+- 当前结论：清理执行与最小校验完成，待 Git 提交/推送；不构成新的科学实验结论。
+
+## 下一步
+
+核对工作树与远端分支后提交并推送 `origin/dev`。本轮清理关闭后暂无科学实验计划。
+
+---
+
 # REPO-CLEANUP-20260928-02 / r1：Atomic-PC 退役与结果合同收口
 
 **状态：已完成。** 授权来源：用户明确要求直接执行本轮清理，并确认 `Atomic-PC W-CAMR-v2` 可直接删除。执行者：Codex。基线：已在修改前执行 `git pull --ff-only origin dev`，基线 `dev@df2d000`，工作树此前干净。

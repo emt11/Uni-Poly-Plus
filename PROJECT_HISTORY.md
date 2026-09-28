@@ -1,5 +1,13 @@
 # Uni-Poly 项目变更周期归档
 
+## 2026-09-28 — REPO-CLEANUP-20260928-03 / r2：退役产物与内部探针精简
+
+- **授权与目标**：用户要求继续清理无意义的 `logs/`、`results/`、`scripts/` 与 `tests/`；不启动训练、GPU、worker、缓存构建、结果重算或全仓测试。执行者为 Codex，基线为上一轮已推送的 `e7ace5c`。
+- **实际修改**：删除已退役 Trimer/GLT-Galph/GLT-O8-DND/旧 GLT-Dual 诊断入口、内部 MCL-PH r3–r5 探针及对应历史测试；删除 834 个结果 payload（约 94.79 GiB），删除 430 个无引用或已退役日志文件（约 88.1 MiB）。保留当前入口依赖的 MCL-PH common-init/split、正式下游 best checkpoint、正式汇总/报告/预测和最终部署包。
+- **结果边界**：`results/` 约 138 GiB → 35 GiB，`logs/` 约 127 MiB → 38 MiB。历史汇总数字未重算；删除的中间 checkpoint、逐步日志和 smoke payload 不再支持恢复旧运行。保留的正式结果仍按原协议解释，不能把清理视为新的实验。
+- **最小验证**：静态扫描确认当前 `src/`、`scripts/`、`tests/`、`configs/` 不再引用已删除入口；后续执行 `git diff --check`、变更 Python `py_compile`、共享入口 import 和结果合同临时 smoke。未运行模型、训练、GPU、缓存或全仓测试。
+- **审查结论与下一步**：本轮清理可提交；下一步仅核对 diff、完成最小静态校验并推送。暂无科学实验计划。
+
 ## 2026-09-28 — MCL-PH-20260921-01 / r13-PAPER5：官方五折五臂正式评估收口
 
 - **授权、角色与目标**：用户要求改用 Periodic-TDL 发布的官方五折 `paper5_outer`，删除旧活动微调路径并全新重跑 GLT_REF、O8_ONLY、M_CAT、M_GATE、M_XATTN 五臂。Codex 实施、运行与本轮只读复核；同一执行者的复核不称外部独立审查。基线为 `322881b`，入口收敛提交 `4dfb05c`、启动记录 `89c1b2e`，均在 `dev`。旧 r11/r12 失败与取消轨迹未复用、未覆盖。
@@ -231,7 +239,7 @@
 * 基线与同步：周期起点 dev@ffce46d（r2 前）；本会话各阶段起点均核对 `HEAD == origin/dev` 并安全 pull。最终 `dev@018f8a0` 已推送并 fetch 核对，工作树干净（仅一个非本轮未跟踪 `.zcodeignore`，保留）。
 * 执行链与提交：
   - S0–S2（前会话，执行者自检完成）：来源/split/XC 审计、FULL/HEAD/LoRA/Ridge 适应接口、`third_task=fp|none|fgr|align` 四分支与 DDP 验证；记录见 Plan.md §15 与 `results/glt_pred_20260918/s0|s1|s2/`。
-  - S3a：三种神经适应开发比较后锁定 FULL 为统一下游策略（`results/glt_pred_20260918/s3a/`、`logs/glt_pred_20260918/s3a/`），development 协议（XC/EPS/EAT × fold0/1，30 epochs，outer_test=NOT_RUN）自此固定。
+  - S3a：三种神经适应开发比较后锁定 FULL 为统一下游策略（`results/glt_pred_20260918/s3a/`、GLT-PRED S3a 逐步日志（已于 2026-09-28 清理）），development 协议（XC/EPS/EAT × fold0/1，30 epochs，outer_test=NOT_RUN）自此固定。
   - S3b-Prep（`d105ee2`）：P_train 911,391 经 `IndexedFrozenDualSource` 绑定 runner 并强制 split 身份；FGR 全 P_train FP64 统计 μ=1.3571292437646856/σ=0.1360748073854848（64,973,694 候选）；ALIGN 252 池全 P_train 诊断 PASS（3,617 microsteps，no_negative_fraction=0，identity 双射）；四 matched config 冻结；no-update smoke PASS（0 updates）。
   - 4GPU 协议（`ebed2c6`）：CPU 实测 112 逻辑=56 物理×2 SMT，T_FGR worker sweep（4/8/12 per rank → 199.8/369.7/524.5 samples/s）定 prep_workers=12/rank；四 config `expected_world_size: 3→4`；ALIGN 336 池（4×84）全 P_train 诊断重跑 PASS（2,713 microsteps，三门槛全 0/双射成立）；validator/tests 更新；no-update smoke 复跑 PASS。此前一次 3GPU↔4GPU 速度对照（用户中止）仅留 benchmark 产物，3GPU 数据不作依据。
   - S3b-END-TO-END（`187a0e7`）：B_FP/B_NONE/T_FGR/T_ALIGN 四条正式 5k 串行（world=4/micro84/accum3/pw12/seed42），全部 runtime PASS + deploy_05000 strict-load；24/24 development units；聚合脚本按固定 gate 输出 `SELECTED_PARENT=B_NONE`（B_NONE gate PASS：XC mean Δ=+0.077；T_FGR/T_ALIGN 对 B_FP 与 B_NONE 全 FAIL → FGR_INCREMENT/ALIGN_INCREMENT=NOT_ESTABLISHED）。
@@ -273,7 +281,7 @@
 * 方案实质（r1）：以单个 RU 的 M 个 persistent canonical 原子状态承载 3D 表示，替换"全 Trimer 物理键更新后读中心键"的旧 GLT 分支；中心 query 访问全部真实 image（R=M(3M−1)，删 exact self、保留左右独立关系、不平均距离），固定完整关系集合以避免 geometry-OFF 的近邻 membership 泄漏；512 维/6 层/8 头，新独立 target-query/source-key 模块与 relation-conditioned bias/value；O8、Concat 与 chem/geo/FP 目标保持。对照：R_GLT、R_2D、G_OFF、S_SHARED；条件组 E_STATIC（侧 source 固定为 h0）与 P_PHYSICAL（真实 3M 动态状态）。开放 Trimer 上的状态共享为近似，不宣称严格周期性，不生成/优化构象。
 * 方案实质（r2）：保留 r1 全部组，新增 `L_MULTI2`（枚举冻结 Trimer 内全部物理有向原子对，每个 canonical 目标的三个物理锚点内独立 softmax，跨度 0/1/2 关系数分别为 3M(M−1)、4M²、2M²）及两个匹配控制 `L_NEAR_GEO`（只关闭跨度 2 距离）与 `L_OFF`（关闭全部距离）；新增 M0/M1 为独立待授权分支，不自动并入 P0–P1。
 * 拟议预算（均未使用）：P0 最多 1024 条数据审计；P1 六路径各 2 步 = 12 updates + 恢复验证 8 updates，另 12 个 smoke epochs；P2–P4 最多 12 条 5k = 60000 研究 updates、72 开发单元/2160 epochs，逐段授权；P5 另行授权（最多 3 组 × 8 任务 × 5 折 = 120 单元/12000 epochs，不新增预训练）。r2 的 M0/M1 另计（6 updates/6 epochs 与 15000 updates/540 epochs）。
-* 实际执行与回滚（执行者记录，供审查）：用户曾明确授权 `GLT-CANON3D-20260920-01 / r1` 的 P0–P1；执行者实现了拟新增文件 `src/dataset/canonical_geometry.py`、`src/modules/canonical_geometry.py`、`tests/test_canonical_geometry.py`、`scripts/audit_canon3d_p0.py`、`configs/mts/canon3d_*.json`，并运行 P0 只读审计写出 `results/glt_canon3d_20260920/p0/p0_audit.json`。用户随后指示停止该任务并要求回滚这些代码改动；执行者已删除上述 5 类新文件（**当前工作树中确认不存在**），仅保留未跟踪的只读产物 `results/glt_canon3d_20260920/p0/p0_audit.json`。该产物不参与后续任何判断，也未进入本日 GALPH 周期。
+* 实际执行与回滚（执行者记录，供审查）：用户曾明确授权 `GLT-CANON3D-20260920-01 / r1` 的 P0–P1；执行者实现了拟新增文件 `src/dataset/canonical_geometry.py`、`src/modules/canonical_geometry.py`、`tests/test_canonical_geometry.py`、`scripts/audit_canon3d_p0.py`、`configs/mts/canon3d_*.json`，并运行 P0 只读审计写出 `glt_canon3d` P0 摘要（逐步产物已清理）。用户随后指示停止该任务并要求回滚这些代码改动；执行者已删除上述 5 类新文件（**当前工作树中确认不存在**），仅保留未跟踪的只读产物 `glt_canon3d` P0 摘要（逐步产物已清理）。该产物不参与后续任何判断，也未进入本日 GALPH 周期。
 * 未完成事项（逐项列出，全部未获验收）：P0 审计无独立审查；P1 的身份/关系数/不变性/G_OFF 回退/部署 strict-load 测试随代码删除而消失；P2 主比较（R_GLT/R_2D/G/S 各 5k）与 24 个开发单元从未运行；P3 条件归因（E_STATIC/P_PHYSICAL）、P4 多 seed 确认、P5 固定协议复评从未运行；r2 的 `L_MULTI2`/`L_NEAR_GEO`/`L_OFF` 与 M0/M1 从未实现或运行。以上内容不因本条归档而关闭或通过；若要重启，必须按当时的合同重新授权并重新建立验证，不得引用本条作为已完成证据。
 * 交接边界：CANON3D 的旧 Python 脚本若在别处残留，不构成本项目活跃计划；旧周期中提到的 S5 launcher/aggregator 源码缺口与本归档无关，仍未关闭，也不由本条修复。
 

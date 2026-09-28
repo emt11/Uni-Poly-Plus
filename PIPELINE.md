@@ -2,6 +2,8 @@
 
 本文描述当前保留路线：`GLT-V2 revision-2`（2D O8 学生及其 N+1/N+2 蒸馏与 C0/C1/C2 对照）。`Atomic-PC W-CAMR-v2`、`MTS-GLT-v2-Base-5k` 与 `MTS-GLT-v3-Galformer-20k` 已退役；历史结果只在 [`RESULTS.md`](RESULTS.md) 和项目归档中保留。
 
+**2026-09-28 产物边界**：结果目录只保留正式汇总、报告、指标、预测、最终部署包和入口仍读取的身份工件；退役路线的逐步日志、smoke/重试 payload 与中间 checkpoint 已清理。原始数字未重算，清理后的目录不再支持从中间状态恢复旧运行。
+
 **路线范围（2026-09-28 清理后）**
 
 保留：
@@ -1125,7 +1127,7 @@ finite。几何 flag 只在 collated Data 内存副本修改，active cache 未�
 本补记只覆盖用户授权的 S0–S2；S3 适应开发、S4 条件架构和 S5 正式确认均未执行。
 
 * S0 只读审计产物为 `results/glt_pred_20260918/s0/s0_audit_r2.json`，日志为
-  `logs/glt_pred_20260918/s0/audit_r2.log`。PI1M 959,588 条记录对应 959,588 个规范化身份，
+  GLT-PRED S0 逐步日志（已于 2026-09-28 清理）。PI1M 959,588 条记录对应 959,588 个规范化身份，
   无重复；下游 6,265 行对应 3,655 个身份，PI1M/下游身份重叠 229。seed=42 的 identity split
   为 train 911,391、validation 47,968；1,024 条 P_train 抽查的 FGR pair coverage 为
   0.9990234375，SPD3 为 0（当前 frozen lga 最大 hop=2），因此没有以 SPD3 缺失冒充 FGR 阻断。
@@ -1136,19 +1138,19 @@ finite。几何 flag 只在 collated Data 内存副本修改，active cache 未�
   和 validation，开发路径禁止 outer-test。局部测试 `tests/test_glt_pred_adaptation.py` 为 2 passed；
   与旧预训练/诊断集合合并为 25 passed、1 warning。`xc/fold0` 的 full/head/lora/ridge smoke 及
   development ridge 均写入 `results/glt_pred_20260918/s1/`，所有成功记录 outer-test 为 `NOT_RUN`；
-  首次 LoRA 设备放置错误保留在 `logs/glt_pred_20260918/s1/xc0_lora.log`，修复后的 retry 才作为通过证据。
+  首次 LoRA 设备放置错误保留在 GLT-PRED S1 逐步日志（已于 2026-09-28 清理），修复后的 retry 才作为通过证据。
 * S2 将第三任务显式设为 `fp|none|fgr|align`。NONE/FGR/ALIGN 不打开 7-RU target cache；FGR
   只从 canonical shortest-path SPD2/3 选择中心 pair（每层最多16、总数最多32），clean distance
   只作归一化监督，decoder 只读 noisy encoder state 和 fusion；ALIGN 使用 128 维独立投影、
   多正例身份池、无负例安全零及可微 distributed all-gather。新增局部测试为 4 passed；合并 S0–S2
   相关集合为 25 passed、1 warning，`py_compile` 和 `--help` 均通过。
 * S2 真实单进程 GPU smoke 使用 4 条 PI1M 记录，结果为
-  `results/glt_pred_20260918/s2/real_smoke.json`，日志 `logs/glt_pred_20260918/s2/real_smoke.log`；
+  `results/glt_pred_20260918/s2/real_smoke.json`，日志 GLT-PRED S2 逐步日志（已于 2026-09-28 清理）；
   FP/NONE/FGR/ALIGN 均 finite loss/backward，`outer_test_accessed=false`。runner 1-update smoke
-  使用临时非生产配置（已删除），FP/NONE/ALIGN 的结果在 `logs/glt_pred_20260918/s2/runner/`，
+  使用临时非生产配置（已删除），FP/NONE/ALIGN 的结果在 GLT-PRED S2 runner 逐步日志（已于 2026-09-28 清理），
   FGR 首次 CPU/GPU 设备检查错误保留于 `fgr.log`，修复后 `fgr_retry.log` 退出码为0；没有写 deploy。
 * S2 3-rank NCCL 边界 smoke 使用 GPU 0/1/2、0 optimizer update，报告
-  `results/glt_pred_20260918/s2/ddp_s2_r3.json`，最终日志 `logs/glt_pred_20260918/s2/ddp_s2_r3.log`。
+  `results/glt_pred_20260918/s2/ddp_s2_r3.json`，最终日志 GLT-PRED S2 DDP 逐步日志（已于 2026-09-28 清理）。
   FGR partial/all-zero、ALIGN 跨 rank partial-repeat、all-zero、全同 identity 五个 case 均 finite
   loss/backward；ALIGN partial global valid anchors=2，all-zero/全同 identity 为0。早期 ALIGN collective
   顺序错误的失败日志保留在 `ddp_s2.log`、`ddp_s2_r2.log` 和 `ddp_s2_dbg.log`，修复后不再重现。
