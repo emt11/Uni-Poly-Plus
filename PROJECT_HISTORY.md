@@ -379,3 +379,11 @@
 - **协议与执行**：`outer5_inner20` 固定 manifest；每 unit 最多 30 epochs、单阶段 full adaptation、batch 32、backbone/head 学习率 1e-5/1e-4、warmup 5、patience 10、按最高验证 R² 选 checkpoint。首轮第 91 个 unit 因无效几何回退缺陷失败；修复后续跑，后按用户指令停止串行 unit、改四卡各跑互不重叠的 unit。历史失败和中断现场均保留，未从中断模型状态恢复。
 - **最终证据**：`logs/mcl_ph_20260921/full8x5_r10r3_3_launcher.exit` 为真实 `0`；`results/mcl_ph_20260921/p2/full8x5_r10r3_3/full8x5_validation.json` 为 `PASS`、200/200 accepted、0 rejected、`outer_test=NOT_RUN`。本轮再次只读运行 `aggregate(...)`，同样返回 200/200 PASS，策略为 legacy；无活动的相关训练进程。运行入口与四卡分配见 `scripts/run_mcl_ph_8x5_4gpu.py`、命令见 `logs/mcl_ph_20260921/full8x5_r10r3_3_launch.sh`。三个轨迹的实际产物与日志保留在同名 `_1/_2/_3` 目录；相关提交包括 `3147f2a`、`3fbcb85`、`db8c06d`、`f445a8c`、`cc487dc`。
 - **结论与界限**：全量旧协议内部验证运行已结束且验收通过；这不是 outer-test 五折成绩，也不能与 Periodic-TDL 论文的测试 R² 直接等同。新训练协议改变冻结阶段、学习率、调度、批量、目标处理及选模指标，旧权重和预测无法后处理成新协议结果。新协议全量重跑属于新增正式预算，须独立授权；原产物不覆盖。
+
+## 2026-09-28 — REPO-CLEANUP-20260928-01：MCL-PH 旧产物与日志最小清理
+
+- **授权与边界**：用户明确要求制定并执行清理，删除当前无用文件并精简日志。Codex 在 cb9e150 后先安全 pull，再限定清理 MCL-PH 已被 r13 替换的旧下游 checkpoint/prediction、p2r2 临时 checkpoint 和大体积原始日志；源码、配置、数据、正式 paper5、正式 5k 部署包、事故说明和结果文档均保留。
+- **实际变化**：删除五个旧 full8x5 结果根中的 best.pt/*.npz，删除 p2r2_perf_bench{,_rev} 与 p2r2_smoke 中的 *.pt，共 676 个文件、37,434,629,606 bytes。保留旧目录中的 JSON、README、step 记录和轻量 metadata，未删除历史代码。
+- **日志处理**：将 logs/mcl_ph_20260921/ 中 228 个大于 100 KiB 的原始日志原地改写为紧凑摘要，保留原路径、退出码、launcher、JSON metadata 和正式结果目录；日志根从约 530 MiB 降至约 17 MiB。摘要明确标记原始逐 step 输出已清理。
+- **验证**：正式 paper5_test.json SHA 保持 f9a5aba2a734eff6430a58c8db6ced215259b0e29fa2512ee1a7d40ef25c1894；状态仍为 PASS、125/125 accepted、0 rejected；125 个 paper5 best.pt 和 test_predictions.npz 保留；四个正式 deploy_05000.pt SHA 未变。只执行路径/JSON/SHA/git diff --check 核对，未运行测试、模型、训练、GPU、worker 或缓存构建。
+- **审查结论与限制**：清理通过，限定为存储和日志整理，不改变科学结果。历史 _mcl_ph_* 脚本仍可能引用已清理的旧产物；它们不属于当前 paper5_outer 活动入口，未恢复或重跑。若要复现旧周期，需要另行恢复产物或授权新计划。后续暂无 GPU 或模型执行。

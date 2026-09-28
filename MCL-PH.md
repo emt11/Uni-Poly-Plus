@@ -29,7 +29,7 @@
 ### r13 稳定证据索引
 
 - 聚合结果：[results/mcl_ph_20260921/p2/paper5_official_r13_1/paper5_test.json](results/mcl_ph_20260921/p2/paper5_official_r13_1/paper5_test.json)，记录 `status=PASS`、`units_expected=125`、`units_accepted=125`、`units_rejected=0`、`outer_test=RUN` 及五臂宏平均。
-- launcher 日志与退出码：[logs/mcl_ph_20260921/paper5_official_r13_1_launcher.log](logs/mcl_ph_20260921/paper5_official_r13_1_launcher.log) 与 [logs/mcl_ph_20260921/paper5_official_r13_1_launcher.exit](logs/mcl_ph_20260921/paper5_official_r13_1_launcher.exit)；后者内容为 `0`。同名日志目录保存 125 个 unit 日志和退出码文件。
+- launcher 日志与退出码：[logs/mcl_ph_20260921/paper5_official_r13_1_launcher.log](logs/mcl_ph_20260921/paper5_official_r13_1_launcher.log) 与 [logs/mcl_ph_20260921/paper5_official_r13_1_launcher.exit](logs/mcl_ph_20260921/paper5_official_r13_1_launcher.exit)；后者内容为 `0`。同名日志目录保留 125 个 unit 的路径稳定摘要和退出码文件；原始逐 step 输出已在 `REPO-CLEANUP-20260928-01` 中精简。
 - 125 个 unit 产物根：[results/mcl_ph_20260921/p2/paper5_official_r13_1/](results/mcl_ph_20260921/p2/paper5_official_r13_1/)，包含五臂 × 五任务 × 五折的 125 个 unit 目录；每个 unit 的 `run.json`、`runtime.json`、`metrics.json`、`best.pt`、`validation_predictions.npz`、`test_predictions.npz` 均存在。
 - 对照与归档：[Plan.md](Plan.md)、[RESULTS.md](RESULTS.md) 和 [PROJECT_HISTORY.md](PROJECT_HISTORY.md)。
 

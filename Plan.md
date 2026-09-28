@@ -1,15 +1,44 @@
-# MCL-PH-20260921-01 / r13-PAPER5：官方五折五臂评估收口
+# REPO-CLEANUP-20260928-01：MCL-PH 产物与日志最小清理
 
-**状态：已完成。** 用户授权 `paper5_outer` 五臂 × 五个可比任务 × 五折全新运行；Codex 实施、运行与本轮只读复核。基线 `322881b`，代码提交 `4dfb05c`，启动记录 `89c1b2e`；本轮归档与结果文档提交见 Git 历史。原 r11/r12 失败产物保留，未参与本次 125-unit 结果。
+**状态：执行中。** 授权来源：用户 2026-09-28 明确要求制定并执行清理计划，删除当前无用文件并精简日志。执行者：Codex。基线：`cb9e150`，修改前工作树干净，已执行 `git pull --ff-only origin dev`（Already up to date）。
 
-## 最终实施与证据
+## 目标与边界
 
-- 官方来源 commit `f3ba6dff6f0d065accdd235dfba160324714f30b`；本项目仅 Eea/Egb/Ei/EPS/Nc 五任务的样本、标签、官方 outer fold 与内部划分可核实匹配。每臂五折；10 个 head-only + 60 个 joint epochs，最低 validation RMSE 选 checkpoint，随后一次性评价 outer-test。四 GPU、125 units / 最多 8,750 epochs。GLT_REF/O8_ONLY 共用 GLT 5k 包，CAT/GATE/XATTN 各用本臂 5k 包。
-- 活动 `scripts/finetune_mcl_ph.py`、`scripts/run_mcl_ph_8x5_4gpu.py` 与 `scripts/aggregate_mcl_ph_8x5.py` 仅支持 `paper5_outer`；旧串行 launcher 已删除。局部测试 10 passed；正式运行命令 `logs/mcl_ph_20260921/paper5_official_r13_1_launch.sh`，日志与退出码在同名日志根，产物 `results/mcl_ph_20260921/p2/paper5_official_r13_1/`。
-- launcher 真实退出码 0；五臂各 25 个 unit 退出 0；`paper5_test.json` 为 `PASS`、125/125 accepted、0 rejected、`outer_test=RUN`。2026-09-28 只读复算聚合也为 125/125 PASS、身份唯一、8,750 executed epochs、best_epoch 3–69；无活动 MCL 微调进程。未逐个重新 strict-load 125 个 `best.pt`，本轮复核不是外部独立审查。
+- 保留当前正式 `paper5_outer` 的 125 个 unit、五个 `deploy_05000.pt` 使用包、官方 split/config、聚合 JSON、结果文档、代码和失败/事故的可读归档。
+- 只清理已被 r13 替换、当前入口不读取的旧 MCL-PH 下游 checkpoint/prediction，以及 p2r2 临时 benchmark/smoke 的大 checkpoint。
+- 将 MCL-PH 运行日志压缩为可读摘要：保留原文件名、退出码、launcher 脚本和机器可读 JSON；对大于 100 KiB 的原始日志写入状态、路径、退出码、关键产物和清理说明，不再保留逐 step 输出。
+- 不删除源码、配置、数据、当前正式结果、正式 5k 部署包、事故说明或 `PROJECT_HISTORY.md` 中仍有意义的结论。
 
-## 审查结论与下一步
+## 允许清理清单
 
-- 正式项目五臂比较完成。macro5 outer-test R²：GLT_REF 0.836666、O8_ONLY 0.835767、CAT 0.829390、GATE 0.829456、XATTN 0.836682。XATTN − GLT_REF = +0.000016，25 个配对折仅 12 个为正；当前证据不支持明确增益。CAT/GATE 的宏平均均低于两个匹配对照。完整逐任务数值与解释边界见 `RESULTS.md`，周期实录见 `PROJECT_HISTORY.md`。
-- **下一步：暂无后续执行。** 保存现有原始日志、checkpoint、预测与聚合；如需发表级横向表格，先只读核对论文原表的任务定义、指标和标准差口径，再作描述性比较，预算 0 GPU / 0 starts / 0 epochs。当前路线 STOP 追加正式训练、P3、OOF、refit、额外 seed 或在已用 outer-test 上调参。任何新实验须先提出新假设、独立评估设计、匹配控制及明确预算，再由用户授权。
-- 科学边界：官方同折只覆盖五个重合任务；项目架构与论文不同，项目曾利用这些折开发路线，因此不是独立盲测，也不能将五臂差值归因为 PH 单机制。历史早期阶段记载保留在 `MCL-PH.md` 与归档中，不覆盖当时失败和超预算事实。
+1. `results/mcl_ph_20260921/p2/full8x5_ptdl_r11_1/`、`full8x5_ptdl_outer_r12_1/`、`full8x5_r10r3_1/`、`full8x5_r10r3_2/`、`full8x5_r10r3_3/` 中的 `best.pt`、`*.npz` 和仅供旧下游恢复的 checkpoint；保留 JSON 指标/聚合与目录说明。
+2. `results/mcl_ph_20260921/p2r2_perf_bench/`、`p2r2_perf_bench_rev/`、`p2r2_smoke/` 中的 `*.pt`；保留 README、分析 JSON、step 记录和轻量日志。
+3. `logs/mcl_ph_20260921/` 下大于 100 KiB 的日志改写为摘要，保留文件名；不删除 `.exit`、`launch.sh`、正式 paper5 的聚合 JSON 或 unit metadata。
+
+## 禁止操作
+
+- 不删除 `results/mcl_ph_20260921/p2/paper5_official_r13_1/`。
+- 不删除 `results/mcl_ph_20260921/p2/pretrain/` 下当前五个正式部署包及其身份/运行记录。
+- 不删除 `MCL-PH-INCIDENT-r3-cat-export-hang.md`、`MCL-PH.md`、`RESULTS.md`、`PROJECT_HISTORY.md`、代码、配置或数据。
+- 不启动训练、GPU、worker、模型测试、缓存构建或全仓测试；不自动恢复、重跑或扩大实验。
+
+## 最小验证与停止条件
+
+1. 清理前记录候选文件数、字节数和保留路径。
+2. 清理后检查正式 paper5 聚合 JSON 仍为 `PASS`、125/125、0 rejected，五个 `deploy_05000.pt` 仍存在，工作树无意外 tracked diff。
+3. 只做路径/JSON/hash 存在性核对和 `git diff --check`；不补充防御性测试。
+4. 若发现当前入口仍依赖候选文件，立即停止该候选，不删除并记录原因。
+
+## 执行记录
+
+- 2026-09-28 UTC：清理前确认无 MCL-PH 进程、工作树无改动；候选旧 checkpoint/prediction 676 个、37,434,629,606 bytes；大于 100 KiB 的 MCL-PH 日志 228 个、517,538,960 bytes。
+- 删除旧 `full8x5` 五个结果根中的 `best.pt`/`*.npz`，以及 `p2r2_perf_bench`、`p2r2_perf_bench_rev`、`p2r2_smoke` 中的 `*.pt`。保留这些目录的 JSON、README、step 记录和轻量结果说明。未触碰正式 paper5 结果与正式 `p2/pretrain` 部署包。
+- 将 228 个大日志原地替换为路径稳定的紧凑摘要，保留 `.exit`、`launch.sh`、JSON metadata 和正式结果目录。日志目录从约 530 MiB 降为约 17 MiB。
+- 清理后正式结果 SHA 保持 `f9a5aba2a734eff6430a58c8db6ced215259b0e29fa2512ee1a7d40ef25c1894`；paper5 仍为 `PASS`、125/125 accepted、0 rejected；125 个 `best.pt` 与 125 个 `test_predictions.npz` 仍存在；四个正式 5k `deploy_05000.pt` SHA 未变。
+- 本轮只做路径、JSON、SHA 和 `git diff --check` 核对；未运行 pytest、模型、训练、GPU、worker 或缓存构建。
+
+## 审查与下一步
+
+- **审查结论：通过，限定为产物清理。** 当前正式 paper5 结果未被修改，当前入口所需的正式包和聚合物仍完整；被删除文件均属于已替换的旧下游 checkpoint/prediction 或临时 benchmark checkpoint。
+- 旧历史脚本仍可能引用被清理的实验路径；这些脚本不属于当前 `paper5_outer` 入口，未在本轮恢复或重跑。若要复活历史复现，需另行恢复对应产物或新建授权计划。
+- 下一步：暂无 GPU 或模型执行。可选的后续仅是把 `gudhi` 依赖和旧 smoke 入口漂移作为单独工程修复计划，仍需用户授权。
