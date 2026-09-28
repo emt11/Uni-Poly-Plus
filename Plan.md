@@ -1,6 +1,6 @@
 # REPO-CLEANUP-20260928-01：MCL-PH 产物与日志最小清理
 
-**状态：执行中。** 授权来源：用户 2026-09-28 明确要求制定并执行清理计划，删除当前无用文件并精简日志。执行者：Codex。基线：`cb9e150`，修改前工作树干净，已执行 `git pull --ff-only origin dev`（Already up to date）。
+**状态：已完成。** 授权来源：用户 2026-09-28 明确要求制定并执行清理计划，删除当前无用文件并精简日志。执行者：Codex。基线：`cb9e150`，修改前工作树干净，已执行 `git pull --ff-only origin dev`（Already up to date）。
 
 ## 目标与边界
 
