@@ -1,6 +1,6 @@
 # MCL-PH：多尺度距离专家与 PH 路由替换 GLT 3D 通道
 
-> **当前收口（2026-09-28，`r13-PAPER5`）**：`paper5_outer` 官方五折五臂已完成，覆盖 Eea/Egb/Ei/EPS/Nc 五个任务、每臂五折，共 125/125 units；launcher 真实退出 0，聚合状态为 `PASS`，`outer_test=RUN`。当前路线 STOP 追加正式训练。五臂宏平均及科学边界见下方当前状态与证据索引；r10–r12 及更早内容仅为历史记录，不产生新的执行授权。
+> **最终关闭（2026-09-28，`r13-PAPER5`）**：`paper5_outer` 官方五折五臂已完成，覆盖 Eea/Egb/Ei/EPS/Nc 五个任务、每臂五折，共 125/125 units；launcher 真实退出 0，聚合状态为 `PASS`，`outer_test=RUN`。MCL-PH 路线已 STOP，本文档与当前计划均已关闭，不再产生执行授权。五臂宏平均、工程收口和科学边界见下方；r10–r12 及更早内容仅为历史记录。
 
 > **历史记录（2026-09-25，r13 启动前）**：用户取消 r12 项目自建五折 outer-test 运行并要求改用 Periodic-TDL 论文官方五折；r12 首批四个 unit 失败后 launcher 已退出，当前无微调进程。官方发布样本与冻结 cohort 逐行一致的任务只有 Eea/Egb/Ei/EPS/Nc，五任务官方 outer/inner 索引已生成并局部验证；EAT、Egc、Xc 不纳入同折可比结果。随后用户授权以 `paper5_outer` 全新重跑五臂 × 五任务 × 五折，共 125 units / 最多 8,750 epochs；当时正式运行刚在 `Uni-Poly:96:mcl_ph_paper5_4gpu` 启动，125 units 尚未完成。该段只记录启动前和启动时现场，不能覆盖下面的最终产物。
 
@@ -12,7 +12,7 @@
 
 ## 0. 状态、角色与授权
 
-**当前 r13-PAPER5（2026-09-28，已完成）**：授权范围为官方五折五臂 `paper5_outer`，五个任务 Eea/Egb/Ei/EPS/Nc、每臂五折，共 125 units、最多 8,750 epochs。实际 125/125 units 通过，launcher 与各 unit 真实退出码均为 0，`paper5_test.json` 与只读聚合均为 `PASS`，`outer_test=RUN`；无活动 MCL 微调进程。当前证据支持结果归档和描述性横向比较，路线 STOP 追加正式训练。以下 r10–r12 及更早段落均为历史记录，不可据此启动、恢复或扩大任务。
+**当前 r13-PAPER5（2026-09-28，已完成并关闭）**：授权范围为官方五折五臂 `paper5_outer`，五个任务 Eea/Egb/Ei/EPS/Nc、每臂五折，共 125 units、最多 8,750 epochs。实际 125/125 units 通过，launcher 与各 unit 真实退出码均为 0，`paper5_test.json` 与只读聚合均为 `PASS`，`outer_test=RUN`；无活动 MCL 微调进程。当前证据支持结果归档和描述性横向比较，路线 STOP 追加正式训练。本周期的最小工程收口已完成，本文档不再安排后续执行。以下 r10–r12 及更早段落均为历史记录，不可据此启动、恢复或扩大任务。
 
 ### r13 五臂 outer-test 结果
 
@@ -37,6 +37,14 @@
 
 - 2026-09-28 的复核只读调用既有聚合逻辑并核对日志、退出码、路径和结果 JSON；**没有逐个重新 strict-load 125 个 `best.pt`**，因此不把本轮复核称为外部独立 checkpoint 审查。
 - 未启动新的训练、模型测试、outer-test 访问、OOF、refit、额外 seed 或缓存构建。当前决定是保存既有日志、checkpoint、预测与聚合，STOP 追加正式训练；任何新实验需另立假设、匹配控制、独立评估和预算并重新授权。
+
+### r13 最终工程收口（2026-09-28）
+
+- **依赖**：`requirements.txt` 新增 `gudhi>=3.8,<4`；当前环境实际版本为 `3.8.0`。
+- **退役入口**：删除已不能调用当前 `paper5_outer` 入口、仍引用旧 smoke 阶段和旧 checkpoint 路径的 `scripts/run_mcl_ph_finetune_smoke.sh`，并删除仅覆盖该退役接口的 `tests/test_mcl_ph_protocol.py`。历史执行记录仍保留在 Git 历史和本文件中；当前官方折合同由 `tests/test_mcl_ph_official_folds.py`、`tests/test_mcl_ph_periodic_tdl_strategy.py` 及现行入口覆盖。
+- **未来 metadata**：`scripts/finetune_mcl_ph.py` 以后写入 `model_variant`、`config_path` 和 `config_sha256`，明确 arm 与实际模型身份。r13 已有 `run.json`、`metrics.json` 和 `best.pt` 不回写；它们仍按当时命令记录的统一 gate config 解释，实际模型身份以 arm、route 和部署包 SHA 为准。
+- **验证**：`py_compile`、保留的预训练 launcher `bash -n`、`git diff --check` 均通过；官方折/Periodic-TDL 定向测试 **7 passed, 1 warning**。未运行 GPU、worker、训练、模型 smoke、缓存构建或新的 outer-test。
+- **最终决定**：r13 结果、依赖收口和历史边界均已记录；MCL-PH 当前计划关闭，**暂无后续执行**。未来任何科学实验必须新建计划并重新定义假设、匹配控制、独立评估、预算和停止条件。
 
 ### 历史 r10R3 状态（2026-09-23；仅存档，不可执行）
 

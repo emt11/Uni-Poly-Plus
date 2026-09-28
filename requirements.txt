@@ -15,6 +15,7 @@ torch-cluster>=1.6,<1.7
 
 # Chemistry and molecular processing
 rdkit>=2026.3,<2027
+gudhi>=3.8,<4
 
 # Runtime utilities
 tqdm>=4.67,<5

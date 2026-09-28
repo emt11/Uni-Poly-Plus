@@ -47,6 +47,7 @@ from scripts.finetune_glt_3d_gain_d2 import resolve_fold, split_indices
 
 ARMS = ('glt_ref', 'o8_only', 'm_cat', 'm_gate', 'm_xattn')
 MCL_FUSION = {'m_cat': 'cat', 'm_gate': 'gate', 'm_xattn': 'xattn'}
+MODEL_VARIANT = {'glt_ref': 'glt_ref', 'o8_only': 'o8_only', **MCL_FUSION}
 SCHEDULE_TOTAL_EPOCHS = 30
 HEAD_INIT_SEED = 20260921
 TASKS = ('eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc')
@@ -521,6 +522,9 @@ def run_unit(args, folder, started, statistics, config, manifest):
                 test_source.close()
         common = dict(
             arm=args.arm, task=args.task, fold=int(args.fold), stage=args.stage,
+            model_variant=MODEL_VARIANT[args.arm],
+            config_path=str(Path(args.config).resolve()),
+            config_sha256=sha256_file(args.config),
             finetune_strategy=args.finetune_strategy,
             selection_metric='validation_rmse',
             protocol=f'mcl_ph_{args.stage}',
@@ -555,6 +559,9 @@ def run_unit(args, folder, started, statistics, config, manifest):
         write_json(folder / 'metrics.json', common)
         save_checkpoint(folder / 'best.pt', dict(
             state_dict=best, arm=args.arm, task=args.task, fold=int(args.fold),
+            model_variant=MODEL_VARIANT[args.arm],
+            config_path=str(Path(args.config).resolve()),
+            config_sha256=sha256_file(args.config),
             architecture=model.__class__.__name__,
             protocol=f'mcl_ph_{args.stage}', config=config, stage=args.stage,
             best_validation_r2=float(result['best_r2']),

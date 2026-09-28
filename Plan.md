@@ -1,44 +1,47 @@
-# REPO-CLEANUP-20260928-01：MCL-PH 产物与日志最小清理
+# MCL-PH-POSTR13-ENG-01 / r1：MCL-PH 最终工程收口
 
-**状态：已完成。** 授权来源：用户 2026-09-28 明确要求制定并执行清理计划，删除当前无用文件并精简日志。执行者：Codex。基线：`cb9e150`，修改前工作树干净，已执行 `git pull --ff-only origin dev`（Already up to date）。
+**状态：已完成。** 授权来源：用户 2026-09-28 要求制定下一步计划并执行，彻底结束 `MCL-PH.md`。规划、执行、自检与审查：Codex（同一主体自检，不称外部独立审查）。基线：`dev@ae227fd`，工作树干净；修改前已核对 remote 为 `emt11/Uni-Poly-Plus`，`git pull --ff-only origin dev` 成功（Already up to date）。上轮 `REPO-CLEANUP-20260928-01` 已归档于 `PROJECT_HISTORY.md`。
 
-## 目标与边界
+## 目标与范围
 
-- 保留当前正式 `paper5_outer` 的 125 个 unit、五个 `deploy_05000.pt` 使用包、官方 split/config、聚合 JSON、结果文档、代码和失败/事故的可读归档。
-- 只清理已被 r13 替换、当前入口不读取的旧 MCL-PH 下游 checkpoint/prediction，以及 p2r2 临时 benchmark/smoke 的大 checkpoint。
-- 将 MCL-PH 运行日志压缩为可读摘要：保留原文件名、退出码、launcher 脚本和机器可读 JSON；对大于 100 KiB 的原始日志写入状态、路径、退出码、关键产物和清理说明，不再保留逐 step 输出。
-- 不删除源码、配置、数据、当前正式结果、正式 5k 部署包、事故说明或 `PROJECT_HISTORY.md` 中仍有意义的结论。
+1. 补齐 MCL-PH 实际使用的 `gudhi` 依赖声明。
+2. 移除不能调用当前 `paper5_outer` 微调入口的旧 downstream smoke launcher 及其专属过时断言；历史执行事实保留在 Git 与 `MCL-PH.md`。
+3. 在今后的 MCL-PH unit metadata 中明确实际 arm、模型 fusion mode 和所传配置路径；现有 r13 正式产物保持逐字节不变，历史 `config` 字段仍按当时实际传入值解释。
+4. 将结果、工程限制和 STOP 决定写入 `MCL-PH.md`，归档本轮后关闭当前计划。
 
-## 允许清理清单
+本轮仅为工程与文档收口，不改变模型、科学定义、样本、split、训练策略、评估指标或预算。`RESULTS.md` 与 `PIPELINE.md` 的现有正式结论无需改写。
 
-1. `results/mcl_ph_20260921/p2/full8x5_ptdl_r11_1/`、`full8x5_ptdl_outer_r12_1/`、`full8x5_r10r3_1/`、`full8x5_r10r3_2/`、`full8x5_r10r3_3/` 中的 `best.pt`、`*.npz` 和仅供旧下游恢复的 checkpoint；保留 JSON 指标/聚合与目录说明。
-2. `results/mcl_ph_20260921/p2r2_perf_bench/`、`p2r2_perf_bench_rev/`、`p2r2_smoke/` 中的 `*.pt`；保留 README、分析 JSON、step 记录和轻量日志。
-3. `logs/mcl_ph_20260921/` 下大于 100 KiB 的日志改写为摘要，保留文件名；不删除 `.exit`、`launch.sh`、正式 paper5 的聚合 JSON 或 unit metadata。
+## 允许与禁止
 
-## 禁止操作
-
-- 不删除 `results/mcl_ph_20260921/p2/paper5_official_r13_1/`。
-- 不删除 `results/mcl_ph_20260921/p2/pretrain/` 下当前五个正式部署包及其身份/运行记录。
-- 不删除 `MCL-PH-INCIDENT-r3-cat-export-hang.md`、`MCL-PH.md`、`RESULTS.md`、`PROJECT_HISTORY.md`、代码、配置或数据。
-- 不启动训练、GPU、worker、模型测试、缓存构建或全仓测试；不自动恢复、重跑或扩大实验。
+- 允许修改 `requirements.txt`、`scripts/finetune_mcl_ph.py`、`MCL-PH.md`、`Plan.md`、`PROJECT_HISTORY.md`，并删除已退役的 `scripts/run_mcl_ph_finetune_smoke.sh` 与其旧契约测试 `tests/test_mcl_ph_protocol.py`。
+- 不改写 `paper5_official_r13_1`、正式 5k 部署包、官方 split、训练/预测数据或历史事故现场；不恢复已清理的旧 checkpoint。
+- 0 GPU、0 worker、0 starts、0 epochs；不启动训练、模型 smoke、P3、OOF、refit、额外 seed、新 outer-test 或缓存构建。
 
 ## 最小验证与停止条件
 
-1. 清理前记录候选文件数、字节数和保留路径。
-2. 清理后检查正式 paper5 聚合 JSON 仍为 `PASS`、125/125、0 rejected，五个 `deploy_05000.pt` 仍存在，工作树无意外 tracked diff。
-3. 只做路径/JSON/hash 存在性核对和 `git diff --check`；不补充防御性测试。
-4. 若发现当前入口仍依赖候选文件，立即停止该候选，不删除并记录原因。
+1. `git diff --check`，Python AST/导入与少量受影响的无模型测试。
+2. 只读核对 r13 聚合 JSON SHA、125/125 PASS、125 个正式 checkpoint/测试预测和四个 5k 部署包 SHA 未变化。
+3. 若发现元数据改动触及训练数值路径，或正式产物身份与既有记录不符，停止受影响修改，保留现场并报告。
 
 ## 执行记录
 
-- 2026-09-28 UTC：清理前确认无 MCL-PH 进程、工作树无改动；候选旧 checkpoint/prediction 676 个、37,434,629,606 bytes；大于 100 KiB 的 MCL-PH 日志 228 个、517,538,960 bytes。
-- 删除旧 `full8x5` 五个结果根中的 `best.pt`/`*.npz`，以及 `p2r2_perf_bench`、`p2r2_perf_bench_rev`、`p2r2_smoke` 中的 `*.pt`。保留这些目录的 JSON、README、step 记录和轻量结果说明。未触碰正式 paper5 结果与正式 `p2/pretrain` 部署包。
-- 将 228 个大日志原地替换为路径稳定的紧凑摘要，保留 `.exit`、`launch.sh`、JSON metadata 和正式结果目录。日志目录从约 530 MiB 降为约 17 MiB。
-- 清理后正式结果 SHA 保持 `f9a5aba2a734eff6430a58c8db6ced215259b0e29fa2512ee1a7d40ef25c1894`；paper5 仍为 `PASS`、125/125 accepted、0 rejected；125 个 `best.pt` 与 125 个 `test_predictions.npz` 仍存在；四个正式 5k `deploy_05000.pt` SHA 未变。
-- 本轮只做路径、JSON、SHA 和 `git diff --check` 核对；未运行 pytest、模型、训练、GPU、worker 或缓存构建。
+- 2026-09-28 UTC：修改前 `git pull --ff-only origin dev` 成功，基线 `dev@ae227fd`，工作树干净；未发现 MCL-PH 训练进程。
+- `requirements.txt` 新增 `gudhi>=3.8,<4`；当前环境版本为 `gudhi 3.8.0`。
+- `scripts/finetune_mcl_ph.py` 为未来 unit metadata 增加 `model_variant`、`config_path`、`config_sha256`，并同步写入未来 `best.pt`；不回写 r13 产物。
+- 删除已退役的 `scripts/run_mcl_ph_finetune_smoke.sh` 与其旧契约测试 `tests/test_mcl_ph_protocol.py`。该测试初次执行暴露 7 项旧 `smoke/development` 或旧 launcher 断言，未视为新代码回归；删除后由现行 paper5 定向测试覆盖。
+- 未修改正式结果、部署包、split、数据、缓存或日志产物；未启动 GPU、worker、训练、模型 smoke、缓存构建或 outer-test。
+
+实际验证：
+
+```text
+python3 -m py_compile scripts/finetune_mcl_ph.py scripts/aggregate_mcl_ph_8x5.py scripts/run_mcl_ph_8x5_4gpu.py  PASS
+bash -n scripts/run_mcl_ph_pretrain_smoke.sh                                      PASS
+git diff --check                                                               PASS
+pytest -q tests/test_mcl_ph_official_folds.py tests/test_mcl_ph_periodic_tdl_strategy.py  7 passed, 1 warning
+```
 
 ## 审查与下一步
 
-- **审查结论：通过，限定为产物清理。** 当前正式 paper5 结果未被修改，当前入口所需的正式包和聚合物仍完整；被删除文件均属于已替换的旧下游 checkpoint/prediction 或临时 benchmark checkpoint。
-- 旧历史脚本仍可能引用被清理的实验路径；这些脚本不属于当前 `paper5_outer` 入口，未在本轮恢复或重跑。若要复活历史复现，需另行恢复对应产物或新建授权计划。
-- 下一步：暂无 GPU 或模型执行。可选的后续仅是把 `gudhi` 依赖和旧 smoke 入口漂移作为单独工程修复计划，仍需用户授权。
+- `MCL-PH.md` 已标记最终关闭；r13 的 `paper5_test.json` 仍为 `PASS`、125/125、0 rejected，正式 5k 包和 125 个 unit 预测/权重未被修改。
+- 旧 smoke/development 入口及对应过时测试已退役；当前 paper5 入口和定向测试保持可用。
+- 本计划审查结论：**通过，已完成，暂无后续执行**。任何未来 MCL-PH 科学实验必须新建计划并重新授权。

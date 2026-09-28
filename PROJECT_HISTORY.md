@@ -387,3 +387,11 @@
 - **日志处理**：将 logs/mcl_ph_20260921/ 中 228 个大于 100 KiB 的原始日志原地改写为紧凑摘要，保留原路径、退出码、launcher、JSON metadata 和正式结果目录；日志根从约 530 MiB 降至约 17 MiB。摘要明确标记原始逐 step 输出已清理。
 - **验证**：正式 paper5_test.json SHA 保持 f9a5aba2a734eff6430a58c8db6ced215259b0e29fa2512ee1a7d40ef25c1894；状态仍为 PASS、125/125 accepted、0 rejected；125 个 paper5 best.pt 和 test_predictions.npz 保留；四个正式 deploy_05000.pt SHA 未变。只执行路径/JSON/SHA/git diff --check 核对，未运行测试、模型、训练、GPU、worker 或缓存构建。
 - **审查结论与限制**：清理通过，限定为存储和日志整理，不改变科学结果。历史 _mcl_ph_* 脚本仍可能引用已清理的旧产物；它们不属于当前 paper5_outer 活动入口，未恢复或重跑。若要复现旧周期，需要另行恢复产物或授权新计划。后续暂无 GPU 或模型执行。
+
+## 2026-09-28 — MCL-PH-POSTR13-ENG-01 / r1：最终工程收口与文档关闭
+
+- **授权与目标**：用户要求制定并执行下一步计划，彻底结束 `MCL-PH.md`。本周期不新增科学实验，只处理 r13 后仍存在的依赖、旧入口和 provenance 收口。基线 `dev@ae227fd`，修改前工作树干净，已 `git pull --ff-only origin dev`。
+- **实际修改**：`requirements.txt` 增加 `gudhi>=3.8,<4`；`scripts/finetune_mcl_ph.py` 为未来 unit metadata 和 `best.pt` 增加 `model_variant`、`config_path`、`config_sha256`；删除已不能调用当前 `paper5_outer` 的 `scripts/run_mcl_ph_finetune_smoke.sh` 及其覆盖退役 `smoke/development` 契约的 `tests/test_mcl_ph_protocol.py`。r13 既有产物未回写。
+- **验证**：`py_compile`（finetune、paper aggregator、四 GPU launcher）通过；保留预训练 launcher `bash -n` 通过；`git diff --check` 通过；`tests/test_mcl_ph_official_folds.py` 与 `tests/test_mcl_ph_periodic_tdl_strategy.py` 为 **7 passed, 1 warning**。初次运行旧 protocol 测试得到 7 项旧契约失败，确认其引用已退役 stage/入口后删除；不作为新实现回归。
+- **产物与科学边界**：未启动 GPU、worker、训练、模型 smoke、缓存构建、outer-test、OOF、refit 或额外 seed。r13 聚合仍为 125/125 PASS、0 rejected；正式 paper5 结果、四个 5k 部署包、split、数据和日志未修改。
+- **审查结论**：工程收口通过，`MCL-PH.md` 已标记最终关闭，STOP 追加正式训练；当前计划完成，暂无后续执行。未来 MCL-PH 科学实验须新建计划并重新授权。
