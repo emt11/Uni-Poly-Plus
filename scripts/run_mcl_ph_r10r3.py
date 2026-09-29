@@ -43,6 +43,7 @@ PACKAGE_FOR = {
        for name, mode in ARM_MODES.items()},
 }
 STATUS = LOGS / 'r10r3_driver_status.json'
+CHECKPOINT_STEPS = (5000,)
 
 
 def sha(path):
@@ -99,7 +100,7 @@ def check_pretrain(arm, stats_sha, shared_sha, common_sha):
     problems, evidence = verify(folder, 5000, True)
     require(not problems, f'{arm} verifier: {problems}')
     require(evidence['status'] == 'PASS', f'{arm} runtime is not PASS')
-    for step in (1000, 2000, 3000, 4000, 5000):
+    for step in CHECKPOINT_STEPS:
         for kind in ('resume', 'deploy'):
             path = folder / f'{kind}_{step:05d}.pt'
             require(path.is_file() and path.stat().st_size > 0, f'missing {path}')
@@ -112,7 +113,7 @@ def check_pretrain(arm, stats_sha, shared_sha, common_sha):
     config = identity['config']
     for key, value in {'fusion_mode': arm, 'microbatch': 84, 'accumulation': 3,
                        'global_batch': 1008, 'amp_dtype': 'bf16',
-                       'max_optimizer_steps': 5000, 'save_every': 1000,
+                       'max_optimizer_steps': 5000, 'save_every': 5000,
                        'router_dense_updates': 500, 'router_top_k_afterwards': 2}.items():
         require(config.get(key) == value, f'{arm} config mismatch: {key}')
     milestones = {}
@@ -127,7 +128,7 @@ def check_pretrain(arm, stats_sha, shared_sha, common_sha):
     require(milestones[500]['router_mode'] == 'dense' and
             milestones[501]['router_mode'] == 'top2',
             f'{arm} router transition is wrong')
-    require(all(step in milestones for step in (1000, 2000, 3000, 4000, 5000)),
+    require(all(step in milestones for step in CHECKPOINT_STEPS),
             f'{arm} missing checkpoint milestone logs')
     package_path = folder / 'deploy_05000.pt'
     package = torch.load(package_path, map_location='cpu', weights_only=False)
@@ -140,7 +141,7 @@ def check_pretrain(arm, stats_sha, shared_sha, common_sha):
     del model, package
     gc.collect()
     record(f'{arm.upper()}_PASS', package_sha256=sha(package_path),
-           milestones=[1000, 2000, 3000, 4000, 5000], router='500:dense,501:top2')
+           milestones=list(CHECKPOINT_STEPS), router='500:dense,501:top2')
 
 
 def launch_pretrain(arm):

@@ -21,11 +21,11 @@ def test_clean_nonbond_pairs_use_heavy_view_indices_after_an_explicit_hydrogen()
     assert result.tolist() == [3.0, 2.0]
 
 
-def test_checkpoint_cadence_includes_each_milestone_once_and_final_smoke_step():
+def test_checkpoint_cadence_saves_only_final_step_and_final_smoke_step():
     due = [step for step in range(1, 5001)
-           if pretrain_mcl_ph.checkpoint_due(step, 5000, 1000)]
-    assert due == [1000, 2000, 3000, 4000, 5000]
-    assert pretrain_mcl_ph.checkpoint_due(2, 2, 1000)
+           if pretrain_mcl_ph.checkpoint_due(step, 5000, 5000)]
+    assert due == [5000]
+    assert pretrain_mcl_ph.checkpoint_due(2, 2, 5000)
     with pytest.raises(ValueError, match='save_every'):
         pretrain_mcl_ph.checkpoint_due(1, 5000, 0)
 

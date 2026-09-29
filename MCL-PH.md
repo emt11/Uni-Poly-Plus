@@ -298,7 +298,7 @@ max_updates: 5000
 warmup_updates: 2000
 schedule_total_updates: 20000
 end_lr: 0.000000001
-save_every: 1000
+save_every: 5000
 atom_mask_ratio: 0.30
 noise_sigma: 0.03
 router_dense_updates: 500
