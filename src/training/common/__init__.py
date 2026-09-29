@@ -1,1 +1,0 @@
-"""Shared mechanical training utilities."""
