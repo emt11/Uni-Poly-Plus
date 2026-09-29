@@ -1,23 +1,6 @@
-"""Public modules for the MTS-GLT-v2 baseline."""
+"""Public modules for the active GLT dual and MCL-PH routes."""
 
-from .mips_local_graph import MIPSLocalGraphEncoder
-from .mts_glt_distill import DistillStudent, NPlusGLTTeacher
-from .periodic_line_glt_v3 import (
-    CompleteTrimerGLTEncoder,
-    CompleteTrimerGLTFusionRegressor,
-    CompleteTrimerGLTRegressor,
-)
-from .uni_encoder import SUPPORTED_MODALITIES, UniEncoderAttention
 from .glt_dual import DualGLTModel, build_dual_glt_model
+from .mips_local_graph import MIPSLocalGraphEncoder
 
-__all__ = [
-    "DualGLTModel", "build_dual_glt_model",
-    "MIPSLocalGraphEncoder",
-    "DistillStudent",
-    "NPlusGLTTeacher",
-    "CompleteTrimerGLTEncoder",
-    "CompleteTrimerGLTFusionRegressor",
-    "CompleteTrimerGLTRegressor",
-    "SUPPORTED_MODALITIES",
-    "UniEncoderAttention",
-]
+__all__ = ["DualGLTModel", "build_dual_glt_model", "MIPSLocalGraphEncoder"]

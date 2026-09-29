@@ -9,10 +9,41 @@ import math
 import pytest
 import torch
 from rdkit import Chem
+from torch_geometric.data import Data
 from src.dataset.graph_data import build_periodic_multimer_mol
 from src.dataset.glt_bond_chemistry import bond_feature_vector
 
-from test_complete_trimer_glt import _toy_pair
+
+def _toy_pair(smiles="*CC*"):
+    molecule, metadata = build_periodic_multimer_mol(smiles, num_repeat_units=3,
+                                                     close_periodic=False)
+    base_count = int(metadata["base_atom_count"])
+    positions = torch.zeros((molecule.GetNumAtoms(), 3), dtype=torch.float32)
+    for unit, atom_indices in enumerate(metadata["unit_atoms"]):
+        for base_id, local in enumerate(atom_indices):
+            positions[int(local)] = torch.tensor([unit * 3.0 + base_id * 1.4,
+                                                   base_id * 0.2, 0.1 * unit])
+    sources, targets, codes = [], [], []
+    code = {Chem.rdchem.BondType.SINGLE: 1, Chem.rdchem.BondType.DOUBLE: 2,
+            Chem.rdchem.BondType.TRIPLE: 3, Chem.rdchem.BondType.AROMATIC: 4}
+    for bond in molecule.GetBonds():
+        left, right = int(bond.GetBeginAtomIdx()), int(bond.GetEndAtomIdx())
+        value = code.get(bond.GetBondType(), 5)
+        sources.extend([left, right]); targets.extend([right, left]); codes.extend([value, value])
+    topology = Data(canonical_to_trimer_base_atom_id=torch.arange(base_count),
+                    atomic_numbers=torch.tensor([molecule.GetAtomWithIdx(int(i)).GetAtomicNum()
+                                                  for i in metadata["unit_atoms"][0]]))
+    trimer = Data(
+        trimer_pos=positions,
+        trimer_atomic_number=torch.tensor([atom.GetAtomicNum() for atom in molecule.GetAtoms()],
+                                          dtype=torch.long),
+        trimer_edge_index=torch.tensor([sources, targets], dtype=torch.long),
+        trimer_bond_type=torch.tensor(codes, dtype=torch.long),
+        trimer_base_ru_atom_id=torch.arange(base_count).repeat(3),
+        trimer_ru_offset=torch.repeat_interleave(torch.tensor([-1, 0, 1], dtype=torch.long), base_count),
+        trimer_geometry_valid=True, trimer_geometry_is_3d=True, trimer_2d_fallback=False)
+    trimer.mips_to_trimer_central_index = torch.tensor(metadata["unit_atoms"][1], dtype=torch.long)
+    return topology, trimer
 from src.dataset.canonical_periodic import build_canonical_periodic_topology
 from src.dataset.glt_dual import bond_paths, build_dual_sample, dual_glt_collate, two_hop_paths
 from src.dataset.periodic_line_glt_complete import build_complete_trimer_glt_sample
@@ -21,7 +52,6 @@ from src.modules.glt_dual import (
     PathAngleBias, triplet_type, build_dual_glt_model,
     mean_pool,
 )
-from src.modules.mts_glt_distill import SourceQPreLNAttention
 
 
 def sample(smiles='*COC*'):
@@ -309,8 +339,7 @@ def test_attention_scaling_source_direction_and_residual_reference():
     residual = x + block.output(aggregate.reshape(3, 512))
     expected = residual + block.ffn(block.norm2(residual))
     torch.testing.assert_close(block(x, source, target, bias), expected)
-    # Legacy class was not edited and still uses per-head scaling.
-    assert SourceQPreLNAttention().head_dim == 64
+    assert block.attention.qkv.out_features // 3 // 8 == 64
     assert block.attention.scale == 512 ** -0.5
 
 

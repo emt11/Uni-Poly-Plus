@@ -169,19 +169,12 @@ def main():
     metadata = {
         "schema": "mips-cache-preflight-cohorts-v1",
         "source": str(source.resolve()),
-        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "source_rows": len(frame),
         "category_counts": dict(sorted(counts.items())),
         "correctness_quotas_realized": quota_counts,
         "correctness_rows": len(selected),
         "performance_rows": len(performance),
         "correctness_is_subset_of_performance": set(selected).issubset(performance),
-        "correctness_ordered_hash": hashlib.sha256(
-            ",".join(map(str, selected)).encode("utf-8")
-        ).hexdigest(),
-        "performance_ordered_hash": hashlib.sha256(
-            ",".join(map(str, performance)).encode("utf-8")
-        ).hexdigest(),
     }
     metadata_path = output_dir / "PI1M_preflight.metadata.json"
     temporary = metadata_path.with_suffix(".json.tmp")

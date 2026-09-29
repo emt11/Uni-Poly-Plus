@@ -55,7 +55,7 @@ def load_sample_index_artifact(path, split):
     if not artifact_path.is_file():
         raise FileNotFoundError(f'sample index artifact is missing: {artifact_path}')
     payload = json.loads(artifact_path.read_text(encoding='utf-8'))
-    if payload.get('schema_version') != 'glt-pred-pretrain-split-v1':
+    if payload.get('schema_version') != 'glt_dual_mcl_pretrain_split-v1':
         raise ValueError('unsupported sample index artifact schema')
     split = str(split or 'train')
     names = {'train': 'train_source_indices',
@@ -292,7 +292,7 @@ def require_tmux():
 def open_source(cohort_root, cache_root, *, task=None, dual_static_root=None,
                 pretrain_target_root=None, selected_indices=None,
                 expected_task_rows=None, expected_split_sha256=None,
-                record_index_path=None,
+                record_index_path=None, union_manifest_path=None,
                 chunk_cache_capacity=CHUNK_CACHE_CAPACITY):
     if selected_indices is None:
         full_cohort = load_dual_cohort(cohort_root, cache_root)
@@ -306,6 +306,7 @@ def open_source(cohort_root, cache_root, *, task=None, dual_static_root=None,
             expected_task_rows=expected_task_rows,
             expected_split_sha256=expected_split_sha256,
             record_index_path=record_index_path,
+            union_manifest_path=union_manifest_path,
         )
     static_cache = target_cache = None
     if dual_static_root is not None:

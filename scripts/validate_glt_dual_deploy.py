@@ -18,7 +18,6 @@ Read-only for the frozen cache; writes only the JSON report.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import sys
@@ -38,14 +37,6 @@ FORBIDDEN_KEY_PARTS = (
     "atom_head", "length_head", "angle_head", "fp_head", "geometry_norm",
     "predictor", "optimizer", "exp_avg",
 )
-
-
-def _sha256(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _tensor_stats(state_dict):
@@ -160,7 +151,6 @@ def main():
     report = {
         "scope": "Phase 8 strict deploy validation; read-only for the frozen cache",
         "checkpoint": str(checkpoint_path),
-        "checkpoint_sha256": _sha256(checkpoint_path),
         "checkpoint_bytes": checkpoint_path.stat().st_size,
         "checks": {
             "metadata_ok": metadata_ok, "metadata": metadata,

@@ -45,7 +45,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .mcl_ph_view import (DESCRIPTOR_COLUMNS, ROUTER_RADII, build_mcl_ph_view,
+from .mcl_ph_view import (DESCRIPTOR_COLUMNS, PH_SEMANTICS, ROUTER_RADII, build_mcl_ph_view,
                           five_descriptors, validate_geometry_carrier)
 
 CACHE_SCHEMA = 'mcl-ph-noisy-trajectory-cache-v1'
@@ -71,13 +71,15 @@ MARKER_FIELDS = ('shard', 'first_position', 'rows', 'finished_at', 'pid')
 # prefix of a cache built for the full schedule.
 IDENTITY_FIELDS = ('seed', 'noise_sigma', 'mask_ratio', 'global_batch',
                    'sample_index_split', 'sample_index_artifact_sha256',
-                   'cohort_manifest_hash', 'dual_static_manifest_hash')
+                   'cohort_manifest_hash', 'dual_static_manifest_hash', 'ph_semantics')
 
 
 def cache_identity(*, seed, noise_sigma, mask_ratio, global_batch, sample_index_split,
                    sample_index_artifact_sha256, cohort_manifest_hash,
-                   dual_static_manifest_hash):
+                   dual_static_manifest_hash, ph_semantics=None):
     """The identity block a cache and a training run must agree on, field for field."""
+    if ph_semantics is not None and ph_semantics != PH_SEMANTICS:
+        raise ValueError('trajectory cache PH semantics differ from implementation')
     identity = {
         'seed': int(seed),
         'noise_sigma': float(noise_sigma),
@@ -87,6 +89,7 @@ def cache_identity(*, seed, noise_sigma, mask_ratio, global_batch, sample_index_
         'sample_index_artifact_sha256': str(sample_index_artifact_sha256),
         'cohort_manifest_hash': str(cohort_manifest_hash),
         'dual_static_manifest_hash': str(dual_static_manifest_hash),
+        'ph_semantics': dict(PH_SEMANTICS),
     }
     for name in IDENTITY_FIELDS:
         value = identity[name]
@@ -97,7 +100,7 @@ def cache_identity(*, seed, noise_sigma, mask_ratio, global_batch, sample_index_
 
 def online_provenance():
     """The ``trajectory_cache`` block of a run that computes its topology online."""
-    return {'mode': 'online'}
+    return {'mode': 'online', 'ph_semantics': dict(PH_SEMANTICS)}
 
 
 def shard_bounds(shard_size, total_positions):
@@ -307,6 +310,8 @@ class MCLPHTrajectoryCache:
         declared = (len(ROUTER_RADII), DESCRIPTOR_COLUMNS)
         if shape != declared:
             raise ValueError(f'trajectory cache shape {shape} is not {declared}')
+        if manifest.get('ph_semantics') != PH_SEMANTICS:
+            raise ValueError('trajectory cache PH semantics mismatch or missing')
         self.manifest = manifest
         self.total_positions = int(manifest['total_positions'])
         self.shard_size = int(manifest['shard_size'])

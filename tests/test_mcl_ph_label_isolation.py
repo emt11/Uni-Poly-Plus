@@ -23,7 +23,7 @@ class _Targets:
 def _frozen_cohort_with_opaque_outer_test(tmp_path, monkeypatch):
     cohort_root = tmp_path / 'downstream' / 'cohort'
     cohort_root.mkdir(parents=True)
-    union_root = cohort_root.parent / 'union_outer5_inner20'
+    union_root = cohort_root.parent / 'union_paper5_outer'
     union_root.mkdir()
     split_hash = 'fixed-split-sha256'
     normalized = [f'polymer-{index}' for index in range(4)]
@@ -149,6 +149,35 @@ def test_open_source_decodes_only_train_validation_labels(tmp_path, monkeypatch)
     assert frame['original_row'].tolist() == selected
     assert frame['sample_key'].tolist() == [keys[index].hex() for index in selected]
     assert frame['label'].tolist() == [10.0, 20.0, 14.0]
+
+
+def test_selected_rows_accept_only_the_declared_external_union(tmp_path, monkeypatch):
+    cohort_root, split_hash, _ = _frozen_cohort_with_opaque_outer_test(
+        tmp_path, monkeypatch)
+    index_path = tmp_path / 'cohort_offsets.json'
+    dual_cache.build_dual_cohort_record_index(cohort_root, index_path)
+    sibling = cohort_root.parent / 'union_paper5_outer' / 'manifest.json'
+    trusted = tmp_path / 'provenance' / 'union_manifest.json'
+    trusted.parent.mkdir()
+    trusted.write_bytes(sibling.read_bytes())
+    sibling.write_text('{}')
+
+    rows = dual_cache.load_dual_cohort_task_rows(
+        cohort_root, tmp_path / 'cache', task='xc', row_indices=(0, 2, 3),
+        expected_task_rows=4, expected_split_sha256=split_hash,
+        record_index_path=index_path, union_manifest_path=trusted)
+    assert [row['original_row'] for row in rows['records']] == [0, 2, 3]
+    with pytest.raises(dual_cache.CacheLifecycleError, match='cohort/union'):
+        dual_cache.load_dual_cohort_task_rows(
+            cohort_root, tmp_path / 'cache', task='xc', row_indices=(0, 2, 3),
+            expected_task_rows=4, expected_split_sha256=split_hash,
+            record_index_path=index_path)
+    trusted.write_text('{}')
+    with pytest.raises(dual_cache.CacheLifecycleError, match='cohort/union'):
+        dual_cache.load_dual_cohort_task_rows(
+            cohort_root, tmp_path / 'cache', task='xc', row_indices=(0, 2, 3),
+            expected_task_rows=4, expected_split_sha256=split_hash,
+            record_index_path=index_path, union_manifest_path=trusted)
 
 
 def test_train_only_scaler_uses_compact_training_indices():

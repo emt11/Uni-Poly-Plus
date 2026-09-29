@@ -11,7 +11,6 @@ separate report stating exactly which value is missing, where its evidence
 lives, and whether that evidence agrees.
 """
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import sys
@@ -26,14 +25,6 @@ GROUP_NAMES = {'backbone', 'backbone_no_decay', 'head', 'head_no_decay'}
 SHARED_FIELDS = ('arm', 'task', 'fold', 'stage', 'executed_epochs', 'best_epoch',
                  'best_validation_r2', 'pretrain_step', 'pretrain_package_sha256',
                  'optimizer_updates')
-
-
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with Path(path).open('rb') as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _groups_problems(groups):
@@ -62,9 +53,6 @@ def audit_unit(root, arm, task, fold):
     run = json.loads(paths['run.json'].read_text(encoding='utf-8'))
     metrics = json.loads(paths['metrics.json'].read_text(encoding='utf-8'))
     checkpoint = torch.load(paths['best.pt'], map_location='cpu', weights_only=False)
-    evidence['run_json_sha256'] = sha256_file(paths['run.json'])
-    evidence['metrics_json_sha256'] = sha256_file(paths['metrics.json'])
-    evidence['best_pt_sha256'] = sha256_file(paths['best.pt'])
     evidence['metrics_json_has_optimizer_groups'] = 'optimizer_groups' in metrics
     run_groups = run.get('optimizer_groups')
     checkpoint_groups = checkpoint.get('optimizer_groups')

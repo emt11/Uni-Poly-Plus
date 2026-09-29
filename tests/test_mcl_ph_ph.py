@@ -14,10 +14,148 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pytest
 
-from scripts.audit_mcl_ph_p0 import betti_by_rank, ph_fixtures, wiener_by_networkx
+def _rank_f2(matrix):
+    """Rank over F2 by Gaussian elimination on a uint8 matrix."""
+    rows = np.array(matrix, dtype=np.uint8, copy=True)
+    if rows.size == 0:
+        return 0
+    row_count, column_count = rows.shape
+    rank, pivot = 0, 0
+    for column in range(column_count):
+        selected = None
+        for row in range(rank, row_count):
+            if rows[row, column]:
+                selected = row
+                break
+        if selected is None:
+            continue
+        if selected != rank:
+            rows[[rank, selected]] = rows[[selected, rank]]
+        for row in range(row_count):
+            if row != rank and rows[row, column]:
+                rows[row] ^= rows[rank]
+        rank += 1
+        if rank == row_count:
+            break
+    return rank
+
+
+def betti_by_rank(points, radius):
+    """Direct Betti numbers of the Vietoris-Rips complex at one radius.
+
+    Independent of any persistence library: the two boundary matrices are built
+    explicitly and reduced over F2, so this checks the persistence plumbing
+    rather than re-running it.
+    """
+    cloud = np.asarray(points, dtype=np.float64)
+    count = int(cloud.shape[0])
+    distance = view.distance_matrix(cloud)
+    edges = [(i, j) for i in range(count) for j in range(i + 1, count)
+             if distance[i, j] <= radius]
+    index = {pair: position for position, pair in enumerate(edges)}
+    boundary_one = np.zeros((len(edges), count), dtype=np.uint8)
+    for position, (i, j) in enumerate(edges):
+        boundary_one[position, i] = 1
+        boundary_one[position, j] = 1
+    triangles = [(i, j, k)
+                 for i in range(count) for j in range(i + 1, count)
+                 for k in range(j + 1, count)
+                 if distance[i, j] <= radius and distance[i, k] <= radius
+                 and distance[j, k] <= radius]
+    boundary_two = np.zeros((len(triangles), len(edges)), dtype=np.uint8)
+    for position, (i, j, k) in enumerate(triangles):
+        boundary_two[position, index[(i, j)]] = 1
+        boundary_two[position, index[(i, k)]] = 1
+        boundary_two[position, index[(j, k)]] = 1
+    rank_one, rank_two = _rank_f2(boundary_one), _rank_f2(boundary_two)
+    return count - rank_one, len(edges) - rank_one - rank_two
+
+
+def wiener_by_networkx(points, radius):
+    """Independent per-component Wiener index and efficiency for one radius."""
+    import networkx
+
+    cloud = np.asarray(points, dtype=np.float64)
+    distance = view.distance_matrix(cloud)
+    count = int(cloud.shape[0])
+    graph = networkx.Graph()
+    graph.add_nodes_from(range(count))
+    for i in range(count):
+        for j in range(i + 1, count):
+            if distance[i, j] <= radius:
+                graph.add_edge(i, j)
+    hop = dict(networkx.all_pairs_shortest_path_length(graph))
+    numerator = denominator = 0.0
+    for component in networkx.connected_components(graph):
+        members = sorted(component)
+        size = len(members)
+        weight = size * (size - 1) / 2.0
+        denominator += weight
+        if size < 3:
+            continue
+        within = sum(hop[a][b] for position, a in enumerate(members)
+                     for b in members[position + 1:])
+        span = (size ** 3 - size) / 6.0 - weight
+        numerator += weight * ((within - weight) / span)
+    wiener = 0.0 if denominator <= 0 else numerator / denominator
+    total = 0.0
+    for source in range(count):
+        for target in range(count):
+            if source != target and target in hop[source]:
+                total += 1.0 / hop[source][target]
+    efficiency = 0.0 if count <= 1 else total / (count * (count - 1))
+    return wiener, efficiency
+
+
+def ph_fixtures():
+    """Small graphs the plan names explicitly, as (name, points) pairs."""
+    root_two = math.sqrt(2.0)
+    fixture = []
+    fixture.append(('isolated_points', np.asarray(
+        [[0.0, 0.0, 0.0], [5.5, 0.0, 0.0], [11.0, 0.0, 0.0]], dtype=np.float64)))
+    fixture.append(('single_point', np.zeros((1, 3), dtype=np.float64)))
+    fixture.append(('chain_tree', np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=np.float64)))
+    fixture.append(('triangle_fill', np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0]], dtype=np.float64)))
+    fixture.append(('square_with_diagonal', np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)))
+    fixture.append(('square_censored', np.asarray(
+        [[0.0, 0.0, 0.0], [3.5, 0.0, 0.0], [3.5, 3.5, 0.0], [0.0, 3.5, 0.0]], dtype=np.float64)))
+    fixture.append(('two_clusters', np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 4.0, 0.0], [2.0, 4.0, 0.0]], dtype=np.float64)))
+    fixture.append(('micro_ring', np.asarray(
+        [[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [1.35, 0.78, 0.0],
+         [0.85, 1.56, 0.0], [-0.05, 1.56, 0.0], [-0.55, 0.78, 0.0]], dtype=np.float64)))
+    fixture.append(('single_edge', np.asarray(
+        [[0.0, 0.0, 0.0], [1.4, 0.0, 0.0]], dtype=np.float64)))
+    fixture.append(('coincident', np.asarray(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.7, 0.0, 0.0]], dtype=np.float64)))
+    del root_two
+    return fixture
+
+
+
 from src.dataset import mcl_ph_view as view
 
 FIXTURES = dict(ph_fixtures())
+
+
+def test_persistence_explicitly_requests_f2(monkeypatch):
+    import types
+    import sys
+    calls = {}
+
+    class FakeTree:
+        def persistence(self, **kwargs):
+            calls.update(kwargs)
+            return [(0, (0.0, float('inf')))]
+
+    monkeypatch.setitem(sys.modules, 'gudhi', types.SimpleNamespace(
+        RipsComplex=lambda **kwargs: types.SimpleNamespace(
+            create_simplex_tree=lambda **kwargs: FakeTree())))
+    view.persistence_pairs(np.zeros((1, 3)))
+    assert calls == {'homology_coeff_field': 2, 'persistence_dim_max': True}
 
 
 def test_grid_and_constants_are_the_declared_ones():

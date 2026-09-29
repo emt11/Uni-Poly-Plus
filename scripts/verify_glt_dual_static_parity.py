@@ -549,14 +549,6 @@ def main():
         report["downstream"] = downstream
         if downstream.get("keys") != expected_keys["downstream"]:
             raise ExpectedKeyMismatch("selected downstream parity keys differ from fixed fixture")
-        report["key_list_sha256"] = {
-            "pi1m": hashlib.sha256(
-                "\n".join(pi1m["keys"]).encode("ascii")
-            ).hexdigest(),
-            "downstream": hashlib.sha256(
-                "\n".join(downstream["keys"]).encode("ascii")
-            ).hexdigest(),
-        }
         report["status"] = "PASS"
     except MissingFixture as exc:
         report.update({"status": "MISSING_FIXTURE", "error_type": type(exc).__name__, "error": str(exc)})

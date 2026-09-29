@@ -52,7 +52,7 @@ def _completed_unit_matches(unit, task, fold, smoke):
                    for name, path in paths.items()}
     except (OSError, ValueError):
         return False
-    expected_protocol = 'outer5_inner20_smoke' if smoke else 'outer5_inner20_formal_shard'
+    expected_protocol = 'paper5_outer'
     expected_outer = 'NOT_RUN' if smoke else 'RUN'
     expected_summary_outer = 'NOT_RUN' if smoke else 'RUN_ONCE'
     run, summary, runtime = records['run'], records['summary'], records['runtime']
@@ -281,7 +281,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('config', 'checkpoint', 'raw-root', 'cohort-root', 'cache-root', 'dual-static-root', 'output'):
         parser.add_argument('--' + name, required=True)
-    parser.add_argument('--split-root', default='data/splits/mips_outer5_inner20')
+    parser.add_argument('--split-root', default='data/splits/mips_paper5_outer')
     parser.add_argument('--task', action='append', dest='tasks')
     parser.add_argument('--fold', action='append', type=int, dest='folds',
                         help='select fold(s); required with --smoke')

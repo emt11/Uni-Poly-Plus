@@ -21,7 +21,6 @@ cache capacity of the static/target reader.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -276,8 +275,6 @@ def main():
             stream = OrderedSampleStream(len(base_source), args.seed)
             indices = [stream.index_at(position) for position in range(args.samples)]
             report["indices"] = indices
-            report["index_list_sha256"] = hashlib.sha256(
-                json.dumps(indices).encode("utf-8")).hexdigest()
             # Bounded in-process memoization warmup, identical for every config.
             for index in indices[: min(len(indices), 256)]:
                 chemical_targets(str(base_source[index][0].normalized_canonical_smiles))

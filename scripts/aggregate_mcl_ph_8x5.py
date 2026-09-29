@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate the five tasks aligned to Periodic-TDL's released five folds."""
+"""Aggregate all eight active tasks on the paper5_outer five-fold contract."""
 
 import argparse
 import json
@@ -37,8 +37,8 @@ def aggregate(root, *, arms, expected_step, stage='paper5_outer'):
         'units_accepted': len(accepted), 'units_rejected': len(rejected),
         'accepted': accepted, 'rejected': rejected, 'outer_test': 'RUN',
         'validation_r2': None, 'test_r2': None,
-        'comparability_scope': ('released Periodic-TDL row identity, official outer folds, '
-                                'released-code inner split; project model and geometry'),
+        'comparability_scope': ('paper5_outer row identity, deterministic outer seed 100 and inner seed 42; '
+                                'project model and geometry'),
     }
     if rejected:
         return payload
@@ -72,12 +72,12 @@ def aggregate(root, *, arms, expected_step, stage='paper5_outer'):
         package_sha = packages.pop()
         validation_table[arm] = {
             'tasks': validation_tasks,
-            'macro5': sum(row['mean'] for row in validation_tasks.values()) / len(PAPER_TASKS),
+            'macro8': sum(row['mean'] for row in validation_tasks.values()) / len(PAPER_TASKS),
             'pretrain_package_sha256': package_sha,
         }
         test_table[arm] = {
             'tasks': test_tasks,
-            'macro5': sum(row['mean'] for row in test_tasks.values()) / len(PAPER_TASKS),
+            'macro8': sum(row['mean'] for row in test_tasks.values()) / len(PAPER_TASKS),
             'pretrain_package_sha256': package_sha,
         }
     payload['validation_r2'] = validation_table

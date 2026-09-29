@@ -363,6 +363,7 @@ def load_dual_cohort_task_rows(
     expected_task_rows,
     expected_split_sha256,
     record_index_path=None,
+    union_manifest_path=None,
 ):
     """Load labels and records only for explicitly selected task row indices.
 
@@ -405,8 +406,8 @@ def load_dual_cohort_task_rows(
             "task_order_then_original_row_preserving_fixed_property_rows":
         raise CacheLifecycleError("selected task rows require the frozen task-row ordering")
 
-    union_root = cohort_root.parent / "union_outer5_inner20"
-    union_manifest_path = union_root / "manifest.json"
+    union_manifest_path = (Path(union_manifest_path).resolve() if union_manifest_path is not None
+                           else cohort_root.parent / "union_paper5_outer" / "manifest.json")
     if not union_manifest_path.is_file():
         raise CacheLifecycleError("downstream union manifest is missing")
     union_manifest = json.loads(union_manifest_path.read_text(encoding="utf-8"))

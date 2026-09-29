@@ -117,7 +117,7 @@ def test_grid_smoke_command_uses_validation_only_mode():
 
 
 def _write_grid_unit(unit, *, smoke):
-    protocol = 'outer5_inner20_smoke' if smoke else 'outer5_inner20_formal_shard'
+    protocol = 'paper5_outer'
     outer = 'NOT_RUN' if smoke else 'RUN'
     summary_outer = 'NOT_RUN' if smoke else 'RUN_ONCE'
     unit.mkdir()
@@ -269,7 +269,7 @@ def test_time_summary_is_finite_and_empty_is_explicit():
 def test_clean_dataset_duplicate_key_keeps_row_labels(monkeypatch):
     calls = []
 
-    def fake_build(*record, static=None):
+    def fake_build(*record, static=None, **kwargs):
         calls.append(record[2])
         return Data(x=torch.tensor([3.0]))
 
@@ -289,7 +289,7 @@ def test_clean_dataset_duplicate_key_keeps_row_labels(monkeypatch):
 def test_clean_dataset_bounded_eviction_rebuilds_correct_data(monkeypatch):
     calls = []
 
-    def fake_build(*record, static=None):
+    def fake_build(*record, static=None, **kwargs):
         calls.append(record[2])
         return Data(x=torch.tensor([float(record[0][0])]))
 
@@ -313,7 +313,7 @@ def test_clean_dataset_bounded_eviction_rebuilds_correct_data(monkeypatch):
 def test_clean_dataset_cache_clones_and_keeps_target_override(monkeypatch):
     calls = []
 
-    def fake_build(*record, static=None):
+    def fake_build(*record, static=None, **kwargs):
         calls.append(record[2])
         return Data(x=torch.tensor([float(len(calls))]))
 

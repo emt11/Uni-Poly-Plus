@@ -3,10 +3,10 @@
 
 No aggregate is written until every fold has been re-verified:
 
-* the fold protocol must be ``outer5_inner20``.  A *missing* protocol is
+* the fold protocol must be ``paper5_outer``.  A *missing* protocol is
   accepted only with ``--allow-legacy-missing-protocol`` **and** a matching
   formal-shard ``run.json`` **and** a prediction identity match against the
-  fixed split manifest; the compatibility is recorded in the output.  A
+  fixed paper5_outer manifest; the compatibility is recorded in the output.  A
   protocol that is present but different is always rejected.
 * row indices must be integers, unique, and exactly the manifest test set;
   the five folds must cover the task rows exactly once and every
@@ -39,8 +39,8 @@ from src.training.glt_dual_runtime import TASKS, write_json
 
 METRIC_RTOL, METRIC_ATOL = 1e-6, 1e-8
 LABEL_RTOL, LABEL_ATOL = 1e-6, 1e-5
-FOLD_PROTOCOL = "outer5_inner20"
-FORMAL_SHARD_PROTOCOLS = {"outer5_inner20", "outer5_inner20_formal_shard"}
+FOLD_PROTOCOL = "paper5_outer"
+FORMAL_SHARD_PROTOCOLS = {"paper5_outer"}
 
 
 def _digest(values) -> str:
@@ -63,9 +63,9 @@ def load_task_reference(task: str, split_root: Path, raw_root: Path):
         raise ValueError(f"split manifest is not a separated five-fold protocol: {manifest_path}")
     if int(manifest["sample_count"]) != len(smiles):
         raise ValueError(f"split manifest sample count differs from raw csv: {manifest_path}")
-    if manifest.get("sample_order_hash") != _digest(smiles) and manifest.get(
-        "sample_order_sha256"
-    ) != _digest(smiles):
+    sample_order_digest = _digest(smiles)
+    if (manifest.get("sample_order_hash") != sample_order_digest
+            and manifest.get("sample_order_sha256") != sample_order_digest):
         raise ValueError(f"raw csv row order differs from the fixed manifest: {csv_path}")
     labels = frame.iloc[:, 1].to_numpy(dtype=np.float64)
     if not np.isfinite(labels).all():

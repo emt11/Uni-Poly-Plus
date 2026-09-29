@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clean dual-encoder fine-tuning using fixed outer5_inner20 manifests."""
+"""Clean dual-encoder fine-tuning using fixed paper5_outer manifests."""
 import argparse
 import json
 import os
@@ -43,7 +43,7 @@ def _rss_bytes():
 
 
 def fixed_manifest(task, csv_path, path):
-    expected = build_manifest(task, csv_path, 'outer5_inner20')
+    expected = build_manifest(task, csv_path, 'paper5_outer')
     if path.exists():
         actual = json.loads(path.read_text(encoding='utf-8'))
         for field in ('protocol', 'sample_count', 'sample_order_hash'):
@@ -245,7 +245,7 @@ def main():
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--dual-static-root',
                         help='downstream training-ready dual_static_v1 artifact')
-    parser.add_argument('--split-root', default='data/splits/mips_outer5_inner20')
+    parser.add_argument('--split-root', default='data/splits/mips_paper5_outer')
     parser.add_argument('--task', action='append', dest='tasks',
                         help='select task(s); required as a single task with --smoke')
     parser.add_argument('--fold', action='append', type=int, dest='folds',
@@ -284,7 +284,7 @@ def main():
         selected_folds = [0, 1]
     unknown_tasks = sorted(set(selected_tasks) - set(TASKS))
     if unknown_tasks or any(value < 0 or value >= 5 for value in selected_folds):
-        raise ValueError('task/fold selection is outside TASKS or outer5_inner20')
+        raise ValueError('task/fold selection is outside TASKS or paper5_outer')
     if args.smoke:
         if len(selected_tasks) != 1 or len(selected_folds) != 1:
             raise ValueError('--smoke requires exactly one --task and one --fold')
@@ -318,12 +318,12 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     validation_only = bool(args.smoke or args.development)
     if adaptation == 'ridge' and not validation_only:
-        raise ValueError('ridge adaptation is validation-only in GLT-PRED S1')
+        raise ValueError('ridge adaptation is validation-only in GLT dual adaptation')
     write_json(output / 'run.json', dict(config=run_config, command=sys.argv,
-        protocol=('outer5_inner20_smoke' if args.smoke else
-                  'outer5_inner20_development' if args.development else
-                  'outer5_inner20_formal_shard' if args.formal_shard else
-                  'outer5_inner20'),
+        protocol=('paper5_outer' if args.smoke else
+                  'paper5_outer' if args.development else
+                  'paper5_outer' if args.formal_shard else
+                  'paper5_outer'),
         smoke=bool(args.smoke), development=bool(args.development),
         formal_shard=bool(args.formal_shard), adaptation=adaptation,
         lora_rank=int(args.lora_rank), lora_alpha=float(args.lora_alpha),
@@ -337,7 +337,7 @@ def main():
         manifest_path = Path(args.split_root) / f'{task}.json'
         if validation_only and not manifest_path.is_file():
             raise FileNotFoundError(
-                f'--smoke requires an existing outer5_inner20 manifest: {manifest_path}'
+                f'--smoke requires an existing paper5_outer manifest: {manifest_path}'
             )
         manifest = fixed_manifest(task, csv_path, manifest_path)
         source_started = time.perf_counter()
@@ -396,8 +396,8 @@ def main():
                         run_config, alpha=args.ridge_alpha)
                     ridge_result.update(
                         task=task, fold=int(fold_id), adaptation='ridge',
-                        protocol=('outer5_inner20_development'
-                                  if args.development else 'outer5_inner20_smoke'),
+                        protocol=('paper5_outer'
+                                  if args.development else 'paper5_outer'),
                         outer_test='NOT_RUN', validation_only=True,
                         scaler_fit_split='train',
                         deployment_step=int(run_config['downstream_step']),
@@ -428,8 +428,8 @@ def main():
                     smoke_result = dict(
                         task=task, fold=fold_id, smoke=bool(args.smoke),
                         development=bool(args.development), adaptation=adaptation,
-                        protocol=('outer5_inner20_development'
-                                  if args.development else 'outer5_inner20_smoke'),
+                        protocol=('paper5_outer'
+                                  if args.development else 'paper5_outer'),
                         best_validation_r2=float(best_r2), best_epoch=int(best_epoch),
                         outer_test='NOT_RUN', validation_only=True,
                         scaler_fit_split='train', deployment_step=int(run_config['downstream_step']),
@@ -444,8 +444,8 @@ def main():
                     save_checkpoint(folder / 'best.pt', dict(
                         state_dict=best, fusion_mode=run_config['fusion_mode'],
                         architecture=encoder.architecture_name, task=task, fold=fold_id,
-                        protocol=('outer5_inner20_development'
-                                  if args.development else 'outer5_inner20_smoke'),
+                        protocol=('paper5_outer'
+                                  if args.development else 'paper5_outer'),
                         split=fold, config=run_config,
                         best_validation_r2=best_r2, best_epoch=best_epoch,
                         scaler_mean=scaler.scaler.mean_.tolist(),
@@ -475,8 +475,8 @@ def main():
                     raise ValueError('outer test indices predicted more than once')
                 predictions[test], visits[test] = y_pred, visits[test] + 1
                 result.update(task=task, fold=fold_id,
-                              protocol=('outer5_inner20_formal_shard'
-                                        if args.formal_shard else 'outer5_inner20'),
+                              protocol=('paper5_outer'
+                                        if args.formal_shard else 'paper5_outer'),
                               formal_shard=bool(args.formal_shard),
                               adaptation=adaptation,
                               deployment_step=int(run_config['downstream_step']),
@@ -485,7 +485,7 @@ def main():
                 save_started = time.perf_counter()
                 pd.DataFrame(dict(row_index=test, target=y_true, prediction=y_pred)).to_csv(folder / 'predictions.csv', index=False)
                 save_checkpoint(folder / 'best.pt', dict(state_dict=best, fusion_mode=run_config['fusion_mode'],
-                    architecture=encoder.architecture_name, task=task, fold=fold_id, protocol='outer5_inner20',
+                    architecture=encoder.architecture_name, task=task, fold=fold_id, protocol='paper5_outer',
                     split=fold, config=run_config, best_validation_r2=best_r2, best_epoch=best_epoch,
                     scaler_mean=scaler.scaler.mean_.tolist(), scaler_scale=scaler.scaler.scale_.tolist()))
                 write_json(folder / 'metrics.json', result)
@@ -530,13 +530,13 @@ def main():
     final_save_started = time.perf_counter()
     pd.DataFrame(all_folds).to_csv(output / 'all_fold_metrics.csv', index=False)
     if args.formal_shard:
-        summary = dict(protocol='outer5_inner20_formal_shard', formal_shard=True,
+        summary = dict(protocol='paper5_outer', formal_shard=True,
             tasks=task_summary, outer_test='RUN_ONCE',
             interpretation='one isolated task/fold shard; aggregate only after all 40 shards')
     elif validation_only:
         summary = dict(
-            protocol=('outer5_inner20_development'
-                      if args.development else 'outer5_inner20_smoke'),
+            protocol=('paper5_outer'
+                      if args.development else 'paper5_outer'),
             smoke=bool(args.smoke), development=bool(args.development),
             adaptation=adaptation,
             tasks=task_summary, outer_test='NOT_RUN',
@@ -544,7 +544,7 @@ def main():
                             if args.development else
                             'single selected task/fold validation-only smoke; not OOF or macro8'))
     else:
-        summary = dict(protocol='outer5_inner20', tasks=task_summary,
+        summary = dict(protocol='paper5_outer', tasks=task_summary,
             macro8_r2=float(np.mean([r['test_r2']['mean'] for r in task_summary.values()])),
             std_definition='sample std across 5 folds (ddof=1)',
             interpretation='development-fold evaluation; not an independent blind test')

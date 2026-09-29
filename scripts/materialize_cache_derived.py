@@ -12,7 +12,6 @@ CacheMissingDerivedArtifact instead of being generated on the fly.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 import time
@@ -30,14 +29,6 @@ from src.dataset.frozen_store import (  # noqa: E402
     ArtifactIdentityError,
     FrozenArtifact,
 )
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def materialize_md200_for_cohort(cohort, md_artifact: FrozenArtifact,
@@ -89,8 +80,6 @@ def materialize_md200_for_cohort(cohort, md_artifact: FrozenArtifact,
         "build_spec_hash": md_artifact.build_spec_hash,
         "shape": [count, 200],
         "dtype": "float32",
-        "values_sha256": _sha256_file(values_path),
-        "valid_sha256": _sha256_file(valid_path),
         "created_at": time.time(),
     }
     metadata_tmp = metadata_path.with_suffix(".json.tmp")

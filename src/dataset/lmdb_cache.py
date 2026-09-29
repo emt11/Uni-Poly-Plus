@@ -1260,8 +1260,6 @@ def materialize_md200_array(cohort, descriptor_store, output_dir):
     os.replace(valid_tmp, valid_path)
     metadata = {
         **expected,
-        "values_sha256": _sha256_file(values_path),
-        "valid_sha256": _sha256_file(valid_path),
         "created_at": time.time(),
     }
     _atomic_json(metadata_path, metadata)

@@ -38,6 +38,14 @@ ROUTER_RADII = tuple(1.5 + 0.1 * index for index in range(31))
 ROUTER_RADII_ARRAY = np.asarray(ROUTER_RADII, dtype=np.float64)
 VR_MAX_EDGE = 4.5
 DESCRIPTOR_COLUMNS = 5
+PH_SEMANTICS = {
+    'implementation_version': 'mcl-ph-descriptors-f2-v2',
+    'homology_coeff_field': 2,
+    'radii': [float(value) for value in ROUTER_RADII],
+    'max_edge_length': VR_MAX_EDGE,
+    'columns': ['randic', 'normalized_wiener', 'efficiency',
+                'betti0_per_atom', 'betti1_per_interval'],
+}
 
 RBF_BINS = 64
 RBF_MAX = 4.0
@@ -115,7 +123,8 @@ def persistence_pairs(points, *, max_edge=VR_MAX_EDGE):
         return pairs
     rips = gudhi.RipsComplex(points=cloud.tolist(), max_edge_length=float(max_edge))
     tree = rips.create_simplex_tree(max_dimension=2)
-    for dimension, (birth, death) in tree.persistence(persistence_dim_max=True):
+    for dimension, (birth, death) in tree.persistence(
+            homology_coeff_field=2, persistence_dim_max=True):
         if dimension not in pairs:
             continue
         birth, death = float(birth), float(death)
@@ -983,25 +992,47 @@ def mcl_ph_collate(records):
                   mcl_bond_index=[], mcl_edge_index=[])
     length_pair, angle_pair, nonbond_pair = [], [], []
     length_graph, angle_graph, nonbond_graph = [], [], []
-    heavy_offset = canonical_offset = 0
+    heavy_offset = canonical_offset = bond_offset = 0
+
+    def shifted(values, offset, size, name):
+        # A missing canonical/heavy mapping is -1, including in later graphs.
+        if values.numel() and (bool((values < -1).any()) or bool((values >= size).any())):
+            raise ValueError(f'{name} contains an invalid local index')
+        return torch.where(values >= 0, values + offset, values)
+
+    def checked_pairs(values, size, name):
+        if values.numel() and (bool((values < 0).any()) or bool((values >= size).any())):
+            raise ValueError(f'{name} contains a negative or cross-graph index')
+        return values
+
     for graph, item in enumerate(inputs):
         heavy = int(item.mcl_z.numel())
         canonical = int(item.mcl_central_index.numel())
+        bonds = int(item.mcl_bond_index.size(0))
         for name in _COLLATE_ATOM_FIELDS:
             packed[name].append(getattr(item, name))
         packed['mcl_atom_batch'].append(torch.full((heavy,), graph, dtype=torch.long))
-        packed['mcl_central_index'].append(item.mcl_central_index + heavy_offset)
-        packed['mcl_image_to_canonical'].append(item.mcl_image_to_canonical + canonical_offset)
-        packed['mcl_bond_index'].append(item.mcl_bond_index + heavy_offset)
-        packed['mcl_edge_index'].append(item.mcl_edge_index + heavy_offset)
-        length_pair.append(targets[graph]['mcl_length_pair'] + heavy_offset)
-        angle_pair.append(targets[graph]['mcl_angle_pair'] + heavy_offset)
-        nonbond_pair.append(targets[graph]['mcl_nonbond_pair'] + heavy_offset)
+        packed['mcl_central_index'].append(shifted(
+            item.mcl_central_index, heavy_offset, heavy, 'mcl_central_index'))
+        packed['mcl_image_to_canonical'].append(
+            shifted(item.mcl_image_to_canonical, canonical_offset, canonical,
+                    'mcl_image_to_canonical'))
+        packed['mcl_bond_index'].append(
+            checked_pairs(item.mcl_bond_index, heavy, 'mcl_bond_index') + heavy_offset)
+        packed['mcl_edge_index'].append(
+            checked_pairs(item.mcl_edge_index, heavy, 'mcl_edge_index') + heavy_offset)
+        length_pair.append(checked_pairs(targets[graph]['mcl_length_pair'], heavy,
+                                         'mcl_length_pair') + heavy_offset)
+        angle_pair.append(checked_pairs(targets[graph]['mcl_angle_pair'], bonds,
+                                        'mcl_angle_pair') + bond_offset)
+        nonbond_pair.append(checked_pairs(targets[graph]['mcl_nonbond_pair'], heavy,
+                                          'mcl_nonbond_pair') + heavy_offset)
         length_graph.append(torch.full((int(length_pair[-1].size(0)),), graph, dtype=torch.long))
         angle_graph.append(torch.full((int(angle_pair[-1].size(0)),), graph, dtype=torch.long))
         nonbond_graph.append(torch.full((int(nonbond_pair[-1].size(0)),), graph, dtype=torch.long))
         heavy_offset += heavy
         canonical_offset += canonical
+        bond_offset += bonds
     for name, values in packed.items():
         setattr(batch, name, torch.cat(values, dim=1 if name == 'mcl_edge_index' else 0))
     batch.mcl_trajectory = torch.stack([item.mcl_trajectory for item in inputs])

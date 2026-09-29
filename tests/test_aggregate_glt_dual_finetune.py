@@ -24,7 +24,7 @@ TASK = "eat"
 SAMPLES = 20
 
 
-def _fixture(tmp_path, *, protocol="outer5_inner20", write_run_json=True):
+def _fixture(tmp_path, *, protocol="paper5_outer", write_run_json=True):
     raw_root, split_root = tmp_path / "raw", tmp_path / "splits"
     raw_root.mkdir(parents=True, exist_ok=True), split_root.mkdir(parents=True, exist_ok=True)
     labels = np.round(np.linspace(-5.0, 4.0, SAMPLES), 2)
@@ -32,7 +32,7 @@ def _fixture(tmp_path, *, protocol="outer5_inner20", write_run_json=True):
                           "Eat": labels})
     csv_path = raw_root / f"smi_{TASK}.csv"
     frame.to_csv(csv_path, index=False)
-    manifest = build_manifest(TASK, csv_path, "outer5_inner20")
+    manifest = build_manifest(TASK, csv_path, "paper5_outer")
     (split_root / f"{TASK}.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     shard_root = tmp_path / "shards"
@@ -57,7 +57,7 @@ def _fixture(tmp_path, *, protocol="outer5_inner20", write_run_json=True):
         (folder / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
         if write_run_json:
             (shard_root / f"{TASK}_fold{fold}" / "run.json").write_text(json.dumps({
-                "protocol": "outer5_inner20_formal_shard", "smoke": False,
+                "protocol": "paper5_outer", "smoke": False,
                 "formal_shard": True, "selected_tasks": [TASK], "selected_folds": [fold],
                 "outer_test": "RUN",
                 "command": ["scripts/finetune_glt_dual.py", "--task", TASK,
@@ -112,7 +112,7 @@ def test_missing_protocol_without_formal_shard_run_record_is_rejected(tmp_path):
 
 def test_wrong_protocol_is_rejected_even_with_switch(tmp_path):
     with pytest.raises(ValueError, match="protocol is not"):
-        _run(tmp_path, protocol="outer5_inner20_smoke", allow_legacy=True)
+        _run(tmp_path, protocol="wrong_protocol", allow_legacy=True)
 
 
 def test_missing_sample_is_rejected(tmp_path):

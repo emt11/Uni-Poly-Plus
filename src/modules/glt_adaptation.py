@@ -1,4 +1,4 @@
-"""Small, explicit downstream adaptation policies for GLT-PRED S1.
+"""Small, explicit downstream adaptation policies for GLT dual.
 
 The helpers in this module deliberately leave the frozen deployment schema
 untouched.  A deployment package is loaded first; LoRA modules are then

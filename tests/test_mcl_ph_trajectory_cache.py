@@ -36,9 +36,10 @@ SHAPE = (len(ROUTER_RADII), DESCRIPTOR_COLUMNS)
 ROWS = 10
 SHARD_SIZE = 4
 
-BASE_IDENTITY = {'seed': 42, 'noise_sigma': 0.03, 'mask_ratio': 0.3, 'global_batch': 1008,
-                 'sample_index_split': 'train', 'sample_index_artifact_sha256': 'a' * 64,
-                 'cohort_manifest_hash': 'b' * 64, 'dual_static_manifest_hash': 'c' * 64}
+BASE_IDENTITY = cache_identity(
+    seed=42, noise_sigma=0.03, mask_ratio=0.3, global_batch=1008,
+    sample_index_split='train', sample_index_artifact_sha256='a' * 64,
+    cohort_manifest_hash='b' * 64, dual_static_manifest_hash='c' * 64)
 
 
 def row_value(shard, first, index):
@@ -164,6 +165,14 @@ def test_reader_accepts_the_matching_identity(tmp_path):
     assert MCLPHTrajectoryCache(tmp_path, expected=dict(BASE_IDENTITY)).total_positions == ROWS
 
 
+def test_reader_rejects_legacy_or_wrong_ph_semantics(tmp_path):
+    manifest = write_cache(tmp_path)
+    manifest.pop('ph_semantics')
+    write_manifest(tmp_path, manifest)
+    with pytest.raises(ValueError, match='PH semantics'):
+        MCLPHTrajectoryCache(tmp_path)
+
+
 def test_identity_helper_refuses_an_empty_field():
     with pytest.raises(ValueError, match='is empty'):
         cache_identity(**{**BASE_IDENTITY, 'cohort_manifest_hash': ''})
@@ -277,7 +286,7 @@ def test_cached_trajectory_validation_is_strict():
 COHORT = ROOT / 'data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1'
 CACHE = ROOT / 'data/processed/mips_trimer_scage'
 STATIC = ROOT / 'data/processed/glt_dual_v2/pi1m/dual_static_v1'
-SPLIT = ROOT / 'results/glt_pred_20260918/s3b_prep/pretrain_split_v1.json'
+SPLIT = ROOT / 'results/mcl_ph_20260921/shared_pretrain/pretrain_split_v1.json'
 STATS = ROOT / 'results/mcl_ph_20260921/p0/statistics.npz'
 FROZEN = all(path.exists() for path in (COHORT, CACHE, STATIC, SPLIT, STATS))
 
@@ -652,9 +661,11 @@ def test_trainer_refuses_a_cache_built_for_another_run(tmp_path):
     assert block['total_positions'] == ROWS and block['shard_size'] == SHARD_SIZE
     assert block['manifest_identity']['mask_ratio'] == BASE_IDENTITY['mask_ratio']
     assert cache.require_positions(ROWS)
-    assert runner.open_trajectory_cache(
+    online_cache, online_block = runner.open_trajectory_cache(
         None, config=config, batch_size=BASE_IDENTITY['global_batch'],
-        sample_index=sample_index, source=source) == (None, {'mode': 'online'})
+        sample_index=sample_index, source=source)
+    assert online_cache is None and online_block['mode'] == 'online'
+    assert online_block['ph_semantics'] == BASE_IDENTITY['ph_semantics']
 
     for field, value in (('seed', 43), ('noise_sigma', 0.05), ('atom_mask_ratio', 0.5)):
         with pytest.raises(ValueError, match='identity mismatch'):
@@ -796,4 +807,3 @@ def test_the_production_reader_refuses_incomplete_coverage(tmp_path):
     assert block['total_positions'] == ROWS
     with pytest.raises(ValueError, match='incomplete over the requested range'):
         cache.require_positions(ROWS)
-

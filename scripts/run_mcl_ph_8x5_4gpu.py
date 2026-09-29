@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run only the paper-aligned MCL-PH five-task, five-fold campaign on four GPUs."""
+"""Run the active MCL-PH eight-task, five-fold campaign on four GPUs."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -15,8 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.aggregate_mcl_ph import check_unit
 from scripts.aggregate_mcl_ph_8x5 import aggregate
 from scripts.finetune_mcl_ph import (ARMS, FOLDS, PAPER_SPLIT_PROTOCOL,
-                                     PAPER_TASKS, unit_directory)
+                                     PAPER_TASKS, PERIODIC_TDL_EPOCHS,
+                                     unit_directory)
 from src.training.glt_dual_runtime import require_tmux, sha256_file
+from src.dataset.cache_lifecycle import json_hash
 
 
 def parse_packages(specs):
@@ -46,19 +48,30 @@ def distribute(units, devices=(0, 1, 2, 3)):
     return {device: units[index::4] for index, device in enumerate(devices)}
 
 
-def verify_splits(split_root, cohort_split_root):
+def verify_splits(split_root, cohort_split_root, cohort_root, cohort_union_manifest):
+    cohort_root = Path(cohort_root)
+    frozen = json.loads((cohort_root / 'manifest.json').read_text(encoding='utf-8'))
+    seal = json.loads((cohort_root / '.frozen').read_text(encoding='utf-8'))
+    if seal != {'manifest_hash': json_hash(frozen)}:
+        raise ValueError('frozen cohort manifest seal mismatch')
+    union = json.loads(Path(cohort_union_manifest).read_text(encoding='utf-8'))
+    if json_hash(union) != frozen.get('union_manifest_hash'):
+        raise ValueError('frozen cohort/union provenance mismatch')
     for task in PAPER_TASKS:
         path = Path(split_root) / f'{task}.json'
         manifest = json.loads(path.read_text(encoding='utf-8'))
         if manifest.get('protocol') != PAPER_SPLIT_PROTOCOL or manifest.get('task') != task:
-            raise ValueError(f'{task}: not the official paper5 fold manifest')
-        source = manifest['official_source']
-        name = 'EPS' if task == 'eps' else task.capitalize()
-        for filename, key in ((f'{name}_cleaned.csv', 'cleaned_csv_sha256'),
-                              (f'{name}_folds.pkl', 'folds_pkl_sha256')):
-            if sha256_file(Path(split_root) / 'source' / filename) != source[key]:
-                raise ValueError(f'{task}: official source identity changed')
-        old = json.loads((Path(cohort_split_root) / f'{task}.json').read_text())
+            raise ValueError(f'{task}: not the active paper5_outer manifest')
+        if manifest.get('splitter', {}).get('random_state') != 100:
+            raise ValueError(f'{task}: outer splitter seed is not 100')
+        if manifest.get('inner_splitter', {}).get('random_state') != 42:
+            raise ValueError(f'{task}: inner splitter seed is not 42')
+        old_path = Path(cohort_split_root) / f'{task}.json'
+        old = json.loads(old_path.read_text())
+        old_sha = sha256_file(old_path)
+        if (old_sha != frozen.get('split_manifest_sha256', {}).get(task)
+                or union.get('split_manifest_sha256', {}).get(task) != old_sha):
+            raise ValueError(f'{task}: frozen cohort source split SHA mismatch')
         if (old.get('sample_order_sha256') != manifest.get('sample_order_sha256')
                 or old.get('sample_count') != manifest.get('sample_count')):
             raise ValueError(f'{task}: official rows differ from frozen cohort rows')
@@ -77,8 +90,10 @@ def run_worker(device, units, args, output, log_root, packages, stopped):
                        '--dual-static-root', args.dual_static_root,
                        '--split-root', args.split_root,
                        '--cohort-split-root', args.cohort_split_root,
+                       '--cohort-union-manifest', args.cohort_union_manifest,
                        '--statistics', args.statistics, '--cohort-index', args.cohort_index,
-                       '--task', task, '--fold', str(fold), '--epochs', '70',
+                       '--task', task, '--fold', str(fold), '--epochs',
+                       str(10 + PERIODIC_TDL_EPOCHS.get(task, 60)),
                        '--finetune-strategy', 'periodic_tdl', '--output', str(output)]
             environment = os.environ.copy()
             environment['CUDA_VISIBLE_DEVICES'] = str(device)
@@ -109,7 +124,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--package', action='append', required=True)
     for name in ('config', 'cohort-root', 'cache-root', 'dual-static-root', 'split-root',
-                 'cohort-split-root', 'statistics', 'cohort-index', 'output', 'log-root'):
+                 'cohort-split-root', 'cohort-union-manifest', 'statistics',
+                 'cohort-index', 'output', 'log-root'):
         parser.add_argument(f'--{name}', required=True)
     args = parser.parse_args()
     require_tmux()
@@ -119,9 +135,9 @@ def main():
     for path in (args.config, args.statistics, args.cohort_index):
         if not Path(path).is_file():
             raise FileNotFoundError(path)
-    verify_splits(args.split_root, args.cohort_split_root)
+    verify_splits(args.split_root, args.cohort_split_root, args.cohort_root,
+                  args.cohort_union_manifest)
     packages = parse_packages(args.package)
-    hashes = {arm: sha256_file(path) for arm, path in packages.items()}
     units = unit_list()
     assignment = distribute(units)
     output.mkdir(parents=True, exist_ok=False)
@@ -131,10 +147,10 @@ def main():
         'units_expected': len(units), 'epochs_per_unit_max': 70,
         'finetune_strategy': 'periodic_tdl', 'stage': 'paper5_outer',
         'outer_test': 'RUN', 'worker_count': 4,
-        'packages': {arm: {'path': str(path), 'sha256': hashes[arm]}
-                     for arm, path in packages.items()},
+        'packages': {arm: {'path': str(path)} for arm, path in packages.items()},
         'split_root': str(Path(args.split_root).resolve()),
         'cohort_split_root': str(Path(args.cohort_split_root).resolve()),
+        'cohort_union_manifest': str(Path(args.cohort_union_manifest).resolve()),
         'cohort_index': str(Path(args.cohort_index).resolve()),
         'reused_units': [],
         'gpu_assignments': {str(device): [f'{a}_{t}_fold{f}' for a, t, f in rows]

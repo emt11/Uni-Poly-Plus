@@ -19,6 +19,55 @@ from torch_geometric.data import Data
 
 from src.dataset import mcl_ph_view as view
 
+
+def test_collate_offsets_angle_bond_rows_and_preserves_missing_mappings(monkeypatch):
+    from src.dataset import glt_dual
+    monkeypatch.setattr(glt_dual, 'dual_glt_collate', lambda _: Data())
+
+    def record(bonds, angle):
+        item = Data()
+        item.mcl_z = torch.ones(3, dtype=torch.long)
+        item.mcl_charge = torch.zeros(3, dtype=torch.long)
+        item.mcl_aromatic = torch.zeros(3, dtype=torch.long)
+        item.mcl_masked = torch.zeros(3, dtype=torch.bool)
+        item.mcl_pos = torch.zeros((3, 3))
+        item.mcl_bond_type = torch.zeros(bonds, dtype=torch.long)
+        item.mcl_edge_scale = torch.zeros(0, dtype=torch.long)
+        item.mcl_edge_distance = torch.zeros(0)
+        item.mcl_edge_type = torch.zeros(0, dtype=torch.long)
+        item.mcl_central_index = torch.tensor([0, 1, -1])
+        item.mcl_image_to_canonical = torch.tensor([0, 1, -1])
+        item.mcl_bond_index = torch.tensor([[0, 1], [1, 2]][:bonds], dtype=torch.long).reshape(-1, 2)
+        item.mcl_edge_index = torch.zeros((2, 0), dtype=torch.long)
+        item.mcl_trajectory = torch.zeros((31, 5))
+        labels = dict(atom_mask=torch.zeros(3, dtype=torch.bool),
+                      atom_label=torch.zeros(3, dtype=torch.long),
+                      mcl_length_target=torch.zeros(0), mcl_length_raw=torch.zeros(0),
+                      mcl_angle_target=torch.zeros(len(angle)),
+                      mcl_nonbond_target=torch.zeros(0), mcl_nonbond_raw=torch.zeros(0),
+                      mcl_nonbond_slot=torch.zeros(0, dtype=torch.long),
+                      mcl_length_pair=torch.zeros((0, 2), dtype=torch.long),
+                      mcl_angle_pair=torch.tensor(angle, dtype=torch.long).reshape(-1, 2),
+                      mcl_nonbond_pair=torch.zeros((0, 2), dtype=torch.long),
+                      mcl_local_valid=torch.tensor(False), mcl_nonbond_valid=torch.tensor(False),
+                      mcl_center_bonds=torch.tensor(bonds), geometry_valid=True,
+                      readout_valid=True, sample_key='fixture', mcl_fallback=False,
+                      mcl_statistics_applied=True)
+        return item, labels
+
+    batch, labels = view.mcl_ph_collate([record(2, [[0, 1]]), record(2, [[0, 1]])])
+    assert labels['mcl_angle_pair'].tolist() == [[0, 1], [2, 3]]
+    for pair, graph in zip(labels['mcl_angle_pair'], labels['mcl_angle_graph']):
+        for bond_row in pair.tolist():
+            ends = batch.mcl_bond_index[bond_row]
+            assert batch.mcl_atom_batch[ends].tolist() == [int(graph), int(graph)]
+    assert batch.mcl_central_index.tolist() == [0, 1, -1, 3, 4, -1]
+    assert batch.mcl_image_to_canonical.tolist() == [0, 1, -1, 3, 4, -1]
+    _, empty = view.mcl_ph_collate([record(0, []), record(2, [[0, 1]])])
+    assert empty['mcl_angle_pair'].tolist() == [[0, 1]]
+    with pytest.raises(ValueError, match='mcl_angle_pair'):
+        view.mcl_ph_collate([record(2, [[0, 1]]), record(2, [[-1, 0]])])
+
 BASE_COUNT = 3
 REPEATS = 3
 ATOM_COUNT = BASE_COUNT * REPEATS
@@ -435,7 +484,7 @@ def test_labelled_sub_streams_are_distinct_and_stable():
 FROZEN = Path('data/processed/glt_dual_v2/pi1m/cohort_30f17b59bc5862a1')
 CACHE = Path('data/processed/mips_trimer_scage')
 STATIC_ROOT = Path('data/processed/glt_dual_v2/pi1m/dual_static_v1')
-SPLIT = Path('results/glt_pred_20260918/s3b_prep/pretrain_split_v1.json')
+SPLIT = Path('results/mcl_ph_20260921/shared_pretrain/pretrain_split_v1.json')
 
 
 @pytest.mark.skipif(not (FROZEN.is_dir() and CACHE.is_dir() and STATIC_ROOT.is_dir()

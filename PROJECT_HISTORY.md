@@ -1,416 +1,108 @@
-# Uni-Poly 项目变更周期归档
+# Uni-Poly 项目实验周期归档
 
-## 2026-09-28 — REPO-CLEANUP-20260928-03 / r2：退役产物与内部探针精简
+本文件记录已关闭周期的当时实现、正式结果与审查结论；当前授权和后续修复状态以 [CURRENT_PLAN.md](CURRENT_PLAN.md) 为准。下列 r13 数值是历史产物的观测值，不表示其角度监督、PH 系数域或当前八任务运行合同已通过修复后的验收。
 
-- **授权与目标**：用户要求继续清理无意义的 `logs/`、`results/`、`scripts/` 与 `tests/`；不启动训练、GPU、worker、缓存构建、结果重算或全仓测试。执行者为 Codex，基线为上一轮已推送的 `e7ace5c`。
-- **实际修改**：删除已退役 Trimer/GLT-Galph/GLT-O8-DND/旧 GLT-Dual 诊断入口、内部 MCL-PH r3–r5 探针及对应历史测试；删除 834 个结果 payload（约 94.79 GiB），删除 430 个无引用或已退役日志文件（约 88.1 MiB）。保留当前入口依赖的 MCL-PH common-init/split、正式下游 best checkpoint、正式汇总/报告/预测和最终部署包。
-- **结果边界**：`results/` 约 138 GiB → 35 GiB，`logs/` 约 127 MiB → 38 MiB。历史汇总数字未重算；删除的中间 checkpoint、逐步日志和 smoke payload 不再支持恢复旧运行。保留的正式结果仍按原协议解释，不能把清理视为新的实验。
-- **最小验证**：静态扫描确认当前 `src/`、`scripts/`、`tests/`、`configs/` 不再引用已删除入口；后续执行 `git diff --check`、变更 Python `py_compile`、共享入口 import 和结果合同临时 smoke。未运行模型、训练、GPU、缓存或全仓测试。
-- **审查结论与下一步**：本轮清理可提交；下一步仅核对 diff、完成最小静态校验并推送。暂无科学实验计划。
+## 2026-09-28｜MCL-PH-20260921-01 / r13-PAPER5：官方五折五臂实验收口
 
-## 2026-09-28 — MCL-PH-20260921-01 / r13-PAPER5：官方五折五臂正式评估收口
+### 授权与范围
 
-- **授权、角色与目标**：用户要求改用 Periodic-TDL 发布的官方五折 `paper5_outer`，删除旧活动微调路径并全新重跑 GLT_REF、O8_ONLY、M_CAT、M_GATE、M_XATTN 五臂。Codex 实施、运行与本轮只读复核；同一执行者的复核不称外部独立审查。基线为 `322881b`，入口收敛提交 `4dfb05c`、启动记录 `89c1b2e`，均在 `dev`。旧 r11/r12 失败与取消轨迹未复用、未覆盖。
-- **最终计划与范围**：仅 Eea/Egb/Ei/EPS/Nc 五个与官方 CSV 行身份、外层折、内部划分可逐项匹配的任务；每臂五折，共 125 个新 unit，10 个 head-only + 60 个 joint epochs/unit，上限 8,750 epochs，最低 inner-validation RMSE 选 checkpoint，再评价 outer-test 一次。四 GPU 并行，每个 unit 使用对应已验收 5k 部署包；O8_ONLY 与 GLT_REF 共用 GLT 包。旧串行 launcher 删除，活动 MCL 微调与聚合入口只接受 `paper5_outer`；历史产物和只读验收兼容保留。EAT、Egc、Xc、Eib、Tg 不计入论文同折比较。
-- **实际运行与验证**：`Uni-Poly:96:mcl_ph_paper5_4gpu` 中执行 `logs/mcl_ph_20260921/paper5_official_r13_1_launch.sh`；unit 日志和退出码在同名日志目录，产物在 `results/mcl_ph_20260921/p2/paper5_official_r13_1/`。launcher `.exit=0`，五臂各 25 个 `.exit=0`，`paper5_test.json` 为 `PASS`、125/125 accepted、0 rejected、`outer_test=RUN`。本轮只读重新调用正式 `aggregate(...)` 再得 125/125 PASS，身份唯一、总执行 8,750 epochs、best_epoch 3–69。无活动 MCL 微调进程。局部代码测试 10 passed（入口收敛时）；本轮只读复核未启动新的训练、模型测试或恢复，也未改动模型产物。结果属于已完成的正式项目评估；复核依赖既有 `check_unit` 实现，未逐一重新 strict-load 125 个 best.pt。
-- **五任务宏平均 outer-test R²**：GLT_REF 0.8366660、O8_ONLY 0.8357672、M_CAT 0.8293899、M_GATE 0.8294561、M_XATTN 0.8366823。相对 GLT_REF：O8_ONLY −0.0008988、CAT −0.0072761、GATE −0.0072099、XATTN +0.0000162。XATTN 在 25 个同任务同折配对中有 12 个高于 GLT_REF；该微小宏差不构成稳定增益或显著性结论。CAT/GATE 在当前配方下未优于两个匹配对照；XATTN 与 GLT_REF 实质接近。
-- **解释边界与决定**：这是论文发布样本和折上的项目五臂对照，模型、几何、预训练、架构及其他细节不同于 Periodic-TDL，不能称原论文完整复现；这些折已用于项目开发，不是独立盲测。三条 MCL 结果不能归因于 PH 单一机制；P3/OOF/refit、额外 seed、独立新数据和重训均未执行。当前证据不支持以预测增益推进 MCL-PH 候选，**STOP 追加正式训练**。下一步仅保留结果归档与发表前来源核对；任何新实验需要新假设、匹配控制、独立评估和用户授权。本周期结束，暂无后续执行。
+- 用户授权使用 Periodic-TDL 官方五折 `paper5_outer`，比较 `GLT_REF`、`O8_ONLY`、`M_CAT`、`M_GATE`、`M_XATTN` 五臂。
+- 官方可比任务为 Eea、Egb、Ei、EPS、Nc；每臂五折，共 125 个 unit，最多 8,750 epochs。
+- r12 项目自建五折运行已被取消并与本轮隔离；r12 失败现场不并入本轮结果。
+- **scientific question**：在同一五任务五折评价下，三种 MCL-PH 融合臂的测试 R² 是否优于同期 GLT_REF 与 O8_ONLY？
+- **reference / controlled change**：同期 GLT_REF、O8_ONLY 是项目内参照；CAT、GATE、XATTN 更换融合及对应预训练包，改变了多项因素，不能从臂间差值单独归因 PH 或交互效应。
+- **comparison budget**：五臂各五任务×五折、每 unit 10 个 head-only 加 60 个 joint epoch，按 inner-validation RMSE 选优后读取一次 outer-test；原运行采用各臂对应的 5k 预训练包。项目内五臂按同一历史评价协议汇总；与论文表仅作数值对照。
 
-## 2026-09-25 — MCL-PH-20260921-01 / r12-PTDL-OUTER5：用户取消并替换评估折
+### 执行与验收证据
 
-用户原授权五臂 × 八任务 × 五折、按验证 RMSE 选 checkpoint 后评价项目 `outer5_inner20` outer-test；Codex 在 `dev@878ac4f` 实现 `full8x5_outer`、逐 unit 测试预测与五折聚合，并提交 `d38fad8`，启动记录提交 `6100c08`。初次四 GPU 运行在 `Uni-Poly:96:mcl_ph_ptdl_outer_4gpu`，命令 `logs/mcl_ph_20260921/full8x5_ptdl_outer_r12_1_launch.sh`，结果及日志根均为 `full8x5_ptdl_outer_r12_1`。首四个 GLT_REF/EAT/fold0–3 分别完成 70 epochs 后，因同进程 train source 的 LMDB 未关闭而无法打开 test source；四个 unit 和 launcher 均退出 1，未继续调度。失败目录没有 `best.pt` 或测试预测；**消耗 4 starts / 280 epochs，0 outer-test 结果**。随后 Codex 修复为训练源关闭后再开 test 源，并以真实 cohort 顺序打开、定向 7 项测试和语法检查验证；`25b081d` 推送 `dev`。未重新启动，追加 4 starts / 280 epochs 的预算请求未获授权。
+- 结果文件：[results/mcl_ph_20260921/p2/paper5_official_r13_1/paper5_test.json](results/mcl_ph_20260921/p2/paper5_official_r13_1/paper5_test.json)。
+- `status=PASS`、`units_expected=125`、`units_accepted=125`、`units_rejected=0`、`outer_test=RUN`。
+- launcher 真实退出码为 `0`：[logs/mcl_ph_20260921/paper5_official_r13_1_launcher.exit](logs/mcl_ph_20260921/paper5_official_r13_1_launcher.exit)。
+- 125 个 unit 的 `run.json`、`runtime.json`、`metrics.json`、`best.pt`、验证预测和测试预测均存在于 [results/mcl_ph_20260921/p2/paper5_official_r13_1/](results/mcl_ph_20260921/p2/paper5_official_r13_1/)。
+- 本条为既有产物的归档；本轮未重新训练、未重新访问 outer-test、未做 OOF/refit、未增加 seed，也未逐个重新 strict-load 125 个 `best.pt`。
+- 以上 `PASS` 是历史聚合合同及既有预测的验收状态，不等于修复后的数据、监督与 artifact 合同通过；当前已核实的限制见文末 2026-09-29 更正。
 
-用户现明确要求停止当前任务并改为与论文官方五折一致；Codex 核实无 MCL 微调进程、r12 launcher `.exit=1`，保留全部失败产物和历史。r12 状态为**已取消／被 r13 替换**，不宣称完成全量实验或获得测试 R²。旧 r11 取消记录在本文件上一条。后续 `r13-PAPER5` 在 `Plan.md`：只对样本和官方折可逐项匹配的五任务建立论文可比入口，正式 125-unit 运行另待明确授权。旧 r12 的详细命令、限制与修复见 commit `25b081d:Plan.md` 及本条，不用旧项目折结果充当官方折结果。
+### Outer-test R²
 
-## 2026-09-24 — MCL-PH-20260921-01 / r11-PTDL5：用户要求停止并替换
+| 臂 | macro5 outer-test R² |
+| --- | ---: |
+| GLT_REF | 0.8366660207475807 |
+| O8_ONLY | 0.8357671864188265 |
+| M_CAT | 0.8293898878677041 |
+| M_GATE | 0.8294560980524395 |
+| M_XATTN | 0.8366822551610775 |
 
-用户原授权五臂 × 八任务 × 五折 Periodic-TDL 两阶段内部验证，从四个 5k 预训练包全新训练，最多 200 starts / 13,750 epochs，只报告 inner-validation。Codex 在 `dev@878ac4f` 运行于 `Uni-Poly:96:mcl_ph_ptdl_4gpu`，目录 `results/mcl_ph_20260921/p2/full8x5_ptdl_r11_1/` 与同名 logs。用户随后明确要求改成五折 outer-test R² 并停止旧任务；Codex 发送一次 Ctrl-C，核实 launcher `.exit=1`、122 个成功 unit、4 个 `.exit=-2` 中断 unit（共 126 starts）、无相关进程。旧现场保留，未达到 200/200，无正式五折结论。本周期以“已取消／被 r12 替换”关闭，取消不改变实际历史消耗。后续计划为 `r12-PTDL-OUTER5`，见当前 `Plan.md`；新旧阶段产物不得混用。
+### 与论文逐任务最佳均值的七任务对照
 
-## DOCS-20260916-04｜GLT-V2 专项清理计划（仅规划）
+本项目列选用 r13 的 **M_XATTN** 历史 outer-test 预测 R²：每项为五个 outer fold 的 R² 算术平均，每折一次训练，未做额外 seed 汇总；`macro5` 是这五个任务均值的算术平均，不是七任务结果，也不是 pooled R²。数据／split 对齐仅已核实五个发布任务的历史行身份与官方折；本项目模型、预训练、几何及评估细节与论文各模型不完全一致，论文表的均值及标准差也不能与本项目单次五折均值视为相同统计口径。正差只表示本表数值较高，不代表公平比较或超过论文方法。项目结果与 fold 明细见上方 `paper5_test.json`，论文参考取自 [SOTA_RESULT.md](SOTA_RESULT.md) 的逐任务最佳 R² 均值。
 
-用户授权编写 Plan_Delete.md，未授权实际删除。Codex 先 pull，保留用户已有空白未跟踪文件，再只读核对本地依赖、远端 store/manifest/run.json、du 尺寸和活动进程，形成清理专项计划。
+| 任务 | 本项目 M_XATTN R² | 论文最佳模型 | 论文 R² 均值 | 差值：本项目−论文 |
+| --- | ---: | --- | ---: | ---: |
+| Eea | 0.924071 | Periodic-TDL | 0.934 | −0.009929 |
+| Egb | 0.928568 | Periodic-TDL (+Chem, +RC) | 0.923 | +0.005568 |
+| Egc | 未完成／不可比较：r13 无正式五折预测 | Periodic-TDL (+Chem, +RC) | 0.911 | — |
+| Ei | 0.791783 | Periodic-TDL | 0.839 | −0.047217 |
+| EPS | 0.733418 | Periodic-TDL | 0.787 | −0.053582 |
+| Nc | 0.805572 | Periodic-TDL | 0.856 | −0.050428 |
+| Xc | 未完成／不可比较：r13 无正式五折预测 | Periodic-TDL | 0.423 | — |
 
-实际交付：明确当前双路与 geonorm 保留范围；固定正式 PI1M/downstream bundle、cohort、static/targets 保留链；将旧根级缓存和 sidecar 列为条件候选，显示尺寸约 119 GiB、实际释放量待核；规定先解除 package／dataset／utils 共用依赖，再精简专用模块。发现 geonorm_5k 正在运行，执行期禁止删除／搬移其依赖。
+EAT 不在论文表中；Eib、Tg 不在当前项目任务集合中。Egc、Xc 虽有活动 split manifest，不能替代缺失的 r13 正式预测。
 
-验证为文档静态自检及 git diff --check，无模型测试、训练、缓存生成或删除；详细清单和预算保存在 Plan_Delete.md。未覆盖当前 Plan.md，未给清理执行授予新权限。下一步是在科学任务结束后形成精确删除 allowlist、由 Codex 审查并取得实际清理授权；本记录完成的是规划文档周期，不代表清理周期完成。
+### 结果解释
 
-本文件保存每轮“规划 → 执行 → 审查”的实际记录。当前任务在 [Plan.md](Plan.md)，协作规则在 [AGENTS.md](AGENTS.md)。按周期关闭时间追加；不以归档内容授权新任务，不追溯编造旧记录。
+- `M_XATTN - GLT_REF = +0.0000162344134968`；25 个同任务同折配对中 12 个为正，不能称明确或稳定增益。
+- `O8_ONLY`、`M_CAT`、`M_GATE` 的 macro5 均低于 `GLT_REF`；`M_CAT` 与 `M_GATE` 分别低约 0.00728 和 0.00721。
+- 五折曾参与项目路线开发，因此不能作为独立盲测；五臂差值不能单独归因于 PH 机制。
+- 本轮没有候选满足继续扩展实验所需的稳定优势证据，MCL-PH 路线 STOP，不追加正式训练。
 
-每轮保存最终实施计划和重要修订、执行摘要、验证证据、审查结论与下一步。仅链接当前 Plan.md 不足以归档；大段日志／diff 使用稳定路径或 commit 引用。未完成但被取消／替换的周期注明实际状态；历史更正以带日期的补充记录追加。
+### 最终状态与后续
 
----
+- r13-PAPER5 历史运行已结束，正式观测值保留；当时的停止追加训练决定不等于当前实现已通过正确性审查。
+- 后续修复路线及其授权状态见 [CURRENT_PLAN.md](CURRENT_PLAN.md)；本条历史归档不授权重训或正式复评。
 
-## DOCS-20260916-01｜协作分工与周期归档机制
 
-* 日期：2026-09-16（Asia/Shanghai）。
-* 状态：文档修改完成；Codex 自检，未进行独立审查。
-* 规划／执行／自检：Codex。用户明确要求本次由 Codex 修改文档，属于默认分工的明确例外。
-* 基线：`ff00919`；开始时 `AGENTS.md` 已有用户将 Claude Code 改为 ZCode 的未提交修改，已保留。`Plan.md` 为零字节。本周期未创建 commit。
+## 2026-09-29｜ROUTE-CONSOLIDATION-20260929-01 / r2：活动路线收敛与 `paper5_outer` 统一
 
-### 规划与授权
+### 授权与目标
 
-用户要求优化 AGENTS.md：Codex 负责规划与审查、ZCode 负责具体执行；使用 Plan.md 交互；每轮完整周期存入根目录一个文档；审查后提供下一步规划。用户同时说明 GLT-V2 诊断计划正在执行，不要求重新启动或改变预算。
+- 用户授权将项目收敛为 GLT dual 参考路线与 MCL-PH 正式路线，关闭其余路线；本周期禁止训练、GPU、worker、缓存重建和正式实验。
+- 八个任务 `eat / eea / egb / egc / ei / eps / nc / xc` 统一使用 `paper5_outer`。
 
-最终实施计划：
+### 实际架构与实现
 
-1. 保留已有角色替换，明确职责、交接内容、修订、授权延续和审查后下一步。
-2. 以 Plan.md 为唯一当前计划入口，以 PROJECT_HISTORY.md 为周期归档；归档后才替换当前计划。
-3. 将已交付的 GLT-V2 计划录入空白 Plan.md，保留原验证与一次最多 800 updates 的回放预算，状态仅按用户报告记录。
-4. 只检查文档与 diff，不启动模型、测试、缓存构建或远端任务。
+- `scripts/create_mips_split_manifests.py` 现在只生成 `data/splits/mips_paper5_outer/`，固定
+  `KFold(seed=100)` + sorted outer-train 上的 `train_test_split(seed=42)`，manifest 保存任务、样本顺序 SHA-256、五折索引、互斥和完整覆盖断言。
+- GLT dual 保留 O8、3D、`concat`/`kfuse` 和现有微调逻辑；MCL-PH 保留
+  `glt_ref/o8_only/m_cat/m_gate/m_xattn`，使用 Periodic-TDL head-only 10 epoch + joint
+  阶段，按 validation RMSE 选优。EGC 为 60 总 epoch，其余七任务为 70；EAT 是项目适配任务。
+- 新增 `src/training/split_protocol.py` 作为两条路线的 split 校验入口；`src/utils.py` 删除旧
+  MTS trainer 分支，仅保留两条活动路线所需的 scaler、训练、评估和 scheduler 工具。
+- MCL-PH 当前聚合器以八任务 Macro8 为期望范围，不能直接验收 r13 五任务的历史 metadata；活动配置和测试改用 `results/mcl_ph_20260921/shared_pretrain/` 下的共享初始化元数据。该目录缺失 `pretrain_split_v1.npz`，预训练恢复合同未完整核实。
 
-### 实际执行
+### 删除与保留
 
-* `AGENTS.md`：增加 Codex／ZCode 职责、Plan.md 四部分内容与状态、先归档再写下一步、文档例外与单一执行者规则；同步授权和交付条款。
-* `Plan.md`：录入 `GLTV2-20260916-01/r1` 的结果汇总、数据来源核对、checkpoint 诊断、有限回放及优化决策计划；执行记录与审查明确待补记。
-* `PROJECT_HISTORY.md`：建立单文档追加归档机制，保存本周期的完整摘要。
-* 未修改模型、训练代码、配置、PIPELINE.md 或 RESULTS.md；未接管当前 ZCode 运行。
+- 删除 MTS/Distill、GLT-Galformer、GLT-PRED、Atomic-PC/EQ3D/DND、旧 PH fusion、退役
+  MCL-PH P2/r10r3 入口及其配置、模块、测试、日志、结果和旧 split 目录。
+- 保留活动路线代码、共享缓存、必要 checkpoint、Periodic-TDL 五任务来源快照、论文来源和
+  历史审计文档；原始 `results/glt_pred_20260918/` 因缺失索引 artifact 暂保留为依赖证据。
 
-### 验证与审查
+### 验证与结果
 
-* 只读检查：开始时执行 `git status --short --branch`、`git diff -- AGENTS.md`，阅读当前 AGENTS.md、Plan.md 并确认 Plan.md 长度为 0。
-* 静态自检：核对文档相对链接、角色分工、授权边界、执行中状态、归档顺序和回放预算；检查最终 diff 与 `git diff --check`。
-* 模型／测试／训练／缓存任务：未执行。远端当前进度：未核实。
-* 结论：协作与归档文档交付；不代表 GLT-V2 诊断完成或科学验收通过。实际执行者尚需补齐本轮进度。
+- 八个 manifest 生成成功；Eea/Egb/Ei/EPS/Nc 五任务的索引与官方五折文件完全一致，八任务
+  每折互斥且完整覆盖。
+- `compileall` 和活动入口导入检查通过。
+- 定向 CPU 测试：GLT dual/MCL-PH 合同与聚合 `93 passed`；MCL-PH view/pretrain `37 passed, 1 skipped`；缓存和读写 `82 passed, 3 skipped`；PH 独立定义 `63 passed`。这些是实现验证，不是性能实验。
+- 未运行训练、GPU、worker、outer-test 或正式实验，未产生新的模型性能结果。
 
-### 下一步
+### 审查结论与后续
 
-当前科学计划 `GLTV2-20260916-01` 保持执行中，不归档为完成。ZCode 先在 Plan.md 补记已执行步骤、活动任务与证据，继续原授权范围；Codex 收到交付后审查、归档该周期，再制定下一步计划。此文档周期与正在运行的科学周期相互独立。
+- 当时核对了 diff、活动 import 闭包、旧路线引用、manifest 和定向测试；这些验证只支持入口收敛与新 manifest 的局部实现结论，不能证明冻结 cohort 与新 split 的 SHA 绑定兼容，也不能证明 PH 目标正确。
+- 本周期的实现与文档工作已结束，没有产生新正式预测；`pretrain_split_v1.npz` 缺失及后续发现的其他风险，按下方更正和当前计划处理。
 
-## DOCS-20260916-02｜每轮 Git 提交与远程同步
+## 2026-09-29｜历史归档更正：当前合同与 r13 结果的适用边界
 
-* 授权与规划：用户要求每次对话产生 Git 修改后，提交本地并同步至 `https://github.com/emt11/Uni-Poly-Plus`。本轮由 Codex 按明确文档授权实施并自检，未作独立审查。
-* 实施：AGENTS.md 新增第 8 节，规定本轮修改显式暂存、提交和推送当前对应分支；保护无关修改，核对远端进展，不强推，并区分本地提交、远程同步和科学验收。
-* 验证：开始时工作树干净，当前分支 dev，origin 指向用户指定仓库；文档变更进行 diff 与空白检查。未运行模型、测试或训练。
-* 交付：本条归档与规则一同提交；实际提交哈希与远程同步结果以 Git 历史及本轮最终回复为准，不在提交前预称推送成功。
-* 下一步：继续现有 GLT-V2 计划，新规则适用于后续执行与文档交接；不改变当前科学计划或预算。
+此节是对已关闭周期结论的静态更正，不是新模型或实验周期；未修改历史预测、checkpoint、聚合文件或任何训练产物。依据 [CURRENT_PLAN.md](CURRENT_PLAN.md) 对旧实现与产物的核查；2026-09-29 本次文档复核时，工作树已有尚未独立审查的代码改动，不能把它们写成修复完成：
 
-## DOCS-20260916-03｜修改前拉取远程更新
-
-* 授权与规划：用户要求每轮修改开始前必须 pull 更新本地；Codex 负责本次文档修改与自检。
-* 执行：先核对工作树干净、dev 分支及 origin 地址，执行 `git pull --ff-only origin dev`，结果为 Already up to date；随后修改 AGENTS.md 第 8 节，规定先拉取、重读文件再修改，以及本地改动保护和同步失败处理。
-* 验证与审查：检查文档 diff 和 `git diff --check`；本轮仅文档自检，未执行模型、训练或测试，不影响当前科学计划。
-* 交付与下一步：本条与规则一起提交推送，实际哈希及同步结果见 Git 历史和最终回复。后续执行统一遵循“pull → 修改与验证 → commit → push → 核对远端”。
-
-## DOCS-20260916-05｜清理计划适配当前远程训练机
-
-* 日期：2026-09-16（UTC）。规划／文档执行／自检均为 Codex；无独立审查。用户明确要求优化当前机上的 `Plan_Delete.md`，未授权实际清理。
-* 基线：`43f83f7a001fd46cd5383f2ca711e81c6ff595db`，`dev` 分支；开始时工作树干净，origin 为 `emt11/Uni-Poly-Plus`。修改前执行 `git pull --ff-only origin dev`，返回 Already up to date，随后重读文件。
-* 最终实施计划与修订：`CLEANUP-20260916-01/r1 → r2`，只做环境适配。唯一清理执行环境为当前 Linux 主机 `dzw2`、项目根 `/root/workspace/Uni-Poly-Plus-master`；去掉 Windows 和两端分别清理假设，明确 GitHub origin 不备份 ignored 数据。保留当前生产 bundle／cohort／static／targets 与科学证据链，原约 119 GiB 候选容量及未重新审计的引用标为 r1 记录，不当成实时验收结果。
-* 实际变化：`Plan_Delete.md` 增加主机／解释器／文件系统核验、活动任务快照、只读复核命令、当前机独立 tmux window／日志约定、逐路径授权与单机验收口径；`Plan.md` 仅增加本次文档交接注记，不替换科学计划或改变实验预算；本文件追加本周期记录。未修改模型、配置、PIPELINE.md 或 RESULTS.md。
-* 只读证据：`hostname`、`pwd -P`、Git 状态／分支／remote、`tmux list-windows -t Uni-Poly`、`ps -eo pid,ppid,etime,args`、store 元数据、`findmnt -T`／`df -h`。09:11 UTC 的 `geonorm_5k` 训练与 worker 仍存活，实际命令读取受保护的 PI1M 数据链，日志为 `logs/glt_dual_static_pretrain_concat_geonorm5k.log`；未核实训练完成或所有候选 fd/mmap，不把进程存活称为训练健康证明。
-* 验证预算与结果：文档 diff／`git diff --check`、旧平台假设与关键路径静态检查；没有模型测试、GPU 任务、全量 LMDB 扫描、缓存生成／搬移／删除，没有创建清理窗口。文档自检不等于清理执行或科学验收。
-* 交付与下一步：本轮完成的是适配文档周期，实际提交及 push 结果见本条对应 Git 历史和最终回复。清理周期仍待授权；后续由 ZCode 在相关任务自然结束并交接后补齐精确 allowlist，Codex 审查后才可进入获准的清理阶段。未核实项 HOLD，不追加实验或终止现有任务。
-
-## CLEANUP-20260916-01/r2｜当前训练机精确缓存清理执行
-
-* 日期：2026-09-16（UTC）；主机 `dzw2`；项目根 `/root/workspace/Uni-Poly-Plus-master`；分支 `dev`；规划、执行和本轮审查均由 Codex 完成。用户明确授权执行 `Plan_Delete.md`，并说明现有任务已结束。
-* 基线与同步：执行前核对 `git status`、branch、origin、tmux、进程和文件系统，并运行 `git pull --ff-only origin dev`，结果 `Already up to date`。删除前 HEAD 为 `5a8fe0fa2d24696a36ae7bcb311710fa12cbf9bb`；没有回滚或覆盖用户改动。
-* 实施范围：依照 `Plan_Delete.md` 3.4 精确 allowlist 删除 4 个 PI1M pilot（dual_static／pretrain_targets）、`cohort_30f17b59bc5862a1_v2`、`periodic_line_glt_distill_v2.parts`，以及两个未冻结 blocked build 的 6 个大 payload。保留失败 manifest／metadata／rejections／writer-lock provenance、16 个分片日志副本、active bundle 与 root-level 读取链、active cohort/static/targets、代码／配置／测试／checkpoint／results／logs。没有删除 tracked 代码或科学产物。
-* 日志与窗口：预检 `Uni-Poly:cleanup_20260916_01`／`logs/cleanup_20260916_01/preflight_audit.log`；删除 `Uni-Poly:cleanup_20260916_01_delete`／`delete.log`；修正后的 postverify／`postverify.log`；验收 `Uni-Poly:cleanup_20260916_01_accept`／`acceptance.log`。所有窗口均独立于训练 pane；未启动 GPU、worker、模型、训练或缓存构建。
-* 结果：删除目标 postverify 全部 `ABSENT`，active 六个 `.frozen`、store、PI1M/downstream cohort/static/targets 和失败 provenance 全部存在。文件系统 `Available` 从 `3028318564352` 增至 `3041005023232` bytes，增加 `12,686,458,880` bytes（约 11.81 GiB）；该数值按文件系统差额记录，不冒称为候选目录大小总和。
-* 验收：保留代码 import、7 个 CLI `--help` 和 active 路径检查成功。首次聚焦测试为 `53 passed, 1 failed, 1 warning`；唯一失败是测试调用漏传可选 `trimer_failure_code`。在再次 `git pull --ff-only origin dev` 后，仅对 `tests/test_cache_lifecycle.py` 的该调用补上 `optional_fields=("trimer_failure_code",)`，没有修改生产生成器、缓存 schema 或科学定义；同一 6 个目标文件在 `cleanup_20260916_01_recheck` 中为 `54 passed, 1 warning`，exit code 0。
-* 模型只读验收：`cleanup_20260916_01_modelcheck` 对 Concat/KFuse 两个 step-5000 deploy 使用 active PI1M cohort 的真实索引 `[20, 9]`（普通明确 E/Z 与真实 `*O*` N=0）。两者均 strict-load、187 个 encoder tensor 与 resume bitwise identical、全有限、预测 `[2,1]`、cache zero-write，报告分别为 `results/cleanup_20260916_01/deploy_validation/concat.json` 与 `kfuse.json`；脚本顶层键沿用历史 `FIXED_CONCAT_DEPLOY_VALID` 名称，KFuse 报告内 `fusion_mode` 明确为 `kfuse`；不执行 optimizer 更新或写生产缓存。
-* 过程偏差：删除脚本首次错误地把 bundle 根当作 `.frozen` 路径并返回 1；实际删除与逐项校验已完成，随后按三层 artifact 的真实 `.frozen` 路径复核通过。该脚本断言属于后续可修复的工具问题，不影响本次已核准路径的删除结果。
-* 审查结论：清理动作、删除目标 postverify、修正后的局部回归和两融合真实双记录 deploy 只读检查均完成；未发现 active cache identity、读取链或 writer 冲突损坏。未执行全量读取、Stereo 全量审计、预训练、微调、聚合重算或缓存重建；既有正式与历史 backward smoke 证据未被删除，不能把本周期只读 forward 当作性能结果。
-* 下一步：本清理周期无继续执行项。若要处理其他 HOLD 候选或重新生成已删除的 pilot/staging，须另行授权并重新做依赖闭包；被删除 ignored 缓存不由 Git 恢复，`cohort_30f17b59bc5862a1_v2` 原 manifest 内容未保留，仅保留删除前 SHA256 与 phase2 provenance。
-
-### 2026-09-16 更正｜CLEANUP-20260916-01/r3 审查后续计划
-
-* 用户明确要求将下一步写入 Plan_Delete.md；本次规划／文档执行／自检均为 Codex，不构成独立审查。文档基线 `4c3416e3499a91acdff7853dea6801ab851024e9`，dev 工作树干净，修改前 pull 为 Already up to date。实际 commit／push 结果见对应 Git 历史及交付回复。
-* 更正上条“无继续执行项”的范围：首批缓存删除已完成，原代码精简未实施；仍需补记现有测试准确命令与六文件列表，以及 static／targets、backward、预测 parity、聚合的适用旧证据或未核实状态。部署报告证明 strict load、resume tensor 一致及有限 forward，不替代上述全部验证。原首次失败及 11.81 GiB 历史空间差额保留。
-* 最终计划：同一 ID 升 r3，ZCode 后续只读追溯现有日志／命令并补齐验收对应表，Codex 复核后收口；找不到材料就保留缺失，不靠新测试补造历史。已删除 cohort_v2 原 manifest 仅留 hash／摘要，记录溯源损失，不自动重建。其余代码和缓存继续 HOLD，若用户仍需精简，另行授权用途分类和精确依赖审查，实际删除不自动启动。
-* 实际修改：Plan_Delete.md 修订计划头、历史快照／阶段边界并新增第 7 节交接任务、预算、停止条件和完成标准；Plan.md 仅更新清理注记；本文件追加同周期更正，不重复归档首批删除，不改写原执行结论。未修改代码、缓存、PIPELINE.md 或 RESULTS.md。
-* 验证与状态：仅文档 diff、引用及 `git diff --check` 自检；没有运行模型、测试、训练或清理，没有执行新依赖调查。本轮完成的是下一步计划落盘，证据补记仍待执行，不能把计划交付写成整个精简项目完成。
-
-### 2026-09-16 更正｜CLEANUP-20260916-01/r3 证据补记完成
-
-* 授权与角色：用户要求继续当前 `Plan_Delete.md`；本次由 Codex 在 `dzw2:/root/workspace/Uni-Poly-Plus-master` 只读追溯第 7 节 A 并修订交接文档，不新增删除、代码、模型测试、训练或缓存重建。没有独立执行者复核，故不将本次自检称为独立审查。
-* 基线与活动任务：修改前工作树干净，分支 `dev`，HEAD `248371d`，`git pull --ff-only origin dev` 为 `Already up to date`。tmux `Uni-Poly` 没有运行中的 pretrain／finetune／builder／pytest；仅旧监视 shell 的轮询仍在，本次未接管或终止。
-* 证据补记：读取 `logs/cleanup_20260916_01/{postverify,acceptance_recheck,modelcheck}.log`、两份 deploy JSON、active `.frozen`／manifest、PI1M/downstream pretrain／finetune `run.json` 和 aggregation summary。删除目标仍为 `ABSENT`，active 读取链仍在。清理后的局部回归已有 `54 passed, 1 warning`、exit 0；两份 deploy 报告已有 strict load、187 encoder tensors、resume bitwise identity、有限 `[2,1]` forward 和 cache zero-write。没有重跑这些检查。
-* 命令和适用性边界：验收与 modelcheck 日志没有保存完整 argv／环境；Plan_Delete 第 7 节列出执行上下文可复述的命令并明确这不是独立日志证据。`scripts/validate_glt_dual_deploy.py` 未接收 static/targets 路径且在 `torch.no_grad()` 中 forward，因此 static/targets 清理后重新消费、backward 和删除前后预测 parity 均未执行／未独立核实。历史 PI1M `run.json` 仍绑定 sample_count `959588`、cohort `b03f96...`、bundle `30f17...`、dual static `9ff122...`、targets `5e7b...`；下游历史 `run.json` 只记录 downstream dual-static 与 `outer5_inner20` 的缓存／split 路径，没有缓存 hash 字段，当前 downstream manifest 与 `.frozen` 自洽，但这些 run.json 不能单独证明历史缓存内容身份一致。
-* 聚合与溯源：复用 Concat/KFuse 8-task×40-fold summary（status PASS，macro8 `0.7877379364475444`／`0.7695629052761048`）和 80-shard summary，没有聚合重算。`cohort_30f17b59bc5862a1_v2` 原 manifest 仍是已知溯源损失，仅保留删除前 SHA256 `9eba93d60781361b005800f98d68ff8eba04a888fadf8b328915e147f1d23945` 与 `phase2_cohort_v2.json`，未生成补档。
-* 交付与结论：已更新 `Plan_Delete.md` 第 7 节、`Plan.md` 清理注记和 `PIPELINE.md` 命令可追溯性表述；`RESULTS.md`、生产代码、缓存、checkpoint 和历史结果未改动。首批清理及有限只读证据收口完成，但代码精简仍未实施；全量读取、Stereo 质量、static/targets consumer、backward、parity 和新实验不因本条记录而通过。后续若继续处理 HOLD 候选，须重新依赖审查并取得明确授权。
-
-## DOCS-20260916-06｜缓存优化计划交付
-
-* 日期：2026-09-16（UTC）。用户要求 Codex 制定缓存优化计划并写入 Plan_Cache.md；规划、文档修改与自检均为 Codex，无独立审查者。只授权文档，未授权代码、缓存、benchmark 或训练执行。
-* 基线与工作树：dev，HEAD 18572e373ae270469affa8ecb805db32f3c6489c；修改前核对 branch／origin 并 pull，返回 Already up to date。用户已有 Plan_Delete.md 删除及未跟踪 Plan_Cache.md（原内容为清理计划）；本轮按用户要求重写后者，不恢复、不提交前者的删除。
-* 最终计划 CACHE-20260916-01/r1：保留三层缓存。A 最多 48 个接受集代表案例、4 条合同错误 source／拒绝证据及 9 个下游 fallback 的有界核对，分别裁定参照差异、审计器错误、真实化学错误和缺证。B 先以两个小 chunk 的 fixture 复现 staging 身份、半成品 chunk、单边发布和冻结后 finalize 的缺口，再做最小恢复修复；最多 32 个真实样本生成独立临时派生数据（不生成坐标），输出不超过 1 GiB。C 固定 2,048 个索引、worker=0 与至多 3 workers、baseline 和至多两个独立候选、每个配对最多 3 次、总计最多 30 分钟，记录吞吐／尾延迟／FD／RSS／映射开销，不能据此宣称 GPU 或模型收益。紧凑表示 D 单列待授权，未来也仅可先做 256 条／1 GiB 单候选，不自动全量迁移。
-* 重要边界：不改变 first_valid、端基、映射、cohort、fallback、目标和随机流；不重写 active manifest／.frozen，不引入全量 hash 或通用迁移框架。两次 rename 不称为整体原子发布；优先用一致身份和幂等恢复处理单边发布。化学抽样不证明全部 FAIL 已解释，metadata hash 不证明 payload 历史未变。193 GiB 明确为清理前快照，历史 pilot benchmark 不被当成当前随机多 worker 证据。
-* 实际文件变化：Plan_Cache.md 从旧清理内容改为缓存优化细则；Plan.md 仅增加专项交接注记，保留下方未收口科学计划；本文件归档文档周期。没有修改 PIPELINE.md、RESULTS.md、模型、构建器、缓存或历史结果。
-* 验证与审查：仅对相关实现／已有报告做静态核对，检查文档引用、预算与授权一致性及 git diff --check；未运行单元测试、故障注入、真实 batch、benchmark、训练、构象生成、缓存构建或清理。文档自检不等于工程验收；实际 commit 和远端核对结果见本条对应 Git 历史及交付回复。
-* 完成与下一步：本轮仅完成计划落盘。缓存实施状态待授权；建议先 A＋B，通过审查再 C，D 暂缓。已有科学计划和清理 HOLD 不因本轮扩大或结束，执行者应在 Plan.md 补记真实进度后交 Codex 审查。
-
-## DOCS-20260916-07｜缓存审查后的 r2 返修计划落盘
-
-* 日期：2026-09-16（UTC）；用户明确要求将下一步写入 Plan_Cache.md。Codex 负责文档规划、修改和自检；对 ZCode 的 7f476b4 交付已有静态审查，本次不执行代码返修、测试或 benchmark。
-* 同步与基线：dev，7f476b481ceff4fa4a0561845230b329f6fa872b；修改前工作树干净，核对 origin 后执行 git pull --ff-only origin dev，返回 Already up to date，并重读相关文件。
-* 计划修订：CACHE-20260916-01 保持同一 ID，r1 → r2，状态需返修。保留 r1 原始目标与报告，将当前缺口和优先级写入第 9–10 节；Plan.md 更新专项入口并追加审查／下一步，其他科学计划和 r1 执行记录不删除、不重新判定。
-* 实质性返修合同：R1 修复完整 builder 幂等计时、未知 staging 身份接纳、临时完成块恢复、复用／冻结前 payload 校验、writer 互斥与释放、最终汇总后冻结六项；用两个小 chunk 的 fixture 测实际 build() 控制流和真实受控双进程竞争。R2 复用原 32 条 sample keys，在总量不超过 1 GiB 的独立临时产物中比较实际新 targets、静态字段、固定 mask/noise 的 clean/noisy 准备结果；缺失边界用 fixture，不扩大真实集合；差异／超限非零退出，不删除已有候选目录。R3 收窄化学源特征分桶的因果措辞和 8 条未解 Stereo 的状态，修正 benchmark 顺序／计数／进程资源口径及中心 angle_pairs 尚未复用的事实；只做工具局部合成测试，不安排新的长 benchmark、角度优化、阶段 D 或生产切换。R4 保存精确命令／退出码，交 Codex 复审。
-* 修改文件：Plan_Cache.md、Plan.md、PROJECT_HISTORY.md；没有修改生产代码、PIPELINE.md、RESULTS.md 或旧报告／缓存。保留容量 64 不采用、默认 2 和全部科学／数据边界；已有授权不因交接撤销，计划不授权扩大预算。
-* 验证：文档 diff、相关引用与逻辑检查、git diff --check；未运行单元测试、故障注入、数据构建、benchmark、模型或训练。提交／推送及远端核对结果见本条对应 Git 历史和交付回复。
-* 周期边界：本条仅归档本次文档交付，不将未完成的 CACHE 实施周期归档为验收通过。r2 返修尚未执行，后续执行者按 Plan.md 记录真实进度，再交 Codex 审查。
-
-## CACHE-20260916-01｜r1→r2→r3 缓存优化周期最终归档（2026-09-17）
-
-* 授权与角色：本周期由用户授权缓存专项返修；Codex 负责规划与最终独立审查，ZCode 负责 r3 实现与局部验证。归档依据为 `Plan_Cache.md` 的 r1、r2、r3 记录及本次关闭核对。
-* 修订链：r1 建立缓存合同、恢复、parity 与读取审查范围；r2 根据 Codex 审查结果收窄为六项恢复／冻结修复、固定 32-key parity 与工具口径返修；r3 完成 published payload contract、summary／冻结边界、固定 key provenance、parity fail-closed gate、benchmark 状态语义及对应 focused tests 的最小收口。
-* 最终实现：r3 代码与测试的最终提交为 `632caa1`（`cache-opt: close r3 contract gaps`）。本周期最终文档状态为 **Codex review PASS / CLOSED**；该 PASS 仅覆盖计划约定的缓存合同、恢复与审计工具收口。
-* 证据：既有 r3 focused tests 日志记录 `36 passed, 1 warning`（`logs/cache_opt_r3_tests2.log`），r2 固定 32-key parity 报告为 PASS（`results/cache_optimization_repair_20260916T234930Z/parity.json`），active frozen cache zero-write 与临时预算门控已在报告／实现中保留。上述证据在本次归档中只读复核，未重新运行测试或实验。
-* 重要边界：本周期**没有全量缓存重建、格式迁移或生产迁移**，没有切换或写入 active cache，没有修改模型、配置、checkpoint 或历史结果数字；未执行的 parity 重跑、长 benchmark、payload 全字节历史完整性、断电耐久、模型／训练验证仍为未验证，不因 CLOSED 状态而改变。
-* 交付与后续：`Plan_Cache.md` 与 `Plan.md` 已将缓存专项标记为 CLOSED，专项不再占据下一执行入口。若需生产切换、全量重建或新的优化，应另行制定计划并取得授权；本归档不产生这些操作的授权。
-
-### 2026-09-17 更正与最终收口｜CACHE-20260916-01/r4 已完成
-
-* 授权与角色：用户明确要求“将当前缓存处理设为完毕”。Codex 根据此前审查及本轮最终修正／既有日志核对完成状态更新；r4 代码和测试由执行者交付，Codex 本轮仅修改文档，不重新运行测试或实验。
-* 历史更正：上条 r3 CLOSED 后又发现发布期锁路径、finalize 诊断路径及 snapshot 异常释放缺口，因此 r3 关闭不是最终状态。保留当时记录和失败日志，以本条 r4 最终收口为准。
-* 最终实施与提交：`6877648` 将 flock 移至稳定的 artifact 同级路径、按 static→targets 加锁并在持锁后重新检查发布状态，增加诊断路径的词法／符号链接解析保护及对应合成回归；`84f91323cc274d04dc178beeb4e73a512ecfed1e` 将取得双锁后的 zero_write_snapshot 放入 try/finally，补充 snapshot 抛 OSError 后同进程可重新获取两把锁的测试。科学定义、数据集合、默认容量 2 和不采用容量 64 的决定不变。
-* 验收证据：本轮只读核对最终 diff、生产调用位置、回归测试源码及 `logs/cache_opt_r4_snapshot_final2.log`。实际命令为 `PYTHONPATH=.:tests pytest -q tests/test_glt_dual_static_recovery.py`，既有结果 `13 passed, 1 warning`、`EXIT_CODE=0`，窗口 `Uni-Poly:cache_opt_r4_snapshot_final2`；此前 r4 12 项、r3 focused tests 和 r2 固定 32-key parity 证据保留，不称为本轮新跑结果。
-* 文档操作：修改前 dev 工作树干净、HEAD 为 `84f9132`，pull 为 Already up to date；同步 `Plan_Cache.md` 完成状态与关闭说明、`Plan.md` 当前交接和本条归档；文档 diff／`git diff --check` 自检，提交与远端同步结果见对应 Git 历史和交付回复。没有改代码、缓存、PIPELINE.md、RESULTS.md 或历史指标。
-* 最终结论：**已完成／CLOSED**，仅覆盖本缓存专项约定的审计解释、构建恢复、冻结／互斥、验证工具与证据口径收口。不等于全量化学认证、payload 全字节历史完整性、断电耐久、生产迁移、吞吐或模型收益验收。
-* 下一步：**暂无后续缓存执行任务**。不补跑真实 parity、长 benchmark、训练，不启动全量重建、迁移、紧凑存储或清理；以后新增缓存工作另行规划并获得授权。其他科学计划不因本条自动完成。
-
-## DOCS-20260917-01｜训练提速实施计划交付
-
-* 授权与角色：用户要求制定当前预训练与微调提速计划；Codex完成静态核查、文档编写与自检，无独立审查者。本轮不执行代码修改、模型或benchmark。
-* 基线：dev，`64d10bcd379a99e82dc5ad827d521ef08d39a342`；工作树干净，pull为Already up to date。该提交已删除旧Plan.md/Plan_Cache.md，本次新建Plan.md作为SPEED-20260917-01/r1入口，不恢复已关闭的缓存专项。
-* 最终计划：保留当前GLT双通道Concat科学定义和训练工作量；先对实际static/targets路径做有界计时，再实现微调无标签clean输入的有限进程内复用和grid空闲槽位及时补位；预训练根据profile至多选择两个准备/预取/诊断开销候选。保留mask/noise、物理关系与中心目标、DDP全局分母、split、train-only scaler及validation选择，不新增全量缓存或改精度/batch。
-* 证据与限制：核对当前源码、geonorm预训练run.json及fixed Concat代表微调run.json；预训练实际已有3workers/rank、BF16、no_sync和详细diagnostics；微调确有逐次clean重建，grid存在批次barrier。机器资源为瞬时快照，不把静态瓶颈假设写成已测提速。
-* 拟议预算：输入parity每类最多32条，边界用fixture；预训练正确性12updates及一次必要2-step定位，性能最多160updates+40组合确认；xc/fold0微调最多8epochs且outer-test=NOT_RUN；墙钟总计2小时/产物10GiB先到即停。预算待授权，不是本轮已执行内容；GPU/worker任务仅在Uni-Poly独立窗口，低频监控。
-* 实际文件：新增Plan.md，追加本条归档；不修改代码、缓存、PIPELINE.md、RESULTS.md或历史产物。文档引用/逻辑及git diff --check自检，无测试、训练、重建、清理。提交/推送结果见本条对应Git历史及交付回复。
-* 结论与下一步：完成的是文档计划周期；SPEED实施仍待授权，未归档为完成。下一步按A→B→C→按证据D实施、记录后交Codex审查；不自动开启正式预训练或全任务微调。
-
-## SPEED-20260917-01｜r1→r4 提速周期最终归档（2026-09-17）
-
-* 授权与角色：用户授权在不改变 GLT-V2 科学定义的前提下执行有界提速返修，并明确不得自动启动正式 5k、20k 或完整微调。Codex 负责规划与最终审查，执行者完成 r1→r4 的代码、测试和 bounded smoke；本次归档由 Codex 只读核对后完成，不新增实验。
-* 修订链：r1 建立计时、clean 输入复用、动态 grid 和候选准备路径的范围；r2/r3 实现有限进程内 clean cache、static/target 读取、中心 one-hop angle 向量化、可选 timing/worker 参数及 free-slot grid；r4 补齐 `prep_workers>0` 的恢复 RNG 顺序、重复 GPU 拒绝、`--clean-cache-gib` 显式转发、重复 key 不同标签和 bounded eviction 边界。
-* 最终实现与记录：代码及测试最终实现提交为 `eda9f5c`（`fix: close speed plan execution contracts`）；r4 执行记录补记提交为 `f19ef02`（`docs: record speed plan r4 results`）。相关先前实现提交 `8cbe78e`、执行记录 `ff4e899` 保留在 Git 历史中。未修改 active cache、模型科学定义、配置、数据划分或历史结果数字。
-* 验证证据（本次未重跑）：`logs/speed_r4_scoped_tests.log` 记录授权选择测试 `5 passed, 5 deselected, 1 warning`、退出码 0；`results/speed_20260917/r4_gpu_resume_report.json` 与 `logs/speed_r4_gpu_resume.log` 记录 4-GPU、`prep-workers=3`、总 8 logical updates 的连续／恢复比较为 PASS，模型、optimizer、scheduler、ordered keys、next position、各类 RNG、loss 与 target count 均符合既有 exact／容差口径。既有 parity、256 profile 与 `xc/fold0` A-B-B-A smoke 证据仍按原记录适用。
-* 结论边界：**Codex review PASS / CLOSED** 仅覆盖 r4 约定的执行合同和有界提速证据。微调提速有 bounded evidence；预训练正式 throughput 未测。没有正式 5k/20k 预训练、Concat/KFuse 完整训练、正式 grid、8×5 微调、独立模型性能比较或全量缓存重建，因此不能把本周期写成正式性能提升或完整科学实验完成。
-* 未执行与限制：没有重跑 PI1M/downstream parity、CPU 长 benchmark 或 baseline；没有启动 speed r5、正式预训练、完整微调、outer-test、构象生成、缓存迁移或新科学路线。合成测试与 bounded GPU smoke 不外推到全量训练吞吐；历史 5000-sample profile 未完成，不作为正式 throughput 证据。
-* 归档操作：本轮仅修改 `Plan.md` 与本文件，未改 `.py`、config、cache、results 数字，未运行测试、benchmark、模型或训练。`Plan.md` 已切换为 `GLT-SCI-20260917-01 / r1`，状态为“待授权”；后续科学周期须由用户明确给出数据、模型包、task/fold、epoch/step 和比较预算后再执行。本归档不产生正式实验授权。
-
-## DOCS-20260918-01｜GLT 工程提速最终执行方案交付
-
-* 授权与角色：用户要求提供其他模型可直接执行的最终方案，明确先完成整个工程阶段，暂不涉及预测性能优化。Codex负责本轮规划、文档修改与自检，没有独立审查者；实施及有界测速仍待用户交付执行授权，不把文档当成已运行任务。
-* 基线与同步：dev，`f1dfd4d`，工作树干净，修改前pull为Already up to date；当前Plan.md为空。读取现行AGENTS、实际GLT CLI、已有SPEED归档/报告并确认关键部署包和split存在；不恢复旧缓存计划，不推断其他路线的执行状态或授权。
-* 最终计划：新建GLT-ENGINEERING-20260918-01/r1完整交接。S0锁定基线/资源，S1补source/static/targets/准备及进程全流程计时，S2真正按步采集详细诊断，S3同static条件下做clean cache独立对照并验证现有动态grid，S4按profile至多选择一个clean目标准备或pin传输候选，否则有据暂缓，S5做同协议ABBA及最终组合确认，S6交付采用/否决结论、启动/回退命令和独立审查材料。
-* 科学边界：GLT双通道Concat、3GPU×84×4、global1008、原初始化/样本流/噪声/精度/loss/schedule及微调split不变；不改模型、融合、readout、目标权重或数据。不做预测性能调参，不读outer-test，不启动5k/20k/8×5、EQ3D或其他科学实验，不写active缓存或生成构象。
-* 固定验证预算：CPU profile256条；PI1M/downstream parity各至多32；预训练总计至多316个实际updates（含短轨迹/恢复、诊断、两个单因素矩阵及组合确认），失败重跑占原预算；微调xc/fold0 cache对照8epochs，加eat/xc folds0/1两种调度smoke16epochs，总24epochs；长任务墙钟3小时、产物20GiB先到即停，GPU/worker任务仅Uni-Poly独立窗口且低频监控。没有收益可否决，不追加sweep；必要验证缺失不得宣称整个方案完成。
-* 证据口径：旧约60→10.5秒是static与clean-cache组合且计时不含完整启动/保存；旧CPU准备计时漏static/target读取；旧4GPU恢复不等于3GPU正式吞吐。这些作为新方案必须解决的测量问题，不改写旧报告。原有LRU、动态grid、角度向量化、BF16/no_sync和恢复修复继续复用。
-* 实际修改：Plan.md写入可独立执行的阶段、固定路径、已有/拟新增CLI、命令、预算、停止与验收条件及空白执行记录；本文件归档本次文档周期。未改生产代码、PIPELINE、RESULTS、缓存或产物；未运行模型、测试、benchmark。文档检查和git diff --check自检，提交/推送信息见对应Git历史与交付回复。
-* 下一步：用户授权“执行本计划”后接手模型按S0–S6执行，Codex独立审查。工程验收完成后仅标暂无后续执行，预测性能优化必须另立计划并授权，不自动衔接启动。
-
-## GLT-ENGINEERING-20260918-01｜r1→r4 工程周期最终归档（2026-09-18）
-
-* 授权与角色：用户授权执行 GLT 双通道工程提速计划及后续最小返修；Codex 负责规划与本次独立审查归档，执行者完成 r1–r4 的实现、局部测试和有界 smoke。归档范围仅为工程接口、正确性、恢复与调度合同，不延伸为预测性能实验。
-* 修订链：r1 建立计时、static/target 读取、clean cache、动态 grid 和有限候选范围；r2 修正 grid resume 身份隔离、预训练窗口计时、CPU profile 边界并补 worker=3 证据；r3 修正 launch-to-exit 计时的起点和退出观察边界，增加并行 batched 收割及真实 3-rank partial/all-zero geometry DDP；r4 修正 batched 完成结果因 active 列表压缩而可能错序的问题。
-* 最终实现与文档提交：r3 实现提交 `4826c90`，r3 执行记录链为 `ed7a782`、`46e9e9c`、`7542369`；r4 最小修复提交 `54798fd`，最终交接文档提交 `4690d3d`。当前 `dev` 已推送并核对至 `4690d3de3f69cbfad97e2b48e61db313037bd202`，工作树干净。
-* r4 独立审查证据：审查确认 `run_glt_dual_finetune_grid.py` 为每个 shard 保留稳定的原始任务序号，batched 仍并行 poll、先观察退出再 wait、保持 batch barrier；确定性假进程测试模拟 B→A→C，返回 A/B/C 且各任务一次。授权调度测试日志 `logs/glt_engineering_20260918/r4_grid_tests.log` 记录 `17 passed, 1 warning`、退出码 0；`py_compile` 和 `git diff --check` 通过。
-* r3 及既有证据范围：r3 局部测试为 `27 passed, 1 warning`；真实 3-rank NCCL 报告 `results/glt_engineering_20260918/r3_no_geometry_ddp.json` 显示 partial-zero 全局计数 `[3,1,3]`、all-zero `[3,0,3]`，两 case 的 loss、backward 和 chemistry/fingerprint gradients finite，且 optimizer updates=0。r2 的 worker=3 恢复、窗口 schema 和 profile 证据按 `Plan.md` 与对应报告保留；不重复运行历史证据。
-* Codex 审查结论：**Codex review PASS / CLOSED（有界工程合同）**。已确认 r4 没有改变 dynamic 补位、失败收口、模型科学定义、训练配置、数据划分、cache、checkpoint 或已有实验数字；没有发现会阻断本周期工程接口收口的剩余问题。
-* 明确边界：`FULL_PRETRAIN_SPEEDUP=NOT_ESTABLISHED`、`FULL_FINETUNE_SPEEDUP=NOT_ESTABLISHED`。本周期没有正式 5k/20k、完整 Concat/KFuse 训练、8×5 微调、outer-test/OOF、全量 parity、ABBA 重跑或 cache rebuild；微调 bounded evidence 和历史预训练观察不外推为完整端到端收益，也没有比较预测性能。
-* 本次归档操作：仅追加本条 `PROJECT_HISTORY.md` 记录并更新 `Plan.md` 状态；不运行测试、模型、训练、benchmark、DDP、profile，不修改 `.py`、config、cache、results 数字或 checkpoint。
-* 后续：本工程周期已完成，暂无自动后续执行。任何预测性能优化必须另立科学计划，明确 reference、controlled change、task/fold、预算和停止条件，并取得用户授权；本归档不产生启动授权。
-
-## GLT-PRED-20260918-01｜r1 规划文档交付（2026-09-18；科学周期未启动）
-
-* 授权与角色：用户要求根据当前GLT分析制定完整预测优化计划，特别考虑将7-RU FP改为3D–2D融合监督，并写入Plan.md。Codex编制与文档自检，无独立审查者；本条只归档文档交付，不关闭或宣称完成科学周期。
-* 基线与既有改动：dev@6d44ed9，用户已清空Plan.md；修改前检查remote/status并pull --ff-only成功（Already up to date）。按请求写入新计划，不恢复旧正文；工程r4完整归档已存在，未重复归档或重启。
-* 最终规划：GLT-PRED-20260918-01/r1，状态待授权。S0核对Xc/来源/身份/预训练划分；S1实现FULL/HEAD/LoRA/Ridge适应接口；S2建立B_FP/B_NONE/T_FGR，FGR以共享融合表示和对称O8端点预测中心RU内SPD2/3原子对干净log距离，保留局部几何去噪与原子任务。S3先适应开发再三组matched预训练；S4条件推进中心原子—真实物理键桥、扭转或原子环境目标；S5锁定配置后正式开发五折确认。
-* 重要边界：FGR为FlexMol-inspired项目条件重建，不是已证明的双模态协同或完整论文复现。不新增构象、修改active缓存、恢复MD200/旧KD；N=0仍无中心geo/FGR监督、保留原子任务。源P_train/P_val及benchmark重叠独立审计；旧checkpoint不能冒充新划分matched baseline。开发不读取outer-test，最终既有folds仍不能称全新盲测。
-* 拟议上限而非授权：S1两epochs；S2最多16updates及两case零update DDP；S3三条5k；S4最多三条5k与12 correctness updates。开发神经微调最多1620+2epochs，S5最多三组8×5×100epochs（120单元），同组完整预算仍须明确授权。无收益不填满预算，不自动加seed/组。所有GPU/worker/长任务只在Uni-Poly独立window留日志，默认10分钟监控。
-* 论文依据：GRIN、FlexMol、TMLR masking design、SCAGE、Token-Mol、DenoiseVAE、PolyConFM（预印本）、ELoRA及TabPFN；原文机制与项目改造分开，链接保存在本轮Plan及Git版本中。
-* 实际修改与检查：只编写Plan.md并追加本条；核对现行代码/配置与参考路径，复查相关论文原始页面；文档格式、引用路径、预算逻辑和git diff --check自检。不运行单测、模型、预训练、微调、benchmark或缓存构建，不修改PIPELINE/RESULTS的既有科学结论。提交与推送信息见本轮Git历史和交付回复。
-* 下一步：建议先授权S0–S2实施和有界验证；S3–S5研究训练/正式评估另行明确。已有授权若明确覆盖全部阶段则按合同条件推进，不重复申请小步骤。科学周期保持待授权，后续由执行者回填记录、Codex独立审查。
-
-## GLT-PRED-20260918-01｜r2 对齐实验规划修订（2026-09-18；科学周期未启动）
-
-* 授权与角色：用户要求判断2D–3D对齐是否合适并加入计划；Codex仅修订Plan.md与本条文档记录并自检，非独立科学验收。修订前dev@cd3af56工作树干净，安全pull成功；不改变r1已记录的历史状态。
-* 最终增量：新增T_ALIGN，保留chem/geo、以独立图级双向多正例InfoNCE替换FP；同身份为跨模态正例、非同身份为负例，invalid/N=0剔除对齐集合但保留其他任务。O8原子GAP与GLT中心内部键GAP经现有LN及独立512→256→128投影对齐，tau0.1，lambda前1000updates线性升至0.1；保留原512维推理表示，不默认叠加FGR/FP或引入teacher。直接依据FlexMol（CIKM2025）的跨模态对齐，聚合物多正例/中心读出为项目适配。
-* 分布式与边界：对比池为3×84的distributed microbatch（最多252），不是累积global1008；远端embedding gather保留梯度，按全局累积有效anchor数归一化。补多正例/全零/全同身份/单pair/padding/远端key梯度与数学参考要求；原子锚定桥不受prefusion ALIGN监督，禁止无监督地晋级该组合。高检索率不证明独有几何知识或XC提升。
-* 拟议预算增量：S3b三组改四组，新增5000研究updates和180开发epochs；S2新增最多12 correctness updates及3个0update DDP case。研究总上限35,000updates＋40 correctness，开发1800＋2epochs；S4/S5名额及seed不增加。全部仍待运行授权，未启动任何实验。
-* 交付与检查：更新矩阵、配置、部署、覆盖/晋级、S4桥依赖及预算总账，保留r1目标。文档格式与git diff --check自检；复核论文原始正文。未运行代码测试、模型、预训练、微调、缓存构建或清理；commit/push见本轮Git历史与交付回复。
-* 下一步：用户可授权r2 S0–S2实现与有界验证；四组科学比较需明确授权S3预算。计划保持待授权，不把本条文档修订归档写成科学周期已完成。
-
-## GLT-PRED-20260918-01｜r2 S0–S5 科学周期最终归档（2026-09-19；执行完成，待 Codex 最终审查）
-
-* 授权与角色：r2 授权 S0–S2 实现与有界验证后，用户在本会话中按阶段逐次明确授权并执行了 S3a/S3b（含 S3b-Prep 数据准备、4GPU 资源协议冻结、四条正式 5k 与 24 个 development 单元）、S4（B_NONE 之上的 ENV/TORSION 候选）与 S5（B_NONE vs B_FP 正式 outer-test）。Codex 负责规划（本 Plan.md）与后续独立审查；ZCode 为实际执行者并完成逐阶段自检。本条由 ZCode 按用户明确要求归档，**不是 Codex 独立审查**；S0–S2 执行者自检记录见 Plan.md §15（保持原样），S3a–S5 的执行记录此前未回填 Plan.md（用户明确禁止修改），以本条为准。
-* 基线与同步：周期起点 dev@ffce46d（r2 前）；本会话各阶段起点均核对 `HEAD == origin/dev` 并安全 pull。最终 `dev@018f8a0` 已推送并 fetch 核对，工作树干净（仅一个非本轮未跟踪 `.zcodeignore`，保留）。
-* 执行链与提交：
-  - S0–S2（前会话，执行者自检完成）：来源/split/XC 审计、FULL/HEAD/LoRA/Ridge 适应接口、`third_task=fp|none|fgr|align` 四分支与 DDP 验证；记录见 Plan.md §15 与 `results/glt_pred_20260918/s0|s1|s2/`。
-  - S3a：三种神经适应开发比较后锁定 FULL 为统一下游策略（`results/glt_pred_20260918/s3a/`、GLT-PRED S3a 逐步日志（已于 2026-09-28 清理）），development 协议（XC/EPS/EAT × fold0/1，30 epochs，outer_test=NOT_RUN）自此固定。
-  - S3b-Prep（`d105ee2`）：P_train 911,391 经 `IndexedFrozenDualSource` 绑定 runner 并强制 split 身份；FGR 全 P_train FP64 统计 μ=1.3571292437646856/σ=0.1360748073854848（64,973,694 候选）；ALIGN 252 池全 P_train 诊断 PASS（3,617 microsteps，no_negative_fraction=0，identity 双射）；四 matched config 冻结；no-update smoke PASS（0 updates）。
-  - 4GPU 协议（`ebed2c6`）：CPU 实测 112 逻辑=56 物理×2 SMT，T_FGR worker sweep（4/8/12 per rank → 199.8/369.7/524.5 samples/s）定 prep_workers=12/rank；四 config `expected_world_size: 3→4`；ALIGN 336 池（4×84）全 P_train 诊断重跑 PASS（2,713 microsteps，三门槛全 0/双射成立）；validator/tests 更新；no-update smoke 复跑 PASS。此前一次 3GPU↔4GPU 速度对照（用户中止）仅留 benchmark 产物，3GPU 数据不作依据。
-  - S3b-END-TO-END（`187a0e7`）：B_FP/B_NONE/T_FGR/T_ALIGN 四条正式 5k 串行（world=4/micro84/accum3/pw12/seed42），全部 runtime PASS + deploy_05000 strict-load；24/24 development units；聚合脚本按固定 gate 输出 `SELECTED_PARENT=B_NONE`（B_NONE gate PASS：XC mean Δ=+0.077；T_FGR/T_ALIGN 对 B_FP 与 B_NONE 全 FAIL → FGR_INCREMENT/ALIGN_INCREMENT=NOT_ESTABLISHED）。
-  - S4（`a89267e`+`ec005d2`）：S3b provenance hardening 后重跑判定不变；ENV（周期 radius-1 环境目标，P_train-only 词表 1118，P_train UNK 0.00039/fixed P_val UNK 0.00054 ≪20% 停止阈值）与 TOR_ON/TOR_OFF（中心 RU 重原子真实三键路径 [cosφ,cos2φ]，noisy 坐标驱动，零初始化门控残差 MLP(2→64→512)，OFF 为等角值控制；coverage 1024/1024 有效、退化 0）；correctness 13 tests + 3×2=6 updates（≤12）；三轨迹串行 5k 全 PASS + strict-load；18/18 development units 全部 outer_test=NOT_RUN；聚合 ENV/TORSION_INCREMENT 均 NOT_ESTABLISHED → `SELECTED_S4_PARENT=B_NONE`。ANCHOR 按源码事实跳过（chem 消费 fusion 前 2D atom_states、geo 消费 fusion 前 3D bond_states、third_task=none 时 fused 仅入图零，无学习信号）。
-  - S5（`8fe5c58`+`018f8a0`）：S4 hardening 复跑不变；formal-shard provenance（protocol=outer5_inner20_formal_shard、formal_shard/adaptation=full/deployment_step=5000/outer_test=RUN_ONCE）与 exactly-once `outer_test_access.json`（STARTED→COMPLETED，已有 marker 拒绝重跑）；B_FP/B_NONE 两 checkpoint strict-load PASS；80/80 formal units（8 tasks × 5 folds × 2 arms）一次通过、0 失败、80 markers 全 COMPLETED、无重复访问；OOF union/目标对齐/双臂 row_index 一致性校验通过（float32 往返按 rtol=1e-5/atol=1e-4）。
-* S5 正式结果（test R²，5-fold mean±std，ddof=0）：macro8 B_FP=0.792319、B_NONE=0.794343（Δ=+0.002024，保护条件满足）；XC Δmean=+0.002179、正 fold 2/5（+0.031/−0.107/−0.003/+0.128/−0.038）→ 预注册 XC 条件（mean>0 且 ≥3/5 正）不满足 → **B_NONE_FORMAL_GATE=FAIL，FINAL_SELECTED_MODEL=B_FP**。B_NONE 在 eat/eea/egb/eps/nc 五任务 fold-mean 更优、egc/ei 更差；XC 两臂方差均大（B_FP 0.28±0.12）。产物 `results/glt_pred_20260918/s5_formal/{summary.json,report.md}`。
-* 预算总账：研究预训练 35,000 updates 上限实际用满（S3b 20,000 + S4 15,000）；S4 correctness 上限 12 实际用 6（加 S2 的 28 上限内合计 ≤34/40）；开发神经微调 1,800 epochs 上限用满（S3a 540 + S3b 720 + S4 540）；S5 正式上限 3 组 120 单元，实际 2 组 80 单元。outer-test 首次正式访问共 80 次，RUN_ONCE，无重复。
-* 结论边界：**本周期至此为“执行完成、待 Codex 最终审查”，不是 CLOSED**。S3b/S4 的 development gate 结论（B_NONE 候选）在正式 outer-test 上未复现（XC fold 方向不一致），最终按预注册规则保留 B_FP 为通用路线；该判定是决策阈值结果，不宣称统计显著。FGR/ALIGN/ENV/TOR 四个目标扩展在 matched 对照下均 NOT_ESTABLISHED，按失败证据原则应 STOP，除非另立新假设与预算。历史 fixed-Concat/O8 参照与本次 paired fold difference 不构成严格因果比较（来源 population 不 matched），只作 HISTORICAL_REFERENCE_ONLY。
-* 未执行与限制：ANCHOR（无信号，跳过）、matched O8 预训练（S5 仅两组 80 单元）、FP+FGR/组合目标、多构象/多任务/ensemble、预训练吞吐正式 benchmark 之外的调度研究、cache 生产切换；S3b 之前的 3GPU 数据仅作历史记录。无正式 5k 之外的超额训练，无 test 结果驱动的重跑/加 seed/换 checkpoint。
-* 归档操作：仅追加本条到 `PROJECT_HISTORY.md`；不修改 `Plan.md`（用户明确禁止）、代码、config、cache、results 或 checkpoint；`git diff --check` 自检。commit/push 见本轮 Git 历史与交付回复。
-* 下一步：交 Codex 对 S0–S5 全链路（源码、configs、tests、正式产物与 commit 链 `d105ee2→ebed2c6→187a0e7→a89267e→ec005d2→8fe5c58→018f8a0`）做最终独立审查并归档审查结论；审查后的生产路线整理、RESULTS/PIPELINE 更新或任何新实验均须另行授权，本归档不产生新授权。
-
-## 2026-09-20｜旧 GLT-PRED 审查补记与 CANON3D r1 规划交付
-
-* 旧周期状态更正：此前 Codex 对 S5 的80个已有预测单元进行了只读独立复算，R²/MAE/RMSE与保存值最大差异约2.22e-16，逐折test行序与固定manifest一致，OOF各样本一次，B_NONE晋级gate失败、保留B_FP的数值判断成立。此为有限范围验收，不是对S0–S5所有训练过程的重放或完整独立审查。
-* 旧周期仍需收尾：2026-09-20源码复核确认launcher完成判定路径仍与实际嵌套产物不一致，aggregator仍直接采用保存的逐折指标；上文执行者所述COMPLETED/OOF唯一性不独立证明所有历史运行绝无重复test访问。此前Plan与执行脱节的情况现由执行者归档解释为用户阶段性禁止修改Plan；不据旧Plan文字反推未授权。保留历史记录，旧周期不因新计划而标为CLOSED。
-* 本轮用户要求与角色：用户要求给出借鉴2D的3D输入优化方案及完整价值验证计划。Codex编写`GLT-CANON3D-20260920-01/r1`并做文档自检；没有执行模型实现或实验，也不是该方案的独立科学验收。
-* 基线与已有改动：dev@79e3d2d；Plan.md已由用户清空，为唯一已跟踪修改。检查远端仓库后`git pull --ff-only origin dev`成功且Already up to date，在空Plan填入新合同，不恢复旧活动计划；历史科学周期未完成项保留在新Plan的衔接节。
-* 最终方案：M个canonical重原子状态，中心query访问全部真实Trimer images，删exact self、保留独立左右物理关系，不平均距离；固定完整M(3M−1)关系避免geometry-OFF的近邻membership泄漏。512维/6层/8头，新3D独立target-query/source-key模块，relation-conditioned bias和value；原O8、Concat与chem/geo/FP目标不变。新atom经对称atom→bond适配沿用中心键监督，N=0不伪造目标。开放Trimer状态共享为近似，不宣称严格周期性。
-* 验证计划实质：R_GLT、R_2D、G_OFF、S_SHARED四组先做matched 5k和XC/EPS/EAT×fold0/1开发筛查；只有几何和替换双重gate通过，才增加固定侧source的E_STATIC及3M动态状态P_PHYSICAL；再用S/G/锁定参考做seed43/44确认。相同数据、公共初始张量、随机流和原20k scheduler前5k；不复活FGR/ALIGN/ENV/TOR，不生成构象，不改变旧缓存。
-* 拟议预算：P0最多1024条数据审计；P1六路径两步共12updates加恢复8updates=20，另12微调smoke epochs；P2–P4最多12条5k=60000研究updates、72开发单元/2160epochs，按条件逐段授权、不为用满预算补跑。P5另行授权且须通过开发确认，最多三组八任务五折120单元/12000epochs，不新增预训练；既有outer-test已见过，只能称固定协议复评。
-* 交付变化：本轮仅Plan.md及本条历史衔接/规划记录；查阅当前源码、配置、报告和GRIN/SpaceFormer/Matformer原始页面，检查预算、引用与Markdown格式。未运行测试、GPU、模型、缓存构建、预训练、微调或清理；未更新PIPELINE/RESULTS以免将拟议路线写成生产事实。
-* 下一步：新科学周期待授权，建议只先授权P0–P1；旧S5工程缺口在复用前做最小修复与CPU测试，不重跑旧outer-test。负结果可以结束新周期，未满足gate不得机械扩展。Git提交/推送结果见本轮交付，不以Git同步代替方案价值验收。
-
-## 2026-09-20｜GLT-CANON3D-20260920-01 / r2 多RU关系规划修订
-
-* 用户要求：在Plan.md基础上新增考虑跨两个RU、借鉴2D和旧N+1/N+2思想的实现方案。Codex本轮只修订Plan.md与本条；未实现、未运行模型或测试，不改变已有执行授权。基线dev@b61876d，安全pull成功。未跟踪`.zcodeignore`与`scripts/audit_canon3d_p0.py`完整保留且不暂存，不能仅因脚本存在宣称P0完成。
-* 源码依据：2D使用canonical状态和带shift的lifted关系；旧revision-2 N+1/N+2先枚举共享中心原子的物理键对，再映射状态，N+1合并左右跨键且平均长度，N+2保留真实两侧。新的r2继承物理身份/多重性，不重复长度平均；旧N+2不等于已观测中心RU±2。
-* 最终新增合同：`L_MULTI2`维护M个canonical状态，枚举冻结Trimer全部物理有向原子对，保留source/target原始image与target anchor及delta=q_source−q_target。共3M(3M−1)关系，其中跨度0/1/2分别为3M(M−1)、4M²、2M²。只删physical exact self，不按canonical/相对shift去重。每个canonical目标的三个物理锚点内独立softmax，以中心1/2、左右各1/4合并消息后更新M状态。侧锚点只有临时message，不递归维护独立隐藏状态。输出是多局部观测估计的代表性RU，不再宣称纯中心几何状态。
-* 几何边界：实际RU−1到RU+1距离可用，但不等于中心到RU+2距离；重新定锚不是坐标平移。所有距离用同一次noisy实际坐标重算，目标保持原中心键/角度与chem/FP。无新增角度、torsion或loss。接口容纳更长真实观测集合，当前只允许K=3；无RU±2坐标不伪造，扩真实K需另立数据与预算合同。
-* 配对验证：新增`L_NEAR_GEO`保留完全相同物理关系但关闭跨度2距离，以及`L_OFF`关闭全部距离。L−NEAR检验跨度2显式几何，L−OFF检验整体几何，L−S只作多锚点/范围整体增量，L−P只作共享折叠/独立物理状态比较。保留全部r1组，不静默将L替换进P4/P5。
-* 新预算均待授权：M0三组各2updates及XC fold0各2epochs，合计6updates/6epochs；M1三条5k及18个30epoch开发单元，合计15000updates/540epochs。新增方向不依赖S已晋级，但替换判断需要已获授权且身份匹配的S/R参考。L相对NEAR/OFF均需XC mean增量≥0.01且两fold均正、EPS/EAT各退化不超过0.01，再验证参考保护条件；未通过停止，通过只列开发候选。与r1最大预算相加为75000研究updates+26correctness、2700开发epochs+18smoke，原P5最多120单元不增加。
-* 验证与下一步：文档逻辑、计数公式、预算与git diff --check自检；没有运行单测、GPU、训练、微调、缓存构建或清理。接手端先读取r2，原r1可在既有授权内继续，新M0/M1须单独授权；不干扰原P0脚本，不把新规划当成实施完成。Git同步结果见本轮交付。
-
-## 2026-09-20｜GLT-CANON3D-20260920-01 / r1–r2 规划归档：被用户新任务替换，未完成事项未获验收
-
-* 归档原因与状态：`Plan.md` 中原有的 `GLT-CANON3D-20260920-01 / r1`（基线 dev@79e3d2d）及其 `/ r2` 多-RU 修订（基线 dev@b61876d）在本日被用户新任务 `GLT-GALPH-PHRETENTION-20260920-01 / r1` 替换。CANON3D 周期**只完成规划**，没有任何阶段通过验收；本条目按用户要求保存其计划与未完成状态，**不标记为已完成，也不推翻其科学问题**（负结果/未执行 ≠ 被否决）。
-* 完整文本的稳定位置：CANON3D r1 的 `Plan.md` 原文保存在 git 提交 `b61876d`（`git show b61876d:Plan.md`），r2 修订保存在 `a231c05` 及其后到 `f991f84` 的 `Plan.md` blob（`git show a231c05:Plan.md`），可随时检索；本条只记录实质与状态，不重复粘贴全文。
-* 方案实质（r1）：以单个 RU 的 M 个 persistent canonical 原子状态承载 3D 表示，替换"全 Trimer 物理键更新后读中心键"的旧 GLT 分支；中心 query 访问全部真实 image（R=M(3M−1)，删 exact self、保留左右独立关系、不平均距离），固定完整关系集合以避免 geometry-OFF 的近邻 membership 泄漏；512 维/6 层/8 头，新独立 target-query/source-key 模块与 relation-conditioned bias/value；O8、Concat 与 chem/geo/FP 目标保持。对照：R_GLT、R_2D、G_OFF、S_SHARED；条件组 E_STATIC（侧 source 固定为 h0）与 P_PHYSICAL（真实 3M 动态状态）。开放 Trimer 上的状态共享为近似，不宣称严格周期性，不生成/优化构象。
-* 方案实质（r2）：保留 r1 全部组，新增 `L_MULTI2`（枚举冻结 Trimer 内全部物理有向原子对，每个 canonical 目标的三个物理锚点内独立 softmax，跨度 0/1/2 关系数分别为 3M(M−1)、4M²、2M²）及两个匹配控制 `L_NEAR_GEO`（只关闭跨度 2 距离）与 `L_OFF`（关闭全部距离）；新增 M0/M1 为独立待授权分支，不自动并入 P0–P1。
-* 拟议预算（均未使用）：P0 最多 1024 条数据审计；P1 六路径各 2 步 = 12 updates + 恢复验证 8 updates，另 12 个 smoke epochs；P2–P4 最多 12 条 5k = 60000 研究 updates、72 开发单元/2160 epochs，逐段授权；P5 另行授权（最多 3 组 × 8 任务 × 5 折 = 120 单元/12000 epochs，不新增预训练）。r2 的 M0/M1 另计（6 updates/6 epochs 与 15000 updates/540 epochs）。
-* 实际执行与回滚（执行者记录，供审查）：用户曾明确授权 `GLT-CANON3D-20260920-01 / r1` 的 P0–P1；执行者实现了拟新增文件 `src/dataset/canonical_geometry.py`、`src/modules/canonical_geometry.py`、`tests/test_canonical_geometry.py`、`scripts/audit_canon3d_p0.py`、`configs/mts/canon3d_*.json`，并运行 P0 只读审计写出 `glt_canon3d` P0 摘要（逐步产物已清理）。用户随后指示停止该任务并要求回滚这些代码改动；执行者已删除上述 5 类新文件（**当前工作树中确认不存在**），仅保留未跟踪的只读产物 `glt_canon3d` P0 摘要（逐步产物已清理）。该产物不参与后续任何判断，也未进入本日 GALPH 周期。
-* 未完成事项（逐项列出，全部未获验收）：P0 审计无独立审查；P1 的身份/关系数/不变性/G_OFF 回退/部署 strict-load 测试随代码删除而消失；P2 主比较（R_GLT/R_2D/G/S 各 5k）与 24 个开发单元从未运行；P3 条件归因（E_STATIC/P_PHYSICAL）、P4 多 seed 确认、P5 固定协议复评从未运行；r2 的 `L_MULTI2`/`L_NEAR_GEO`/`L_OFF` 与 M0/M1 从未实现或运行。以上内容不因本条归档而关闭或通过；若要重启，必须按当时的合同重新授权并重新建立验证，不得引用本条作为已完成证据。
-* 交接边界：CANON3D 的旧 Python 脚本若在别处残留，不构成本项目活跃计划；旧周期中提到的 S5 launcher/aggregator 源码缺口与本归档无关，仍未关闭，也不由本条修复。
-
-## 2026-09-20｜COLLAB-20260920-01 / r1：明确 Codex 规划审查、ZCode 执行闭环
-
-* 授权与角色：用户明确要求更新 `AGENTS.md`；Codex 执行本次文档修改，基线 `dev@41d33b0`，修改前工作树干净，安全 pull 成功。
-* 最终规则与实际修改：在 `AGENTS.md` §4 明确用户将 Codex 规划转交 ZCode，并返回执行结果；Codex 核对实际 diff、日志和产物后给出审查结论，制定下一步或返修计划及一致的执行提示词。接收结果不等于接管执行，保留用户明确要求 Codex 执行时的例外。
-* 验证与结论：仅文档逻辑与 `git diff --check` 自检，无独立审查；未运行测试、模型、训练或缓存任务。本次规则更新完成，提交与远端核验见本轮交付。
-* 边界与下一步：未修改当前 `Plan.md`，不改变 PH retention 周期的阻断状态或实验授权；本次规则修改暂无后续执行。
-
-## GLT-GALPH-PHRETENTION-20260920-01｜r1–r6 完整周期归档（2026-09-20；Codex 验收通过，限定负结果结束）
-
-* **状态与结论**：本周期于 2026-09-20 由用户启动、Codex 规划审查、ZCode 执行，**r6 实现与 18-unit 开发比较经 Codex 验收通过**；**当前 PH retention 配方未建立预测增量**，周期以该**限定负结果**结束，**暂无后续执行**。归档时基线 `dev@9c0bc7e`，工作树干净、`HEAD...origin/dev = 0/0`；本轮为纯文档收口，未运行模型、测试、训练、诊断前向、缓存构建、清理或任何 optimizer update。
-* **原始科学问题与三个匹配组**：同一个已核实的 C1 `deploy_05000.pt` 主干，在下游**保留样本特异 PH**（F_REAL）是否优于**关闭 PH**（F_OFF）与**同容量固定 PH 分支**（F_CONST，使用 P_train 平均 profile）。三组共享同一部署包、公共参数与新投影/门控初始张量、数据顺序与公共随机流；结构为 `r3_new = r3 + tanh(gamma) * W_ph(冻结 PH encoder(profile))`，`gamma` 初始化为 0、不复用预训练 `alpha_ph`、不加开门正则、PH encoder 冻结且在 `model.train()` 后仍 eval、无效 PH 为零残差且不删除样本。任务为 xc/eps/eat × fold0/1（`outer5_inner20`、seed 42、FULL adaptation、≤30 epochs、patience 10、train-only scaler、validation 选优、无 refit、不访问 outer-test）。
-* **r1（`41d33b0`）encoder 退化阻断**：下游实现与 11 项检查、sidecar 构建与有界验证完成，但预训练 C1 的 PH encoder 在下游无法提供样本特异信息 → 18 个 development units **未执行**，报告科学阻断而非绕过。**未获独立审查的后续修正**（r2 起）：`best_epoch=30` 触及 30-epoch 上限不能称为"未触及上限"；`C0−N0` 是 CLS 编码＋读出组合的变化，不是纯 CLS 归因。
-* **r2（`d372b08`）组合修复预检与预算偏差**：证据收口（不再称 encoder 是"严格常量函数"，改为"在已检查的 64 条固定 P_train 输入与 fp32/bf16 两种精度下失去可观测样本区分性"，且分阶段：step 1000 仍可分辨、step 2000 低于容差、step ≥3000 逐位一致）；四项最小工程返修（梯度 parity、runner 协议/预算、sidecar 拒绝覆盖、aggregator 身份与风险判定）；两条各 256 updates 的匹配预检：R_LEGACY（原配方）复现旧 C1 逐位一致，R_REPAIR（PH 路径 `weight_decay=0` 独立参数组 + `tanh(alpha)` 初值 0.02）256 步内可训练。**据实记录超预算**：合同允许两臂合计 ≤512 updates，实际消耗 **1026 updates（超 514）**，原因是首版监测行步号错位（17/65/129）后为符合合同重跑 v2；v1 保留为 parity 证据。该记录**独立保留、不因后续轮次抵销**。
-* **r3（`0e22534`、`4e48f47`）诊断缺陷修复与证据替代范围**：修复 `batch.ph_profile` 原地修改导致的跨条件输入污染（新增 `_with_profile` 浅拷贝视图）与 bf16 前向后以 FP32 重算 residual/head 的口径混用（残差改由模型自身张量反推，并给出同上下文"直接视图"）；新增输入不变性/调用顺序独立性/状态逐位还原等 CPU 测试；**替代范围**：`ph_degeneration_diagnostics_r3.json` 取代旧文件 `ph_degeneration_diagnostics.json` 的 **model 段**（旧文件保留，sha256 `3e762dc4…` 记录在 `supersedes`），`step0`/`probe_set`/`fixed_window` 段与 encoder 段 12/12 逐字段相同；本轮 **0 optimizer updates**。
-* **r4（`dbb1225`、`54974c4`、`778ad6d`）单条修复 C1 5k 长程确认**：从原始 common initialization 出发、PH 路径 `weight_decay=0`、`tanh(alpha)=0.02` 初值，跑满 **5000/5000 optimizer updates**（81.3 min，无失败无重试，seed 42、world 4、micro 84×accum 3 = 1008、bf16、lr 2e-4、warmup 2000）；13 个监测点全 `all_finite`，衰减项恒为精确 0，PH 梯度/更新处处非零，范数微升（`patch.2.W` 13.0952→13.1289），probe 区分性 0.1811→0.5264；strict-load 与 resume 共享 204 张量逐位一致。**据实报告**：模型自身把门控收敛到 `tanh(alpha) = −2.25e-4`（残差/参考 1.5e-2 → 1.3e-4），未强制开门、未加正则。另记录 1 次**报告判据**返修（strict-load 判据由"逐位一致"改为比值单位上的绝对差 vs 行内阈值，0 updates）。r4 表述更正：诊断文件的 `step 0` 行属 **common-init/LEGACY 参考**（门控恰为 0），REPAIR 实际起点为 `tanh(alpha)=0.02`。
-* **r5（`1a60fbc`、`5d0ca89`）新主干接线与报告故障**：为修复版部署包建立**唯一身份记录**（`configs/mts/glt_galph_c1_repair_5k_identity.json`，sha256 `3063cf8bef341841b665c93f118a1eb251308d5d67dfa41b4179465570f302e2`、step 5000、cls/global、`scale-interaction-v2`、204 张量 strict-load 逐位一致）与共享校验模块，runner/aggregator 同源校验；38 项局部测试与 0-update 接线诊断（三组输入/表示两两不同、样本顺序相同）通过。**三组 smoke 各跑满 2 epochs（合计 6/6 epochs，授权额度全部消耗）后在本轮新增报告代码中崩溃**（常量 profile 留在 CPU、batch 在 CUDA），**无 `metrics.json`/`best.pt` 落盘**；按合同"失败前消耗和重跑消耗都计入预算；若需要超预算重跑，停止并报告"**未重跑**，18 units 未启动。失败现场全部保留：`p3/smoke_*`（仅 `run.json`）、各组 traceback、`p3/chain_status.log`，以及更正 shell 缺陷（`$(date)` 覆盖 `$?` 使退出码失真）的 `p3/chain_status_correction.txt`。
-* **r6（`886623a`、`9c0bc7e`）返修、恢复验证与 18-unit 开发比较**：① 结果先落盘——`best.pt` 与核心指标先于可选 PH 诊断写出，诊断失败保留二者并记 `complete=false` + 失败阶段、进程非零退出且写 FAIL `runtime.json`；aggregator 拒绝 `complete!=true` 的单元；launcher 立即捕获真实退出码、失败即停、错误路径不写 `ALL_DONE`（并修掉 `GROUPS` 与 bash 内建变量冲突导致组名变成 `0` 的问题）。② 零训练回归 **44 passed**（含"诊断抛异常仍保留 checkpoint 且状态非 PASS"等 6 项）。③ 先做 0-update 报告路径检查，再跑 **3 组 × 1 epoch 恢复 smoke（新增 3 epochs）**：三组 exit=0，每组 **26 项校验 + 5 项分离性检查全部通过**。④ 18 个 development units 完成，三组 exit=0、**411/540 epochs**、无失败无重试。
-* **最终数值（开发比较，非 blind test）**：三任务均值 F_OFF `0.7238879309271581`、F_CONST `0.7238928536512238`、F_REAL `0.7238929676124265`；**F_REAL − F_OFF = 5.036685268300367e-6**（Codex 独立复算；产物为 `5.036685268411389e-6`，相对差约 2e-11）、**F_REAL − F_CONST = 1.1396120269679955e-7**、F_CONST − F_OFF = 4.92272406571459e-6；预登记阈值 +0.005（XC 另需 +0.01 且两折不退化）**未达到**；无任务退化超过 0.01（`risk_flags` 为空）；aggregator `VERDICT = STOP`。
-* **门控限制（与结果同时成立）**：训练得到的门控极小（`|tanh γ| ≤ 3.8e-4`，残差约占参考 1.2e-4），故本轮实际比较的是"几乎关闭的 PH 残差"；按要求未调整门控、未加开门正则、未改融合结构，也未解冻 encoder。
-* **接线有效性（排除"三组其实相同"）**：输入源分别为 `zero_placeholder`／`p_train_mean_fixed`（跨样本 spread 恰为 0）／`sample_own_frozen`（spread 0.71–0.96），encoder summary 与 const 相差 0.29–0.35，`best.pt` 中约 203–206/243 张量逐位不同（`ph_proj.weight` 相差 0.015–0.042），γ 在 F_CONST/F_REAL 均被训练到非零、F_OFF 恒为 0。
-* **测试与产物路径**：局部测试 `tests/test_glt_galformer_ph_retention.py`、`tests/test_glt_galph_ph_retention_r5.py`、`tests/test_glt_galph_ph_retention_r6.py`、`tests/test_glt_galph_ph_diagnostic.py`（日志 `logs/glt_galph_ph_retention_20260920/{preexisting_tests*.log,retention_tests_r2/r3/r4.log,r5_tests.log,r6_tests.log}`）；预检与诊断 `results/glt_galph_ph_retention_20260920/p1/`（`pretrain_R_*`、`pretrain_C1_REPAIR_5K/`（含 `resume_01000..05000.pt`、`deploy_05000.pt`、`ph_monitor.jsonl`、`optimizer_groups.json`）、`ph_diagnostics_C1_REPAIR_5K.json`、`ph_degeneration_diagnostics[_r3].json`、`ph_probe_*.{npy,json}`）；新主干下游 `p4/`（`smoke_r6/`、`development/`、`development_aggregate.json`、`smoke_r6_verification.json`、`diagnostics_path_check.json`）；r5 失败现场 `p3/`；sidecar `p0/ph_sidecar_downstream/`。日志根 `logs/glt_galph_ph_retention_20260920/{p2,p3,p4}/`。
-* **提交链（可用于检索）**：`41d33b0`（r1）→ `d372b08`（r2）→ `0e22534`/`4e48f47`（r3）→ `dbb1225`/`54974c4`/`778ad6d`（r4）→ `1a60fbc`/`5d0ca89`（r5）→ `886623a`/`9c0bc7e`（r6），全部推送至 `origin/dev`；本轮文档收口 commit 见交付回复。
-* **执行者自检与独立审查的区分**：周期内所有运行、监测、一致性检查、测试与文档均属 **ZCode 执行者自检**，执行者从未宣布验收通过；**Codex 独立审查**的范围为 r6 实现与 18-unit 开发比较（其结论为"验收通过、未建立预测增量、以限定负结果结束"）。r4 的 5000-update 轨迹、r2 的 1026-update 预检与 r5 的失败 smoke 均**未**经 Codex 逐条重放；执行者自检不得当作独立审查。
-* **未完成／未验证（不因归档而关闭）**：① 早期（<1000 步）PH 路径的实际贡献；② 非零门控（更强条件化）下 PH 是否带来增益——本轮明确未做该干预；③ N1 是否与 C1 同构退化（只复核部署权重与旧记录）；④ 8 任务 5 折与 outer-test 层面的任何结论（本轮未运行，且共享 validation 折不是独立盲测）；⑤ 旧 S5 launcher 完成判定路径与 aggregator 逐折校验缺口（与本周期无关，仍未关闭）。
-* **归档操作**：仅追加本条到 `PROJECT_HISTORY.md`，并同步更新 `Plan.md`（审查结论与收口）、`RESULTS.md`（本轮开发结果与解释边界）、`PIPELINE.md`（新 checkpoint 身份、完整产物判定、失败保留机制）；**未**运行模型、测试、训练、诊断前向、缓存构建或清理，**未**改动代码与配置，**未**删除或覆盖任何 checkpoint、sidecar、失败现场与旧诊断。
-## GLT-PH-END2END-20260920-01 / r1 文档规划交付（2026-09-20）
-
-- **角色、授权与状态**：用户要求Codex在PH.md制定可由ZCode执行的多个端到端PH融合方案，目标为提升微调预测表现；本轮仅完成规划文档，实验仍待授权。Codex完成文档自检，不称独立实现审查；ZCode本轮未执行。
-- **基线与保护**：dev@fd6378f，ff-only pull成功；原工作树有Plan.md删除、.zcodeignore未跟踪及空PH.md。本轮不恢复Plan.md、不提交这两项用户改动，仅新增PH.md并追加本归档。
-- **完整规划摘要**：A在原6层512维GLT第2/4层后加入PH-token cross-attention；B在第3/5层后按真实原子—键incidence引入2.5/4/6Å空间消息，用PH路由共享小模块（推荐先做）；C用6层256维原子空间Transformer替换line主干，局部元素选择PH进入第2/4层，输出投影512。保留O8，冻结现有Trimer来源，不生成构象。每family CONST/STAT/PH三臂分别控制新容量、普通空间统计及真实PH，三臂同初始化与预算。先复用当前global PH，C单独核算local PH成本，不将其称完整PiPE或MCP复现。
-- **训练与微调**：主轮共同2D/3D masked-token CE＋InfoNCE，无默认PH重建或FP；新配方AdamW lr2e-4、global1008、warmup2000、20k schedule、5k截断，PH参数wd0。新训练R0/R2D用于比较，现有修复C1 5k作为CURRENT部署锚点只重新微调，不重训。微调outer5_inner20、train-only scaler、Huber0.5、encoder lr1e-5/head1e-4，探索30epochs、后续100epochs、patience10；PH在预训练和微调均可训练，无late-residual新门控。
-- **阶段与上限**：首次建议仅授权P0＋P1-B。每新增arm P1≤10updates及1epoch，CURRENT另1epoch；P2-B五条各5k共25k；P3-B含CURRENT六臂36units/1080epochs。A/C各需单独授权，各增加15k及18units/540epochs。最多11条新轨迹55k、含CURRENT72探索units/2160epochs，非一次性授权。最多一个family晋级；四个新部署从5k续至20k新增≤60k；加CURRENT共五臂，确认90units/9000epochs，正式200units/20000epochs，均另需授权。全量离线特征构建先测算和授权，不隐藏为Dataset前处理。
-- **验收／停止**：候选对CONST和R0的macro3≥+0.005、XC≥+0.01且XC两折为正，对STAT macro3/XC为正，对CURRENT探索为正、确认达到相同增量阈值；跨任务退化保护0.01。仅开发阈值非显著性保证。正式前不访问outer-test，不使用历史不匹配分数做PH归因；可训练性、smoke、开发、正式层级分开。无收益接受限定负结果，不追加无边界sweep。
-- **工程与证据**：复用现有mask/DDP/split/保存恢复；专门覆盖空几何rank、N=0、NUL key、物理mapping、PH/STAT区别、置换和欧氏不变性、报告先保存再诊断及真实退出码。文档检查为相关引用、公式/代码围栏、预算算术、git diff --check；无模型、测试、GPU、训练、缓存或构象生成。
-- **交付与后续**：详细接口、方程、拟新增路径、预算和执行边界保存在本次提交的PH.md。文档交付已完成；新实验未执行，未宣布性能提升。下一步由用户授权P0/P1-B，再由ZCode执行、Codex审查；不自动恢复或替换Plan.md。
-
-## GLT-3D-GAIN-20260921-01 / r1 文档规划交付（2026-09-21）
-
-- **授权、角色与状态**：用户要求暂搁 PH 并在 `3D.md` 编写可由其他模型执行的具体 3D 优化计划。Codex 负责规划、文档修改与自检；本条只归档文档交付，诊断和科学实验仍待授权，不将 PH 已有工作标为取消或验收完成。
-- **基线与保护**：最终编写基线 `dev@63a2e13`，ff-only pull 成功；期间读到 PH 执行者新增的 `41b8566`、`63a2e13`，按最新状态规划，未修改其文件。保留用户删除 `Plan.md` 和未跟踪 `.zcodeignore`；本轮仅新增 `3D.md`、追加本归档。不恢复 Plan.md、不停止进程、不清理产物。
-- **最终计划**：以 S5 B_FP step5000 的 concat／无 CLS 双路为主参考，明确区别于旧 N+1/N+2 和 GALPH C1。D0 核验部署、split、映射、中心 N=0、参数组与监督流；D1 仅在 XC/EPS/EAT×fold0/1 的 train/validation 上提取冻结 2D/3D 表示，进行固定输入干预、四类 Ridge 与 cross-fitted residual probe。D1 最多174次 CPU Ridge 拟合、256条干预探针、单 GPU 编码60分钟和 CPU拟合60分钟，神经网络 updates 为0；不读 outer-test 进行选型。
-- **条件优化方案**：若冻结表示支持可读增量，D2 比较同包 F2D、原双路、预训练 norm 低学习率、进一步降低 GLT lr 四臂；最多4 smoke epochs＋24开发units/720epochs。若编码响应正常但增量不足，另授权 D3：保留物理 Trimer 与中心键读出，第3/5层后加入 incident-bond→atom→bond 的128维消息模块，比较原 GLT、化学邻接、4Å空间邻接。两种新增模块同参数；空间距离及邻接由当前 noisy 坐标生成，微调用 clean。保留原 masked-atom、几何重建及FP三任务，不混入PH或CLS。D3预算为30 correctness/resume updates、4 smoke epochs、三条各5k预训练、24开发units/720epochs，各阶段分别授权。
-- **门控与限制**：候选须相对相应双路、容量控制及同包2D对照达到 macro3 +0.005、XC +0.01且两折为正、任一任务退化不超过0.01；均为工程筛选非显著性保证。最多选一候选，后续54确认units及120正式units仅为待授权预留，不自动启动。不自动延长20k、不生成构象、不重建缓存、不修复或重启PH、不同时修改状态共享/读出/损失。失败消耗计预算，缺陷先返修；有效实现仍无收益时允许限定STOP。
-- **验证与交付**：只做相关代码／配置只读核对、文档逻辑、预算及 `git diff --check`；没有运行单元测试、模型、GPU、训练、缓存构建或诊断前向。完整接口、预算、停止条件及执行入口见本次提交的 `3D.md`；提交哈希与远端核验见本轮交付回复及 Git 历史。自检不称独立实验审查。
-- **下一步**：建议用户先授权 D0＋D1，由指定执行者完成并在 `3D.md` 记录，Codex 审查后选择返修、D2、D3或STOP。PH保持搁置；不以新规划替代其既有执行记录或宣称既有 PH 阶段已验收。
-
-## GLT-3D-GAIN-20260921-01｜r1–r6 完整周期归档（2026-09-21；纯文档收口，限定负结果结束）
-
-* **状态与结论**：本周期 2026-09-21 由用户启动、Codex 规划、ZCode 执行，从零更新诊断走到 24-unit 开发比较。**D2 四臂开发比较中 FNORM 与 FSTABLE 均未达到预登记门槛**，`FBASE − F2D` 的 macro3 为负，周期以**限定负结果**结束，**暂无后续执行**。归档基线 `dev@1981466`，工作树在本轮收口前干净、`HEAD...origin/dev = 0/0`。**本轮为纯文档收口：未运行任何测试、模型前向、训练、诊断或 optimizer update**；只做文本更正、审查登记与归档。
-* **审查登记的来源与限度**：按用户指示登记本次审查。**执行者未获得审查意见全文**，本条只登记用户明确转达的要点及据此完成的更正（r5 的“模型前向为 0”表述、r6 的表述／表格、`best.pt` 的 resume 表述、r4 超额单列、技术验收不等于追认授权）；未转达的部分不在归档中宣布，也不以执行者自检代替独立审查。
-* **原始科学问题与四臂合同**：同一个 S5 `B_FP` step5000 部署包（`results/glt_pred_20260918/s3b_formal/b_fp/pretrain/deploy_05000.pt`）抽取的四臂，在 `mips_outer5_inner20` 上比较“预训练融合归一化／3D 编码器的更新策略是否导致负迁移”。`F2D` 只跑 O8（head 输入 `[norm2(z2), 0]`，1024 宽，GLT 分支不构建不执行）、`FBASE` 双路原配置（o8 1e-5／glt 1e-5／norm2·norm3 1e-4／head 1e-4）、`FNORM` 仅把 norm 降到 1e-5、`FSTABLE` 再把 GLT 降到 3e-6。共享：MSE、AdamW、wd 0.02、batch 32、eval 64、seed 42、patience 10、30-epoch schedule（warmup 5，早停只改停止位置）、train-only scaler、validation 选优、每单元同一初始张量与同一公共随机流。
-* **r1（`95e3185`）D0＋D1**：D0 静态审计确认 `norm2/norm3` 落在高学习率兜底组、部署包排除 `predictor.*`、六个开发单元几何 invalid 全为 0、仅 xc 各折 train 有 1 个“几何有效但中心键为 0”样本；D1 零更新诊断完成 6 个单元的冻结表示、干预与 probe（174 次 Ridge），`split_fuse` 与 `fuse()` 等价性实测 `max|delta| = 0.000e+00`；结论为 `L23−L2` macro3 −0.01469、残差 macro3 −0.02060，未达门槛，但几何干预确实驱动表示（1.3e-07 噪声地板之上 6 个数量级）。
-* **r2（`563668f`）解释返修与数值稳健性**：删除“余弦接近零排除信息冗余”等 5 处越界推论（保留旧数值，追加更正）；Ridge 改 float64＋`solver='svd'`、scaler 仅拟合 train（含残差内折）；九点网格下 **294/294** 次真实数据拟合（新预算，与 r1 的 174 次分开计），残差 macro3 由 −0.0206 变为 **+0.005745**，XC 两折均正，按原门槛“恰好通过”；同时记录增量 85% 来自 XC、三个单元的最优 alpha 撞上界。
-* **r3（`eae7b81`）D2 实现与 smoke**：四臂实现＋14 项测试，四臂 XC/fold0 各 1 epoch（**4 epochs／36 updates**）；191/191 共享张量逐位一致、strict-load 通过、F2D 在删除全部 14 个几何字段后仍可前向而 FBASE 抛错、F2D 死参数 262,144。
-* **r4（`4d9f302`）公共随机流与记录返修**：`DualArm` 把 3D 前向放进 `IsolatedRandomStream`（进入保存公共 CPU/CUDA 状态、退出保存私有状态并恢复公共状态，异常同样恢复），私有流只播种一次、跨 batch 推进；**并据实报告 GPU 调用实耗 16 次、原授权 8 次、超额 8 次**（两次报告路径缺陷各消耗一次完整运行，失败日志保留），该条目**单列且未获追认**；launcher 改为失败即以原退出码中止、日志只追加、仅全部成功写完成标志；单元记录改为 `arm/task/fold` 独立目录并区分 PASS/FAILED，`executed_epochs` 取自实际 history。
-* **r5（`751a35b`）split 契约收口**：r4 的 `resolve_fold` 因按**集合大小**求和而放行重复索引与负索引，且未校验协议与 `validation_is_test`；收紧为 protocol 严格等于 `outer5_inner20`、`validation_is_test` 必须为 false、索引必须为整数且在范围内且去重、三集两两不交、并集严格等于 `set(range(sample_count))`；新增 5 项合成测试；六个真实单元 manifest 只读校验全部接受，且 split 文件 sha256 与 cohort manifest 绑定一致；**未重建或替换任何 manifest**。
-* **r6（`6aba976`、`1981466`）24-unit 开发比较**：新增有界 GPU slot 调度器（启动前固定 24 项清单到 `schedule.json`，已存在 schedule 或单元目录即拒绝启动，单 slot 串行、`CUDA_VISIBLE_DEVICES` 绑定）与聚合器（只接受 24 个预定身份，逐项核验 runtime/stage/outer_test/split/冻结 config/部署包/学习率表/requested·executed epochs/updates 一致性/best 值与 history 一致/产物存在/指标有限/随机流契约，**目录存在或日志 PASS 不作完成证据**）。**24/24 单元 PASS、0 失败 0 重试、668/720 epochs、5544 optimizer updates、网格墙钟 833 s**；聚合 `{"status": "COMPLETE", "accepted": 24, "problems": 0}`。
-* **最终数值**：逐任务两折均值 F2D `0.41646／0.80583／0.98107`（macro3 **0.73445**）、FBASE `0.38152／0.82123／0.98701`（0.72992）、FNORM `0.38139／0.82122／0.98751`（0.73004）、FSTABLE `0.38990／0.82256／0.98664`（0.73303）。配对差：`FBASE − F2D` macro3 **−0.00453**（xc −0.03495，两折 −0.06650／−0.00339 均负；eps +0.01541；eat +0.00594）；`FNORM − FBASE` macro3 **+0.00012**（xc −0.00013、eps −0.00001、eat +0.00050，差异落在第 4–5 位小数）；`FSTABLE − FNORM` macro3 **+0.00299**（xc +0.00852 且两折 +0.00525／+0.01179 均正、eps +0.00134、eat −0.00087）。**门槛未达到**：候选相对 FBASE 的 macro3 为 FNORM **+0.00012**／FSTABLE **+0.00311**，相对 F2D 为 FNORM **−0.00441**／FSTABLE **−0.00142**，四项均低于 +0.005；FSTABLE 的 xc 均值 **+0.00838** 也低于 +0.01。聚合器 selection 为空，两个候选的完整结果均已报告。`fstable/xc/fold1` 的 best_epoch 触及 30 上限（未延长训练）。
-* **测试与产物路径**：`tests/test_glt_3d_gain.py`（r1）、`tests/test_glt_3d_gain_r2.py`（r2/r3）、`tests/test_glt_3d_gain_d2.py`（r3–r5）、`tests/test_glt_3d_gain_d2_aggregate.py`（r6）；D0/D1 产物 `results/glt_3d_gain_20260921/{d0,d1,d1_r2}/`；D2 产物 `results/glt_3d_gain_20260921/{d2_smoke,d2_r4,d2_development}/`（后者含 `schedule.json`、`grid_runtime.json`、`aggregate.json`、`report.md` 与 24 个单元目录）；日志 `logs/glt_3d_gain_20260921/`。归档时 `Uni-Poly` 中可核实的本周期窗口为 `glt3d_r4_rng` 与 `glt3d_r6_dev`（r6 网格）；**r3 smoke 所用的窗口名未在记录中保留、标记为未核实**，该任务可由 `d2_smoke.log` 与产物时间（2026-09-21 02:41 UTC 起）定位。
-* **提交链（可用于检索）**：`95e3185` → `563668f` → `eae7b81` → `4d9f302` → `751a35b` → `6aba976` → `1981466`（本轮文档收口的提交哈希见交付回复），全部推送至 `origin/dev`。
-* **执行者自检与独立审查的区分**：周期内全部运行、测试、一致性检查与文档均由 **ZCode 执行**；Codex 的规划文档见 r1 条目。**Codex 的逐条审查意见原文未提供给执行者**，本条只登记用户转达的要点；因此归档不得读作 Codex 已逐条复核 r4 的 16 次 GPU 调用、r5 的 manifest 只读校验或 r6 的 24 个单元。
-* **未完成／未验证（不因归档而关闭）**：① r4 的 8 次超额 GPU 调用是否追认；② `best.pt` 不是完整 resume 状态，恢复路径本轮未使用也未测试；③ 聚合器拒绝条件的 15＋3 项由合成 JSON 覆盖，未在真实失败单元上触发过；④ 8 任务 5 折、outer-test 与多 seed 层面的任何结论；⑤ D1 的 `alpha` 饱和与“验证集反复使用”的方法学限制；⑥ D3（空间接触）与 PH 相关方向均未启动。
-* **归档操作**：仅追加本条到 `PROJECT_HISTORY.md`，并更新 `3D.md`（审查登记、周期状态、三处表述更正）与 `RESULTS.md`（D2 开发比较与解释边界）。`PIPELINE.md` **未改动**：本周期未改变生产模型、部署包身份、数据语义或流程。**未**运行测试、模型、训练、诊断或清理，**未**修改任何代码、配置或产物，**未**删除或覆盖任何历史证据。
-
-### 2026-09-21 — GLT-SPATIAL-20260921-01 / r1：下一轮计划文档交付
-
-- **角色与授权**：用户要求 Codex 制定下一步 3D 优化计划并允许覆盖 `3D.md`，随后明确必须有论文依据。Codex 本轮仅规划、检视相关代码/配置和文档自检；ZCode 未执行新计划。本条归档的是已交付的文档编制，不是新实验周期验收。
-- **历史保护**：旧 D2 已有以上完整归档，原 `3D.md` 全文保留于 `3912249:3D.md`；不再次标记运行通过、不追认 r4 超额、不改旧数值和产物。用户未跟踪 `.zcodeignore` 保持原状。
-- **论文核对**：MMPolymer（CIKM 2024，arXiv:2406.04727v2）支持有限代理与原子对距离编码方向；Mol-TDL（2024 预印本，arXiv:2410.04765v1）支持距离邻接与非键关系的研究动机。新计划给出具体章节和链接，明确不构成完整复现。4 Å 取自后者研究范围；128维、插入第3/5层、固定0.1残差以及 bond→atom→bond 公式均标为项目工程假设，非论文已验证参数。
-- **最终计划**：只增加非键空间消息，保留 O8、原 GLT 六层、中心读出、concat、既有三个预训练任务和单冻结 Trimer。三条新匹配预训练 BASE/CHEM/SPACE；四条下游 O8_ONLY/BASE/CHEM/SPACE。CHEM 控制新增模块容量，SPACE−CHEM 是新增空间关系的整体效应，不称纯距离值或物理能量贡献。噪声邻域从当前 noisy 坐标重建，N=0/invalid 不伪造中心监督。
-- **阶段与边界**：推荐先单独授权 P0（零模型审计）＋P1（有限 CPU 模型检查、预训练共6updates、空几何DDP两次分布式前反向、微调共4epochs）。P2三臂总15000updates、P3共24units/最多720epochs均待后续授权；每阶段结束交回审查。失败重跑计入预算，耗尽即停，不用报告错误理由自动扩额。PH、outer-test、构象生成、缓存重建、额外 sweep/seed 均不启动。
-- **预登记判据**：SPACE 对 BASE/CHEM/O8_ONLY 每个对照都须 macro3≥+0.005、XC均值≥+0.01且两折为正、任务均值退化不超过0.01，才列后续确认候选。这是开发工程门槛而非统计显著性或论文结论；失败允许 STOP。
-- **实际变更/验证**：仅替换 `3D.md` 并追加本条；核对原论文网页、相关配置和历史记录，运行 `git diff --check`。未运行测试、模型、训练、缓存构建或诊断。无独立第二审查者；文档自检不等于实验验收。
-- **下一步**：`GLT-SPATIAL-20260921-01 / r1` 执行状态为待授权。用户若决定启动，交 ZCode 先执行 P0＋P1，不自动进入 P2/P3。文档提交哈希见本次交付及 Git 历史。
-
-### 2026-09-21 — MCL-PH-20260921-01 / r1：多尺度与PH替换方案文档交付
-
-- **授权/角色**：用户要求Codex将连续讨论的MI-MoE适配、2/3/4 Å、五描述符路由、新预训练与两个融合候选写入`MCL-PH.md`，交其他模型执行。Codex本轮仅规划和文档自检；ZCode未实施。文档基准`0d633d8`，安全pull无更新。原目标文件为空、未跟踪；用户`.zcodeignore`不动，缺失的`Plan.md`不恢复。
-- **计划替换边界**：本轮指定MCL-PH为新的研究合同；`3D.md`空间adapter与`PH.md`旧候选保留历史内容，不作为本轮执行指令，不自动叠加预算。GLT/PH旧实验未重跑，历史失败与超额记录不改。本条关闭的是文档编制，不是实验周期。
-- **论文与新增设计**：核对MI-MoE（2026预印本）的距离专家/五描述符路由、FlexMol（CIKM2025）的跨模态attention，并引用SchNet/GMU经典基础。三专家、PH归一化边界、warmup→Top-2、同步RU遮蔽、非键分桶监督和残差融合均明确标注项目适配，不保证原文性能迁移。
-- **最终架构合同**：真实重原子Trimer，元素/电荷/芳香性＋距离RBF/真实bond type；三个独立三层128维空间专家。1.5–4.5 Å每0.1 Å的Randić/Wiener/efficiency/Betti0/Betti1轨迹驱动router，前500updates dense、其后Top-2；所有实际原子更新，按PH权重混合后仅中心原子与O8对齐。融合不能直接重选三个专家：主候选原子通道Gate，竞争者中心原子Cross-Attention，另有token concat控制；统一512图读出，无独立3D旁路。旧GLT只保留reference。
-- **预训练与防泄漏**：原子CE与融合CE同head、有效双路各0.5；局部几何及分尺度非键距离去噪；单一均衡项1e-3，新路线不使用FP。三RU同名身份同步mask，审计O8路径显式身份副本。PH/邻域/距离/target候选统一来自本次noisy坐标，clean仅供目标。独立维护几何输入、中心读出和各监督有效性；中心内部键0不能伪造中心监督，但可有原子读出。
-- **阶段与预算**：全部待授权，推荐先P0＋P1。P0 CPU60分钟，0模型调用；P1局部CPU模型≤96forward/48backward、预训练四路径总8updates、额外两次分布式空几何前反向、五臂微调总5epochs。P2四条5k轨迹＋五组30units≤900epochs；合格parent才申请P3新增R_GRAPH/R_CONST/R_SAME4三条5k＋18units≤540epochs。P2/P3总35000updates、48units/1440epochs为审议上限，不是默认授权。失败重跑计额度、阶段间交回。
-- **验收与解释**：P2相对同轮GLT_REF/O8_ONLY按macro3≥0.005、XC均值≥0.01且两折为正、任务退化≤0.01筛选；高级融合需再胜CAT才取代合格简单模型。P3分别检验PH输入、样本相关路由、不同距离范围，不用整体新架构收益宣称PH单因素有效。不访问outer-test、不新增构象/seed/sweep；无收益允许STOP。
-- **实际文件/检查**：仅新增`MCL-PH.md`、追加本条。核对源码/config接口、论文网页，文档自检公式维度、预算、选择规则、smoke部署routing模式、历史N=0与原子N记号，运行`git diff --check`；未运行代码测试、模型、数据构建、GPU或训练，无第二独立审查者。提交见本轮Git历史与交付回复。
-- **下一步**：用户若采用此合同，授权ZCode先执行P0＋P1，交付后由Codex审查。当前实验状态仍为待授权，不将本条文档归档写作模型验收。
-
-### 2026-09-23 — MCL-PH-20260921-01 / r10R3-GX1：GATE、XATTN 正式预训练周期归档
-
-- **角色、授权与目标**：用户在已完成 CAT 5k 后明确要求继续 GATE 与 XATTN 两臂正式预训练，各一次、各最多 5000 updates，严格串行且逐臂验收；执行与原始自检由 Codex 完成，本次归档前另依据现场文件、日志和代码作只读核对。GATE/XATTN 周期已结束；P2 development 尚未执行，整个 MCL-PH 任务未结束。
-- **基线与修订**：本周期从 `dev@73a1980` 开始，GATE 验收记录在 `90c0a2d`，XATTN 启动记录在 `d4f31ee`。三臂配置仅 `fusion_mode` 不同；共同统计 SHA `9dc8160f…cf8b1`、新参数共同初值 SHA `49930939…83d1`、GLT common-init SHA `1c9f97cf…1951d` 均与运行身份一致。使用完整离线拓扑轨迹 cache；不重建 cache、不恢复旧 CAT、不设置墙钟 timeout。
-- **实际行为与产物**：未修改模型、数据、训练配置或预算定义。GATE 和 XATTN 分别在 `Uni-Poly:mcl_ph_r10r3_gate` 与 `Uni-Poly:mcl_ph_r10r3_xattn` 从原始初值运行到 step 5000。日志为 `logs/mcl_ph_20260921/p2_{gate,xattn}_r10r3_pretrain.log`，新产物目录为 `results/mcl_ph_20260921/p2/pretrain/{gate,xattn}_r10r3/`；旧失败现场和 CAT 产物未覆盖。
-- **验证与审查**：两臂真实退出码均为 0，runtime `PASS/5000`、cleanup/export/main-return 完成，各有五组千步 resume/deploy；step 500 dense、501 Top-2。GATE 已有生产 verifier 与 CPU strict-load 的独立日志；本轮对 XATTN 运行 `scripts/verify_mcl_ph_arm.py --strict-cleanup` 得 PASS，并对 CAT/GATE/XATTN 三包重新用 `build_mcl_arm` strict-load。XATTN 完整日志有四 rank 各 5000 个 step 前缀，且无非有限值标记；多进程 stdout 行交错使部分完整 JSON 行不可解析，不能把“解析到的完整行数”误当步数。runner 的非有限 loss/梯度硬失败机制和 PASS 退出提供额外约束。P2 聚合器针对性测试 15 passed。无 development、outer-test 或预测性能结论。
-- **最终部署包 SHA256**：CAT `eed6276565f0bc827fc1f56056a25cd8469db184b0e334d04c3dd0f3cfea0e49`；GATE `312ea6708ee1b930001c1963714dfbdee44d8de711c5293bc0378be7a73b24e8`；XATTN `9f2bea298b7341eaaf02e85a84f95974334e64b5436310127d30d82ae49f206e`；GLT_REF `7dc016dc422c58a6bba705a7a69c9f21051231350393a93d621b33e973883c47`，O8_ONLY 共用 GLT_REF 包。
-- **预算与下一步**：历史失败 154＋成功 GLT_REF 5000＋失败 CAT 4928＋成功 CAT/GATE/XATTN 各 5000＝**25,082 updates / 6 次正式启动**；development 0/30 units、0/900 epochs。GATE/XATTN 执行证据验收通过；下一计划为 `r10R3-DEV1`，只做五臂×三任务×两折的 development 筛查，状态待授权。P3、OOF、refit、outer-test 均未获本计划授权。
-
-### 2026-09-24 — MCL-PH-20260921-01 / r10R3-FULL8X5：旧微调协议五臂全量周期归档
-
-- **授权与角色**：用户授权五臂 × 8 任务 × 5 个 outer fold、仅 train/inner-validation，并随后要求四张 GPU 并行。Codex 实施、运行和自检；本条依据最终现场作只读复核，不把同一主体自检称为独立外部审查。
-- **协议与执行**：`outer5_inner20` 固定 manifest；每 unit 最多 30 epochs、单阶段 full adaptation、batch 32、backbone/head 学习率 1e-5/1e-4、warmup 5、patience 10、按最高验证 R² 选 checkpoint。首轮第 91 个 unit 因无效几何回退缺陷失败；修复后续跑，后按用户指令停止串行 unit、改四卡各跑互不重叠的 unit。历史失败和中断现场均保留，未从中断模型状态恢复。
-- **最终证据**：`logs/mcl_ph_20260921/full8x5_r10r3_3_launcher.exit` 为真实 `0`；`results/mcl_ph_20260921/p2/full8x5_r10r3_3/full8x5_validation.json` 为 `PASS`、200/200 accepted、0 rejected、`outer_test=NOT_RUN`。本轮再次只读运行 `aggregate(...)`，同样返回 200/200 PASS，策略为 legacy；无活动的相关训练进程。运行入口与四卡分配见 `scripts/run_mcl_ph_8x5_4gpu.py`、命令见 `logs/mcl_ph_20260921/full8x5_r10r3_3_launch.sh`。三个轨迹的实际产物与日志保留在同名 `_1/_2/_3` 目录；相关提交包括 `3147f2a`、`3fbcb85`、`db8c06d`、`f445a8c`、`cc487dc`。
-- **结论与界限**：全量旧协议内部验证运行已结束且验收通过；这不是 outer-test 五折成绩，也不能与 Periodic-TDL 论文的测试 R² 直接等同。新训练协议改变冻结阶段、学习率、调度、批量、目标处理及选模指标，旧权重和预测无法后处理成新协议结果。新协议全量重跑属于新增正式预算，须独立授权；原产物不覆盖。
-
-## 2026-09-28 — REPO-CLEANUP-20260928-01：MCL-PH 旧产物与日志最小清理
-
-- **授权与边界**：用户明确要求制定并执行清理，删除当前无用文件并精简日志。Codex 在 cb9e150 后先安全 pull，再限定清理 MCL-PH 已被 r13 替换的旧下游 checkpoint/prediction、p2r2 临时 checkpoint 和大体积原始日志；源码、配置、数据、正式 paper5、正式 5k 部署包、事故说明和结果文档均保留。
-- **实际变化**：删除五个旧 full8x5 结果根中的 best.pt/*.npz，删除 p2r2_perf_bench{,_rev} 与 p2r2_smoke 中的 *.pt，共 676 个文件、37,434,629,606 bytes。保留旧目录中的 JSON、README、step 记录和轻量 metadata，未删除历史代码。
-- **日志处理**：将 logs/mcl_ph_20260921/ 中 228 个大于 100 KiB 的原始日志原地改写为紧凑摘要，保留原路径、退出码、launcher、JSON metadata 和正式结果目录；日志根从约 530 MiB 降至约 17 MiB。摘要明确标记原始逐 step 输出已清理。
-- **验证**：正式 paper5_test.json SHA 保持 f9a5aba2a734eff6430a58c8db6ced215259b0e29fa2512ee1a7d40ef25c1894；状态仍为 PASS、125/125 accepted、0 rejected；125 个 paper5 best.pt 和 test_predictions.npz 保留；四个正式 deploy_05000.pt SHA 未变。只执行路径/JSON/SHA/git diff --check 核对，未运行测试、模型、训练、GPU、worker 或缓存构建。
-- **审查结论与限制**：清理通过，限定为存储和日志整理，不改变科学结果。历史 _mcl_ph_* 脚本仍可能引用已清理的旧产物；它们不属于当前 paper5_outer 活动入口，未恢复或重跑。若要复现旧周期，需要另行恢复产物或授权新计划。后续暂无 GPU 或模型执行。
-
-## 2026-09-28 — MCL-PH-POSTR13-ENG-01 / r1：最终工程收口与文档关闭
-
-- **授权与目标**：用户要求制定并执行下一步计划，彻底结束 `MCL-PH.md`。本周期不新增科学实验，只处理 r13 后仍存在的依赖、旧入口和 provenance 收口。基线 `dev@ae227fd`，修改前工作树干净，已 `git pull --ff-only origin dev`。
-- **实际修改**：`requirements.txt` 增加 `gudhi>=3.8,<4`；`scripts/finetune_mcl_ph.py` 为未来 unit metadata 和 `best.pt` 增加 `model_variant`、`config_path`、`config_sha256`；删除已不能调用当前 `paper5_outer` 的 `scripts/run_mcl_ph_finetune_smoke.sh` 及其覆盖退役 `smoke/development` 契约的 `tests/test_mcl_ph_protocol.py`。r13 既有产物未回写。
-- **验证**：`py_compile`（finetune、paper aggregator、四 GPU launcher）通过；保留预训练 launcher `bash -n` 通过；`git diff --check` 通过；`tests/test_mcl_ph_official_folds.py` 与 `tests/test_mcl_ph_periodic_tdl_strategy.py` 为 **7 passed, 1 warning**。初次运行旧 protocol 测试得到 7 项旧契约失败，确认其引用已退役 stage/入口后删除；不作为新实现回归。
-- **产物与科学边界**：未启动 GPU、worker、训练、模型 smoke、缓存构建、outer-test、OOF、refit 或额外 seed。r13 聚合仍为 125/125 PASS、0 rejected；正式 paper5 结果、四个 5k 部署包、split、数据和日志未修改。
-- **审查结论**：工程收口通过，`MCL-PH.md` 已标记最终关闭，STOP 追加正式训练；当前计划完成，暂无后续执行。未来 MCL-PH 科学实验须新建计划并重新授权。
-
-## 2026-09-28 — REPO-CLEANUP-20260928-02 / r1：Atomic-PC 退役与结果合同收口
-
-- **授权与基线**：用户明确要求直接执行清理，并确认 `Atomic-PC W-CAMR-v2` 可直接删除。修改前已在 `dev` 执行 `git pull --ff-only origin dev`，基线为 `df2d000`，工作树干净。
-- **实际删除**：删除 Atomic-PC 专属配置、W-CAMR 入口、dataset/collator、Atomic-PC encoder/model、joint pretrainer、`w_camr_v2_support/`、专属测试；删除物理结果目录 `results/original_mips_atomic_pc_v1/` 与 `results/original_mips_atomic_pc_w_camr_v2/`。共享的 `original_mips_knowledge_fusion.py`、`original_mips_md200.py`、`md200_sidecar.py` 因 GLT-V2 仍使用而保留。
-- **日志清理**：按 SHA256 对 tracked 日志分组，删除 16 个完全重复副本，每组保留一个文件；未删除正式 MCL-PH、GLT-V2 或事故摘要日志。
-- **结果合同**：新增 `src/result_contract.py`，提供 manifest、unit、runtime、aggregate 的原子写入接口；`scripts/run_mts_finetune_scheduler.py` 为新结果根写入 manifest，并在调度完成后写入 runtime。历史结果不迁移、不重算、不改写。
-- **文档**：更新 `AGENTS.md`、`PIPELINE.md`、`RESULTS.md` 和 `Plan.md`，当前保留路线收敛为 GLT-V2 revision-2，Atomic-PC 只保留历史结果文字记录。
-- **边界**：未启动训练、GPU、worker、模型 smoke、缓存构建或结果重算；MCL-PH 正式产物未修改。
-- **验证**：`git diff --check`、变更 Python 文件 `py_compile`、Atomic-PC 代码引用扫描、结果合同临时 manifest/unit/runtime/aggregate smoke，以及 GLT-V2 共享 import 均通过。未运行训练、GPU、worker、模型 smoke、缓存构建、结果重算或全仓测试。
-- **下一步**：校验通过后提交并推送本轮变更；暂无新的科学实验。
+- r13 所用旧实现的 `mcl_ph_collate` 对角度键行使用原子偏移；旧 `persistence_pairs` 未显式指定 F2，本机 GUDHI 默认 F11。当前工作树已出现键偏移和显式 F2 的未提交修改，本次未对其运行测试或验收。r13 分数仍是旧实现的观测值，不能称为正确角度监督或 F2 PH 实现的性能；错误对真实训练的影响幅度未核实。
+- 冻结 downstream cohort 绑定旧 split SHA；新 `paper5_outer` manifest 的文件 SHA 不匹配，旧 manifest 现已删除。五个历史任务的官方折索引对齐，不等于当前冻结 cohort 来源合同可运行。GLT_REF 新 predictor 的历史初始身份未保存；Xc 的当前 scaler 与学习率记录有不一致，但 r13 未运行 Xc。
+- 除缺失的 `pretrain_split_v1.npz` 外，旧包的 PH 定义及缓存身份、历史五任务只读验收入口也待独立核实。先前“artifact 缺失是唯一未解决项”“暂无后续执行”的判断已失效；阶段 A 在当前计划中的状态仍为“待授权”，本次文档修改不改变授权或执行状态。具体范围、验证预算与停止条件以当前计划为准。

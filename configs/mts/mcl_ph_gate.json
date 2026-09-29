@@ -36,9 +36,9 @@
   "epochs": 30,
   "finetune_warmup": 5,
   "patience": 10,
-  "sample_index_artifact": "results/glt_pred_20260918/s3b_prep/pretrain_split_v1.json",
+  "sample_index_artifact": "results/mcl_ph_20260921/shared_pretrain/pretrain_split_v1.json",
   "sample_index_split": "train",
-  "common_init_artifact": "results/glt_pred_20260918/s3b_prep/common_init_v1.pt",
+  "common_init_artifact": "results/mcl_ph_20260921/shared_pretrain/common_init_v1.pt",
   "statistics_artifact": "results/mcl_ph_20260921/p0/statistics.npz",
   "fusion_mode": "gate"
 }

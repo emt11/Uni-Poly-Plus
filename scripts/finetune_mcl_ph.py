@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""MCL-PH official Periodic-TDL five-fold downstream arms.
+"""MCL-PH paper5_outer eight-task downstream arms.
 
-Five arms that share one protocol and differ only in the encoder family that
+Five arms that share the paper5_outer protocol and differ only in the encoder family that
 was pre-trained:
 
 | arm | pre-trained route | 3D branch | downstream head |
@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import hashlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -43,7 +44,7 @@ from src.modules.glt_adaptation import AdaptationAdapter
 from src.training.glt_dual_runtime import (open_source, require_tmux, save_checkpoint,
                                            sha256_file, write_json)
 from src.utils import evaluate, scale_targets, set_global_seed, train_epoch
-from scripts.finetune_glt_3d_gain_d2 import resolve_fold, split_indices
+from src.training.split_protocol import resolve_fold, split_indices
 
 ARMS = ('glt_ref', 'o8_only', 'm_cat', 'm_gate', 'm_xattn')
 MCL_FUSION = {'m_cat': 'cat', 'm_gate': 'gate', 'm_xattn': 'xattn'}
@@ -51,10 +52,10 @@ MODEL_VARIANT = {'glt_ref': 'glt_ref', 'o8_only': 'o8_only', **MCL_FUSION}
 SCHEDULE_TOTAL_EPOCHS = 30
 HEAD_INIT_SEED = 20260921
 TASKS = ('eat', 'eea', 'egb', 'egc', 'ei', 'eps', 'nc', 'xc')
-PAPER_TASKS = ('eea', 'egb', 'ei', 'eps', 'nc')
+PAPER_TASKS = TASKS
 FOLDS = (0, 1, 2, 3, 4)
-SPLIT_PROTOCOL = 'outer5_inner20'
-PAPER_SPLIT_PROTOCOL = 'periodic_tdl_official5'
+SPLIT_PROTOCOL = 'paper5_outer'
+PAPER_SPLIT_PROTOCOL = 'paper5_outer'
 PERIODIC_TDL_EPOCHS = {'egc': 50}
 # EAT is absent from the paper's nine tasks. Its entries below are an explicit
 # project adaptation using the Eea settings, not a published Periodic-TDL value.
@@ -68,6 +69,17 @@ PERIODIC_TDL_HEAD_DROPOUT = {'egc': 0.0, 'eea': 0.1, 'egb': 0.1,
 
 def periodic_tdl_head(model):
     return model.head if hasattr(model, 'head') else model.model.predictor
+
+
+def head_initial_sha256(model):
+    digest = hashlib.sha256()
+    for name, tensor in sorted(periodic_tdl_head(model).state_dict().items()):
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode('utf-8'))
+        digest.update(str(tuple(value.shape)).encode('ascii'))
+        digest.update(str(value.dtype).encode('ascii'))
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
 
 
 def periodic_tdl_trainability(model, *, head_only):
@@ -340,11 +352,12 @@ def unit_directory(output, arm, task, fold):
 
 def validate_stage_scope(stage, task, fold, epochs, cohort_index, strategy='periodic_tdl'):
     if stage != 'paper5_outer' or strategy != 'periodic_tdl':
-        raise ValueError('only official paper5_outer Periodic-TDL fine-tuning is active')
-    if task not in PAPER_TASKS or fold not in FOLDS:
-        raise ValueError('official Periodic-TDL folds are verified only for Eea/Egb/Ei/EPS/Nc')
-    if epochs != 70:
-        raise ValueError('official Periodic-TDL tasks require 70 epochs')
+        raise ValueError('only paper5_outer Periodic-TDL fine-tuning is active')
+    if task not in TASKS or fold not in FOLDS:
+        raise ValueError('paper5_outer is defined for all eight active tasks')
+    expected_epochs = 10 + PERIODIC_TDL_EPOCHS.get(task, 60)
+    if epochs != expected_epochs:
+        raise ValueError(f'paper5_outer {task} requires {expected_epochs} epochs')
     if not cohort_index:
         raise ValueError('a trusted cohort index is required')
 
@@ -392,7 +405,10 @@ def build_summary(common, *, config, device, command):
 def run_unit(args, folder, started, statistics, config, manifest):
     split_protocol = PAPER_SPLIT_PROTOCOL
     if not args.cohort_split_root:
-        raise ValueError('official-fold evaluation requires the frozen cohort split root')
+        raise ValueError('paper5_outer evaluation requires the frozen cohort split root')
+    if not args.cohort_union_manifest:
+        raise ValueError('paper5_outer evaluation requires the frozen cohort union manifest')
+    initialization_seed = set_global_seed(int(config['seed']) + int(args.fold))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     package = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     expected = int(args.expected_pretrain_step)
@@ -413,6 +429,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
         collate = mcl_ph_downstream_collate
         dataset_class = MCLPHCleanDataset
         copied = None
+    initialization_hash = head_initial_sha256(model)
     model.to(device)
     configure_periodic_tdl_dropout(model, args.task)
 
@@ -428,22 +445,23 @@ def run_unit(args, folder, started, statistics, config, manifest):
     original_split = json.loads(cohort_split_path.read_text(encoding='utf-8'))
     if (original_split.get('sample_order_sha256') != manifest.get('sample_order_sha256')
             or int(original_split.get('sample_count', -1)) != int(manifest['sample_count'])):
-        raise ValueError('official folds do not match the frozen cohort row identity')
+        raise ValueError('paper5_outer folds do not match the frozen cohort row identity')
     source, frame = open_source(
         args.cohort_root, args.cache_root, task=args.task,
         dual_static_root=args.dual_static_root, selected_indices=selected_indices,
         expected_task_rows=int(manifest['sample_count']),
         expected_split_sha256=cohort_split_sha256,
-        record_index_path=args.cohort_index)
+        record_index_path=args.cohort_index,
+        union_manifest_path=args.cohort_union_manifest)
     try:
         if frame['original_row'].astype(int).tolist() != selected_indices:
             raise ValueError('selected downstream rows differ from train/validation indices')
         dataset = (dataset_class(source, frame['label'].to_numpy(dtype=np.float64), statistics)
                    if args.arm in MCL_FUSION else
                    dataset_class(source, frame['label'].to_numpy(dtype=np.float64)))
-        set_global_seed(int(config['seed']) + int(args.fold))
+        set_global_seed(initialization_seed)
         scaler = scale_targets(dataset, args.task, train_indices=train_local_indices,
-                               transform_mode='standard')
+                               transform_mode='identity' if args.task == 'xc' else 'standard')
         batch_size = 24
         train_loader = DataLoader(
             Subset(dataset, train_local_indices), batch_size=batch_size,
@@ -490,7 +508,8 @@ def run_unit(args, folder, started, statistics, config, manifest):
                 dual_static_root=args.dual_static_root, selected_indices=test_indices,
                 expected_task_rows=int(manifest['sample_count']),
                 expected_split_sha256=cohort_split_sha256,
-                record_index_path=args.cohort_index)
+                record_index_path=args.cohort_index,
+                union_manifest_path=args.cohort_union_manifest)
             try:
                 if test_frame['original_row'].astype(int).tolist() != test_indices:
                     raise ValueError('selected downstream rows differ from outer-test indices')
@@ -538,15 +557,25 @@ def run_unit(args, folder, started, statistics, config, manifest):
             history=result['history'],
             train_sample_count=len(train_indices),
             validation_sample_count=len(validation_indices),
-            scaler_fit_split='train',
+            scaler_fit_split='none' if args.task == 'xc' else 'train',
+            target_transform=scaler.transform_mode,
+            initialization_seed=initialization_seed,
+            head_initial_sha256=initialization_hash,
+            head_init_seed=(HEAD_INIT_SEED if args.arm != 'glt_ref' else initialization_seed),
             split=dict(split_evidence, outer_test='RUN'),
             evaluation_split_sha256=sha256_file(split_path),
             evaluation_split_path=str(split_path.resolve()),
             cohort_split_sha256=cohort_split_sha256,
-            official_source=manifest.get('official_source'),
+            cohort_union_manifest_path=str(Path(args.cohort_union_manifest).resolve()),
+            split_generator=manifest.get('splitter'),
             **test_result,
-            learning_rate_table={'head_stage1': 3e-4, 'backbone_stage2': 1e-4,
-                                 'head_stage2': 1e-3},
+            learning_rate_table={
+                'head_stage1': next(group['lr'] for group in result['optimizer_groups_by_stage']['head']
+                                    if group['name'] == 'head'),
+                'backbone_stage2': next(group['lr'] for group in group_evidence
+                                        if group['name'] == 'backbone'),
+                'head_stage2': next(group['lr'] for group in group_evidence
+                                    if group['name'] == 'head')},
             weight_decay=PERIODIC_TDL_WEIGHT_DECAY[args.task],
             adaptation='head10_then_joint',
             pretrain_step=expected, pretrain_package_sha256=sha256_file(args.checkpoint),
@@ -561,7 +590,7 @@ def run_unit(args, folder, started, statistics, config, manifest):
             state_dict=best, arm=args.arm, task=args.task, fold=int(args.fold),
             model_variant=MODEL_VARIANT[args.arm],
             config_path=str(Path(args.config).resolve()),
-            config_sha256=sha256_file(args.config),
+            config_sha256=common['config_sha256'],
             architecture=model.__class__.__name__,
             protocol=f'mcl_ph_{args.stage}', config=config, stage=args.stage,
             best_validation_r2=float(result['best_r2']),
@@ -571,6 +600,9 @@ def run_unit(args, folder, started, statistics, config, manifest):
             requested_epochs=int(args.epochs), executed_epochs=int(executed_epochs),
             optimizer_updates=int(result['optimizer_updates']),
             scaler_mean=scaler.scaler.mean_.tolist(), scaler_scale=scaler.scaler.scale_.tolist(),
+            target_transform=scaler.transform_mode,
+            initialization_seed=initialization_seed,
+            head_initial_sha256=initialization_hash,
             optimizer_groups=group_evidence, split=common['split'],
             outer_test=common['outer_test']))
     finally:
@@ -610,9 +642,11 @@ def main():
     parser.add_argument('--dual-static-root', required=True)
     parser.add_argument('--split-root', required=True)
     parser.add_argument('--cohort-split-root', help='frozen cohort split binding for paper5_outer')
+    parser.add_argument('--cohort-union-manifest', required=True,
+                        help='trusted frozen cohort union manifest, stored outside active artifacts')
     parser.add_argument('--cohort-index', help='trusted byte-offset index; required for label-isolated stages')
     parser.add_argument('--statistics')
-    parser.add_argument('--task', required=True, choices=PAPER_TASKS)
+    parser.add_argument('--task', required=True, choices=TASKS)
     parser.add_argument('--fold', type=int, default=0, choices=FOLDS)
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--finetune-strategy', choices=('periodic_tdl',),

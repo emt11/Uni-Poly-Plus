@@ -307,6 +307,10 @@ def test_deployment_round_trips_strictly(mode):
 def test_deployment_rejects_a_legacy_bundle_and_a_wrong_fusion():
     source_model = make_pretrainer('gate')
     package = deployment_package(source_model.encoder, 2)
+    legacy_semantics = dict(package)
+    legacy_semantics.pop('ph_semantics')
+    with pytest.raises(ValueError, match='PH semantics'):
+        load_deployment(MCLPHEncoder('gate'), legacy_semantics, 2)
     legacy = dict(package, architecture='O8-BondPath-GalformerTrimer-Hop2')
     with pytest.raises(ValueError):
         load_deployment(MCLPHEncoder('gate'), legacy, 2)

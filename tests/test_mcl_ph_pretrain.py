@@ -174,8 +174,8 @@ def test_ddp_four_rank_partial_and_fully_absent_geometry():
                for slot in range(3))
 
 
-COMMON_INIT = (Path(__file__).resolve().parents[1] / 'results' / 'glt_pred_20260918'
-               / 's3b_prep' / 'common_init_v1.pt')
+COMMON_INIT = (Path(__file__).resolve().parents[1] / 'results' / 'mcl_ph_20260921'
+               / 'shared_pretrain' / 'common_init_v1.pt')
 
 
 def test_only_the_o8_backbone_comes_from_the_shared_common_state():

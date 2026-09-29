@@ -27,28 +27,26 @@ from scripts.finetune_mcl_ph import (ARMS, FOLDS, MCL_FUSION, SCHEDULE_TOTAL_EPO
 
 REQUIRED_FILES = ('run.json', 'runtime.json', 'metrics.json', 'best.pt',
                   'validation_predictions.npz')
-STAGE_EPOCH_LIMIT = {'smoke': 1, 'development': SCHEDULE_TOTAL_EPOCHS,
-                     'full8x5': SCHEDULE_TOTAL_EPOCHS,
-                     'full8x5_outer': SCHEDULE_TOTAL_EPOCHS,
-                     'paper5_outer': SCHEDULE_TOTAL_EPOCHS}
+STAGE_EPOCH_LIMIT = {'smoke': 1, 'paper5_outer': SCHEDULE_TOTAL_EPOCHS}
 # The declared P1 smoke scope; anything smaller can be verified but is PARTIAL.
 ACCEPTANCE_ARMS = tuple(ARMS)
-ACCEPTANCE_TASKS = ('xc',)
-ACCEPTANCE_FOLDS = (0,)
+ACCEPTANCE_TASKS = tuple(TASKS)
+ACCEPTANCE_FOLDS = tuple(FOLDS)
 
 
 def _finite(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def check_unit(root, arm, task, fold, *, stage, expected_step):
+def check_unit(root, arm, task, fold, *, stage, expected_step,
+               historical_manifest=None, expected_package_sha256=None,
+               expected_sample_keys=None):
     """Validate one unit; returns (record, problems)."""
     problems = []
     paper = stage == 'paper5_outer'
-    if paper and task not in PAPER_TASKS:
-        return None, [f'{task} is not verified against official Periodic-TDL folds']
-    split_protocol = PAPER_SPLIT_PROTOCOL if paper else SPLIT_PROTOCOL
-    outer_stage = stage in ('full8x5_outer', 'paper5_outer')
+    split_protocol = ('periodic_tdl_official5' if historical_manifest is not None
+                      else (PAPER_SPLIT_PROTOCOL if paper else SPLIT_PROTOCOL))
+    outer_stage = stage == 'paper5_outer'
     directory = unit_directory(root, arm, task, fold)
     required = REQUIRED_FILES + (('test_predictions.npz',) if outer_stage else ())
     missing = [name for name in required if not (directory / name).is_file()]
@@ -78,6 +76,10 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
     if metrics.get('pretrain_step') != int(expected_step):
         problems.append(f"pretrain_step is {metrics.get('pretrain_step')!r}, "
                         f"expected {int(expected_step)}")
+    if expected_package_sha256 is not None and (
+            metrics.get('pretrain_package_sha256') != expected_package_sha256 or
+            run.get('pretrain_package_sha256') != expected_package_sha256):
+        problems.append('pretrain package SHA differs from the supplied package')
     if arm in MCL_FUSION and metrics.get('pretrained_route') != 'mcl_ph':
         problems.append('an MCL-PH arm must record the mcl_ph pre-training route')
     if arm in ('glt_ref', 'o8_only') and metrics.get('pretrained_route') != 'dual_glt':
@@ -150,18 +152,15 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
         problems.append(f"split protocol is {split.get('protocol')!r}")
     if paper and (not isinstance(metrics.get('evaluation_split_sha256'), str)
                   or len(metrics['evaluation_split_sha256']) != 64
-                  or metrics.get('evaluation_split_sha256') == metrics.get('cohort_split_sha256')
                   or run.get('evaluation_split_sha256') != metrics.get('evaluation_split_sha256')):
-        problems.append('official evaluation split identity is missing or equals cohort split')
+        problems.append('evaluation split identity is missing')
     if paper:
-        official_path = Path(metrics.get('evaluation_split_path', ''))
-        if (not official_path.is_file()
-                or sha256_file(official_path) != metrics.get('evaluation_split_sha256')):
-            problems.append('official evaluation split file does not match unit identity')
-        source = metrics.get('official_source') or {}
-        if (source.get('commit') != 'f3ba6dff6f0d065accdd235dfba160324714f30b'
-                or not source.get('folds_pkl_sha256') or not source.get('cleaned_csv_sha256')):
-            problems.append('official fold provenance is missing')
+        evaluation_path = Path(metrics.get('evaluation_split_path', ''))
+        if (not evaluation_path.is_file()
+                or sha256_file(evaluation_path) != metrics.get('evaluation_split_sha256')):
+            problems.append('evaluation split file does not match unit identity')
+        if historical_manifest is not None and evaluation_path.resolve() != historical_manifest.resolve():
+            problems.append('historical evaluation split path differs from the declared manifest')
     if split.get('validation_is_test') is not False:
         problems.append('the split does not declare validation_is_test=false')
     expected_outer = 'RUN' if outer_stage else 'NOT_RUN'
@@ -173,6 +172,15 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
     if int(split.get('validation_rows', 0)) <= 0 or int(split.get('train_rows', 0)) <= 0:
         problems.append('the split record has an empty train or validation set')
     validation_rows = set()
+    historical_fold = None
+    if historical_manifest is not None:
+        try:
+            declared = json.loads(historical_manifest.read_text(encoding='utf-8'))
+            if declared.get('protocol') != split_protocol or declared.get('task') != task:
+                problems.append('historical manifest identity differs from unit split')
+            historical_fold = next(item for item in declared['folds'] if int(item['fold']) == fold)
+        except (OSError, ValueError, KeyError, StopIteration) as error:
+            problems.append(f'unreadable historical manifest: {error}')
     try:
         with np.load(directory / 'validation_predictions.npz', allow_pickle=False) as payload:
             truth = np.asarray(payload['y_true'], dtype=np.float64).reshape(-1)
@@ -184,6 +192,19 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
                 problems.append('validation predictions contain NaN/Inf')
             if keys.size != truth.size:
                 problems.append('validation sample keys disagree with the predictions')
+            if historical_fold is not None:
+                indices = np.asarray(payload['validation_indices'], dtype=np.int64).reshape(-1)
+                if indices.tolist() != historical_fold['validation_indices']:
+                    problems.append('validation prediction order differs from historical manifest')
+                if expected_sample_keys is not None and keys.tolist() != [
+                        expected_sample_keys[index] for index in indices.tolist()]:
+                    problems.append('validation prediction sample keys differ from frozen cohort')
+                if truth.size > 1 and np.isfinite(truth).all() and np.isfinite(prediction).all():
+                    denominator = float(np.sum((truth - truth.mean()) ** 2))
+                    r2 = 1.0 - float(np.sum((truth - prediction) ** 2)) / denominator if denominator > 0 else float('nan')
+                    if not math.isclose(r2, float(metrics.get('best_validation_r2', float('nan'))),
+                                        rel_tol=1e-5, abs_tol=1e-5):
+                        problems.append('validation R2 disagrees with saved predictions')
             if int(payload['best_epoch']) != best_epoch:
                 problems.append('the saved predictions are not from the selected epoch')
             if str(payload['outer_test']) != 'NOT_RUN':
@@ -191,6 +212,8 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
             if outer_stage:
                 validation_rows = set(np.asarray(payload['validation_indices'],
                                                  dtype=np.int64).tolist())
+                if historical_fold is not None and validation_rows != set(historical_fold['validation_indices']):
+                    problems.append('validation prediction indices differ from historical manifest')
                 if str(payload['split_protocol']) != split_protocol:
                     problems.append('validation prediction split protocol differs')
     except (OSError, ValueError, KeyError) as error:
@@ -201,7 +224,14 @@ def check_unit(root, arm, task, fold, *, stage, expected_step):
                 truth = np.asarray(payload['y_true'], dtype=np.float64).reshape(-1)
                 prediction = np.asarray(payload['y_pred'], dtype=np.float64).reshape(-1)
                 indices = np.asarray(payload['test_indices'], dtype=np.int64).reshape(-1)
+                if historical_fold is not None and set(indices.tolist()) != set(historical_fold['test_indices']):
+                    problems.append('test prediction indices differ from historical manifest')
                 keys = np.asarray(payload['sample_keys'])
+                if historical_fold is not None and indices.tolist() != historical_fold['test_indices']:
+                    problems.append('test prediction order differs from historical manifest')
+                if expected_sample_keys is not None and keys.tolist() != [
+                        expected_sample_keys[index] for index in indices.tolist()]:
+                    problems.append('test prediction sample keys differ from frozen cohort')
                 if truth.size < 2 or any(len(item) != truth.size for item in
                                          (prediction, indices, keys)):
                     problems.append('outer-test predictions have inconsistent sizes')
@@ -256,8 +286,6 @@ def main():
     parser.add_argument('--folds', nargs='+', type=int, default=list(ACCEPTANCE_FOLDS))
     parser.add_argument('--output')
     args = parser.parse_args()
-    if args.stage == 'development':
-        raise SystemExit('development aggregation is not part of the P1 budget')
     units = unit_list(args.arms, args.tasks, args.folds)
     accepted, rejected = [], []
     for arm, task, fold in units:

@@ -28,7 +28,7 @@ from torch import nn
 from .glt_dual import BondPathO8, mean_pool
 from ..dataset.mcl_ph_view import (AROMATIC_VOCABULARY, BOND_CATEGORY_COUNT,
                                    CHARGE_VOCABULARY, ELEMENT_VOCABULARY,
-                                   RBF_CENTERS, RBF_WIDTH, DESCRIPTOR_COLUMNS,
+                                   RBF_CENTERS, RBF_WIDTH, DESCRIPTOR_COLUMNS, PH_SEMANTICS,
                                    ROUTER_RADII)
 
 EXPERT_HIDDEN = 128
@@ -575,6 +575,7 @@ def deployment_package(encoder, step, *, cutoffs=(2.0, 3.0, 4.0),
         'ph_definition': {'radii': [float(value) for value in ROUTER_RADII],
                           'columns': DESCRIPTOR_COLUMNS, 'max_edge_length': 4.5,
                           'field': 'F2', 'max_dimension': 1},
+        'ph_semantics': dict(PH_SEMANTICS),
         'router': {'dense_updates': int(router_dense_updates), 'top_k': int(router_top_k),
                    'inference_mode': 'top2'},
         'training_route': 'mcl_ph',
@@ -589,6 +590,8 @@ def load_deployment(encoder, package, expected_step=None, *, expected_fusion=Non
         raise ValueError('deployment is not an MCL-PH bundle')
     if package.get('training_route') != 'mcl_ph':
         raise ValueError('deployment was not produced by the MCL-PH route')
+    if package.get('ph_semantics') != PH_SEMANTICS:
+        raise ValueError('deployment PH semantics mismatch or missing')
     if package.get('fusion_mode') != encoder.fusion_mode:
         raise ValueError('deployment fusion mode differs from the model')
     if expected_fusion is not None and package.get('fusion_mode') != str(expected_fusion):
