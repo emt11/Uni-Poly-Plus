@@ -165,8 +165,9 @@ def _validate_geometry_fallback_carrier(topology, trimer):
         raise ValueError("geometry fallback structural identity is corrupt")
 
 
-def build_dual_sample(topology, trimer, smiles, *, identity=None,
-                      bond_path_features=None, static=None, torsion_mode=None):
+def _build_dual_sample_without_md(topology, trimer, smiles, *, identity=None,
+                      bond_path_features=None, static=None, torsion_mode=None, torsion_revision=None,
+                      geometry_mode="finite_internal"):
     """Build only model-required fields; never carry MD/coordinate tensors into a batch.
 
     ``identity`` and ``bond_path_features`` are pure functions of
@@ -174,6 +175,8 @@ def build_dual_sample(topology, trimer, smiles, *, identity=None,
     one sample may resolve/construct them once and reuse them here instead of
     paying for a second graph-isomorphism search.
     """
+    if geometry_mode not in ("finite_internal", "finite_incident", "periodic_template"):
+        raise ValueError("unknown geometry mode")
     result = Data()
     required = (
         "mips_x", "mips_backbone_mask", "canonical_ru_atom_index",
@@ -271,7 +274,50 @@ def build_dual_sample(topology, trimer, smiles, *, identity=None,
         result.line_mask = torch.from_numpy(np.array(static['line_path_mask'], dtype=bool, copy=True))
         result.line_path_group = torch.from_numpy(np.array(static['line_path_group'], dtype=np.int64, copy=True))
         result.line_is_self = torch.from_numpy(np.array(static['line_is_self'], dtype=bool, copy=True))
-    if torsion_mode is not None:
+    # Physical endpoint identities come from frozen coordinate rows and RU tables.
+    if result.geometry_valid:
+        if static is not None:
+            pa = torch.as_tensor(np.array(static['token_pos_index_a'], copy=True)).long()
+            pb = torch.as_tensor(np.array(static['token_pos_index_b'], copy=True)).long()
+            angle_pos = torch.as_tensor(np.array(static['angle_pos_triplet'], copy=True)).long()
+        else:
+            from .glt_dual_static import _token_position_indices, _angle_triplets
+            pa0, pb0 = _token_position_indices(row['tokens'], topology, trimer)
+            pa, pb = torch.from_numpy(pa0).long(), torch.from_numpy(pb0).long()
+            angle_pos = torch.from_numpy(_angle_triplets(result.line_path.numpy(), result.line_mask.numpy(), result.line_is_self.numpy(), pa0, pb0)).long()
+        offset = torch.as_tensor(trimer.trimer_ru_offset).long()
+        base = torch.as_tensor(trimer.trimer_base_ru_atom_id).long()
+        z = torch.as_tensor(trimer.trimer_atomic_number).long()
+        central = torch.as_tensor(trimer.mips_to_trimer_central_index).long()
+        inverse = {int(base[pos]): canonical for canonical, pos in enumerate(central.tolist())}
+        if len(inverse) != result.mips_x.size(0):raise ValueError('nonunique canonical physical identity')
+        ca=torch.tensor([inverse[int(base[pos])] for pos in pa.tolist()])
+        cb=torch.tensor([inverse[int(base[pos])] for pos in pb.tolist()])
+        a0=(offset[pa]==0)&(z[pa]>1);b0=(offset[pb]==0)&(z[pb]>1)
+        rows=torch.arange(pa.numel())
+        result.incidence_index=torch.stack([torch.cat([rows[a0],rows[b0]]),torch.cat([ca[a0],cb[b0]])])
+        result.bond_canonical_a=ca;result.bond_canonical_b=cb
+        result.bond_length_weight=(a0.float()+b0.float())*.5
+        shared=angle_pos[:,0,1]
+        result.line_center_angle=(shared>=0)&(offset[shared.clamp_min(0)]==0)&(z[shared.clamp_min(0)]>1)
+    else:
+        result.incidence_index=torch.empty((2,0),dtype=torch.long)
+        result.bond_canonical_a=result.bond_canonical_b=torch.empty(0,dtype=torch.long)
+        result.bond_length_weight=torch.empty(0)
+        result.line_center_angle=torch.zeros(result.line_path.size(0),dtype=torch.bool)
+    if geometry_mode == 'periodic_template':
+        from .glt_periodic_geometry import attach_periodic_template
+        if result.geometry_valid:
+            attach_periodic_template(result, offset[pa], offset[pb], angle_pos, offset)
+        else:
+            attach_periodic_template(result, torch.empty(0,dtype=torch.long), torch.empty(0,dtype=torch.long), torch.empty((0,2,3),dtype=torch.long), torch.empty(0,dtype=torch.long))
+    result.geometry_mode = geometry_mode
+    if torsion_revision not in (None,'glt_physical_torsion_r1') or (torsion_revision and (torsion_mode!='on' or geometry_mode!='finite_incident')):
+        raise ValueError('invalid physical torsion FT mode')
+    if torsion_revision:
+        from .glt_dual_pretrain import attach_physical_torsion
+        attach_physical_torsion(result,static,trimer,trimer.trimer_pos)
+    elif torsion_mode is not None:
         # Deployment-side torsion fields: real values from the frozen clean
         # geometry, via the same canonical bond table and physical-bond
         # identity as the pretraining path.  A deployment that carries the
@@ -290,7 +336,7 @@ def build_dual_sample(topology, trimer, smiles, *, identity=None,
             dtype=torch.long).reshape(-1)
         if result.geometry_valid:
             index, values, valid = _torsion_fields(
-                static, _topology_z(topology).tolist(), trimer.trimer_pos, mapping, 'on',
+                static, _topology_z(topology).tolist(), trimer.trimer_pos, mapping, mode,
                 bond_table)
         else:
             index = torch.zeros(0, dtype=torch.long)
@@ -400,12 +446,30 @@ class FrozenDualLayerSource(Dataset):
                 target_cache.close()
 
 
+def build_dual_sample(topology, trimer, smiles, **kwargs):
+    data = _build_dual_sample_without_md(topology, trimer, smiles, **kwargs)
+    if hasattr(topology, 'geometry_quality_eligible') and not bool(topology.geometry_quality_eligible):
+        data.geometry_valid=False
+        data.geometry_invalid_reason='quality_ineligible'
+        data.bond_length_weight.zero_()
+        data.bond_center.zero_()
+        data.line_center_angle.zero_()
+    if hasattr(topology, 'md200'):
+        data.md200 = topology.md200.clone()
+        data.md200_valid = topology.md200_valid.clone()
+    return data
+
+
 def dual_glt_collate(samples):
     if not samples:
         raise ValueError('empty dual batch')
     batch = Data()
     fields = {}
     atom_offset = bond_offset = relation_offset = 0
+    periodic_offset = periodic_relation_offset = 0
+    modes = {getattr(item, "geometry_mode", "finite_internal") for item in samples}
+    if len(modes) != 1: raise ValueError("mixed geometry modes")
+    batch.geometry_mode = next(iter(modes))
     has_torsion = hasattr(samples[0], 'torsion_values')
     if not all(hasattr(item, 'torsion_values') == has_torsion for item in samples):
         raise ValueError('torsion fields must be present on every sample or none')
@@ -415,11 +479,15 @@ def dual_glt_collate(samples):
         for name in ('mips_x', 'mips_backbone_mask', 'lga_spd', 'lga_path_mask',
                      'lga_path_shift', 'lga_source_image_shift', 'bond_path_features',
                      'bond_path_mask', 'bond_z_a', 'bond_z_b', 'bond_distance',
-                     'bond_type', 'bond_center', 'line_angle', 'line_mask', 'line_is_self'):
+                     'bond_type', 'bond_center', 'line_angle', 'line_mask', 'line_is_self',
+                     'bond_length_weight', 'line_center_angle'):
             fields.setdefault(name, []).append(getattr(item, name))
         fields.setdefault('lga_relation_mask', []).append(getattr(
             item, 'lga_relation_mask', torch.zeros(item.lga_spd.numel(), dtype=torch.bool)))
         fields.setdefault('lga_edge_index', []).append(item.lga_edge_index + atom_offset)
+        fields.setdefault('incidence_index', []).append(item.incidence_index + torch.tensor([[bond_offset], [atom_offset]]))
+        for endpoint in ('bond_canonical_a', 'bond_canonical_b'):
+            fields.setdefault(endpoint, []).append(getattr(item, endpoint) + atom_offset)
         for name, offset in [('lga_path_index', atom_offset), ('line_path', bond_offset)]:
             value = getattr(item, name)
             fields.setdefault(name, []).append(torch.where(value >= 0, value + offset, value))
@@ -432,11 +500,32 @@ def dual_glt_collate(samples):
             torsion_index.append(item.torsion_bond_index + bond_offset)
             torsion_values.append(item.torsion_values)
             torsion_mask.append(item.torsion_mask)
+        if batch.geometry_mode == 'periodic_template':
+            for name in ('periodic_observation_anchor','periodic_observation_weight','periodic_line_shift','periodic_line_path_shift','periodic_line_angle','periodic_line_mask','periodic_line_self'):
+                fields.setdefault(name, []).append(getattr(item,name))
+            fields.setdefault('periodic_bond_index',[]).append(item.periodic_bond_index+periodic_offset)
+            keys=item.periodic_keys.clone();keys[:,:2]+=atom_offset
+            fields.setdefault('periodic_keys',[]).append(keys)
+            fields.setdefault('periodic_incidence_index',[]).append(item.periodic_incidence_index+torch.tensor([[periodic_offset],[atom_offset]]))
+            for name in ('periodic_line_source','periodic_line_target'):
+                fields.setdefault(name,[]).append(getattr(item,name)+periodic_offset)
+            value=item.periodic_line_path
+            fields.setdefault('periodic_line_path',[]).append(torch.where(value>=0,value+periodic_offset,value))
+            fields.setdefault('periodic_line_group',[]).append(item.periodic_line_group+periodic_relation_offset)
+            fields.setdefault('periodic_bond_batch',[]).append(torch.full((item.periodic_keys.size(0),),graph,dtype=torch.long))
+            periodic_offset+=item.periodic_keys.size(0)
+            periodic_relation_offset+=item.periodic_line_source.numel()
         atom_offset += n
         bond_offset += m
         relation_offset += item.line_source.numel()
     for name, values in fields.items():
-        setattr(batch, name, torch.cat(values, dim=1 if name == 'lga_edge_index' else 0))
+        setattr(batch, name, torch.cat(values, dim=1 if name in ('lga_edge_index', 'incidence_index', 'periodic_incidence_index') else 0))
+    revisions=[getattr(item,'torsion_revision',None) for item in samples]
+    if any(r!=revisions[0] for r in revisions):raise ValueError('mixed torsion revisions')
+    if revisions[0]:
+        batch.torsion_revision=revisions[0]
+        batch.torsion_counts=torch.cat([item.torsion_counts for item in samples],dim=0)
+        batch.torsion_available=torch.cat([item.torsion_available for item in samples],dim=0)
     if has_torsion:
         batch.torsion_bond_index = torch.cat(torsion_index, dim=0)
         batch.torsion_values = torch.cat(torsion_values, dim=0)
@@ -444,6 +533,64 @@ def dual_glt_collate(samples):
     batch.graph_available = torch.tensor([x.graph_available for x in samples], dtype=torch.bool)
     batch.geometry_valid = torch.tensor([x.geometry_valid for x in samples], dtype=torch.bool)
     batch.geometry_invalid_reason = [x.geometry_invalid_reason for x in samples]
+    revisions=[getattr(item,'nonbonded_revision',None) for item in samples]
+    if any(r!=revisions[0] for r in revisions):raise ValueError('mixed nonbonded input revisions')
+    if revisions[0]:
+        offset=0;indices=[]
+        for item in samples:
+            indices.append(item.nonbonded_bond_index+offset);offset+=item.bond_distance.numel()
+        batch.nonbonded_revision=revisions[0]
+        batch.nonbonded_bond_index=torch.cat(indices)
+        batch.nonbonded_distance=torch.cat([item.nonbonded_distance for item in samples])
+        batch.nonbonded_mask=torch.cat([item.nonbonded_mask for item in samples])
     if all(hasattr(x, 'y') and x.y is not None for x in samples):
         batch.y = torch.stack([x.y for x in samples])
+    has_md = [hasattr(item, 'md200') for item in samples]
+    if any(has_md):
+        if not all(has_md):
+            raise ValueError('MD200 must be present for every graph')
+        batch.md200 = torch.cat([item.md200 for item in samples], dim=0)
+        batch.md200_valid = torch.cat([item.md200_valid for item in samples], dim=0)
+        if batch.md200.shape != (len(samples), 200) or batch.md200_valid.shape != (len(samples),):
+            raise ValueError('MD200 collate shape mismatch')
     return batch
+
+
+def build_glt_2d_sample(topology, smiles, *, static=None):
+    """O8-only chemical fields; no geometry carrier or coordinate access."""
+    names=('mips_x','mips_backbone_mask','lga_edge_index','lga_spd','lga_path_index',
+           'lga_path_mask','lga_path_shift','lga_source_image_shift')
+    if any(not hasattr(topology,k) for k in names):raise ValueError('incomplete O8 topology')
+    n=topology.mips_x.size(0)
+    if not torch.equal(topology.canonical_ru_atom_index.long(),torch.arange(n)):raise ValueError('noncanonical O8 topology')
+    data=Data(**{k:getattr(topology,k).clone() for k in names})
+    data.graph_available=bool(topology.graph_available)
+    data.lga_relation_mask=getattr(topology,'lga_relation_mask',torch.zeros(data.lga_spd.numel(),dtype=torch.bool)).clone()
+    if static is None:data.bond_path_features,data.bond_path_mask=bond_paths(topology,smiles)
+    else:
+        if any(k not in static for k in ('bond_path_features','bond_path_mask')):raise ValueError('missing 2D bond chemistry')
+        data.bond_path_features=torch.from_numpy(np.array(static['bond_path_features'],dtype=np.float32,copy=True))
+        data.bond_path_mask=torch.from_numpy(np.array(static['bond_path_mask'],dtype=bool,copy=True))
+    if not torch.isfinite(data.mips_x).all() or data.bond_path_features.shape!=(data.lga_spd.numel(),2,14) or data.bond_path_mask.shape!=(data.lga_spd.numel(),2):raise ValueError('invalid 2D feature schema')
+    for value in (data.lga_edge_index,data.lga_path_index[data.lga_path_mask.bool()]):
+        if value.numel() and (value.min()<0 or value.max()>=n):raise ValueError('O8 index out of range')
+    return data
+
+
+def glt_2d_collate(samples):
+    """Offset only canonical atoms; physical geometry is never copied."""
+    if not samples:raise ValueError('empty 2D batch')
+    fields={};offset=0
+    for graph,item in enumerate(samples):
+        n=item.mips_x.size(0)
+        for k in ('mips_x','mips_backbone_mask','lga_spd','lga_path_mask','lga_path_shift',
+                  'lga_source_image_shift','lga_relation_mask','bond_path_features','bond_path_mask'):
+            fields.setdefault(k,[]).append(getattr(item,k))
+        fields.setdefault('lga_edge_index',[]).append(item.lga_edge_index+offset)
+        fields.setdefault('lga_path_index',[]).append(torch.where(item.lga_path_index>=0,item.lga_path_index+offset,item.lga_path_index))
+        fields.setdefault('canonical_graph_index',[]).append(torch.full((n,),graph,dtype=torch.long))
+        offset+=n
+    data=Data(**{k:torch.cat(v,dim=1 if k=='lga_edge_index' else 0) for k,v in fields.items()})
+    data.graph_available=torch.tensor([s.graph_available for s in samples],dtype=torch.bool)
+    if all(getattr(s,'y',None) is not None for s in samples):data.y=torch.stack([s.y for s in samples])
+    return data

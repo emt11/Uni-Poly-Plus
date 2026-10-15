@@ -811,7 +811,7 @@ def cached_topology_trajectory(trajectory):
 
 def prepare_mcl_ph_sample(topology, trimer, smiles, *, seed, key, position,
                           sigma=0.03, ratio=None, static=None, identity=None,
-                          statistics=None, view='noisy', trajectory_override=None):
+                          statistics=None, view='noisy', trajectory_override=None, shared_view=None):
     """Build one MCL-PH sample and its independent supervision targets.
 
     ``view='noisy'`` is the pre-training configuration: the experts, the RBF,
@@ -835,9 +835,12 @@ def prepare_mcl_ph_sample(topology, trimer, smiles, *, seed, key, position,
     """
     if static is None:
         raise ValueError('the MCL-PH route requires the frozen dual-static rows')
-    shared = build_mcl_ph_view(topology, trimer, smiles, seed=seed, key=key,
-                               position=position, sigma=sigma, ratio=ratio,
-                               identity=identity, view=view)
+    shared = (shared_view if shared_view is not None else
+              build_mcl_ph_view(topology, trimer, smiles, seed=seed, key=key,
+                                position=position, sigma=sigma, ratio=ratio,
+                                identity=identity, view=view))
+    if shared.view != view:
+        raise ValueError('shared coordinate view differs')
     mask, fallback, changed = shared.mask, shared.fallback, shared.changed
     identity = shared.identity
     base_view, field_view = shared.base_view, shared.field_view
@@ -1087,7 +1090,10 @@ def load_geometric_statistics(path):
     the downstream or validation rows.
     """
     with np.load(path, allow_pickle=False) as payload:
-        missing = [name for name in STATISTICS_FIELDS if name not in payload.files]
+        direct = ('identity_contract' in payload.files and
+                  str(payload['identity_contract'].item()) == 'mcl-ph-train-statistics-direct-v1')
+        required = STATISTICS_FIELDS[:-1] if direct else STATISTICS_FIELDS
+        missing = [name for name in required if name not in payload.files]
         if missing:
             raise ValueError('MCL-PH statistics artifact is missing: ' + ','.join(missing))
         mean = np.asarray(payload['length_mu'], dtype=np.float64).reshape(-1)
@@ -1106,9 +1112,23 @@ def load_geometric_statistics(path):
             'samples': int(np.asarray(payload['samples']).reshape(-1)[0]),
             'seed': int(np.asarray(payload['seed']).reshape(-1)[0]),
             'sigma_noise': float(np.asarray(payload['sigma']).reshape(-1)[0]),
-            'ordered_key_sha256': str(np.asarray(payload['ordered_key_sha256']).reshape(-1)[0]),
+            'ordered_key_sha256': (None if direct else
+                                  str(np.asarray(payload['ordered_key_sha256']).reshape(-1)[0])),
             'path': str(path),
         }
+        if direct:
+            for name in ('fit_source_indices', 'valid_source_indices'):
+                if name not in payload.files:
+                    raise ValueError('direct statistics source indices are missing')
+                values = np.asarray(payload[name])
+                if values.dtype != np.int64 or values.ndim != 1 or not len(values) or values[0] < 0 \
+                        or np.any(values[:-1] >= values[1:]):
+                    raise ValueError('direct statistics source indices are invalid')
+            fit = payload['fit_source_indices']
+            valid = payload['valid_source_indices']
+            if len(valid) != record['samples'] or not np.isin(valid, fit).all():
+                raise ValueError('direct statistics valid rows differ from fitted rows')
+            record['identity_contract'] = 'direct'
     for family in ('length', 'nonbond'):
         value = record[family]
         if not math.isfinite(value['mu']) or not math.isfinite(value['sigma']) \
@@ -1116,7 +1136,36 @@ def load_geometric_statistics(path):
             raise ValueError(f'{family} normalization statistics are not usable')
     if record['router_mean'].shape != (len(ROUTER_RADII), DESCRIPTOR_COLUMNS):
         raise ValueError('router constant profile must be [31,5]')
+    if record['router_std'].shape != record['router_mean'].shape \
+            or not np.isfinite(record['router_mean']).all() \
+            or not np.isfinite(record['router_std']).all() or not (record['router_std'] > 0).all():
+        raise ValueError('router statistics are not finite and positive')
+    if record['samples'] <= 0 or not math.isfinite(record['sigma_noise']) or record['sigma_noise'] < 0:
+        raise ValueError('statistics sample count or noise scale is invalid')
     return record
+
+
+def validate_direct_statistics_source(path, statistics, source, *, seed, sigma, ratio=0.30):
+    """Bind a formal normalization artifact to actual selected train rows."""
+    from pathlib import Path
+    import json
+
+    if statistics.get('identity_contract') != 'direct':
+        raise ValueError('direct source requires direct train statistics')
+    base = getattr(source, 'base', source)
+    metadata = json.loads(Path(path).with_suffix('.json').read_text())
+    if (metadata.get('scope') != 'full' or metadata.get('conclusion') != 'PASS'
+            or Path(metadata['source_root']).resolve() != base.root.resolve()):
+        raise ValueError('statistics are not a full fit from the selected direct source')
+    if (statistics['seed'] != int(seed) or statistics['sigma_noise'] != float(sigma)
+            or metadata.get('mask_ratio') != float(ratio)):
+        raise ValueError('statistics noise recipe differs from the training recipe')
+    expected = np.asarray([source.source_index_at(i) for i in range(len(source))], dtype=np.int64)
+    with np.load(path, allow_pickle=False) as payload:
+        if not np.array_equal(payload['fit_source_indices'], expected):
+            raise ValueError('statistics fitted source rows differ from selected train rows')
+    if any(base.entries[int(index)]['pretrain_role'] != 'train' for index in expected):
+        raise ValueError('statistics source contains non-train rows')
 
 
 class MCLPHMicrobatchStream:
@@ -1153,6 +1202,8 @@ class MCLPHMicrobatchStream:
         return self.steps * self.accumulation
 
     def __getitem__(self, item):
+        from src.training.glt_dual_runtime import pretrain_source_fields
+
         step = self.start_step + item // self.accumulation
         offset = item % self.accumulation
         rows = []
@@ -1163,10 +1214,12 @@ class MCLPHMicrobatchStream:
             if self.order is not None:
                 index = int(self.order[index])
             key = self.source.samples[index][0].hex()
+            topology, trimer, smiles, static, _, identity = pretrain_source_fields(
+                self.source, index, include_identity=True)
             rows.append(prepare_mcl_ph_sample(
-                *self.source[index], seed=self.seed, key=key, position=position,
+                topology, trimer, smiles, seed=self.seed, key=key, position=position,
                 sigma=self.sigma, ratio=self.ratio,
-                static=self.source.static_for(index), statistics=self.statistics,
+                static=static, statistics=self.statistics, identity=identity,
                 view=self.view,
                 trajectory_override=(None if self.trajectory_cache is None
                                      else self.trajectory_cache[position])))

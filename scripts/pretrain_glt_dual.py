@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Explicit three-task training entry; never builds frozen layers."""
+"""Atom/geometry pretraining with optional FGR/ALIGN; never builds FP heads."""
 import argparse
+import math
 from contextlib import nullcontext
 import hashlib
 import json
@@ -23,8 +24,18 @@ from src.training.glt_dual_runtime import (require_tmux, open_source, save_check
                                          rng_state, restore_rng, scheduled_lr, move_labels,
                                          OrderedSampleStream, RankMicrobatchStream,
                                          IndexedFrozenDualSource, load_sample_index_artifact,
-                                         apply_common_initialization)
+                                         apply_common_initialization, pretrain_source_fields, prepare_source_sample,
+                                         pretrain_loader)
 from src.utils import set_global_seed
+
+
+def write_consumption(path, *, attempted, completed, status):
+    """Publish one rank-0 ledger atomically for the concurrently reading controller."""
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    write_json(temporary, dict(starts=1, attempted_updates=attempted,
+                               completed_updates=completed, status=status))
+    os.replace(temporary, path)
 
 
 def _module_grad_norms(model):
@@ -35,7 +46,6 @@ def _module_grad_norms(model):
         'glt_3d_encoder': model.encoder.glt,
         'length_head': model.length_head,
         'angle_head': model.angle_head,
-        'fp_head': model.fp_head,
         'fgr_head': model.fgr_head,
         'align_proj2': model.align_proj2,
         'align_proj3': model.align_proj3,
@@ -83,7 +93,7 @@ def _check_reference(reference, step, lr, target_counts, losses, rtol=1e-3):
         raise RuntimeError(f'resume LR differs from the original run at step {step}')
     if [float(x) for x in expected['target_counts']] != [float(x) for x in target_counts]:
         raise RuntimeError(f'resume target counts differ from the original run at step {step}')
-    for name, value, original in zip(('chem', 'geometry', 'fingerprint'), losses,
+    for name, value, original in zip(('chem', 'geometry', 'third'), losses,
                                      expected['losses']):
         if abs(value - float(original)) > rtol * max(1e-6, abs(float(original))):
             print(json.dumps({'reference_mismatch': name, 'step': step,
@@ -128,6 +138,13 @@ def _third_stream_signature(prepared, third_task):
     return digest.hexdigest()
 
 
+def alignment_weight_at(config,step):
+    if not config.get('align_enabled'):return 0.
+    weight=float(config.get('align_weight',.1));warmup=int(config.get('align_warmup_steps',1000))
+    if not math.isfinite(weight) or weight<=0 or warmup<=0:raise ValueError('invalid ALIGN weight/warmup')
+    return weight*min(float(step)/warmup,1.)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('config', 'cohort-root', 'cache-root', 'output'):
@@ -135,7 +152,7 @@ def main():
     parser.add_argument('--dual-static-root',
                         help='training-ready dual_static_v1 artifact')
     parser.add_argument('--pretrain-target-root',
-                        help='pretrain_targets_v1 artifact')
+                        help='optional BRICS-only pretrain_targets_v1 artifact')
     parser.add_argument('--sample-index-artifact',
                         help='read-only pretrain source-index split artifact')
     parser.add_argument('--sample-index-split', choices=('train', 'validation', 'fixed_validation'),
@@ -146,6 +163,8 @@ def main():
     parser.add_argument('--prep-workers', type=int, default=0,
                         help='DataLoader workers per rank for input prefetch '
                              '(0 = inline preparation, the exact original path)')
+    parser.add_argument('--lmdb-readahead', action='store_true',
+                        help='normal kernel prefetch for contiguous direct LMDB values')
     parser.add_argument('--diagnostics', action='store_true',
                         help='observation only: per-step component/gradient logging; '
                              'never writes deployment packages')
@@ -158,8 +177,8 @@ def main():
     parser.add_argument('--geometry-head-norm', action='store_true',
                         help='P2 single change: non-affine LayerNorm of the 3D bond state '
                              'feeding the geometry heads only')
-    parser.add_argument('--third-task', choices=('fp', 'none', 'fgr', 'align'),
-                        help='third objective; defaults to config third_task or fp')
+    parser.add_argument('--third-task', choices=('none', 'fgr', 'align'),
+                        help='optional objective; defaults to config third_task or none')
     parser.add_argument('--fgr-mu', type=float,
                         help='P_train FGR log-distance mean (required for a formal FGR run)')
     parser.add_argument('--fgr-sigma', type=float,
@@ -181,14 +200,19 @@ def main():
     args = parser.parse_args()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
-    third_task = str(args.third_task or config.get('third_task', 'fp')).lower()
+    r10=bool(config.get('r10_revision'))
+    if r10:
+        from src.modules.glt_r10 import validate_pt_config
+        validate_pt_config(config)
+        if os.environ.get('CUDA_VISIBLE_DEVICES')!='2,3':raise ValueError('r10 PT requires physical GPU2,3')
+    third_task = str(args.third_task or config.get('third_task', 'none')).lower()
     fgr_mu = float(args.fgr_mu if args.fgr_mu is not None else config.get('fgr_mu', 0.0))
     fgr_sigma = float(args.fgr_sigma if args.fgr_sigma is not None else config.get('fgr_sigma', 1.0))
     fgr_max_pairs = int(args.fgr_max_pairs if args.fgr_max_pairs is not None
                         else config.get('fgr_max_pairs', 32))
     align_temperature = float(args.align_temperature if args.align_temperature is not None
                               else config.get('align_temperature', 0.1))
-    if third_task not in {'fp', 'none', 'fgr', 'align'}:
+    if third_task not in {'none', 'fgr', 'align'}:
         raise ValueError('unsupported third task')
     if not torch.isfinite(torch.tensor(fgr_mu)) or not torch.isfinite(torch.tensor(fgr_sigma)) or fgr_sigma <= 0:
         raise ValueError('FGR normalization must be finite with positive sigma')
@@ -212,8 +236,21 @@ def main():
     if torsion_mode is not None and str(torsion_mode).lower() not in {'on', 'off'}:
         raise ValueError('torsion_mode must be on or off when present')
     torsion_mode = str(torsion_mode).lower() if torsion_mode else None
-    if config.get('use_md200') is not False or config['amp_dtype'] not in ('fp32', 'bf16'):
+    from src.modules.glt_dual import torsion_options
+    torsion_options(config)
+    if config.get('torsion_revision') and not r10:
+        from src.modules.glt_dual import s4_resource_options
+        s4_resource_options(config)
+        if os.environ.get('CUDA_VISIBLE_DEVICES')!='2,3':raise ValueError('S4 PT requires physical GPU2,3')
+    if config.get('reference_revision'):
+        from scripts.run_glt_pt_matched_reference_unit import validate_config
+        validate_config(config)
+        if os.environ.get('CUDA_VISIBLE_DEVICES')!='2,3':raise ValueError('S5 PT requires physical GPU2,3')
+    new_cycle = config.get('fusion_revision') == 'glt_fusion_r1'
+    if (not new_cycle and config.get('use_md200') is not False) or config['amp_dtype'] not in ('fp32', 'bf16'):
         raise ValueError('dual route requires no MD200 and fp32/bf16 precision')
+    if new_cycle and config.get('use_md200') and not config.get('md200_root'):
+        raise ValueError('MD-on arm requires the explicit MD200 sidecar')
     if args.diagnostics_every <= 0:
         raise ValueError('--diagnostics-every must be a positive integer')
     if not args.diagnostics and args.diagnostics_every != 1:
@@ -254,14 +291,22 @@ def main():
     source, frame = open_source(
         args.cohort_root, args.cache_root,
         dual_static_root=args.dual_static_root,
-        # FP is the only objective that consumes the 7-RU Morgan target.
-        # Non-FP branches intentionally do not open that cache.
-        pretrain_target_root=(args.pretrain_target_root if third_task == 'fp' else None),
+        # The current objectives do not require the legacy Morgan target cache.
+        pretrain_target_root=None,
+        readonly_readahead=args.lmdb_readahead,
+        verify_key_digest=not bool(config.get('opt_mode')),
+        md200_root=config.get('md200_root'),
     )
     try:
+        from src.training.glt_dual_runtime import apply_geometry_quality
+        source=apply_geometry_quality(source,config.get('quality_root'))
+        if r10 and config.get('qc_weight_root'):
+            from src.dataset.glt_r10 import attach_qc_source
+            source=attach_qc_source(source,config['qc_weight_root'])
         sample_index_path = args.sample_index_artifact or config.get('sample_index_artifact')
         sample_index_split = args.sample_index_split or config.get('sample_index_split')
         sample_index = load_sample_index_artifact(sample_index_path, sample_index_split)
+        is_direct = bool(sample_index and sample_index.get('direct_contract'))
         if sample_index is not None:
             if len(source) != int(sample_index['payload'].get('pi1m_record_count', len(source))):
                 raise ValueError('sample index base cohort count mismatch')
@@ -273,8 +318,11 @@ def main():
         if batch_size % (micro * world):
             raise ValueError('microbatch * accumulation * world must equal global_batch')
         accumulation = batch_size // (micro * world)
+        if config.get('torsion_revision') and config['accumulation']!=accumulation:raise ValueError('S4 accumulation/runtime mismatch')
+        if config.get('reference_revision') and config['accumulation']!=accumulation:raise ValueError('S5 accumulation/runtime mismatch')
         set_global_seed(config['seed'])
-        base = DualPretrainer(config['fusion_mode'],
+        from src.modules.glt_dual import locality_options
+        base = DualPretrainer(config['fusion_mode'], **locality_options(config),
                               collect_diagnostics=bool(args.diagnostics),
                               geometry_head_norm=bool(args.geometry_head_norm or config.get('geometry_head_norm', False)),
                               third_task=third_task, fgr_mu=fgr_mu,
@@ -282,14 +330,34 @@ def main():
                               align_temperature=align_temperature,
                               atom_target=atom_target,
                               env_vocab_size=(len(env_vocab) if env_vocab is not None else None),
-                              torsion=torsion_mode is not None).to(device)
+                              torsion=bool(config.get('torsion_modules',torsion_mode is not None)), torsion_revision=config.get('torsion_revision'), opt_mode=config.get('opt_mode'),
+                              fusion_revision=config.get('fusion_revision'), use_md200=config.get('use_md200', False),
+                              atom_ce_input=config.get('atom_ce_input', 'raw'),
+                              align_enabled=config.get('align_enabled', False), local_enabled=config.get('local_enabled', False),
+                              geometry_scales=config.get('geometry_scales'),
+                              fusion_gate=config.get("fusion_gate","none"), quality_root=config.get("quality_root"),
+                              align_weight=config.get("align_weight",.1), align_warmup_steps=config.get("align_warmup_steps",1000),
+                              align_revision=config.get("align_revision"),align_init_seed=config.get("align_init_seed"),align_direction=config.get('align_direction','symmetric'),
+                              **({'nonbonded_revision':config['nonbonded_revision']} if r10 else {}),
+                              **{key:config[key] for key in ('geometry_revision','geometry_mode','angle_value_enabled','readout') if key in config}).to(device)
+        if r10:
+            from src.modules.glt_r10 import configure_runtime
+            configure_runtime(base.encoder)
+        if config.get('initial_state'):
+            initial = torch.load(config['initial_state'], map_location='cpu', weights_only=False)
+            if initial['opt_mode'] != config.get('opt_mode') or initial.get('step')!=0:raise ValueError('step0 mode/step mismatch')
+            if config.get('geometry_revision') and initial.get('config')!=config:raise ValueError('step0 config mismatch')
+            for name,value in initial['model'].items():
+                target=base.state_dict().get(name)
+                if target is None or value.shape!=target.shape or value.dtype!=target.dtype or not torch.isfinite(value).all():raise ValueError('step0 tensor mismatch '+name)
+            base.load_state_dict(initial['model'], strict=True)
         common_init = None
         common_init_path = args.common_init_artifact or config.get('common_init_artifact')
         if common_init_path:
             # The environment output head has a different output space; every
             # other shared parameter must come from the same step-0 state.
             exclude = ('atom_head.head.weight', 'atom_head.head.bias') if atom_target == 'environment' else ()
-            common_init = apply_common_initialization(base, common_init_path, exclude=exclude)
+            common_init = apply_common_initialization(base, common_init_path, exclude=exclude, direct=is_direct)
         optimizer = torch.optim.AdamW(base.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
         module = DistributedDataParallel(base, device_ids=[device.index] if device.type == 'cuda' else None,
                                          find_unused_parameters=True) if world > 1 else base
@@ -314,20 +382,33 @@ def main():
                         sample_index_split=(sample_index['split'] if sample_index else None),
                         common_init_artifact_sha256=(common_init['sha256'] if common_init else None))
         # Exact ordered identities, without adding a separate cache schema.
+        bindings = None
+        if is_direct:
+            from src.training.mcl_ph_direct_contract import assert_actual_equal
+        if is_direct and not config.get('opt_mode'):
+            from src.training.mcl_ph_direct_contract import direct_binding, direct_identity
+            bindings = direct_binding(source, common_init=common_init_path, seed=config['seed'],
+                                      total_positions=int(config['max_optimizer_steps']) * batch_size)
+            identity = direct_identity(identity)
         ordered_keys = [key.hex() for key, _ in source.samples]
         resume_rng = None
         if args.resume:
             state = torch.load(args.resume, map_location='cpu', weights_only=False)
             if state['identity'] != identity or state['ordered_keys'] != ordered_keys:
                 raise ValueError('resume data/config/world size differs')
+            if is_direct:
+                assert_actual_equal(state.get('direct_binding'), bindings)
             base.load_state_dict(state['model'], strict=True)
             optimizer.load_state_dict(state['optimizer'])
+            if is_direct:
+                from src.training.mcl_ph_direct_contract import verify_restored_checkpoint
+                verify_restored_checkpoint(base, optimizer, state, batch_size=batch_size)
             start = state['step']
             if state['next_position'] != start * batch_size or state['scheduler']['step'] != start:
                 raise ValueError('resume scheduler/data position mismatch')
             # Restore after constructing the optional DataLoader iterator below.
-            # Worker-base-seed creation consumes the process Torch RNG; doing it
-            # before restore keeps that setup draw outside the resumed stream.
+            # Its dedicated generator keeps setup draws outside model RNG;
+            # restoring here also protects historical checkpoints.
             resume_rng = state['rng'][rank]
         else:
             # Identical initialization; independent dropout streams after DDP sync.
@@ -394,14 +475,14 @@ def main():
                 third_task=third_task, fgr_mu=fgr_mu, fgr_sigma=fgr_sigma,
                 fgr_max_pairs=fgr_max_pairs,
                 atom_target=atom_target, env_vocab=env_vocab,
-                torsion_mode=torsion_mode,
+                torsion_mode=(None if config.get('geometry_revision') and not config.get('torsion_modules') else torsion_mode), torsion_revision=config.get('torsion_revision'), opt_mode=config.get('opt_mode'), geometry_mode=config.get('geometry_mode','finite_internal'),nonbonded_revision=config.get('nonbonded_revision'),
             )
-            prefetch = iter(torch.utils.data.DataLoader(
-                dataset, batch_size=None, num_workers=int(args.prep_workers),
-                prefetch_factor=4, persistent_workers=False, pin_memory=False,
-            ))
+            prefetch = iter(pretrain_loader(
+                dataset, workers=args.prep_workers, seed=config['seed'], rank=rank))
         if resume_rng is not None:
             restore_rng(resume_rng)
+            if is_direct:
+                assert_actual_equal(rng_state(), resume_rng, 'restored.rng')
         reference = _reference_steps(args.reference_log) if args.reference_log else {}
         diagnostics_path = output / 'diagnostics_steps.jsonl'
         timing_path = output / 'timing_steps.jsonl'
@@ -415,9 +496,12 @@ def main():
             if world > 1:
                 dist.barrier()
         rank_record_path = (output / f'records_rank{rank}.jsonl'
-                            if args.diagnostics or args.timing or benchmark_mode else None)
+                            if args.diagnostics or args.timing or benchmark_mode or config.get('opt_mode') else None)
         for step in range(start, stop):
             step_number = step + 1
+            if new_cycle and rank == 0:
+                write_consumption(output / 'consumption.json', attempted=step_number,
+                                  completed=step, status='RUNNING')
             step_started = time.perf_counter()
             # All ranks finish warmup before the first timed update.  The
             # barrier is deliberately at the transition, rather than relying
@@ -443,25 +527,24 @@ def main():
                     for local in range(micro):
                         position = step * batch_size + offset * world * micro + rank * micro + local
                         index = stream.index_at(position)
-                        rows.append(prepare_pretrain_sample(
-                            *source[index], seed=config['seed'],
+                        rows.append(prepare_source_sample(
+                            source, index, seed=config['seed'],
                             key=source.samples[index][0].hex(), position=position,
                             sigma=config['noise_sigma'], ratio=config['atom_mask_ratio'],
-                            static=source.static_for(index),
-                            target=(source.target_for(index) if third_task == 'fp' else None),
                             third_task=third_task, fgr_mu=fgr_mu,
                             fgr_sigma=fgr_sigma, fgr_max_pairs=fgr_max_pairs,
                             atom_target=atom_target, env_vocab=env_vocab,
-                            torsion_mode=torsion_mode))
+                            torsion_mode=(None if config.get('geometry_revision') and not config.get('torsion_modules') else torsion_mode), torsion_revision=config.get('torsion_revision'), opt_mode=config.get('opt_mode'), geometry_mode=config.get('geometry_mode','finite_internal'),nonbonded_revision=config.get('nonbonded_revision')))
                     prepared.append(pretrain_collate(rows))
+            if config.get('torsion_revision'):
+                torsion_counts=sum((data.torsion_counts.sum(0) for data,_ in prepared),torch.zeros(6,dtype=torch.long)).tolist()
             timing['preparation_seconds'] = time.perf_counter() - prep_started
             counts = torch.zeros(3, device=device)
+            extra_counts = torch.zeros(2, device=device)
             for data, labels in prepared:
                 masked = torch.bincount(data.canonical_graph_index[labels['atom_mask']], minlength=data.graph_available.numel())
-                centers = torch.bincount(data.bond_batch[data.bond_center], minlength=data.graph_available.numel())
-                if third_task == 'fp':
-                    third_count = data.graph_available.sum()
-                elif third_task == 'fgr':
+                centers = torch.bincount(data.bond_batch[(data.bond_length_weight>0) if config.get('geometry_revision') else data.bond_center], minlength=data.graph_available.numel())
+                if third_task == 'fgr':
                     third_count = (labels['fgr_graph_valid'].to(device)
                                    & data.geometry_valid.to(device).bool()).sum()
                 elif third_task == 'align':
@@ -469,21 +552,36 @@ def main():
                         labels['align_identity'], labels['align_valid'], device=device)
                 else:
                     third_count = torch.tensor(0., device=device)
+                geo_valid=(centers > 0) & data.geometry_valid
+                geo_count=(labels['geometry_quality_weight'][geo_valid].sum() if config.get('qc_weight_root') else geo_valid.sum())
                 counts += torch.stack([(masked > 0).sum().to(device),
-                                       ((centers > 0) & data.geometry_valid).sum().to(device),
+                                       geo_count.to(device),
                                        third_count.to(device)])
+                if new_cycle:
+                    if config.get('align_enabled'):
+                        extra_counts[0] += alignment_local_anchor_count(
+                            labels['align_identity'], labels['align_valid'], device=device)
+                    if config.get('local_enabled'):
+                        incident_graphs = data.canonical_graph_index[data.incidence_index[1]].unique()
+                        extra_counts[1] += data.geometry_valid[incident_graphs].sum().to(device)
             if world > 1:
                 dist.all_reduce(counts)
+                if new_cycle:
+                    dist.all_reduce(extra_counts)
             lr = scheduled_lr(step, **{key: config[key] for key in ('lr', 'warmup_steps', 'schedule_total_steps', 'end_lr')})
             for group in optimizer.param_groups:
                 group['lr'] = lr
             optimizer.zero_grad(set_to_none=True)
             totals = torch.zeros(3, device=device)
+            extra_totals = torch.zeros(2, device=device)
+            raw_geometry_totals = torch.zeros(2, device=device)
             target_counts = torch.zeros(4, device=device)
             fallbacks, reasons = 0, {}
             h2d_seconds = forward_backward_seconds = optimizer_seconds = 0.0
             objective_weights = list(config['loss_weights'])
             if third_task == 'align':
+                objective_weights[2] = 0.1 * min(float(step_number) / 1000., 1.)
+            if new_cycle and third_task == 'fgr':
                 objective_weights[2] = 0.1 * min(float(step_number) / 1000., 1.)
             for offset, (data, labels) in enumerate(prepared):
                 fallbacks += labels['fallback_count']
@@ -506,7 +604,12 @@ def main():
                     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config['amp_dtype'] == 'bf16'):
                         result = module(moved_data, moved_labels,
                                         collect_diagnostics=diag_this_step)
-                        loss = global_objective(result['sums'], counts, world, objective_weights)
+                        loss = global_objective(result['sums'], counts, world, objective_weights,fractional_counts=bool(config.get('qc_weight_root')))
+                        if new_cycle:
+                            extra_weights = [alignment_weight_at(config,step_number),
+                                             0.05 if config.get('local_enabled') else 0.]
+                            extra_weights = [extra_weights[0],extra_weights[1]*min(float(step_number)/1000.,1.)]
+                            loss = loss + global_objective(result['extra_sums'], extra_counts, world, extra_weights)
                     if not torch.isfinite(loss):
                         raise FloatingPointError('nonfinite pretraining loss')
                     loss.backward()
@@ -514,6 +617,9 @@ def main():
                         torch.cuda.synchronize(device)
                     forward_backward_seconds += time.perf_counter() - forward_backward_started
                 totals += result['sums'].detach()
+                if new_cycle:
+                    extra_totals += result['extra_sums'].detach()
+                    raw_geometry_totals += result['raw_geometry_sums'].detach()
                 target_counts += result['targets'].detach()
             if args.timing and device.type == 'cuda':
                 torch.cuda.synchronize(device)
@@ -521,17 +627,38 @@ def main():
             grad_total_preclip = float(torch.nn.utils.clip_grad_norm_(
                 base.parameters(), 1., error_if_nonfinite=True))
             optimizer.step()
+            if new_cycle and rank == 0:
+                write_consumption(output / 'consumption.json', attempted=step_number,
+                                  completed=step_number, status='RUNNING')
             if args.timing and device.type == 'cuda':
                 torch.cuda.synchronize(device)
             optimizer_seconds = time.perf_counter() - optimizer_started
             if world > 1:
                 dist.all_reduce(totals)
                 dist.all_reduce(target_counts)
+                if new_cycle:
+                    dist.all_reduce(extra_totals)
+                    dist.all_reduce(raw_geometry_totals)
             record = dict(step=step + 1, rank=rank, lr=float(lr),
                 losses=(totals / counts.clamp_min(1)).tolist(), valid_graphs=counts.tolist(),
                 target_counts=target_counts.tolist(), local_fallbacks=fallbacks, local_skip_reasons=reasons,
-                third_stream_signature=_third_stream_signature(prepared, third_task),
+                third_stream_signature=(None if is_direct else _third_stream_signature(prepared, third_task)),
                 third_task=third_task)
+            if config.get('torsion_revision'):
+                record['local_torsion_counts']=torsion_counts
+                record['torsion_count_scope']='rank presentations: quadruplets,valid,graphs_with,valid_graphs_without,degenerate,seam_paths'
+            if new_cycle:
+                record.update(extra_losses=(extra_totals/extra_counts.clamp_min(1)).tolist(),
+                              extra_valid_graphs=extra_counts.tolist(),
+                              raw_geometry_losses=(raw_geometry_totals/counts[1].clamp_min(1)).tolist(),
+                              extra_weights=extra_weights,extra_weighted_contributions=((extra_totals/extra_counts.clamp_min(1))*torch.tensor(extra_weights,device=device)).tolist())
+            if config.get('geometry_revision') and rank == 0:
+                record['grad_norms'] = _module_grad_norms(base)
+                record['grad_total_preclip'] = grad_total_preclip
+            record['cpu_observed_timing'] = dict(
+                preparation_seconds=timing['preparation_seconds'],
+                step_seconds=time.perf_counter() - step_started,
+                scope='host wall time without additional CUDA synchronization')
             if args.timing:
                 timing.update(h2d_seconds=h2d_seconds,
                               forward_backward_seconds=forward_backward_seconds,
@@ -567,6 +694,12 @@ def main():
                     _check_reference(reference, step + 1, float(lr),
                                      target_counts.tolist(),
                                      (totals / counts.clamp_min(1)).tolist())
+            if config.get('geometry_revision') and step_number in (1000,2500,5000):
+                if config.get('endpoint_revision'):
+                    from scripts.run_glt_pt_locality_unit import evaluate_process_validation
+                else:
+                    from scripts.evaluate_glt_pt_endpoint import evaluate_process_validation
+                evaluate_process_validation(base, config, step_number, device, rank, world)
             if benchmark_mode:
                 if step_number > start + args.benchmark_warmup:
                     # This is intentionally a CPU-observed diagnostic only;
@@ -584,7 +717,7 @@ def main():
                         states[0] = rng_state()
                     if rank == 0:
                         save_checkpoint(output / f'resume_{step + 1:05d}.pt', dict(identity=identity,
-                            ordered_keys=ordered_keys, step=step + 1,
+                            ordered_keys=ordered_keys, direct_binding=bindings, step=step + 1,
                             next_position=(step + 1) * batch_size, model=base.state_dict(),
                             optimizer=optimizer.state_dict(), rng=states,
                             scheduler=dict(step=step + 1, lr=float(lr))))
@@ -602,10 +735,17 @@ def main():
                     states[0] = rng_state()
                 if rank == 0:
                     save_checkpoint(output / f'resume_{step + 1:05d}.pt', dict(identity=identity,
-                        ordered_keys=ordered_keys, step=step + 1, next_position=(step + 1) * batch_size,
+                        ordered_keys=ordered_keys, direct_binding=bindings, step=step + 1, next_position=(step + 1) * batch_size,
                         model=base.state_dict(), optimizer=optimizer.state_dict(), rng=states,
                         scheduler=dict(step=step + 1, lr=float(lr))))
-                    save_checkpoint(output / f'deploy_{step + 1:05d}.pt', deployment_package(base, step + 1))
+                    package = deployment_package(base, step + 1)
+                    if r10:
+                        from src.modules.glt_r10 import bind_package
+                        package=bind_package(package,config)
+                    if config.get('reference_revision'):
+                        from scripts.run_glt_pt_matched_reference_unit import bind_deployment
+                        package = bind_deployment(package, config)
+                    save_checkpoint(output / f'deploy_{step + 1:05d}.pt', package)
                 if world > 1:
                     dist.barrier()
         if benchmark_mode:
@@ -651,6 +791,9 @@ def main():
             runtime.update(status='PASS', completed_steps=int(stop - start),
                            benchmark_mode=benchmark_mode, finished_at_monotonic=time.perf_counter())
             write_json(output / 'runtime.json', runtime)
+            if new_cycle:
+                write_consumption(output / 'consumption.json', attempted=stop,
+                                  completed=stop, status='COMPLETED')
     finally:
         source.close()
         if dist.is_initialized():

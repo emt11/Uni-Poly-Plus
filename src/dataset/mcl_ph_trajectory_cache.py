@@ -74,9 +74,45 @@ IDENTITY_FIELDS = ('seed', 'noise_sigma', 'mask_ratio', 'global_batch',
                    'cohort_manifest_hash', 'dual_static_manifest_hash', 'ph_semantics')
 
 
+DIRECT_IDENTITY_FIELDS = ('seed', 'noise_sigma', 'mask_ratio', 'global_batch',
+                          'sample_index_split', 'ph_semantics', 'identity_contract',
+                          'source_root', 'source_rows', 'selected_rows')
+
+
+def identity_fields(identity):
+    return DIRECT_IDENTITY_FIELDS if identity.get('identity_contract') == 'direct-row-v1' else IDENTITY_FIELDS
+
+
+def direct_source_identity(source):
+    base = getattr(source, 'base', source)
+    if getattr(base, 'kind', None) != 'pi1m':
+        raise ValueError('direct cache requires a PI1M source')
+    return dict(source_root=str(base.root.resolve()), source_rows=len(base), selected_rows=len(source))
+
+
+def require_direct_source_rows(root, source, *, publish=False):
+    base = getattr(source, 'base', source)
+    indices = np.asarray([source.source_index_at(i) for i in range(len(source))], dtype=np.int64)
+    keys = np.frombuffer(b''.join(source.samples[i][0] for i in range(len(source))), dtype=np.uint8).reshape(-1, 32)
+    if any(base.entries[int(index)]['pretrain_role'] != 'train' for index in indices):
+        raise ValueError('direct cache selected a non-train source row')
+    for name, values in [('source_indices.npy', indices), ('source_keys.npy', keys)]:
+        path = Path(root) / name
+        if path.exists():
+            actual = np.load(path, mmap_mode='r', allow_pickle=False)
+            if actual.dtype != values.dtype or not np.array_equal(actual, values):
+                raise ValueError(f'direct cache source row binding differs: {name}')
+        elif publish:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open('xb') as stream:
+                np.save(stream, values, allow_pickle=False)
+        else:
+            raise FileNotFoundError(f'direct cache source row binding missing: {path}')
+
+
 def cache_identity(*, seed, noise_sigma, mask_ratio, global_batch, sample_index_split,
-                   sample_index_artifact_sha256, cohort_manifest_hash,
-                   dual_static_manifest_hash, ph_semantics=None):
+                   sample_index_artifact_sha256=None, cohort_manifest_hash=None,
+                   dual_static_manifest_hash=None, ph_semantics=None, direct_source=None):
     """The identity block a cache and a training run must agree on, field for field."""
     if ph_semantics is not None and ph_semantics != PH_SEMANTICS:
         raise ValueError('trajectory cache PH semantics differ from implementation')
@@ -91,7 +127,12 @@ def cache_identity(*, seed, noise_sigma, mask_ratio, global_batch, sample_index_
         'dual_static_manifest_hash': str(dual_static_manifest_hash),
         'ph_semantics': dict(PH_SEMANTICS),
     }
-    for name in IDENTITY_FIELDS:
+    if direct_source is not None:
+        identity = {name: identity[name] for name in DIRECT_IDENTITY_FIELDS[:6]}
+        identity.update(identity_contract='direct-row-v1', **direct_source)
+    elif any(value is None for value in (sample_index_artifact_sha256, cohort_manifest_hash, dual_static_manifest_hash)):
+        raise ValueError('legacy trajectory cache identity is missing a digest')
+    for name in identity_fields(identity):
         value = identity[name]
         if value is None or (isinstance(value, str) and not value):
             raise ValueError(f'trajectory cache identity field {name} is empty')
@@ -184,10 +225,17 @@ def write_manifest(root, manifest):
     os.replace(temporary, root / MANIFEST_NAME)
 
 
-def describe_shard(root, shard, first_position, rows):
+def describe_shard(root, shard, first_position, rows, *, direct=False):
     path = Path(root) / SHARDS_DIRNAME / shard_file_name(first_position, rows)
-    return {'shard': int(shard), 'file': path.name, 'first_position': int(first_position),
-            'rows': int(rows), 'sha256': sha256_file(path)}
+    entry = {'shard': int(shard), 'file': path.name, 'first_position': int(first_position), 'rows': int(rows)}
+    if direct:
+        data = np.load(path, mmap_mode='r', allow_pickle=False)
+        if data.dtype != DESCRIPTOR_DTYPE or data.shape != (rows, len(ROUTER_RADII), DESCRIPTOR_COLUMNS) or not np.isfinite(data).all():
+            raise ValueError(f'direct cache shard layout or finite values differ: {path}')
+        entry['content_validation'] = 'finite-float32'
+    else:
+        entry['sha256'] = sha256_file(path)
+    return entry
 
 
 def segment_key(shard, first_position):
@@ -313,6 +361,7 @@ class MCLPHTrajectoryCache:
         if manifest.get('ph_semantics') != PH_SEMANTICS:
             raise ValueError('trajectory cache PH semantics mismatch or missing')
         self.manifest = manifest
+        self.direct = manifest.get('identity_contract') == 'direct-row-v1'
         self.total_positions = int(manifest['total_positions'])
         self.shard_size = int(manifest['shard_size'])
         self.shape = shape
@@ -323,7 +372,9 @@ class MCLPHTrajectoryCache:
             raise ValueError('trajectory cache manifest shard list is malformed')
         self._entries = {}
         for entry in entries:
-            missing = [name for name in SHARD_ROW_FIELDS if name not in entry]
+            missing = [name for name in (SHARD_ROW_FIELDS[:-1] if self.direct else SHARD_ROW_FIELDS) if name not in entry]
+            if self.direct and entry.get('content_validation') != 'finite-float32':
+                raise ValueError('direct cache shard finite validation is missing')
             if missing:
                 raise ValueError('trajectory cache shard row is missing: ' + ','.join(missing))
             index = int(entry['shard'])
@@ -347,7 +398,9 @@ class MCLPHTrajectoryCache:
     def require_identity(self, expected):
         """Refuse a cache that does not describe the same presentations as this run."""
         problems = []
-        for name in IDENTITY_FIELDS:
+        if identity_fields(expected) != identity_fields(self.manifest):
+            raise ValueError('trajectory cache identity contract differs')
+        for name in identity_fields(expected):
             if name not in expected:
                 raise ValueError(f'the expected cache identity does not declare {name}')
             actual = self.manifest.get(name, '<missing>')
@@ -379,7 +432,7 @@ class MCLPHTrajectoryCache:
                  'shard_size': self.shard_size,
                  'shards': len(self._bounds), 'completed_shards': self.completed_shards,
                  'complete': bool(self.complete),
-                 'manifest_identity': {name: self.manifest.get(name) for name in IDENTITY_FIELDS}}
+                 'manifest_identity': {name: self.manifest.get(name) for name in identity_fields(self.manifest)}}
         if required_positions is not None:
             block['required_positions'] = int(required_positions)
         return block
@@ -414,7 +467,9 @@ class MCLPHTrajectoryCache:
                              f'expected {expected}')
         if handle.dtype != DESCRIPTOR_DTYPE:
             raise ValueError(f'trajectory cache shard {path.name} has dtype {handle.dtype}')
-        if self.verify_checksums and sha256_file(path) != str(entry['sha256']):
+        if self.direct and self.verify_checksums and not np.isfinite(handle).all():
+            raise ValueError(f'direct trajectory cache contains NaN/Inf: {path}')
+        if not self.direct and self.verify_checksums and sha256_file(path) != str(entry['sha256']):
             raise ValueError(f'trajectory cache shard {path.name} does not match its '
                              f'manifest hash')
         self._handles[shard] = handle
@@ -428,7 +483,10 @@ class MCLPHTrajectoryCache:
         shard, offset = divmod(index, self.shard_size)
         # A writable copy: the caller hands the row to ``torch.from_numpy``, and
         # the mapping itself must stay read-only.
-        return np.array(self._handle(shard)[offset], dtype=DESCRIPTOR_DTYPE, copy=True)
+        row = np.array(self._handle(shard)[offset], dtype=DESCRIPTOR_DTYPE, copy=True)
+        if not np.isfinite(row).all():
+            raise ValueError(f'trajectory cache contains NaN/Inf at position {index}')
+        return row
 
     def close(self):
         self._handles = {}
@@ -497,7 +555,8 @@ class TrajectoryCacheBuilder:
         split = load_sample_index_artifact(sample_index_artifact, sample_index_split)
         if split is None:
             raise ValueError('the trajectory cache is built on the frozen P_train subset')
-        self.split_sha256 = str(split['sha256'])
+        self.split_sha256 = split['sha256']
+        self.direct_contract = bool(split.get('direct_contract'))
         self.source_base, _ = open_source(cohort_root, cache_root,
                                           dual_static_root=dual_static_root)
         self.source = IndexedFrozenDualSource(self.source_base, split['indices'])

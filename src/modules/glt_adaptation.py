@@ -146,3 +146,75 @@ class AdaptationAdapter(nn.Module):
 
     def forward(self, data):
         return self.encoder(data), None
+
+
+class HeadFeatureCache:
+    """In-memory features for one frozen head stage; labels remain dataset-owned."""
+
+    def __init__(self, model, dataset, context):
+        import copy
+        self.model=model;self.dataset=dataset
+        self.context=copy.deepcopy(context);self.active=True;self.features=None;self.label_shape=None
+        if set(context)!= {'parent','configuration','input_view','dtype','sample_indices'}:
+            raise ValueError('incomplete head feature cache binding')
+        if len(context['sample_indices'])!=len(dataset) or context['dtype']!='fp32':
+            raise ValueError('head feature cache indices/dtype mismatch')
+
+    def validate(self, context):
+        if not self.active or context!=self.context:
+            raise ValueError('inactive or mismatched head feature cache')
+        if self.model.training:
+            raise ValueError('head feature cache requires an eval encoder')
+        head=getattr(self.model,'head',None)
+        if head is None:head=self.model.model.predictor
+        ids={id(p) for p in head.parameters()}
+        if any(p.requires_grad for p in self.model.parameters() if id(p) not in ids):
+            raise ValueError('head feature cache encoder is not frozen')
+
+    def build(self, device, batch_size, collate):
+        from torch.utils.data import DataLoader
+        from src.training.glt_dual_runtime import rng_state,restore_rng
+        self.validate(self.context)
+        saved=rng_state();was_training=self.model.training
+        values=[]
+        try:
+            loader=DataLoader(self.dataset,batch_size=batch_size,shuffle=False,
+                num_workers=0,collate_fn=collate,generator=torch.Generator().manual_seed(0))
+            with torch.no_grad():
+                for data in loader:
+                    features=self.model.features(data.to(device)).detach().float().cpu()
+                    if features.ndim!=2 or features.shape[1] not in (512,1024) or not torch.isfinite(features).all():
+                        raise ValueError('invalid cached head features')
+                    label_shape=tuple(data.y.shape[1:])
+                    if self.label_shape is None:self.label_shape=label_shape
+                    if self.label_shape!=label_shape or data.y.shape[0]!=features.shape[0]:
+                        raise ValueError('inconsistent cached label batch shape')
+                    values.append(features)
+            self.features=torch.cat(values)
+            if self.features.shape[0]!=len(self.dataset):raise ValueError('cache feature row count mismatch')
+        finally:
+            self.model.train(was_training);restore_rng(saved)
+
+    def loader(self, original):
+        from torch.utils.data import DataLoader,Dataset,Subset
+        from torch_geometric.data import Data,Batch
+        if original.num_workers!=0:raise ValueError('head feature cache requires the authorized workers0 recipe')
+        if isinstance(original.dataset,Subset):
+            if original.dataset.dataset is not self.dataset:raise ValueError('cache dataset/view mismatch')
+            indices=list(original.dataset.indices)
+        elif original.dataset is self.dataset:indices=list(range(len(self.dataset)))
+        else:raise ValueError('cache dataset/view mismatch')
+        cache=self
+        class Features(Dataset):
+            def __len__(self):return len(indices)
+            def __getitem__(self,index):
+                cache.validate(getattr(cache.model,'feature_cache_context',cache.context))
+                row=indices[index]
+                if hasattr(cache.dataset,'targets'):label=torch.tensor([float(cache.dataset.targets[row])],dtype=torch.float32)
+                else:label=cache.dataset[row].y.clone()
+                return Data(cached_features=cache.features[row:row+1],y=label.reshape((1,)+cache.label_shape))
+        return DataLoader(Features(),batch_sampler=original.batch_sampler,
+            num_workers=0,collate_fn=Batch.from_data_list,generator=original.generator)
+
+    def invalidate(self):
+        self.active=False;self.features=None

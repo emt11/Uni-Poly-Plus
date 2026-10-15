@@ -409,26 +409,80 @@ class FusionCrossAttention(nn.Module):
         for layer in (self.query, self.key, self.value, self.out):
             nn.init.xavier_uniform_(layer.weight)
         self.scale = float(self.dim) ** -0.5
+        # Absent from the reference/pretraining state dict.  The one-factor
+        # downstream variant explicitly enables this after strict loading.
+        self.register_parameter('residual_scale', None)
+
+    def enable_learnable_scale(self):
+        if self.residual_scale is not None:
+            raise ValueError('the learnable residual scale is already enabled')
+        self.residual_scale = nn.Parameter(self.out.weight.new_tensor(FUSION_SCALE))
+
+    def _graph_attention(self, query, key, value, graph):
+        """Exact graph-local attention, with bounded power-of-two padding.
+
+        At most four times the graph-local score entries are materialized;
+        cross-graph scores and the batch-wide N x N mask are never built.
+        Softmax still sees every real key in its graph.  Operand casts and
+        caller-controlled autocast follow the reference implementation.
+        """
+        count = int(query.size(0))
+        output = query.new_zeros((count, self.heads, self.dim), dtype=torch.float32)
+        if not count:
+            return output
+        # One host transfer gives every bucket's static shape. Avoid repeated
+        # CUDA nonzero calls, which synchronise once for each bucket.
+        host_graph = graph.detach().cpu()
+        _, inverse, counts = torch.unique(host_graph, sorted=True, return_inverse=True,
+                                          return_counts=True)
+        order = torch.argsort(inverse, stable=True)
+        starts = counts.cumsum(0) - counts
+        sizes = counts.tolist()
+        host_within = torch.arange(count) - torch.repeat_interleave(starts, counts)
+        order = order.to(graph.device, non_blocking=True)
+        within = host_within.to(graph.device, non_blocking=True)
+        buckets = {}
+        for index, size in enumerate(sizes):
+            capacity = 1 << (int(size) - 1).bit_length()
+            buckets.setdefault(capacity, []).append(index)
+        for capacity, graph_ids in buckets.items():
+            host_selected = torch.cat([torch.arange(int(starts[index]),
+                                      int(starts[index]) + sizes[index]) for index in graph_ids])
+            selected_order = host_selected.to(graph.device, non_blocking=True)
+            selected = order[selected_order]
+            local_atom = within[selected_order]
+            local_graph = torch.repeat_interleave(torch.arange(len(graph_ids)),
+                           torch.tensor([sizes[index] for index in graph_ids])).to(
+                               graph.device, non_blocking=True)
+            shape = (len(graph_ids), capacity, 3, self.heads, self.dim)
+            packed = query.new_zeros(shape, dtype=torch.float32)
+            packed[local_graph, local_atom] = torch.stack(
+                (query[selected], key[selected], value[selected]), dim=1).float()
+            packed_q, packed_k, packed_v = packed.unbind(dim=2)
+            lengths = torch.tensor([sizes[index] for index in graph_ids]).to(
+                graph.device, non_blocking=True)
+            real_keys = torch.arange(capacity, device=graph.device)[None, :] < lengths[:, None]
+            chunks = []
+            for start in range(0, capacity, self.chunk):
+                score = torch.einsum('bihd,bjhd->bhij',
+                                     packed_q[:, start:start + self.chunk], packed_k)
+                score = (score * self.scale).masked_fill(
+                    ~real_keys[:, None, None, :], float('-inf'))
+                weight = torch.softmax(score, dim=-1)
+                chunks.append(torch.einsum('bhij,bjhd->bihd', weight, packed_v))
+            attended = torch.cat(chunks, dim=1)
+            output[selected] = attended[local_graph, local_atom].to(output.dtype)
+        return output
 
     def forward(self, hidden, tokens, graph):
         count = int(hidden.size(0))
         query = self.query(self.norm2(hidden)).reshape(count, self.heads, self.dim)
         key = self.key(self.norm3(tokens)).reshape(count, self.heads, self.dim)
         value = self.value(self.norm3(tokens)).reshape(count, self.heads, self.dim)
-        # Padding/graph mask only: a key is visible to a query of its own graph.
-        same = graph.reshape(-1, 1) == graph.reshape(1, -1)
-        output = hidden.new_zeros((count, self.heads, self.dim), dtype=torch.float32)
-        for start in range(0, count, self.chunk):
-            stop = min(start + self.chunk, count)
-            score = torch.einsum('ihd,jhd->hij', query[start:stop].float(), key.float())
-            score = score * self.scale
-            # The mask is applied to the whole key set, so each chunk performs
-            # an exact softmax over every key; nothing is renormalised locally.
-            score = score.masked_fill(~same[start:stop].unsqueeze(0), float('-inf'))
-            weight = torch.softmax(score, dim=-1)
-            output[start:stop] = torch.einsum('hij,jhd->ihd', weight, value.float())
-        joined = output.to(hidden.dtype).reshape(count, -1)
-        return hidden + FUSION_SCALE * self.out(joined)
+        output = self._graph_attention(query, key, value, graph)
+        joined = output.to(hidden.dtype).reshape(count, self.heads * self.dim)
+        residual = FUSION_SCALE if self.residual_scale is None else self.residual_scale
+        return hidden + residual * self.out(joined)
 
 
 class FusionConcat(nn.Module):

@@ -77,6 +77,20 @@ def test_worker_iterator_then_restore_preserves_parent_torch_rng():
     del iterator, loader
 
 
+def test_pretrain_prefetch_does_not_advance_parent_rng():
+    torch.manual_seed(9271)
+    saved = torch.get_rng_state().clone()
+    loader = runtime.pretrain_loader(_IndexDataset(), workers=2, seed=42, rank=1)
+    iterator = iter(loader)
+    assert list(iterator) == list(range(8))
+    assert torch.equal(torch.get_rng_state(), saved)
+
+
+def test_pretrain_prefetch_rejects_zero_workers():
+    with pytest.raises(ValueError, match='positive worker count'):
+        runtime.pretrain_loader(_IndexDataset(), workers=0, seed=42, rank=0)
+
+
 def test_grid_rejects_duplicate_gpu_slots_before_launch():
     with pytest.raises(ValueError, match='distinct GPU slots'):
         _validate_gpu_slots(['1', '1'])

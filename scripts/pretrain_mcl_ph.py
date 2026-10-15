@@ -36,7 +36,7 @@ from src.training.glt_dual_runtime import (IndexedFrozenDualSource, OrderedSampl
                                            apply_common_initialization, load_sample_index_artifact,
                                            move_labels, open_source, require_tmux,
                                            restore_rng, rng_state, save_checkpoint, sha256_file,
-                                           write_json)
+                                           write_json, pretrain_source_fields, pretrain_loader)
 from src.utils import set_global_seed
 
 ARMS = ('cat', 'gate', 'xattn')
@@ -50,6 +50,15 @@ def checkpoint_due(step, stop, every):
     if int(every) <= 0:
         raise ValueError('save_every must be positive')
     return int(step) == int(stop) or int(step) % int(every) == 0
+
+
+def load_initial_state(model, path):
+    """Load a complete step-zero model; optimizer and RNG are not resumed."""
+    model.load_state_dict(torch.load(path, map_location='cpu', weights_only=False), strict=True)
+
+
+def router_stop_required(config, low_windows):
+    return bool(config.get('stop_on_router_low_util', True)) and any(n >= 3 for n in low_windows)
 
 
 def checkpoint_rng_states(world):
@@ -88,18 +97,19 @@ def _gradient_groups(model):
     return report
 
 
-def _parameter_snapshot(model):
-    digest = hashlib.sha256()
+def _parameter_snapshot(model, *, direct=False):
+    digest = None if direct else hashlib.sha256()
     summary = {}
     for name, value in sorted(model.state_dict().items()):
         tensor = value.detach().float().cpu().reshape(-1)
-        digest.update(name.encode('utf-8'))
-        digest.update(tensor.numpy().tobytes())
+        if digest is not None:
+            digest.update(name.encode('utf-8'))
+            digest.update(tensor.numpy().tobytes())
         if tensor.numel():
             summary[name] = {'shape': list(value.shape),
                              'rms': float(tensor.pow(2).mean().sqrt()),
                              'mean': float(tensor.mean())}
-    return digest.hexdigest(), summary
+    return None if direct else digest.hexdigest(), summary
 
 
 class StageLogger:
@@ -270,7 +280,7 @@ def SHARED_INIT_EXCLUDE_NAMES(model, artifact_state):
         | {name for name in artifact_state if not name.startswith('encoder.o8.')}))
 
 
-def apply_shared_init(model, path):
+def apply_shared_init(model, path, *, direct=False):
     payload = torch.load(Path(path), map_location='cpu', weights_only=False)
     if payload.get('schema') != SHARED_INIT_SCHEMA:
         raise ValueError('shared initialization artifact has an unsupported schema: '
@@ -285,12 +295,16 @@ def apply_shared_init(model, path):
         raise ValueError(f'shared initialization tensor set mismatch: '
                          f'missing={missing[:4]} extra={extra[:4]}')
     for name, value in state.items():
+        if direct and (current[name].dtype != value.dtype or not torch.isfinite(value).all()):
+            raise ValueError(f'shared initialization tensor dtype/finite mismatch: {name}')
         if tuple(current[name].shape) != tuple(value.shape):
             raise ValueError(f'shared initialization shape mismatch: {name}')
     with torch.no_grad():
         for name, value in state.items():
             current[name].copy_(value)
-    return {'path': str(Path(path).resolve()), 'sha256': sha256_file(path),
+            if direct and not torch.equal(current[name].detach().cpu(), value.detach().cpu()):
+                raise ValueError(f'shared initialization tensor copy differs: {name}')
+    return {'path': str(Path(path).resolve()), 'sha256': None if direct else sha256_file(path),
             'schema': payload['schema'], 'seed': payload['seed'],
             'tensor_count': len(state)}
 
@@ -385,7 +399,7 @@ _OUTPUT = [None]
 
 def _trajectory_cache_identity(config, *, batch_size, sample_index, source):
     """The identity an offline topology cache must match field for field."""
-    from src.dataset.mcl_ph_trajectory_cache import cache_identity
+    from src.dataset.mcl_ph_trajectory_cache import cache_identity, direct_source_identity
 
     return cache_identity(seed=int(config['seed']),
                           noise_sigma=float(config['noise_sigma']),
@@ -394,19 +408,25 @@ def _trajectory_cache_identity(config, *, batch_size, sample_index, source):
                           sample_index_split=sample_index['split'],
                           sample_index_artifact_sha256=sample_index['sha256'],
                           cohort_manifest_hash=source.cohort['manifest_hash'],
-                          dual_static_manifest_hash=source.static_cache.manifest_hash)
+                          dual_static_manifest_hash=source.static_cache.manifest_hash,
+                          direct_source=(direct_source_identity(source) if sample_index.get('direct_contract') else None))
 
 
 def open_trajectory_cache(path, *, config, batch_size, sample_index, source):
     """Open the offline topology cache and return ``(cache, identity block)``.
 
     A cache that does not describe this run's presentations is refused here,
-    before the model is built and before any position is read.  ``None`` keeps
-    the declared online behaviour of every earlier MCL-PH run.
+    before the model is built and before any position is read.  A configured
+    cache is used when the CLI has no override.  The r4 direct contract requires
+    a completed cache; historical runs retain their declared online behaviour.
     """
-    from src.dataset.mcl_ph_trajectory_cache import MCLPHTrajectoryCache, online_provenance
+    from src.dataset.mcl_ph_trajectory_cache import MCLPHTrajectoryCache, online_provenance, require_direct_source_rows
 
+    path = path or config.get('trajectory_cache')
     if not path:
+        if sample_index.get('direct_contract'):
+            raise ValueError('direct pretraining requires a completed trajectory cache; '
+                             'set --trajectory-cache or config.trajectory_cache')
         return None, online_provenance()
     expected = _trajectory_cache_identity(config, batch_size=batch_size,
                                           sample_index=sample_index, source=source)
@@ -416,6 +436,11 @@ def open_trajectory_cache(path, *, config, batch_size, sample_index, source):
     # the reader's default, or `_mcl_ph_r10r2_pipeline_bench.py`), not a per-run cost.
     # Identity, coverage, layout, dtype and file presence still fail closed here.
     cache = MCLPHTrajectoryCache(path, expected=expected, verify_checksums=False)
+    if sample_index.get('direct_contract'):
+        if not cache.complete or not cache.manifest.get('complete'):
+            cache.close()
+            raise ValueError('direct pretraining trajectory cache is not complete')
+        require_direct_source_rows(path, source)
     block = {'mode': 'cached', 'path': str(Path(path).resolve()),
              'schema': cache.manifest['schema'], 'dtype': cache.manifest['dtype'],
              'total_positions': cache.total_positions, 'shard_size': cache.shard_size,
@@ -442,13 +467,18 @@ def main():
                         help='fixed shared initial state for the new parameters; created once '
                              'if it does not exist yet')
     parser.add_argument('--prep-workers', type=int, default=0)
+    parser.add_argument('--lmdb-readahead', action='store_true',
+                        help='normal kernel prefetch for contiguous direct LMDB values')
     parser.add_argument('--trajectory-cache', help='offline noisy-topology cache root; '
                                                    'omitted means the declared online path')
     parser.add_argument('--diagnostics', action='store_true')
     parser.add_argument('--stop-after-step', type=int, default=0)
     parser.add_argument('--no-deploy', action='store_true')
     parser.add_argument('--resume')
+    parser.add_argument('--initial-state', help='complete model state at step zero; fresh optimizer/RNG')
     args = parser.parse_args()
+    if args.resume and args.initial_state:
+        parser.error('--resume and --initial-state are mutually exclusive')
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
     fusion_mode = str(config['fusion_mode']).lower()
@@ -499,7 +529,8 @@ def main():
         dist.barrier()
     statistics = load_geometric_statistics(args.statistics)
     source, frame = open_source(args.cohort_root, args.cache_root,
-                               dual_static_root=args.dual_static_root)
+                               dual_static_root=args.dual_static_root,
+                               readonly_readahead=args.lmdb_readahead)
     stages = _NullStages()
     # Set only after the training body and the export epilogue both finished, so
     # that the cleanup below never promotes a record belonging to a failed run.
@@ -515,7 +546,13 @@ def main():
         expected_manifest = sample_index['payload'].get('pi1m_manifest_hash')
         if expected_manifest and expected_manifest != source.cohort['manifest_hash']:
             raise ValueError('sample index/base cohort manifest mismatch')
+        is_direct = bool(sample_index.get('direct_contract'))
         source = IndexedFrozenDualSource(source, sample_index['indices'])
+        if sample_index.get('direct_contract'):
+            from src.dataset.mcl_ph_view import validate_direct_statistics_source
+            validate_direct_statistics_source(args.statistics, statistics, source,
+                                              seed=config['seed'], sigma=config['noise_sigma'],
+                                              ratio=config['atom_mask_ratio'])
         micro, batch_size = int(config['microbatch']), int(config['global_batch'])
         if batch_size % (micro * world):
             raise ValueError('microbatch * accumulation * world must equal global_batch')
@@ -526,7 +563,8 @@ def main():
         set_global_seed(int(config['seed']))
         base = MCLPHPretrainer(fusion_mode, dropout=float(config.get('dropout', 0.1)),
                                cutoffs=cutoffs, router_dense_updates=dense_updates,
-                               collect_diagnostics=bool(args.diagnostics)).to(device)
+                               collect_diagnostics=bool(args.diagnostics),
+                               local_objective=config.get('local_objective', 'expert')).to(device)
         common = None
         common_path = args.common_init_artifact or config.get('common_init_artifact')
         if common_path:
@@ -538,14 +576,16 @@ def main():
             artifact_state = (torch.load(Path(common_path), map_location='cpu',
                                          weights_only=False).get('common_state_dict') or {})
             excluded = SHARED_INIT_EXCLUDE_NAMES(base, artifact_state)
-            common = apply_common_initialization(base, common_path, exclude=excluded)
+            common = apply_common_initialization(base, common_path, exclude=excluded, direct=is_direct)
             covered = [name for name in base.state_dict() if name.startswith('encoder.o8.')]
             if not covered:
                 raise ValueError('the O8 backbone was not covered by the common initialization')
             common['o8_tensor_count'] = len(covered)
             common['artifact_tensors_not_used'] = len(excluded) - (
                 len(base.state_dict()) - len(covered))
-        shared_init = apply_shared_init(base, args.shared_new_init)
+        shared_init = apply_shared_init(base, args.shared_new_init, direct=is_direct)
+        if args.initial_state:
+            load_initial_state(base, args.initial_state)
         optimizer = torch.optim.AdamW(base.parameters(), lr=float(config['lr']),
                                       weight_decay=float(config['weight_decay']))
         module = (DistributedDataParallel(base, device_ids=[device.index] if device.type == 'cuda'
@@ -561,22 +601,40 @@ def main():
             dual_static_manifest_hash=source.static_cache.manifest_hash,
             sample_index_artifact_sha256=sample_index['sha256'],
             sample_index_split=sample_index['split'],
-            statistics_sha256=sha256_file(args.statistics),
+            statistics_sha256=None if is_direct else sha256_file(args.statistics),
             statistics_samples=statistics['samples'],
             common_init_artifact_sha256=(common['sha256'] if common else None),
             shared_new_init_sha256=shared_init['sha256'],
             fusion_mode=fusion_mode, cutoffs=list(cutoffs),
             router_dense_updates=dense_updates, router_top_k=top_k,
             route='mcl_ph', third_task='none', use_md200=False,
+            initial_state=str(Path(args.initial_state).resolve()) if args.initial_state else None,
             trajectory_cache=trajectory_block)
+        bindings = None
+        if is_direct:
+            from src.training.mcl_ph_direct_contract import direct_binding, direct_identity, assert_actual_equal
+            bindings = direct_binding(source, common_init=common_path, shared_init=args.shared_new_init, statistics=args.statistics,
+                                      seed=config['seed'], total_positions=int(config['max_optimizer_steps']) * batch_size)
+            identity = direct_identity(identity)
         ordered_keys = [key.hex() for key, _ in source.samples]
         resume_rng = None
         if args.resume:
             state = torch.load(args.resume, map_location='cpu', weights_only=False)
+            # A complete resume restores its model, optimizer and RNG directly;
+            # the step-zero path is inherited provenance, not a new CLI input.
+            if 'initial_state' in state['identity']:
+                identity['initial_state'] = state['identity']['initial_state']
+            else:
+                identity.pop('initial_state', None)
             if state['identity'] != identity or state['ordered_keys'] != ordered_keys:
                 raise ValueError('resume data/config/world size differs')
+            if is_direct:
+                assert_actual_equal(state.get('direct_binding'), bindings)
             base.load_state_dict(state['model'], strict=True)
             optimizer.load_state_dict(state['optimizer'])
+            if is_direct:
+                from src.training.mcl_ph_direct_contract import verify_restored_checkpoint
+                verify_restored_checkpoint(base, optimizer, state, batch_size=batch_size)
             start = int(state['step'])
             if state['next_position'] != start * batch_size or state['scheduler']['step'] != start:
                 raise ValueError('resume scheduler/data position mismatch')
@@ -610,7 +668,12 @@ def main():
                 trajectory_cache=trajectory_block,
                 parameter_count=int(sum(p.numel() for p in base.parameters())),
                 started_at_monotonic=time.perf_counter()))
-            digest, summary = _parameter_snapshot(base)
+            if config.get('save_initial_state'):
+                save_checkpoint(output / 'initial_model.pt', {
+                    name: value.detach().cpu().clone() for name, value in base.state_dict().items()})
+                digest, summary = None, {}
+            else:
+                digest, summary = _parameter_snapshot(base, direct=is_direct)
             write_json(output / 'step_0000.json', dict(
                 step=0, note='initial values only; no optimizer update has run',
                 parameter_digest=digest, parameters=summary,
@@ -632,11 +695,16 @@ def main():
                 microbatch=micro, accumulation=accumulation, start_step=start, max_steps=stop,
                 sigma=float(config['noise_sigma']), ratio=float(config['atom_mask_ratio']),
                 statistics=statistics, trajectory_cache=trajectory_cache)
-            prefetch = iter(torch.utils.data.DataLoader(
-                dataset, batch_size=None, num_workers=int(args.prep_workers),
-                prefetch_factor=4, persistent_workers=False, pin_memory=False))
+            prefetch = iter(pretrain_loader(
+                dataset, workers=args.prep_workers, seed=config['seed'], rank=rank))
         if resume_rng is not None:
             restore_rng(resume_rng)
+            if is_direct:
+                assert_actual_equal(rng_state(), resume_rng, 'restored.rng')
+        # Observe the actual training choices; no probe batches or extra forwards.
+        router_window = torch.zeros(7, device=device)
+        router_low_windows = [0, 0, 0]
+        hard_min = config.get('router_hard_min')
         for step in range(start, stop):
             step_number = step + 1
             step_started = time.perf_counter()
@@ -654,12 +722,14 @@ def main():
                         position = (step * batch_size + offset * world * micro
                                     + rank * micro + local)
                         index = stream.index_at(position)
+                        topology, trimer, smiles, static, _, sample_identity = pretrain_source_fields(
+                            source, index, include_identity=True)
                         rows.append(prepare_mcl_ph_sample(
-                            *source[index], seed=int(config['seed']),
+                            topology, trimer, smiles, seed=int(config['seed']),
                             key=source.samples[index][0].hex(), position=position,
                             sigma=float(config['noise_sigma']),
                             ratio=float(config['atom_mask_ratio']),
-                            static=source.static_for(index), statistics=statistics,
+                            static=static, statistics=statistics, identity=sample_identity,
                             trajectory_override=(None if trajectory_cache is None
                                                  else trajectory_cache[position])))
                     prepared.append(mcl_ph_collate(rows))
@@ -713,6 +783,13 @@ def main():
                                        report['balance']]).detach()
                 counts += torch.stack([report['atom_count'], report['geo_count']]).detach().float()
                 target_counts += report['targets'].detach()
+                if hard_min is not None:
+                    valid = report['readout_valid'].bool()
+                    router_window[3:6] += report['router_dense'][valid].detach().float().sum(0)
+                    router_window[6] += valid.sum()
+                    if report['router_top_k'] is not None:
+                        router_window[:3] += torch.bincount(
+                            report['router_top_k'][valid].reshape(-1), minlength=3)
             forward_backward_seconds = time.perf_counter() - forward_started
             if world > 1:
                 dist.all_reduce(totals)
@@ -722,6 +799,7 @@ def main():
             grad_total = float(torch.nn.utils.clip_grad_norm_(base.parameters(), 1.0,
                                                               error_if_nonfinite=True))
             optimizer.step()
+            stages.mark('optimizer_update', 'complete', step=step_number)
             record = dict(step=step_number, rank=rank, lr=float(lr),
                           losses={'atom': float(totals[0] / counts[0].clamp_min(1)),
                                   'geometry': float(totals[1] / counts[1].clamp_min(1)),
@@ -745,11 +823,32 @@ def main():
                 record['diagnostics'] = diagnostics
             if base.last_diagnostics is not None:
                 record['monitoring'] = base.last_diagnostics
+            if hard_min is not None and step_number % 100 == 0:
+                if world > 1:
+                    dist.all_reduce(router_window)
+                valid_count = float(router_window[6])
+                denominator = max(1., valid_count)
+                hard_rates = (router_window[:3] / denominator).tolist()
+                record['router_valid_window'] = dict(
+                    updates=100, valid_graphs=valid_count,
+                    soft_mean=(router_window[3:6] / denominator).tolist(),
+                    hard_rates=hard_rates if step_number > dense_updates else None,
+                    hard_rate_denominator='valid graphs; two selections per graph')
+                if step_number > dense_updates and valid_count:
+                    router_low_windows = [n + 1 if rate < float(hard_min) else 0
+                                          for n, rate in zip(router_low_windows, hard_rates)]
+                    record['router_valid_window']['consecutive_low_windows'] = router_low_windows
+                router_window.zero_()
             record['memory'] = memory_record()
             if torch.cuda.is_available():
                 # The window above ends here; the next step's window starts now.
                 torch.cuda.reset_peak_memory_stats()
             print(json.dumps(record, default=str), flush=True)
+            if rank == 0 and record.get('router_valid_window'):
+                with (output / 'router_windows.jsonl').open('a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(dict(step=step_number, **record['router_valid_window'])) + '\n')
+            if router_stop_required(config, router_low_windows):
+                raise RuntimeError('STOP_ROUTER_COLLAPSE: three 100-update windows below threshold')
             if rank == 0 and (step_number in SAVED_STEPS or step_number in (start + 1, stop)):
                 with (output / 'steps.jsonl').open('a', encoding='utf-8') as handle:
                     handle.write(json.dumps(record, sort_keys=True, default=str) + '\n')
@@ -762,7 +861,7 @@ def main():
                 if rank == 0:
                     stages.mark('resume_save', 'enter', step=step_number)
                     save_checkpoint(output / f'resume_{step_number:05d}.pt', dict(
-                        identity=identity, ordered_keys=ordered_keys, step=step_number,
+                        identity=identity, ordered_keys=ordered_keys, direct_binding=bindings, step=step_number,
                         next_position=step_number * batch_size, model=base.state_dict(),
                         optimizer=optimizer.state_dict(), rng=states,
                         scheduler=dict(step=step_number, lr=float(lr))))
@@ -773,11 +872,19 @@ def main():
                         package = deployment_package(
                             base.encoder, step_number, cutoffs=cutoffs,
                             router_dense_updates=dense_updates, router_top_k=top_k,
-                            source={'cohort_hash': source.cohort['manifest_hash'],
-                                    'statistics_sha256': sha256_file(args.statistics),
-                                    'shared_new_init_sha256': shared_init['sha256']},
+                            source=(dict(identity_contract='actual-rows-arrays-tensors-v1',
+                                         cohort_root=str(Path(args.cohort_root).resolve()),
+                                         statistics=str(Path(args.statistics).resolve()),
+                                         resume_checkpoint=f'resume_{step_number:05d}.pt') if is_direct else
+                                    {'cohort_hash': source.cohort['manifest_hash'],
+                                     'statistics_sha256': sha256_file(args.statistics),
+                                     'shared_new_init_sha256': shared_init['sha256']}),
                             progress=stages.tensor_progress)
                         stages.mark('deployment_package', 'complete', step=step_number)
+                        package['pretraining_objective'] = dict(
+                            local=base.local_objective,
+                            mixed_weight=.5 if base.local_objective == 'expert_mixed_50' else 0.,
+                            nonbond='unchanged expert distance bins')
                         stages.mark('deploy_save', 'enter', step=step_number)
                         save_checkpoint(output / f'deploy_{step_number:05d}.pt', package)
                         stages.mark('deploy_save', 'complete', step=step_number)

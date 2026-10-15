@@ -42,7 +42,7 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl")
-    # Each row is [chemistry, geometry, fingerprint].  Zeros model a rank
+    # Each row is [chemistry, geometry, optional third task].  Zeros model a rank
     # without a valid target for that objective.
     local_counts_table = (
         (2.0, 0.0, 1.0),

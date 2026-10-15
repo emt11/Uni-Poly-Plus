@@ -316,6 +316,25 @@ def attach_unavailable_trimer_mcl(data, reason: str):
     return _attach_placeholder(data, reason, _sample_seed(smiles))
 
 
+def attach_unavailable_trimer_identity(data, smiles, reason: str):
+    """Keep full chemistry for a ledger failure, with no coordinates or embedding.
+
+    This explicit publication path does not change the generator's rejection
+    policy. It preserves a failed sample for atom supervision and 2D fallback.
+    """
+    if reason not in {'TIMEOUT', 'NO_VALID_CONFORMER', 'ETKDG_NO_VALID_CONFORMER'}:
+        raise ValueError('unsupported final geometry rejection: ' + str(reason))
+    _attach_placeholder(data, reason, _sample_seed(smiles))
+    molecule, metadata = build_periodic_multimer_mol(
+        _canonical_source_mol(smiles), 3, close_periodic=False,
+        terminal_capping='missing_seam_bond_order_hydrogen_equivalents')
+    base, units, mapping = _validate_trimer_contract(data, molecule, metadata)
+    hydrogenated = Chem.AddHs(Chem.Mol(molecule))
+    _attach_all_atom_topology(data, molecule, hydrogenated, metadata,
+                              base, units, mapping)
+    return data
+
+
 # ---------------------------------------------------------------------------
 #  Main entry point
 # ---------------------------------------------------------------------------
@@ -1018,8 +1037,15 @@ def attach_finite_trimer_mcl(
         # not enter the seed material, whose declared identity is canonical RU.
         if isinstance(sample_key, (bytes, bytearray, memoryview)):
             raw_key = bytes(sample_key)
-            if len(raw_key) != 32:
-                raise TrimerContractError("invalid_sample_key_identity")
+        elif isinstance(sample_key, str) and len(sample_key) == 64:
+            try:
+                raw_key = bytes.fromhex(sample_key)
+            except ValueError as error:
+                raise TrimerContractError("invalid_sample_key_identity") from error
+        else:
+            raise TrimerContractError("invalid_sample_key_identity")
+        if len(raw_key) != 32 or raw_key != hashlib.sha256(identity.encode("utf-8")).digest():
+            raise TrimerContractError("invalid_sample_key_identity")
 
     def _reject(code, round_reached, attempts, last_embed_failure=""):
         diagnostics["total_time"] = time.monotonic() - started

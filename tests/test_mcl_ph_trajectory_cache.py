@@ -512,14 +512,23 @@ def test_driver_builds_and_marks_every_segment(tmp_path, synthetic_builder):
     assert len(calls.read_text(encoding='utf-8').split()) == len(markers)
 
 
-def test_a_second_run_rebuilds_nothing(tmp_path, synthetic_builder):
+def test_a_second_run_rebuilds_nothing(tmp_path, synthetic_builder, monkeypatch):
     calls = tmp_path / 'calls.txt'
     extra = synthetic_builder(calls=str(calls))
     _build(tmp_path, extra=extra)
     before = calls.read_text(encoding='utf-8').split()
+    manifest_path = tmp_path / 'manifest.json'
+    original_manifest = manifest_path.read_bytes()
+    original_mtime = manifest_path.stat().st_mtime_ns
+    monkeypatch.setattr(cli, 'write_manifest', lambda *args, **kwargs:
+                        pytest.fail('completed cache manifest must remain read-only'))
+    monkeypatch.setattr(cli.mp, 'get_context', lambda *args, **kwargs:
+                        pytest.fail('completed cache must not start workers'))
     manifest, log = _build(tmp_path, extra=extra)
     assert calls.read_text(encoding='utf-8').split() == before
     assert manifest['complete']
+    assert manifest_path.read_bytes() == original_manifest
+    assert manifest_path.stat().st_mtime_ns == original_mtime
     assert any('NOTHING TO DO' in line for line in log)
 
 
@@ -717,6 +726,66 @@ def _open_production(path, **overrides):
         batch_size=overrides.get('batch_size', BASE_IDENTITY['global_batch']),
         sample_index=overrides.get('sample_index', sample_index),
         source=overrides.get('source', source))
+
+
+def test_trainer_uses_configured_cache_and_cli_override(tmp_path):
+    import scripts.pretrain_mcl_ph as runner
+    write_cache(tmp_path)
+    config, sample_index, source = _trainer_arguments()
+    config['trajectory_cache'] = str(tmp_path)
+    cache, block = runner.open_trajectory_cache(None, config=config,
+        batch_size=BASE_IDENTITY['global_batch'], sample_index=sample_index, source=source)
+    try:
+        assert block['mode'] == 'cached'
+        assert block['path'] == str(tmp_path.resolve())
+    finally:
+        cache.close()
+    config['trajectory_cache'] = str(tmp_path / 'absent')
+    cache, block = runner.open_trajectory_cache(str(tmp_path), config=config,
+        batch_size=BASE_IDENTITY['global_batch'], sample_index=sample_index, source=source)
+    cache.close()
+
+
+def test_direct_training_never_silently_computes_ph_online():
+    import scripts.pretrain_mcl_ph as runner
+    with pytest.raises(ValueError, match='requires a completed trajectory cache'):
+        runner.open_trajectory_cache(None, config={}, batch_size=1008,
+            sample_index={'direct_contract': True}, source=None)
+
+
+@pytest.mark.parametrize('complete,missing_shard', [(False, False), (True, True)])
+def test_direct_training_rejects_incomplete_cache(tmp_path, monkeypatch, complete, missing_shard):
+    import scripts.pretrain_mcl_ph as runner
+    write_cache(tmp_path)
+    path = tmp_path / 'manifest.json'
+    manifest = json.loads(path.read_text())
+    manifest['complete'] = complete
+    if missing_shard:
+        manifest['shards'].pop()
+    path.write_text(json.dumps(manifest))
+    config, sample_index, source = _trainer_arguments()
+    sample_index['direct_contract'] = True
+    monkeypatch.setattr(runner, '_trajectory_cache_identity', lambda *args, **kwargs: BASE_IDENTITY)
+    with pytest.raises(ValueError, match='cache is not complete'):
+        runner.open_trajectory_cache(str(tmp_path), config=config,
+            batch_size=BASE_IDENTITY['global_batch'], sample_index=sample_index, source=source)
+
+
+def test_missing_completed_direct_shard_is_never_recreated(tmp_path):
+    identity = cache_identity(seed=42, noise_sigma=.03, mask_ratio=.3,
+        global_batch=1008, sample_index_split='train',
+        direct_source={'source_root': '/frozen/fixture', 'source_rows': 2, 'selected_rows': 2})
+    shard = shard_file_name(0, 4)
+    manifest = dict(identity, schema=CACHE_SCHEMA, complete=True, total_positions=4,
+        shard_size=4, shards=[{'file': shard, 'shard': 0, 'first_position': 0, 'rows': 4}])
+    write_manifest(tmp_path, manifest)
+    before = (tmp_path / 'manifest.json').read_bytes()
+    with pytest.raises(ValueError, match='shard file is missing'):
+        cli.build_cache(builder_payload={'identity': identity}, root=tmp_path,
+            shard_size=4, total_positions=4, chunk_size=2, workers=1,
+            requested_total_positions=4, max_updates=1)
+    assert not (tmp_path / SHARDS_DIRNAME / shard).exists()
+    assert (tmp_path / 'manifest.json').read_bytes() == before
 
 
 def test_the_production_reader_does_not_hash_shards(tmp_path, monkeypatch):

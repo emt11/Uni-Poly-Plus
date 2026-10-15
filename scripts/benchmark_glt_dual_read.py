@@ -34,7 +34,7 @@ import numpy as np
 import torch
 
 from src.dataset.cache_lifecycle import zero_write_snapshot
-from src.dataset.glt_dual_pretrain import chemical_targets, prepare_pretrain_sample
+from src.dataset.glt_dual_pretrain import chemical_groups, prepare_pretrain_sample
 from src.training.glt_dual_runtime import OrderedSampleStream, RankMicrobatchStream, open_source
 
 
@@ -277,7 +277,7 @@ def main():
             report["indices"] = indices
             # Bounded in-process memoization warmup, identical for every config.
             for index in indices[: min(len(indices), 256)]:
-                chemical_targets(str(base_source[index][0].normalized_canonical_smiles))
+                chemical_groups(str(base_source[index][0].normalized_canonical_smiles))
         finally:
             base_source.close()
 

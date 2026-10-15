@@ -1,4 +1,4 @@
-"""On-demand three-task targets; no descriptor input or persistent cache writes."""
+"""On-demand atom/geometry and optional FGR/ALIGN targets; no FP labels."""
 import copy
 import hashlib
 import math
@@ -9,7 +9,7 @@ import numpy as np
 
 import torch
 from rdkit import Chem
-from rdkit.Chem import BRICS, rdFingerprintGenerator
+from rdkit.Chem import BRICS
 
 from .graph_data import build_periodic_multimer_mol
 from .glt_bond_chemistry import bond_type_index
@@ -23,16 +23,13 @@ def sample_generator(seed, key, position):
     return torch.Generator().manual_seed(value)
 
 
+@lru_cache(maxsize=512)
 def chemical_groups(smiles):
-    """Build only the common 3-RU BRICS groups.
-
-    FP-free objectives still need the deterministic motif partition, but must
-    not pay for or accidentally consume the 7-RU Morgan target.
-    """
+    """Build the deterministic 3-RU BRICS partition for atom masking."""
     source = Chem.MolFromSmiles(str(smiles))
     if source is None:
         raise ValueError("invalid P-SMILES for chemical groups")
-    # BRICS groups and the fingerprint roots are model-side identities.  The
+    # BRICS groups are model-side identities. The
     # input spelling is a provenance view and may use a different RDKit atom
     # order, so canonicalize before extracting any integer atom ids.
     normalized = Chem.MolToSmiles(source, canonical=True)
@@ -58,26 +55,6 @@ def chemical_groups(smiles):
         if center:
             groups.append(tuple(center))
     return tuple(sorted(groups))
-
-
-@lru_cache(maxsize=512)
-def chemical_targets(smiles):
-    groups = chemical_groups(str(smiles))
-    source = Chem.MolFromSmiles(str(smiles))
-    if source is None:
-        raise ValueError("invalid P-SMILES for chemical targets")
-    normalized = Chem.MolToSmiles(source, canonical=True)
-    large, info = build_periodic_multimer_mol(
-        normalized, 7, close_periodic=False
-    )
-    roots = info['unit_atoms'][3]
-    terminals = [info['unit_left_boundaries'][0], info['unit_right_boundaries'][-1]]
-    distances = Chem.GetDistanceMatrix(large)
-    if any(distances[root, end] < 3 for root in roots for end in terminals):
-        raise ValueError('7-RU topology does not cover center Morgan radius plus boundary context')
-    generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048, includeChirality=False)
-    fingerprint = torch.from_numpy(generator.GetFingerprintAsNumPy(large, fromAtoms=roots).copy()).float()
-    return groups, fingerprint
 
 
 def _fgr_canonical_mapping(topology, trimer, identity, molecule, metadata):
@@ -202,7 +179,7 @@ def fgr_true_trimer_candidates(topology, trimer, smiles=None, *, identity=None):
 
 
 def fgr_pairs(topology, trimer, smiles=None, *, identity=None, seed, key, position,
-              mu=0.0, sigma=1.0, max_pairs=32):
+              mu=0.0, sigma=1.0, max_pairs=32, generator=None):
     """Return deterministic sampled, normalized centre-RU SPD2/3 pairs."""
     if not math.isfinite(float(mu)) or not math.isfinite(float(sigma)) or sigma <= 0:
         raise ValueError('FGR normalization requires finite mu and positive sigma')
@@ -212,7 +189,8 @@ def fgr_pairs(topology, trimer, smiles=None, *, identity=None, seed, key, positi
         topology, trimer, smiles, identity=identity)
     if not pair_tensor.numel():
         return pair_tensor, distances, spd
-    generator = sample_generator(seed, f'{key}:fgr', position)
+    if generator is None:
+        generator = sample_generator(seed, f'{key}:fgr', position)
     chosen_indices = []
     remaining = int(max_pairs)
     for hop in (2, 3):
@@ -279,14 +257,6 @@ def motif_mask(topology, groups, generator, ratio=0.3):
     if int(mask.sum()) != target:
         raise ValueError('canonical topology cannot supply connected fallback mask')
     return mask, True
-
-
-def _unpack_fingerprint(packed):
-    packed = np.asarray(packed, dtype=np.uint8)
-    if packed.shape != (256,):
-        raise ValueError('packed Morgan fingerprint must have shape [256]')
-    bits = np.unpackbits(packed, bitorder='little')
-    return torch.from_numpy(bits[:2048].copy()).float()
 
 
 def _topology_z(topology):
@@ -458,43 +428,152 @@ def _torsion_fields(static, atomic_numbers, positions, mapping, mode, bond_table
     return index, values, mask
 
 
+def physical_torsion_fields(static, trimer, positions):
+    """Deterministic paths over frozen physical bonds; no canonical/image merge."""
+    if static is None:raise ValueError('physical torsion requires frozen static')
+    positions=torch.as_tensor(positions,dtype=torch.float32)
+    z=torch.as_tensor(trimer.trimer_atomic_number,dtype=torch.long).reshape(-1)
+    if positions.shape!=(len(z),3):raise ValueError('physical torsion position shape mismatch')
+    pa=np.asarray(static['token_pos_index_a']);pb=np.asarray(static['token_pos_index_b'])
+    za=np.asarray(static['token_z_a']);zb=np.asarray(static['token_z_b'])
+    if any(x.ndim!=1 or x.dtype.kind not in 'iu' for x in (pa,pb,za,zb)) or not(len(pa)==len(pb)==len(za)==len(zb)):
+        raise ValueError('physical torsion endpoint schema mismatch')
+    adjacency={};bonds={}
+    for row,(a,b) in enumerate(zip(pa.tolist(),pb.tolist())):
+        if a==b or min(a,b)<0 or max(a,b)>=len(z):raise ValueError('physical torsion endpoint bounds')
+        if int(z[a])!=int(za[row]) or int(z[b])!=int(zb[row]):raise ValueError('physical torsion element identity mismatch')
+        key=tuple(sorted((a,b)))
+        if key in bonds:raise ValueError('duplicate frozen physical bond')
+        bonds[key]=row
+        if int(z[a])>1 and int(z[b])>1:
+            adjacency.setdefault(a,set()).add(b);adjacency.setdefault(b,set()).add(a)
+    quads=[];rows=[];seams=[]
+    offset=torch.as_tensor(trimer.trimer_ru_offset).reshape(-1)
+    base=torch.as_tensor(trimer.trimer_base_ru_atom_id).reshape(-1)
+    if len(offset)!=len(z) or len(base)!=len(z):raise ValueError('physical torsion image identity mismatch')
+    for a in adjacency:
+        if int(offset[a]) not in (-1,0,1) or int(base[a])<0:raise ValueError('invalid physical torsion RU identity')
+    seen=set()
+    for (b,c),row in bonds.items():
+        if b not in adjacency or c not in adjacency:continue
+        for a in sorted(adjacency[b]-{c}):
+            for d in sorted(adjacency[c]-{b}):
+                quad=(a,b,c,d)
+                if len(set(quad))!=4:continue
+                key=min(quad,quad[::-1])
+                if key in seen:continue
+                seen.add(key);quads.append(quad);rows.append(row)
+                seams.append(any(int(offset[x])!=int(offset[y]) for x,y in zip(quad,quad[1:])))
+    index=torch.tensor(rows,dtype=torch.long)
+    if not quads:
+        values=torch.zeros((0,2));valid=torch.zeros(0,dtype=torch.bool)
+    else:
+        coords=positions[torch.tensor(quads,dtype=torch.long)]
+        if not torch.isfinite(coords).all():raise ValueError('nonfinite valid physical torsion coordinates')
+        b0=coords[:,0]-coords[:,1];b1=coords[:,2]-coords[:,1];b2=coords[:,3]-coords[:,2]
+        length=torch.linalg.vector_norm(b1,dim=1)
+        u=b1/length.clamp_min(1e-8).unsqueeze(1)
+        v=b0-(b0*u).sum(1,keepdim=True)*u;w=b2-(b2*u).sum(1,keepdim=True)*u
+        valid=(length>1e-8)&(torch.linalg.vector_norm(v,dim=1)>=1e-3)&(torch.linalg.vector_norm(w,dim=1)>=1e-3)
+        phi=torch.atan2((torch.cross(u,v,dim=1)*w).sum(1),(v*w).sum(1))
+        cosine=phi.cos();values=torch.stack((cosine,2*cosine.square()-1),dim=1)
+        values=torch.where(valid.unsqueeze(1),values,torch.zeros_like(values))
+    counts=torch.tensor([[len(quads),int(valid.sum()),int(valid.any()),int(not valid.any()),int((~valid).sum()),sum(seams)]],dtype=torch.long)
+    return index,values,valid,counts
+
+def attach_physical_torsion(data,static,trimer,positions):
+    if data.geometry_valid:
+        index,values,valid,counts=physical_torsion_fields(static,trimer,positions)
+    else:
+        index=torch.empty(0,dtype=torch.long);values=torch.empty((0,2));valid=torch.empty(0,dtype=torch.bool)
+        counts=torch.zeros((1,6),dtype=torch.long)
+    data.torsion_bond_index=index;data.torsion_values=values;data.torsion_mask=valid
+    data.torsion_counts=counts;data.torsion_revision='glt_physical_torsion_r1'
+    data.torsion_available=torch.tensor([bool(valid.any())])
+
+
+def validate_canonical_topology(topology):
+    """Accept the original tagged schema or its published direct field schema."""
+    from .canonical_periodic import (CANONICAL_TOPOLOGY_SCHEMA,
+        CANONICAL_FEATURE_SCHEMA, CANONICAL_LGA_SCHEMA_VERSION)
+    from .graph_data import MIPS_ATOM_FEATURE_DIM
+    tags = dict(canonical_periodic_topology_schema=CANONICAL_TOPOLOGY_SCHEMA,
+        feature_schema=CANONICAL_FEATURE_SCHEMA,
+        mips_local_lga_schema_version=CANONICAL_LGA_SCHEMA_VERSION)
+    if any(getattr(topology,k,None) not in (None,v) for k,v in tags.items()):
+        raise ValueError('canonical topology schema mismatch')
+    # select_record_fields intentionally omits the historical schema labels.
+    required = ('mips_x','mips_backbone_mask','canonical_ru_atom_index',
+        'canonical_to_trimer_base_atom_id','normalized_canonical_smiles',
+        'lga_edge_index','lga_spd','lga_path_index','lga_path_mask',
+        'lga_path_shift','lga_source_image_shift')
+    if not bool(getattr(topology,'mts_canonical_periodic',False)) or any(
+            getattr(topology,k,None) is None for k in required):
+        raise ValueError('canonical topology field schema mismatch')
+    n = topology.mips_x.size(0)
+    mapping = topology.canonical_to_trimer_base_atom_id
+    if (topology.mips_x.shape != (n,MIPS_ATOM_FEATURE_DIM)
+            or topology.mips_x.dtype != torch.float32 or not torch.isfinite(topology.mips_x).all()
+            or mapping.dtype != torch.long or mapping.shape != (n,)
+            or not torch.equal(mapping.sort().values,torch.arange(n))
+            or not torch.equal(topology.canonical_ru_atom_index,torch.arange(n))):
+        raise ValueError('canonical topology feature/identity schema mismatch')
+
+
 def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
-                            sigma=0.03, ratio=0.3, static=None, target=None,
-                            third_task='fp', fgr_mu=0.0, fgr_sigma=1.0,
+                            sigma=0.03, ratio=0.3, static=None, target=None, identity=None,
+                            source_type="legacy_uncached",
+                            third_task='none', fgr_mu=0.0, fgr_sigma=1.0,
                             fgr_max_pairs=32, atom_target='element',
-                            env_vocab=None, torsion_mode=None):
+                            env_vocab=None, torsion_mode=None, torsion_revision=None, opt_mode=None, geometry_mode="finite_internal", nonbonded_revision=None):
     if not bool(topology.graph_available):
         raise ValueError('three-task training requires valid canonical 2D topology')
     if not math.isfinite(sigma) or sigma < 0 or not 0 < ratio < 1:
         raise ValueError('invalid noise sigma or masking ratio')
-    generator = sample_generator(seed, key, position)
+    if torsion_revision not in (None,'glt_physical_torsion_r1') or (torsion_revision and (torsion_mode!='on' or geometry_mode!='finite_incident')):
+        raise ValueError('invalid physical torsion preparation mode')
+    new_cycle = opt_mode == 'GLT_FUSION_R1'
+    seam = geometry_mode in ('finite_incident','periodic_template')
+    generator = (torch.Generator().manual_seed((int(seed) + 1000003 * int(position)) % (2**63-1))
+                 if new_cycle else sample_generator(seed, key, position))
     third_task = str(third_task).lower()
-    if third_task not in {'fp', 'none', 'fgr', 'align'}:
+    if third_task not in {'none', 'fgr', 'align'}:
         raise ValueError('unsupported third pretraining task')
-    identity = None
-    # FGR candidate identity is independent of the optional target cache, but
-    # still requires the strict source→normalized→canonical mapping contract.
-    if third_task == 'fgr' and identity is None:
-        identity = resolve_normalized_identity(topology, smiles, require_fields=True)
-    if target is not None:
-        if 'brics_groups' not in target:
-            raise ValueError('pretrain target row is missing BRICS groups')
-        groups = tuple(tuple(int(atom) for atom in group)
-                       for group in target['brics_groups'])
-        if third_task == 'fp':
-            if 'fingerprint_packed' not in target:
-                raise ValueError('FP target row is missing fingerprint_packed')
-            fingerprint = _unpack_fingerprint(target['fingerprint_packed'])
-        else:
-            fingerprint = torch.zeros(2048)
-        identity = None
+    if identity is not None:
+        validate_canonical_topology(topology)
+        mapping = identity.get('canonical_to_normalized_base')
+        if (identity.get('validated_source_smiles') != str(smiles)
+                or identity.get('normalized_smiles') != topology.normalized_canonical_smiles
+                or identity.get('validated_source_schema') != 'mcl-ph-direct-source-v1'
+                or identity.get('validated_topology_schema') != getattr(topology,'canonical_periodic_topology_schema',None)
+                or not torch.is_tensor(mapping) or mapping.dtype != torch.long
+                or not torch.equal(mapping, topology.canonical_to_trimer_base_atom_id)
+                or identity.get('base_count') != topology.mips_x.size(0)):
+            raise ValueError('validated identity/source/topology schema mismatch')
     else:
         identity = resolve_normalized_identity(topology, smiles, require_fields=True)
-        if third_task == 'fp':
-            groups, fingerprint = chemical_targets(identity["normalized_smiles"])
-        else:
-            groups = chemical_groups(identity["normalized_smiles"])
-            fingerprint = torch.zeros(2048)
+    if target is not None:
+        # Legacy direct records retain an obsolete packed fingerprint. Like
+        # the BRICS cache reader, leave it untouched and consume only groups.
+        if (not isinstance(target, dict) or 'brics_groups' not in target
+                or set(target) - {'brics_groups', 'fingerprint_packed'}):
+            raise ValueError('invalid pretrain target cache schema')
+        raw = target['brics_groups']
+        if (not isinstance(raw, (tuple, list)) or not raw
+                or any(not isinstance(group, (tuple, list)) or not group for group in raw)
+                or any(isinstance(atom, (bool, np.bool_)) or not isinstance(atom, (int, np.integer))
+                       for group in raw for atom in group)):
+            raise ValueError('invalid cached BRICS groups')
+        groups = tuple(tuple(int(atom) for atom in group) for group in raw)
+        count = topology.mips_x.size(0)
+        if (sorted(atom for group in groups for atom in group) != list(range(count))
+                or any(tuple(sorted(group)) != group for group in groups)
+                or tuple(sorted(groups)) != groups):
+            raise ValueError('cached BRICS groups/order do not partition normalized atoms')
+    else:
+        if source_type == 'direct_pi1m':
+            raise ValueError('direct PI1M target cache is missing')
+        groups = chemical_groups(identity['normalized_smiles'])
     mask, fallback = motif_mask(topology, groups, generator, ratio)
     # Static chemistry/connectivity/path is a pure function of
     # (topology, smiles): build it once and share it between the clean and
@@ -504,10 +583,10 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
         static_paths = bond_paths(topology, smiles, identity=identity)
         clean = build_dual_sample(
             topology, trimer, smiles, identity=identity,
-            bond_path_features=static_paths,
+            bond_path_features=static_paths, geometry_mode=geometry_mode,
         )
     else:
-        clean = build_dual_sample(topology, trimer, smiles, static=static)
+        clean = build_dual_sample(topology, trimer, smiles, static=static, geometry_mode=geometry_mode)
     noisy = clean
     if clean.geometry_valid:
         changed = copy.copy(trimer)
@@ -516,16 +595,30 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
         if static is None:
             noisy = build_dual_sample(
                 topology, changed, smiles, identity=identity,
-                bond_path_features=static_paths,
+                bond_path_features=static_paths, geometry_mode=geometry_mode,
             )
         else:
-            noisy = build_dual_sample(topology, changed, smiles, static=static)
+            noisy = build_dual_sample(topology, changed, smiles, static=static, geometry_mode=geometry_mode)
         if not noisy.geometry_valid:
             raise ValueError(f'noise invalidated required geometry: {noisy.geometry_invalid_reason}')
         for field in ('line_source', 'line_target', 'line_path', 'line_path_group', 'bond_center'):
             if not torch.equal(getattr(clean, field), getattr(noisy, field)):
                 raise ValueError('coordinate perturbation changed physical topology')
-    needs_bond_table = (atom_target == 'environment') or (torsion_mode is not None)
+    if new_cycle or opt_mode in ('F_TOKEN', 'M_TOKEN_CE'):
+        # Unknown element (0) maps to existing unknown Gaussian categories.
+        za = noisy.bond_z_a.clone(); zb = noisy.bond_z_b.clone()
+        za[mask[noisy.bond_canonical_a]] = 0
+        zb[mask[noisy.bond_canonical_b]] = 0
+        noisy.bond_z_a, noisy.bond_z_b = za, zb
+    if new_cycle:
+        if not hasattr(noisy, 'md200'):
+            # MD-off arms retain the same projection parameters, with an
+            # explicitly unavailable channel. MD-on sources require a sidecar.
+            noisy.md200 = torch.zeros((1, 200), dtype=torch.float32)
+            noisy.md200_valid = torch.zeros(1, dtype=torch.bool)
+        md_generator = torch.Generator().manual_seed((20261007 + 2000003 * int(position)) % (2**63-1))
+        noisy.md200_valid = noisy.md200_valid & (torch.rand((), generator=md_generator) >= 0.5)
+    needs_bond_table = (atom_target == 'environment') or (torsion_mode is not None and torsion_revision is None)
     bond_table = None
     if needs_bond_table:
         if identity is None:
@@ -546,7 +639,10 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
     safe_a = path[:, 0].clamp_min(0)
     safe_b = path[:, 1].clamp_min(0)
     row_valid &= path[:, 0] < path[:, 1]
-    row_valid &= clean.bond_center[safe_a] & clean.bond_center[safe_b]
+    if seam or opt_mode == 'G_SEAM_GEO':
+        row_valid &= clean.line_center_angle
+    else:
+        row_valid &= clean.bond_center[safe_a] & clean.bond_center[safe_b]
     selected = torch.where(row_valid)[0]
     pairs = path[selected, :2].long()
     cosines = clean.line_angle[selected, 0].cos()
@@ -555,28 +651,34 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
         reasons.append('chem:single_atom')
     if not clean.geometry_valid:
         reasons.append('geo:' + clean.geometry_invalid_reason)
-    elif not clean.bond_center.any():
+    elif not bool((clean.bond_length_weight > 0).any() if seam else clean.bond_center.any()):
         reasons.append('geo:no_center_bonds')
     elif not pairs.numel():
         reasons.append('angle:no_center_angles')
     fgr_index, fgr_target, fgr_spd = (fgr_pairs(
         topology, trimer, smiles, identity=identity, seed=seed, key=key, position=position,
-        mu=fgr_mu, sigma=fgr_sigma, max_pairs=fgr_max_pairs)
+        mu=fgr_mu, sigma=fgr_sigma, max_pairs=fgr_max_pairs,
+        generator=(torch.Generator().manual_seed((20261007 + 3000017 * int(position)) % (2**63-1))
+                   if new_cycle else None))
         if third_task == 'fgr' else
         (torch.empty((0, 2), dtype=torch.long), torch.empty(0), torch.empty(0, dtype=torch.long)))
-    targets = dict(atom_mask=mask,
+    targets = dict(preparation_source=source_type, brics_source="cached" if target is not None else "legacy_computed",
+        atom_mask=mask,
         atom_label=(targets_atom if targets_atom is not None
                     else topology.mips_x[:, :101].argmax(-1)),
-        distance=clean.bond_distance[clean.bond_center].clone(),
+        distance=(clean.bond_distance[clean.bond_length_weight > 0] if seam or opt_mode == 'G_SEAM_GEO' else clean.bond_distance[clean.bond_center]).clone(),
+        distance_weight=(clean.bond_length_weight[clean.bond_length_weight > 0] if seam or opt_mode == 'G_SEAM_GEO' else torch.ones(int(clean.bond_center.sum()))),
         angle_pairs=pairs.reshape(-1, 2),
         angle_cos=cosines if cosines.numel() else torch.empty(0),
-        fingerprint=fingerprint.clone(), fallback=fallback, skip_reasons=reasons,
+        fallback=fallback, skip_reasons=reasons,
         fgr_pair_index=fgr_index, fgr_target=fgr_target, fgr_spd=fgr_spd,
         fgr_valid=bool(fgr_target.numel()),
-        align_identity=str(key),
-        align_valid=bool(clean.geometry_valid and clean.bond_center.any()),
+        align_identity=(str(topology.normalized_canonical_smiles) if new_cycle else str(key)),
+        align_valid=bool(clean.geometry_valid and ((clean.bond_length_weight>0).any() if seam else clean.bond_center.any())),
         third_task=third_task)
-    if torsion_mode is not None:
+    if torsion_revision:
+        attach_physical_torsion(noisy,static,changed if clean.geometry_valid else trimer,(changed if clean.geometry_valid else trimer).trimer_pos)
+    elif torsion_mode is not None:
         mode = str(torsion_mode).lower()
         if mode not in {'on', 'off'}:
             raise ValueError('torsion mode must be on or off')
@@ -596,6 +698,12 @@ def prepare_pretrain_sample(topology, trimer, smiles, *, seed, key, position,
         noisy.torsion_bond_index = index
         noisy.torsion_values = values
         noisy.torsion_mask = valid
+    if nonbonded_revision is not None:
+        if nonbonded_revision!='glt_nonbonded_r10_g1' or geometry_mode!='finite_incident' or torsion_mode is not None:
+            raise ValueError('invalid nonbonded preparation contract')
+        from .glt_r10 import attach_nonbonded
+        carrier=changed if clean.geometry_valid else trimer
+        attach_nonbonded(noisy,static,carrier,carrier.trimer_pos)
     return noisy, targets
 
 
@@ -617,9 +725,8 @@ def pretrain_collate(records):
         atom_offset += item.mips_x.size(0)
         bond_offset += item.bond_distance.numel()
     labels = {name: torch.cat([t[name] for t in targets]) for name in
-              ('atom_mask', 'atom_label', 'distance', 'angle_cos')}
+              ('atom_mask', 'atom_label', 'distance', 'distance_weight', 'angle_cos')}
     labels.update(angle_pairs=torch.cat(pairs), angle_graph=torch.cat(angle_graph),
-        fingerprint=torch.stack([t['fingerprint'] for t in targets]),
         fgr_pair_index=(torch.cat(fgr_pairs_list) if fgr_pairs_list else torch.empty((0, 2), dtype=torch.long)),
         fgr_target=(torch.cat(fgr_targets) if fgr_targets else torch.empty(0)),
         fgr_spd=(torch.cat(fgr_spd) if fgr_spd else torch.empty(0, dtype=torch.long)),
@@ -627,6 +734,11 @@ def pretrain_collate(records):
         fgr_graph_valid=torch.tensor(fgr_graph_valid, dtype=torch.bool),
         align_identity=[t['align_identity'] for t in targets],
         align_valid=torch.tensor([bool(t['align_valid']) for t in targets], dtype=torch.bool),
+        preparation_source=[t['preparation_source'] for t in targets],
+        brics_source=[t['brics_source'] for t in targets],
         fallback_count=sum(t['fallback'] for t in targets),
         skip_reasons=[reason for t in targets for reason in t['skip_reasons']])
+    if any('geometry_quality_weight' in t for t in targets):
+        if not all('geometry_quality_weight' in t for t in targets):raise ValueError('mixed QC weight views')
+        labels['geometry_quality_weight']=torch.tensor([t['geometry_quality_weight'] for t in targets],dtype=torch.float32)
     return data, labels

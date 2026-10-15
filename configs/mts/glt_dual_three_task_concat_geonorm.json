@@ -18,7 +18,7 @@
   "loss_weights": [
     1,
     1,
-    0.1
+    0
   ],
   "downstream_step": 5000,
   "encoder_lr": 1e-05,
@@ -29,5 +29,6 @@
   "epochs": 100,
   "finetune_warmup": 5,
   "patience": 10,
-  "geometry_head_norm": true
+  "geometry_head_norm": true,
+  "third_task": "none"
 }

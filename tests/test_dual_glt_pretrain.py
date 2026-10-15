@@ -1,4 +1,4 @@
-"""Three-task local verification only. Synthetic coordinates are not real fixtures."""
+"""Atom/geometry checks only. Synthetic coordinates are not real fixtures."""
 import copy
 import json
 
@@ -7,12 +7,11 @@ import pandas as pd
 import pytest
 import torch
 from rdkit import Chem
-from rdkit.Chem import rdFingerprintGenerator
 
-from test_complete_trimer_glt import _toy_pair
+from tests.test_dual_glt import _toy_pair
 from src.dataset.canonical_periodic import build_canonical_periodic_topology
 from src.dataset.glt_dual import build_dual_sample, dual_glt_collate
-from src.dataset.glt_dual_pretrain import (chemical_targets, motif_mask, sample_generator,
+from src.dataset.glt_dual_pretrain import (chemical_groups, motif_mask, sample_generator,
                                          prepare_pretrain_sample, pretrain_collate)
 from src.dataset.graph_data import build_periodic_multimer_mol
 from src.modules.glt_dual import build_dual_glt_model
@@ -31,7 +30,7 @@ def record(smiles='*COC*', position=0, **kwargs):
 def test_motif_partition_fallback_single_atom_and_replay():
     for smiles in ('*COC*', '*CC(=O)NCC*', '*C*'):
         top = build_canonical_periodic_topology(smiles)
-        groups, _ = chemical_targets(smiles)
+        groups = chemical_groups(smiles)
         assert sorted(i for group in groups for i in group) == list(range(top.mips_x.size(0)))
         a, fallback = motif_mask(top, groups, sample_generator(42, smiles, 7))
         b, _ = motif_mask(top, groups, sample_generator(42, smiles, 7))
@@ -52,7 +51,7 @@ def test_noise_all_features_match_one_coordinate_draw_and_targets_are_clean():
     original = tri.trimer_pos.clone()
     noisy, labels = prepare_pretrain_sample(top, tri, '*COC*', seed=42, key='x', position=3)
     generator = sample_generator(42, 'x', 3)
-    motif_mask(top, chemical_targets('*COC*')[0], generator)
+    motif_mask(top, chemical_groups('*COC*'), generator)
     changed = copy.copy(tri)
     changed.trimer_pos = original + .03 * torch.randn(original.shape, generator=generator)
     expected = build_dual_sample(top, changed, '*COC*')
@@ -75,7 +74,7 @@ def test_noise_all_features_match_one_coordinate_draw_and_targets_are_clean():
     torch.testing.assert_close(rotated.line_angle, noisy.line_angle, atol=1e-4, rtol=1e-4)
 
 
-def test_center_fingerprint_independent_reference_and_no_coordinates(monkeypatch):
+def test_atom_mask_target_uses_only_three_ru_and_has_no_fp(monkeypatch):
     import src.dataset.glt_dual_pretrain as module
     actual_builder = module.build_periodic_multimer_mol
     repeats = []
@@ -84,16 +83,11 @@ def test_center_fingerprint_independent_reference_and_no_coordinates(monkeypatch
         assert kwargs['close_periodic'] is False
         return actual_builder(*args, **kwargs)
     monkeypatch.setattr(module, 'build_periodic_multimer_mol', watched)
-    chemical_targets.cache_clear()
-    _, actual = chemical_targets('*C*')
-    assert repeats == [3, 7]
-    mol, meta = build_periodic_multimer_mol('*C*', 7, close_periodic=False)
-    assert all(a.GetAtomicNum() != 0 for a in mol.GetAtoms())
-    generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048, includeChirality=False)
-    expected = np.zeros(2048, dtype=np.uint8)
-    for root in meta['unit_atoms'][3]:
-        expected |= generator.GetFingerprintAsNumPy(mol, fromAtoms=[root])
-    np.testing.assert_array_equal(actual.numpy(), expected)
+    chemical_groups.cache_clear()
+    assert chemical_groups('*C*') == ((0,),)
+    assert repeats == [3]
+    from src.dataset.glt_dual_static import build_pretrain_target
+    assert set(build_pretrain_target('*C*')) == {'brics_groups'}
 
 
 def test_per_graph_and_ddp_gradient_reference():
@@ -111,19 +105,22 @@ def test_per_graph_and_ddp_gradient_reference():
 
 
 @pytest.mark.parametrize('mode', ['concat', 'kfuse'])
-def test_three_tasks_gradients_loading_and_mask_leakage(mode):
+def test_atom_geometry_gradients_loading_and_mask_leakage(mode):
     rows = [record(), record('*C*')]
     data, labels = pretrain_collate(rows)
     model = DualPretrainer(mode).eval()
     result = model(data, labels)
-    assert result['counts'].tolist() == [1, 1, 2]
+    assert result['counts'].tolist() == [1, 1, 0]
+    assert 'fingerprint' not in labels
+    assert not hasattr(model, 'fp_head')
+    assert not any(name.startswith('fp_head.') for name in model.state_dict())
     loss = global_objective(result['sums'], result['counts'])
     chem_grad = torch.autograd.grad(result['sums'][0], model.encoder.glt.endpoint.weight,
                                     allow_unused=True, retain_graph=True)[0]
     assert chem_grad is None or chem_grad.abs().sum() == 0
     loss.backward()
     for name in ('encoder.o8.atom_embedding.projection.weight', 'encoder.glt.endpoint.weight',
-                 'atom_head.head.weight', 'length_head.2.weight', 'angle_head.2.weight', 'fp_head.3.weight'):
+                 'atom_head.head.weight', 'length_head.2.weight', 'angle_head.2.weight'):
         grad = model.get_parameter(name).grad
         assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0, name
     before = model.encoder.o8(data, labels['atom_mask'])
@@ -158,8 +155,42 @@ def test_empty_geometry_and_batch_target_offsets():
     torch.testing.assert_close(labels['angle_pairs'][n:2*n], second[1]['angle_pairs'] + first[0].bond_distance.numel())
     assert data.geometry_valid.tolist() == [True, True, False]
     result = DualPretrainer()(*pretrain_collate([invalid]))
-    assert result['counts'].tolist() == [1, 0, 1]
+    assert result['counts'].tolist() == [1, 0, 0]
     assert torch.isfinite(result['sums']).all()
+
+
+def test_removed_fp_cannot_be_selected_and_old_common_is_initialization_only(tmp_path):
+    with pytest.raises(ValueError,match='unsupported third'):
+        DualPretrainer(third_task='fp')
+    with pytest.raises(ValueError,match='unsupported third'):
+        record(third_task='fp')
+    from src.training.glt_dual_runtime import apply_common_initialization
+    model=DualPretrainer()
+    state={k:v.clone() for k,v in model.state_dict().items()}
+    old=dict(state)
+    for name in ('fp_head.0.weight','fp_head.0.bias','fp_head.3.weight','fp_head.3.bias'):
+        old[name]=torch.ones(1)
+    path=tmp_path/'legacy_common.pt'
+    torch.save({'common_state_dict':old},path)
+    info=apply_common_initialization(model,path,direct=True)
+    assert set(info['tensor_names'])==set(state)
+    assert info['fixed_seed_unshared_tensor_names']==[]
+    for name,value in state.items():torch.testing.assert_close(value,model.state_dict()[name])
+    # Only initialization projects out the retired head; resume is strict.
+    with pytest.raises(RuntimeError,match='Unexpected key'):
+        model.load_state_dict(old,strict=True)
+
+
+@pytest.mark.parametrize('third_task',['align','fgr'])
+def test_other_optional_objectives_remain_trainable_without_fp(third_task):
+    data,labels=pretrain_collate([record('*COC*',third_task=third_task),record('*CCN*',third_task=third_task)])
+    model=DualPretrainer(third_task=third_task).eval()
+    result=model(data,labels)
+    assert 'fingerprint' not in labels and not hasattr(model,'fp_head')
+    assert result['counts'][2]>0
+    global_objective(result['sums'],result['counts']).backward()
+    head=model.align_proj2.net[0] if third_task=='align' else model.fgr_head.mlp[0]
+    assert head.weight.grad is not None and head.weight.grad.abs().sum()>0
 
 
 def test_rng_and_schedule_resume():

@@ -48,8 +48,7 @@ def _row(*, geometry_valid=True, reason="", n_line=2, n_token=3, n_bond=2,
 
 
 def _target_row():
-    return {"brics_groups": [np.asarray([0, 1], dtype=np.int32)],
-            "fingerprint_packed": np.zeros(256, dtype=np.uint8)}
+    return {"brics_groups": [np.asarray([0, 1], dtype=np.int32)]}
 
 
 def _hold_build_lock(artifact_root, ready, release):
@@ -282,8 +281,8 @@ def test_published_artifact_identity_is_checked_and_never_rewritten(tmp_path):
     broken_target = tmp_path / "broken_target"
     _publish(broken_target, [2], fmt="glt-dual-pretrain-targets-v1", targets=True)
     np.save(
-        broken_target / "chunks" / "chunk_00000000" / "fingerprint_packed.npy",
-        np.zeros((1, 256), dtype=np.uint8),
+        broken_target / "chunks" / "chunk_00000000" / "brics_sample_group_ptr.npy",
+        np.zeros(1, dtype=np.int64),
     )
     with pytest.raises(CacheLifecycleError):
         _published_identity(broken_target)
@@ -691,9 +690,9 @@ def test_full_build_path_is_idempotent_and_resumes_missing_target(tmp_path, monk
     # Published-side reuse validates payloads before the idempotent branch;
     # either side being damaged is a hard refusal, not a target-only/static-only
     # continuation.
-    target_payload_path = target_root / "chunks" / "chunk_00000000" / "fingerprint_packed.npy"
+    target_payload_path = target_root / "chunks" / "chunk_00000000" / "brics_sample_group_ptr.npy"
     target_payload = np.load(target_payload_path).copy()
-    np.save(target_payload_path, np.zeros((2, 256), dtype=np.uint8))
+    np.save(target_payload_path, np.zeros(1, dtype=np.int64))
     with pytest.raises(CacheLifecycleError):
         builder.build(args_both)
     np.save(target_payload_path, target_payload)

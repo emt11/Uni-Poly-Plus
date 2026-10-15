@@ -29,14 +29,8 @@ def _required_gradients(model, mode):
         "glt_encoder": ("encoder.glt.endpoint.weight",),
         "chemistry_head": ("atom_head.head.weight",),
         "geometry_heads": ("length_head.2.weight", "angle_head.2.weight"),
-        "fingerprint_head": ("fp_head.3.weight",),
     }
-    if mode == "concat":
-        groups["fusion"] = ("encoder.norm2.weight", "encoder.norm3.weight")
-    else:
-        # One knowledge source makes Q/K softmax identically one; Value is the
-        # scientifically required trainable update in this configuration.
-        groups["kfuse_value"] = ("encoder.kfuse.v_proj.glt3d.weight",)
+    # With atom/geometry alone the raw fusion readout is not supervised.
     report = {}
     for group, names in groups.items():
         values = []

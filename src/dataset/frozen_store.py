@@ -103,7 +103,7 @@ _READ_ENV_REGISTRY = {}
 _READ_ENV_REGISTRY_LOCK = threading.Lock()
 
 
-def _acquire_readonly_env(data_path: Path):
+def _acquire_readonly_env(data_path: Path, *, readahead=False):
     registry_key = (os.getpid(), os.path.realpath(str(data_path)))
     with _READ_ENV_REGISTRY_LOCK:
         entry = _READ_ENV_REGISTRY.get(registry_key)
@@ -113,12 +113,14 @@ def _acquire_readonly_env(data_path: Path):
                 subdir=True,
                 readonly=True,
                 lock=False,
-                readahead=False,
+                readahead=bool(readahead),
                 meminit=False,
                 max_readers=2048,
             )
             entry = [environment, 0]
             _READ_ENV_REGISTRY[registry_key] = entry
+        elif bool(entry[0].flags()['readahead']) != bool(readahead):
+            raise ValueError('readonly LMDB handle already open with a different readahead mode')
         entry[1] += 1
         return entry[0], registry_key
 

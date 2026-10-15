@@ -32,7 +32,7 @@ def _finite_gradients(module):
     """Return finite/presence summaries without requiring unused heads."""
 
     present, finite, nonzero = 0, 0, 0
-    groups = {"chemistry": [], "fingerprint": [], "geometry": []}
+    groups = {"chemistry": [], "geometry": []}
     for name, parameter in module.named_parameters():
         gradient = parameter.grad
         if gradient is None:
@@ -43,8 +43,6 @@ def _finite_gradients(module):
         nonzero += int(bool(gradient.abs().sum() > 0))
         if name.startswith("atom_head") or name.startswith("encoder.o8") or name.startswith("encoder.glt"):
             groups["chemistry"].append((name, is_finite, float(gradient.abs().sum())))
-        elif name.startswith("fp_head"):
-            groups["fingerprint"].append((name, is_finite, float(gradient.abs().sum())))
         elif name.startswith("length_head") or name.startswith("angle_head"):
             groups["geometry"].append((name, is_finite, float(gradient.abs().sum())))
     return {
@@ -135,11 +133,8 @@ def _run_case(case, prepared, device, rank, world):
     if not gradients["finite"]:
         raise RuntimeError(f"{case}: non-finite gradient")
     chemistry = gradients["groups"]["chemistry"]
-    fingerprint = gradients["groups"]["fingerprint"]
     if not chemistry or any(not item[1] for item in chemistry):
         raise RuntimeError(f"{case}: chemistry gradient is missing/non-finite")
-    if not fingerprint or any(not item[1] for item in fingerprint):
-        raise RuntimeError(f"{case}: fingerprint gradient is missing/non-finite")
     rows = [None] * world
     dist.all_gather_object(rows, {
         "rank": rank,
@@ -160,10 +155,6 @@ def _run_case(case, prepared, device, rank, world):
         "gradient_finite": all(row["gradient"]["finite"] for row in rows),
         "chemistry_gradient_finite": all(
             all(item[1] for item in row["gradient"]["groups"]["chemistry"])
-            for row in rows
-        ),
-        "fingerprint_gradient_finite": all(
-            all(item[1] for item in row["gradient"]["groups"]["fingerprint"])
             for row in rows
         ),
     }

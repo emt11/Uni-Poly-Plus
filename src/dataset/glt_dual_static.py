@@ -35,7 +35,7 @@ STATIC_FIELDS = (
     "line_path_mask", "line_path_group", "line_is_self",
     "angle_pos_triplet", "distance_token_index", "angle_pairs",
 )
-TARGET_FIELDS = ("brics_groups", "fingerprint_packed")
+TARGET_FIELDS = ("brics_groups",)
 
 
 def _as_numpy(value, dtype=None):
@@ -178,16 +178,12 @@ def build_dual_static(topology, trimer, smiles):
 
 
 def build_pretrain_target(smiles):
-    """Return packed deterministic BRICS groups and Morgan bits."""
-    from .glt_dual_pretrain import chemical_targets
+    """Return only the deterministic BRICS groups needed for atom masking."""
+    from .glt_dual_pretrain import chemical_groups
 
-    groups, fingerprint = chemical_targets(str(smiles))
-    bits = torch.as_tensor(fingerprint).detach().cpu().numpy().astype(np.uint8)
-    if bits.shape != (2048,) or not np.isin(bits, (0, 1)).all():
-        raise ValueError("pretrain fingerprint has invalid shape or bits")
+    groups = chemical_groups(str(smiles))
     return {
         "brics_groups": tuple(tuple(int(atom) for atom in group) for group in groups),
-        "fingerprint_packed": np.packbits(bits, bitorder="little").astype(np.uint8),
     }
 
 
@@ -258,19 +254,16 @@ def _pack_rows(rows, target=False):
     offsets_name = "group_offsets" if target else None
     packed = {}
     if target:
-        group_ptr, atom_ptr, atoms, fingerprints = [0], [0], [], []
+        group_ptr, atom_ptr, atoms = [0], [0], []
         for row in rows:
             for group in row["brics_groups"]:
                 atoms.extend(group)
                 atom_ptr.append(len(atoms))
             group_ptr.append(len(atom_ptr) - 1)
-            fingerprints.append(row["fingerprint_packed"])
         packed.update(
             brics_sample_group_ptr=np.asarray(group_ptr, dtype=np.int64),
             brics_group_atom_ptr=np.asarray(atom_ptr, dtype=np.int64),
             brics_atom_index=np.asarray(atoms, dtype=np.int32),
-            fingerprint_packed=np.stack(fingerprints).astype(np.uint8)
-            if fingerprints else np.empty((0, 256), dtype=np.uint8),
         )
         return packed
     for name in fields:
@@ -409,7 +402,6 @@ def load_chunk_payload(chunk, item, *, targets=False):
     if targets:
         required = {
             "brics_sample_group_ptr", "brics_group_atom_ptr", "brics_atom_index",
-            "fingerprint_packed",
         }
     else:
         required = set(STATIC_FIELDS) | {
@@ -422,6 +414,10 @@ def load_chunk_payload(chunk, item, *, targets=False):
         raise CacheLifecycleError(f"chunk manifest lacks required arrays: {chunk}: {missing}")
     arrays = {}
     for name, expected in sorted(recorded.items()):
+        if targets and name == "fingerprint_packed":
+            # Legacy artifacts may record this obsolete array. BRICS readers
+            # no longer open it or require the file to be present.
+            continue
         path = Path(chunk) / f"{name}.npy"
         if not path.is_file():
             raise CacheLifecycleError(f"chunk payload file is missing: {path}")
@@ -466,7 +462,7 @@ def load_chunk_payload(chunk, item, *, targets=False):
             raise CacheLifecycleError(
                 f"chunk ragged payload length does not match its offsets: {name}")
     if targets:
-        for name in ("brics_sample_group_ptr", "fingerprint_packed"):
+        for name in ("brics_sample_group_ptr",):
             if name not in arrays:
                 raise CacheLifecycleError(f"target chunk lacks pretrain targets: {chunk}")
     elif "geometry_valid" not in arrays or "geometry_invalid_reason" not in arrays:
@@ -531,7 +527,6 @@ class _ChunkReader:
                 for group in range(int(arrays["brics_sample_group_ptr"][local]),
                                    int(arrays["brics_sample_group_ptr"][local + 1]))
             ]
-            result["fingerprint_packed"] = np.asarray(arrays["fingerprint_packed"][local])
         return result
 
 

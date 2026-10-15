@@ -53,7 +53,7 @@ def test_periodic_tdl_scope_and_task_hyperparameters():
         runner.validate_stage_scope(
             'paper5_outer', task, 4, 60 if task == 'egc' else 70,
             'index', 'periodic_tdl')
-    with pytest.raises(ValueError, match='only paper5_outer'):
+    with pytest.raises(ValueError, match='unsupported Periodic-TDL'):
         runner.validate_stage_scope('full8x5', 'eea', 4, 70, 'index', 'periodic_tdl')
     with pytest.raises(ValueError, match='requires 60'):
         runner.validate_stage_scope('paper5_outer', 'egc', 4, 70, 'index', 'periodic_tdl')

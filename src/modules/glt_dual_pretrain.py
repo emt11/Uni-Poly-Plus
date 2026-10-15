@@ -1,4 +1,4 @@
-"""Three-task objective for the physical Trimer dual encoder (no teacher)."""
+"""Atom/geometry objectives with optional FGR or ALIGN (no FP, no teacher)."""
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
@@ -108,10 +108,12 @@ def alignment_local_anchor_count(identities, valid, *, device=None):
     return torch.tensor(float(count), device=device)
 
 
-def alignment_loss(graph_2d, graph_3d, identities, valid, *, temperature=0.1):
+def alignment_loss(graph_2d, graph_3d, identities, valid, *, temperature=0.1, direction='symmetric'):
     """Return (local sum, local valid-anchor count) for two-way multi-positive InfoNCE."""
     if not math_is_finite_positive(temperature):
         raise ValueError('ALIGN temperature must be finite and positive')
+    if direction not in ('symmetric','2d_anchor'):
+        raise ValueError('invalid ALIGN anchor direction')
     if graph_2d.shape != graph_3d.shape or graph_2d.ndim != 2 or graph_2d.size(-1) != 128:
         raise ValueError('ALIGN projected representations must be [B,128] and paired')
     valid = valid.bool()
@@ -164,7 +166,8 @@ def alignment_loss(graph_2d, graph_3d, identities, valid, *, temperature=0.1):
         log_den = torch.logsumexp(masked_logits, dim=1)
         positive_count = positives.sum(1).clamp_min(1).float()
         return -(logits.masked_fill(~positives, 0).sum(1) / positive_count - log_den)
-    local_loss = .5 * (directional(logits23, positive23) + directional(logits32, positive32))
+    local_loss = (.5 * (directional(logits23, positive23) + directional(logits32, positive32))
+                  if direction=='symmetric' else directional(logits23, positive23) + z2.sum()*0)
     return local_loss[anchor].sum(), anchor.sum().float()
 
 
@@ -176,12 +179,15 @@ class DualPretrainer(nn.Module):
     ENV_HEAD_INIT_SEED = 20260918
 
     def __init__(self, fusion_mode='concat', *, collect_diagnostics=False,
-                 geometry_head_norm=False, third_task='fp', fgr_mu=0.0,
+                 geometry_head_norm=False, third_task='none', fgr_mu=0.0,
                  fgr_sigma=1.0, align_temperature=0.1, atom_target='element',
-                 env_vocab_size=None, torsion=False):
+                 env_vocab_size=None, torsion=False, torsion_revision=None, opt_mode=None,
+                 fusion_revision=None, use_md200=False, atom_ce_input='raw',
+                 align_enabled=False, local_enabled=False, geometry_scales=None,
+                 geometry_revision=None, geometry_mode="finite_internal", angle_value_enabled=False, readout="internal", fusion_gate="none", align_weight=0.1, align_warmup_steps=1000, quality_root=None, align_revision=None, align_init_seed=None, align_direction='symmetric', **locality):
         super().__init__()
         third_task = str(third_task).lower()
-        if third_task not in {'fp', 'none', 'fgr', 'align'}:
+        if third_task not in {'none', 'fgr', 'align'}:
             raise ValueError('unsupported third pretraining task')
         if not math_is_finite_positive(align_temperature):
             raise ValueError('ALIGN temperature must be finite and positive')
@@ -193,7 +199,28 @@ class DualPretrainer(nn.Module):
         if (atom_target == 'environment') != (env_vocab_size is not None):
             raise ValueError('environment atom target requires the vocabulary size')
         self.atom_target = atom_target
-        self.encoder = build_dual_glt_model(fusion_mode, torsion=bool(torsion))
+        self.opt_mode = opt_mode
+        if atom_ce_input not in ('raw', 'fused'):
+            raise ValueError('atom CE input must be raw or fused')
+        if align_enabled and local_enabled:
+            raise ValueError('A+L is outside this cycle')
+        self.align_weight=float(align_weight)
+        self.align_warmup_steps=int(align_warmup_steps)
+        self.quality_root=quality_root
+        if not math_is_finite_positive(self.align_weight) or self.align_warmup_steps<=0:raise ValueError("invalid ALIGN schedule")
+        self.atom_ce_input = atom_ce_input
+        self.align_enabled = bool(align_enabled)
+        self.local_enabled = bool(local_enabled)
+        if local_enabled and fusion_mode != 'tk':
+            raise ValueError('local constraint requires TK fusion')
+        self.geometry_scales = geometry_scales
+        if geometry_scales is not None and (set(geometry_scales) != {'length', 'angle'}
+                or not all(math_is_finite_positive(v) for v in geometry_scales.values())):
+            raise ValueError('geometry standard deviations must be positive and finite')
+        self.encoder = build_dual_glt_model(fusion_mode, torsion=bool(torsion), torsion_revision=torsion_revision,
+            fusion_revision=fusion_revision, use_md200=use_md200,
+            geometry_revision=geometry_revision, geometry_mode=geometry_mode,
+            angle_value_enabled=angle_value_enabled, readout=readout, fusion_gate=fusion_gate, **locality)
         self.encoder.predictor = nn.Identity()
         self.atom_head = AtomGraphDecoder(101 if atom_target == 'element' else int(env_vocab_size))
         if atom_target == 'environment':
@@ -208,19 +235,32 @@ class DualPretrainer(nn.Module):
         self.fgr_mu = float(fgr_mu)
         self.fgr_sigma = float(fgr_sigma)
         self.align_temperature = float(align_temperature)
-        self.fp_head = (nn.Sequential(nn.Linear(1024 if fusion_mode == 'concat' else 512, 512),
-                                      nn.GELU(), nn.Dropout(0.1), nn.Linear(512, 2048))
-                        if third_task == 'fp' else None)
         if third_task == 'fgr':
-            self.fgr_context = (nn.Identity() if fusion_mode == 'concat'
+            self.fgr_context = (nn.Identity() if fusion_mode == 'concat' or fusion_revision
                                 else nn.Linear(512, 1024))
             self.fgr_head = FGRDecoder(1024)
         else:
             self.fgr_context = None
             self.fgr_head = None
-        if third_task == 'align':
-            self.align_proj2 = AlignmentProjection()
-            self.align_proj3 = AlignmentProjection()
+        self.align_revision=align_revision
+        self.align_init_seed=align_init_seed
+        self.align_direction=align_direction
+        if align_direction not in ('symmetric','2d_anchor') or (align_direction!='symmetric' and align_revision!='glt_align_r10_a2'):
+            raise ValueError('ALIGN direction requires the A2 revision')
+        if align_revision is not None:
+            allowed_ce=('raw','fused') if align_revision=='glt_align_r10_a1' else ('fused',)
+            if align_revision not in ('glt_align_2d_u1','glt_align_r10_a1','glt_align_r10_a2') or type(align_init_seed) is not int or align_init_seed!=314161 or not align_enabled or third_task!='none' or align_temperature!=0.10 or self.align_weight!=0.10 or self.align_warmup_steps!=1000 or self.encoder.endpoint_revision or fusion_mode!='token' or fusion_gate!='none' or use_md200 or geometry_mode!='finite_incident' or geometry_revision!='glt_periodic_seam_r1' or readout!='incident' or not angle_value_enabled or atom_ce_input not in allowed_ce or not geometry_head_norm or opt_mode!='GLT_FUSION_R1' or local_enabled or torsion or quality_root is not None:raise ValueError('invalid revision-specific ALIGN configuration')
+            if align_revision=='glt_align_r10_a2' and align_direction!='2d_anchor':raise ValueError('A2 requires 2D anchors')
+        elif align_init_seed is not None:raise ValueError('ALIGN seed requires revision')
+        if third_task == 'align' or align_enabled:
+            if align_revision:
+                with torch.random.fork_rng(devices=[]):
+                    torch.default_generator.manual_seed(align_init_seed)
+                    self.align_proj2 = AlignmentProjection()
+                    self.align_proj3 = AlignmentProjection()
+            else:
+                self.align_proj2 = AlignmentProjection()
+                self.align_proj3 = AlignmentProjection()
         else:
             self.align_proj2 = self.align_proj3 = None
         # Diagnostics are observation only: no parameter, buffer, RNG draw or
@@ -231,7 +271,7 @@ class DualPretrainer(nn.Module):
         # normalization of the 3D bond representation shared by the length and
         # angle heads.  Non-affine => no parameters, no buffers, no optimizer
         # state, unchanged checkpoint schema.  The raw 3D state that feeds
-        # fusion/pooling/fingerprint/chemistry is left untouched.
+        # fusion/pooling/chemistry is left untouched.
         self.geometry_head_norm = bool(geometry_head_norm)
         self.geometry_norm = (nn.LayerNorm(512, elementwise_affine=False)
                               if self.geometry_head_norm else None)
@@ -264,31 +304,38 @@ class DualPretrainer(nn.Module):
             encoded = self.encoder.encode(data, atom_mask=labels['atom_mask'])
             graphs = data.graph_available.numel()
             mask = labels['atom_mask']
-            atom_logits = self.atom_head(encoded['atom_states'], data.lga_edge_index)
+            fused = self.encoder.fuse(encoded)
+            atom_input = encoded['fused_atom_states'] if self.atom_ce_input == 'fused' or self.opt_mode == 'M_TOKEN_CE' else encoded['atom_states']
+            atom_logits = self.atom_head(atom_input, data.lga_edge_index)
             chem, chem_valid = per_graph(F.cross_entropy(atom_logits[mask].float(),
                 labels['atom_label'][mask], reduction='none'), data.canonical_graph_index[mask], graphs)
             bond_states = encoded['bond_states']
             if self.geometry_norm is not None:
                 bond_states = self.geometry_norm(bond_states)
-            center_rows = data.bond_center.bool()
+            center_rows = (data.bond_length_weight > 0) if self.encoder.geometry_revision or self.opt_mode == 'G_SEAM_GEO' else data.bond_center.bool()
             lengths = self.length_head(bond_states[center_rows]).float().flatten()
-            length_loss, length_valid = per_graph((lengths - labels['distance'].float()).square(),
-                data.bond_batch[data.bond_center], graphs)
+            if self.encoder.geometry_revision or self.opt_mode == 'G_SEAM_GEO':
+                from .glt_dual_opt import weighted_graph_loss
+                length_loss, length_valid = weighted_graph_loss((lengths-labels['distance'].float()).square(), labels['distance_weight'], data.bond_batch[center_rows], graphs)
+            else:
+                length_loss, length_valid = per_graph((lengths-labels['distance'].float()).square(), data.bond_batch[center_rows], graphs)
             a, b = labels['angle_pairs'].unbind(1)
             left, right = bond_states[a], bond_states[b]
             angles = self.angle_head(torch.cat([left + right, (left - right).abs()], -1)).float().flatten()
             angle_loss, angle_valid = per_graph((angles - labels['angle_cos'].float()).square(),
                                                 labels['angle_graph'], graphs)
             geo_valid = length_valid & encoded['geometry_valid']
+            raw_length, raw_angle = length_loss, angle_loss
+            if self.geometry_scales is not None:
+                length_loss = length_loss / float(self.geometry_scales['length'])**2
+                angle_loss = angle_loss / float(self.geometry_scales['angle'])**2
             geometry = length_loss + angle_loss
-            fused = self.encoder.fuse(encoded)
-            if self.third_task == 'fp':
-                fp_logits = self.fp_head(fused).float()
-                third_per_graph = F.binary_cross_entropy_with_logits(
-                    fp_logits, labels['fingerprint'].float(), reduction='none').mean(-1)
-                third_valid = data.graph_available.bool()
-                third_target_count = third_valid.sum() * 2048
-            elif self.third_task == 'fgr':
+            quality=labels.get('geometry_quality_weight')
+            if quality is not None:
+                if quality.shape!=(graphs,) or not torch.isfinite(quality).all() or not ((quality==0)|(quality==.5)|(quality==1)).all():
+                    raise ValueError('invalid geometry quality weight')
+                geometry=geometry*quality
+            if self.third_task == 'fgr':
                 pair_index = labels['fgr_pair_index'].long()
                 if pair_index.numel():
                     pair_states = self.fgr_head(
@@ -330,11 +377,29 @@ class DualPretrainer(nn.Module):
                 third_count = third_count.to(dtype=torch.long)
             result = dict(sums=torch.stack([chem[chem_valid].sum(), geometry[geo_valid].sum(),
                                             third_sum]),
-                counts=torch.stack([chem_valid.sum(), geo_valid.sum(), third_count]),
-                targets=torch.stack([mask.sum(), data.bond_center.sum(),
+                counts=torch.stack([chem_valid.sum(), geo_valid.sum() if quality is None else quality[geo_valid].sum(), third_count]),
+                targets=torch.stack([mask.sum(), center_rows.sum(),
                                      labels['angle_graph'].new_tensor(a.numel()),
                                      third_target_count.to(dtype=torch.long)]),
-                angle_graphs=angle_valid.sum())
+                angle_graphs=angle_valid.sum() if quality is None else quality[angle_valid].sum())
+            if self.encoder.fusion_revision:
+                zero = fused.sum() * 0
+                align_sum, align_count = zero, zero.detach()
+                if self.align_enabled:
+                    align_sum, align_count = alignment_loss(
+                        self.align_proj2(encoded['graph_2d']),
+                        self.align_proj3(encoded['graph_3d']), labels['align_identity'],
+                        labels['align_valid'].bool() & encoded['geometry_valid'],
+                        temperature=self.align_temperature,direction=self.align_direction)
+                local_sum, local_count = zero, zero.detach()
+                if self.local_enabled:
+                    local_sum, local_count = local_attention_loss(
+                        encoded['local_attention'], data.incidence_index, zero)
+                result['extra_sums'] = torch.stack([align_sum, local_sum])
+                result['extra_counts'] = torch.stack([align_count, local_count])
+                result['raw_geometry_sums'] = torch.stack([
+                    raw_length[geo_valid].sum() if quality is None else (raw_length*quality)[geo_valid].sum(),
+                    raw_angle[geo_valid].sum() if quality is None else (raw_angle*quality)[geo_valid].sum()])
             if diagnostics_enabled:
                 pre_tanh = captured.get('pre_tanh')
                 # One valid path step per row marks a real one-hop angle; rows
@@ -356,7 +421,7 @@ class DualPretrainer(nn.Module):
                         "chem": chem[chem_valid].sum(),
                         "length": length_loss[geo_valid].sum(),
                         "angle": angle_loss[geo_valid].sum(),
-                        "fingerprint" if self.third_task == 'fp' else "third": third_sum,
+                        "third": third_sum,
                     },
                     "components": {
                         "chem_sum": float(chem[chem_valid].sum().detach()), "chem_count": int(chem_valid.sum()),
@@ -368,8 +433,6 @@ class DualPretrainer(nn.Module):
                         "graphs_without_angle": int((geo_valid & ~angle_valid).sum()),
                         "third_task": self.third_task,
                         "third_sum": float(third_sum.detach()), "third_count": int(third_count),
-                        "fp_sum": float(third_sum.detach()) if self.third_task == 'fp' else None,
-                        "fp_count": int(third_count) if self.third_task == 'fp' else 0,
                         "length_plus_angle_reconstructs_geometry": bool(torch.isclose(
                             length_loss[geo_valid].sum() + angle_loss[geo_valid].sum(),
                             geometry[geo_valid].sum(), rtol=1e-5, atol=1e-6)),
@@ -434,27 +497,231 @@ class DualPretrainer(nn.Module):
                 handle.remove()
 
 
-def global_objective(sums, global_counts, world_size=1, weights=(1., 1., .1)):
+def global_objective(sums, global_counts, world_size=1, weights=(1., 1., .1), *, fractional_counts=False):
     """DDP averages gradients: multiply local graph sums by world/global count."""
-    return (sums * sums.new_tensor(weights) * world_size / global_counts.clamp_min(1)).sum()
+    denominators=(torch.where(global_counts>0,global_counts,torch.ones_like(global_counts))
+                  if fractional_counts else global_counts.clamp_min(1))
+    return (sums * sums.new_tensor(weights) * world_size / denominators).sum()
+
+
+def local_attention_loss(attention, incidence, zero):
+    """KL(P||A), uniform incidence targets, atom then graph averaging."""
+    losses = []
+    bond, atom = incidence.long()
+    for _, ai, bi, weights in attention:
+        atom_losses = []
+        for row, index in enumerate(ai):
+            incident = bond[atom == index].unique()
+            if not incident.numel():
+                continue
+            columns = torch.searchsorted(bi, incident)
+            if bool((columns >= bi.numel()).any()) or not torch.equal(bi[columns], incident):
+                raise ValueError('center incidence leaves graph physical bond tokens')
+            probabilities = weights[row, columns]
+            if not bool(torch.isfinite(probabilities).all()) or bool((probabilities <= 0).any()):
+                raise FloatingPointError('local attention probabilities invalid')
+            atom_losses.append(-probabilities.log().mean() - probabilities.new_tensor(float(incident.numel())).log())
+        if atom_losses:
+            losses.append(torch.stack(atom_losses).mean())
+    return (torch.stack(losses).sum(), zero.new_tensor(float(len(losses)))) if losses else (zero, zero.detach())
 
 
 def deployment_package(pretrainer, step):
-    return dict(architecture=pretrainer.encoder.architecture_name,
-        fusion_mode=pretrainer.encoder.fusion_mode, step=int(step), use_md200=False,
+    package=dict(architecture=pretrainer.encoder.architecture_name,
+        fusion_gate=pretrainer.encoder.fusion_gate, quality_root=pretrainer.quality_root,
+        align_weight=pretrainer.align_weight, align_warmup_steps=pretrainer.align_warmup_steps, align_temperature=pretrainer.align_temperature,
+        fusion_mode=pretrainer.encoder.fusion_mode, step=int(step), use_md200=pretrainer.encoder.use_md200,
+        fusion_revision=pretrainer.encoder.fusion_revision,
+        atom_ce_input=pretrainer.atom_ce_input, align_enabled=pretrainer.align_enabled,
+        local_enabled=pretrainer.local_enabled, geometry_scales=pretrainer.geometry_scales,
         torsion_modules=bool(pretrainer.encoder.glt.torsion_mlp is not None),
+        readout=pretrainer.encoder.readout, opt_mode=pretrainer.opt_mode,
+        geometry_revision=pretrainer.encoder.geometry_revision, geometry_mode=pretrainer.encoder.geometry_mode,
+        angle_value_enabled=pretrainer.encoder.angle_value_enabled,
+        torsion_mode='off' if pretrainer.encoder.glt.torsion_mlp is None else 'on',
+        input_schema='periodic_local_observations_v1' if pretrainer.encoder.geometry_revision else 'legacy',
+        geometry_target='seam' if pretrainer.encoder.geometry_revision or pretrainer.opt_mode == 'G_SEAM_GEO' else 'internal',
+        third_task=pretrainer.third_task, element_mask='all_copies_unknown' if pretrainer.encoder.fusion_revision or pretrainer.opt_mode in ('F_TOKEN','M_TOKEN_CE') else 'legacy',
         state_dict={k: v.detach().cpu().clone() for k, v in pretrainer.encoder.state_dict().items()
                     if not k.startswith('predictor.')})
 
+    if pretrainer.encoder.endpoint_revision:
+        from .glt_dual import locality_options
+        package.update(locality_options({k:getattr(pretrainer.encoder,k) for k in ('endpoint_revision','endpoint_module','endpoint_input_mode','endpoint_init_seed','fusion_attention_mode','incident_bias')}))
+    if pretrainer.align_revision:
+        package.update(pretrain_revision=pretrainer.align_revision,align_revision=pretrainer.align_revision,align_init_seed=pretrainer.align_init_seed,align_input='raw_graph_2d_graph_3d',fusion_attention_mode='global',incident_bias=0.0,endpoint_revision=None)
+    if pretrainer.encoder.torsion_revision:
+        from .glt_dual import PHYSICAL_TORSION,S4_RESOURCE
+        from pathlib import Path
+        package.update(PHYSICAL_TORSION)
+        package.update(S4_RESOURCE,common_initialization=str(Path(__file__).resolve().parents[2]/'results/glt_periodic_seam_20261009/r1/initialization/F_CE_step0.pt'))
+        package.update(plan='GLT-OPTIMIZATION-20261011-01',revision='r6',cycle='S4',arm='T_FCE',common_initial_state='results/glt_periodic_seam_20261009/r1/initialization/F_CE_step0.pt')
+    return package
+
+
+def u1_alignment_options(package):
+    if package.get('r10_revision'):
+        from .glt_r10 import validate_package
+        cfg=validate_package(package)
+        return {k:package[k] for k in ('align_revision','align_init_seed','align_direction')} if cfg['align_enabled'] else {}
+    names=('pretrain_revision','align_revision','align_init_seed','align_input','align_enabled','align_temperature','align_weight','align_warmup_steps')
+    if not package.get('pretrain_revision') and not package.get('align_revision'):
+        if package.get('align_init_seed') is not None or package.get('align_input') is not None:raise ValueError('incomplete U1 ALIGN metadata')
+        return {}
+    expected=dict(pretrain_revision='glt_align_2d_u1',align_revision='glt_align_2d_u1',align_init_seed=314161,align_input='raw_graph_2d_graph_3d',align_enabled=True,align_temperature=.1,align_weight=.1,align_warmup_steps=1000,fusion_attention_mode='global',incident_bias=0.0,endpoint_revision=None,fusion_gate='none',local_enabled=False,use_md200=False,torsion_modules=False,atom_ce_input='fused',geometry_revision='glt_periodic_seam_r1',geometry_mode='finite_incident',readout='incident',angle_value_enabled=True,third_task='none',opt_mode='GLT_FUSION_R1')
+    if any(k not in package or type(package[k]) is not type(v) or package[k]!=v for k,v in expected.items()):raise ValueError('invalid U1 ALIGN metadata')
+    return {k:package[k] for k in names}
+
 
 def load_deployment(model, package, expected_step=5000):
+    from .glt_dual import locality_options
+    from .glt_dual import torsion_options
+    torsion=torsion_options(package)
+    r10=bool(package.get('r10_revision'))
+    if torsion and not r10:
+        from .glt_dual import s4_resource_options
+        s4_resource_options(package)
+    if package.get('torsion_revision')!=model.torsion_revision:
+        raise ValueError('deployment physical torsion revision mismatch')
+    if torsion and not r10 and any(package.get(k)!=v for k,v in dict(plan='GLT-OPTIMIZATION-20261011-01',revision='r6',cycle='S4',arm='T_FCE').items()):
+        raise ValueError('deployment physical torsion cycle mismatch')
+    alignment=u1_alignment_options(package)
+    if package.get('nonbonded_revision')!=model.glt.nonbonded_revision:raise ValueError('deployment nonbonded revision mismatch')
+    locality=locality_options(package)
+    if bool(locality)!=bool(model.endpoint_revision) or any(getattr(model,k)!=v for k,v in locality.items()):
+        raise ValueError('deployment locality/endpoint mismatch')
     if (package.get('architecture') != model.architecture_name
             or package.get('fusion_mode') != model.fusion_mode
-            or package.get('use_md200') is not False or package.get('step') != expected_step):
+            or package.get('use_md200') != model.use_md200 or package.get('step') != expected_step
+            or package.get('fusion_revision') != model.fusion_revision):
         raise ValueError('dual checkpoint architecture/fusion/step mismatch')
+    if package.get('readout', 'internal') != model.readout:
+        raise ValueError('deployment readout mismatch')
+    from src.dataset.glt_periodic_geometry import geometry_options
+    options=geometry_options(package.get('geometry_revision'), package.get('geometry_mode','finite_internal'),
+        package.get('angle_value_enabled',False),package.get('readout','internal'))
+    for key,value in options.items():
+        if getattr(model,key)!=value:raise ValueError('deployment geometry mismatch: '+key)
+    if package.get('torsion_modules',False) != (model.glt.torsion_mlp is not None):
+        raise ValueError('deployment torsion modules mismatch')
+    if model.geometry_revision:
+        if (package.get('input_schema')!='periodic_local_observations_v1'
+                or package.get('geometry_target')!='seam'
+                or package.get('element_mask')!='all_copies_unknown'):
+            raise ValueError('deployment geometry schema/target/mask mismatch')
+    if package.get('fusion_gate','none') != model.fusion_gate:raise ValueError('deployment gate mismatch')
     current = model.state_dict()
     expected = {name for name in current if not name.startswith('predictor.')}
     if set(package['state_dict']) != expected:
         raise ValueError('deployment must contain exactly encoder and fusion tensors')
+    for name,value in package['state_dict'].items():
+        if value.shape!=current[name].shape or value.dtype!=current[name].dtype:
+            raise ValueError('deployment tensor shape/dtype mismatch: '+name)
+        if (locality or alignment or torsion) and not torch.isfinite(value).all():raise ValueError('nonfinite S3 deployment tensor: '+name)
     current.update(package['state_dict'])
     model.load_state_dict(current, strict=True)
+
+
+def deployment_model_options(package, expected_step=5000):
+    """Resolve only the published GLT encoder contracts before construction."""
+    from .glt_dual import locality_options, torsion_options, s4_resource_options
+    from src.dataset.glt_periodic_geometry import geometry_options
+    required = ('architecture', 'fusion_mode', 'fusion_revision', 'use_md200', 'step', 'state_dict')
+    if not isinstance(package, dict) or any(k not in package for k in required):
+        raise ValueError('incomplete GLT deployment package')
+    if type(package['step']) is not int or package['step'] != expected_step:
+        raise ValueError('deployment step mismatch')
+    if package['fusion_revision'] not in (None, 'glt_fusion_r1'):
+        raise ValueError('unknown fusion revision')
+    legacy = package['fusion_revision'] is None and package.get('input_schema') == 'legacy'
+    # The saved original F_CE predates gate/connection/ALIGN-revision fields.
+    # Defaults apply only to its exact observed producer schema and semantics.
+    fce_fields = {'architecture','fusion_mode','step','use_md200','fusion_revision',
+        'atom_ce_input','align_enabled','local_enabled','geometry_scales',
+        'torsion_modules','readout','opt_mode','geometry_revision','geometry_mode',
+        'angle_value_enabled','torsion_mode','input_schema','geometry_target',
+        'third_task','element_mask','state_dict'}
+    old_fce = set(package) == fce_fields and all(package.get(k) == v for k,v in dict(
+        fusion_mode='token',fusion_revision='glt_fusion_r1',use_md200=False,
+        atom_ce_input='fused',align_enabled=False,local_enabled=False,torsion_modules=False,
+        readout='incident',opt_mode='GLT_FUSION_R1',geometry_revision='glt_periodic_seam_r1',
+        geometry_mode='finite_incident',angle_value_enabled=True,torsion_mode='off',
+        input_schema='periodic_local_observations_v1',geometry_target='seam',
+        third_task='none',element_mask='all_copies_unknown',geometry_scales=None).items())
+    fields = ('geometry_revision', 'geometry_mode', 'angle_value_enabled', 'readout',
+              'fusion_gate', 'torsion_modules', 'torsion_mode', 'align_enabled',
+              'atom_ce_input', 'local_enabled', 'third_task', 'opt_mode',
+              'input_schema', 'geometry_target', 'element_mask',
+              'align_temperature','align_weight','align_warmup_steps')
+    if not legacy and any(k not in package for k in fields if not (old_fce and k in ('fusion_gate','align_temperature','align_weight','align_warmup_steps'))):
+        raise ValueError('new deployment is missing architecture metadata')
+    if legacy and (package.get('geometry_revision') is not None
+                   or package.get('pretrain_revision') is not None
+                   or package.get('endpoint_revision') is not None
+                   or package.get('torsion_revision') is not None):
+        raise ValueError('legacy defaults do not apply to revised packages')
+    for name in ('use_md200', 'torsion_modules', 'align_enabled', 'local_enabled', 'angle_value_enabled'):
+        if name in package and type(package[name]) is not bool:
+            raise ValueError('invalid boolean metadata: ' + name)
+    geometry = geometry_options(package.get('geometry_revision'),
+        package.get('geometry_mode', 'finite_internal'),
+        package.get('angle_value_enabled', False), package.get('readout', 'internal'))
+    locality = locality_options(package)
+    connection = dict(fusion_attention_mode=package.get('fusion_attention_mode','global'),
+                      incident_bias=package.get('incident_bias',0.0))
+    if not locality and (connection['fusion_attention_mode'] != 'global'
+                         or type(connection['incident_bias']) not in (int,float)
+                         or connection['incident_bias'] != 0.0):
+        raise ValueError('connection requires an explicit endpoint contract')
+    torsion = torsion_options(package)
+    u1_alignment_options(package)
+    if package.get('align_enabled') and not package.get('pretrain_revision'):
+        # Earlier fusion packages used ALIGN without the later U1 projections.
+        if package['fusion_revision'] != 'glt_fusion_r1' or package.get('opt_mode') != 'GLT_FUSION_R1':
+            raise ValueError('unsupported legacy ALIGN contract')
+    if torsion and not package.get('r10_revision'):
+        s4_resource_options(package)
+        if any(package.get(k) != v for k,v in dict(plan='GLT-OPTIMIZATION-20261011-01',
+                revision='r6', cycle='S4', arm='T_FCE').items()):
+            raise ValueError('deployment physical torsion cycle mismatch')
+    if package.get('reference_revision') is not None:
+        if package['reference_revision'] != 'glt_matched_reference_s5':
+            raise ValueError('unknown reference revision')
+        # Reuse S5's exact config/source binding rather than weaken its contract.
+        from scripts.run_glt_pt_matched_reference_unit import reference_metadata
+        cfg = package.get('training_config')
+        if not isinstance(cfg, dict) or any(package.get(k) != v for k,v in reference_metadata(cfg).items()):
+            raise ValueError('S5 parent metadata/source mismatch')
+        if any(package.get(k) for k in ('torsion_modules', 'torsion_revision', 'endpoint_revision', 'align_enabled')):
+            raise ValueError('S5 deployment contains forbidden branch')
+    if package.get('torsion_mode', 'off') != ('on' if package.get('torsion_modules', False) else 'off'):
+        raise ValueError('torsion mode/modules mismatch')
+    if geometry['geometry_revision'] and any(package.get(k) != v for k,v in dict(
+            input_schema='periodic_local_observations_v1',geometry_target='seam',
+            element_mask='all_copies_unknown').items()):
+        raise ValueError('deployment geometry schema/target/mask mismatch')
+    architecture = ('O8-BondPath-GalformerTrimer-Hop2-MD200-r1'
+                    if package['fusion_revision'] else 'O8-BondPath-GalformerTrimer-Hop2')
+    if package['architecture'] != architecture:
+        raise ValueError('unknown GLT architecture')
+    result=dict(fusion_mode=package['fusion_mode'], fusion_revision=package['fusion_revision'],
+        use_md200=package['use_md200'], fusion_gate=package.get('fusion_gate', 'none'),
+        torsion=package.get('torsion_modules', False), torsion_revision=package.get('torsion_revision'),
+        **geometry, **{**connection, **locality})
+    if package.get('nonbonded_revision'):
+        if not package.get('r10_revision'):raise ValueError('nonbonded input requires r10 contract')
+        result['nonbonded_revision']=package['nonbonded_revision']
+    return result
+
+
+def restore_deployment(package, expected_step=5000, *, dropout=0.1):
+    """Construct the declared encoder, then use the existing strict loader."""
+    from .glt_dual import build_dual_glt_model
+    options = deployment_model_options(package, expected_step)
+    if not isinstance(package['state_dict'], dict) or any(
+            not torch.is_tensor(value) or not torch.isfinite(value).all()
+            for value in package['state_dict'].values()):
+        raise ValueError('invalid/nonfinite deployment tensors')
+    model = build_dual_glt_model(dropout=dropout, **options)
+    load_deployment(model, package, expected_step)
+    return model

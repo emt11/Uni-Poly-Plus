@@ -29,6 +29,8 @@ import sys
 import time
 import traceback
 
+import torch
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.dataset.mcl_ph_view import DESCRIPTOR_COLUMNS, ROUTER_RADII
@@ -40,7 +42,8 @@ from src.dataset.mcl_ph_trajectory_cache import (BUILD_STATE_DIRNAME, CACHE_SCHE
                                                  create_shard_files, describe_shard,
                                                  position_chunks, read_segment_markers,
                                                  segment_key, shard_bounds, shard_paths,
-                                                 sha256_file, write_manifest)
+                                                 sha256_file, write_manifest, identity_fields,
+                                                 direct_source_identity, require_direct_source_rows)
 
 BUILDER_CLASS = TrajectoryCacheBuilder
 _WORKER = {}
@@ -72,6 +75,14 @@ def _child_max_rss_bytes():
 
 
 def _init_worker(payload):
+    # PH/RDKit workers must not each fan out into the full BLAS/OpenMP pool.
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # A forked worker may inherit an already initialized inter-op pool;
+        # intra-op remains explicitly bounded and no worker may enlarge it.
+        pass
     _WORKER['builder'] = BUILDER_CLASS(**payload)
 
 
@@ -128,9 +139,21 @@ def build_cache(*, builder_payload, root, shard_size, total_positions, chunk_siz
     (root / SHARDS_DIRNAME).mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     manifest = _load_manifest(root)
+    direct = builder_payload['identity'].get('identity_contract') == 'direct-row-v1'
+    if manifest is not None:
+        for name in identity_fields(builder_payload['identity']):
+            if manifest.get(name) != builder_payload['identity'][name]:
+                raise ValueError(f'cache resume identity differs: {name}')
     if not resume:
         _reset_cache(root, shard_size, total_positions, log)
         manifest = None
+    if manifest is not None and direct:
+        # Never recreate a declared completed file as a fresh zero-filled shard.
+        # Its old segment markers would otherwise make those zeros look written.
+        for entry in manifest.get('shards', []):
+            path = root / SHARDS_DIRNAME / str(entry['file'])
+            if not path.is_file():
+                raise ValueError(f'direct cache resume evidence differs: shard file is missing: {path}')
     create_shard_files(root, shard_size, total_positions)
     adopted = None
     if adopt_written:
@@ -153,10 +176,14 @@ def build_cache(*, builder_payload, root, shard_size, total_positions, chunk_siz
             problems.append(f'shard {index} file is missing')
         elif len(marked) < len(expected.get(index, {})):
             problems.append(f'shard {index} has not every segment marked as written')
-        elif sha256_file(path) != str(entry['sha256']):
+        elif not direct and sha256_file(path) != str(entry['sha256']):
             problems.append(f'shard {index} does not match its recorded hash')
         else:
+            if direct:
+                describe_shard(root, index, first, rows, direct=True)
             done[index] = entry
+    if problems and direct:
+        raise ValueError('direct cache resume evidence differs: ' + '; '.join(problems))
     if problems:
         log(f'=== DISCARDED {len(problems)} recorded shard(s): ' + '; '.join(problems[:5])
             + (' ...' if len(problems) > 5 else ''))
@@ -167,7 +194,7 @@ def build_cache(*, builder_payload, root, shard_size, total_positions, chunk_siz
         if all(segment_key(index, first) in markers and
                int(markers[segment_key(index, first)]['rows']) == int(rows)
                for first, rows in expected[index].items()):
-            done[index] = describe_shard(root, index, *bounds[index])
+            done[index] = describe_shard(root, index, *bounds[index], direct=direct)
             recovered.append(index)
     if recovered:
         log(f'=== RECOVERED {len(recovered)} shard(s) from their segment markers: '
@@ -194,8 +221,16 @@ def build_cache(*, builder_payload, root, shard_size, total_positions, chunk_siz
         write_manifest(root, payload)
         return payload
 
-    publish(False)
     pending = [task for task in tasks if segment_key(task[0], task[1]) not in markers]
+    if (manifest is not None and manifest.get('complete') and not pending
+            and len(done) == len(bounds)
+            and manifest.get('total_positions') == int(total_positions)
+            and manifest.get('shard_size') == int(shard_size)):
+        # Reusing a completed product is read-only: preserve its completion flag,
+        # timestamps and build provenance, and never start PH workers again.
+        log(f'=== CACHE BUILD NOTHING TO DO {_now()} shards={len(done)} reuse=read-only')
+        return manifest
+    publish(False)
     pending_rows = sum(int(task[2]) for task in pending)
     log(f'=== CACHE BUILD START {_now()} root={root} positions={total_positions} '
         f'shards={len(bounds)} chunk={chunk_size} workers={workers} '
@@ -207,7 +242,7 @@ def build_cache(*, builder_payload, root, shard_size, total_positions, chunk_siz
         log(f'=== CACHE BUILD NOTHING TO DO {_now()} shards={len(done)}')
         return final
 
-    clock = {'rows': 0, 'segments': 0, 'shards': 0, 'last_log': time.monotonic()}
+    clock = {'rows': 0, 'segments': 0, 'shards': 0, 'last_log': time.monotonic(), 'last_rows': 0}
     failures, lost = {}, []
 
     def on_segment(record):
@@ -235,6 +270,8 @@ def build_cache(*, builder_payload, root, shard_size, total_positions, chunk_siz
                 outstanding = {segment_key(task[0], task[1]): task for task in pending}
                 pending, last_progress = [], time.monotonic()
             time.sleep(max(0.2, float(poll_seconds)))
+            if direct and (failures or lost):
+                raise RuntimeError(f'direct cache worker failed; preserving build evidence: {failures or lost}')
             markers = read_segment_markers(root)
             fresh = [key for key in outstanding if key in markers]
             for key in fresh:
@@ -249,7 +286,7 @@ def build_cache(*, builder_payload, root, shard_size, total_positions, chunk_siz
                 if all(segment_key(index, first) in markers and
                        int(markers[segment_key(index, first)]['rows']) == int(rows)
                        for first, rows in expected[index].items()):
-                    done[index] = describe_shard(root, index, *bounds[index])
+                    done[index] = describe_shard(root, index, *bounds[index], direct=direct)
                     clock['shards'] += 1
                     publish(False)
             now = time.monotonic()
@@ -258,11 +295,12 @@ def build_cache(*, builder_payload, root, shard_size, total_positions, chunk_siz
                 log(f'--- {_now()} rows={clock["rows"]}/{pending_rows} '
                     f'({100.0 * clock["rows"] / max(1, pending_rows):.2f}%) '
                     f'segments={clock["segments"]}/{len(outstanding) + clock["segments"]} '
-                    f'shards_done={clock["shards"]} rate={clock["rows"] / window:.1f}/s '
+                    f'shards_done={clock["shards"]} rate={(clock["rows"] - clock["last_rows"]) / window:.1f}/s '
                     f'outstanding={len(outstanding)} requeues={requeues} '
                     f'load1={os.getloadavg()[0]:.1f} rss={(_resident_bytes() or 0) / 2**30:.2f}GiB '
                     f'child_max_rss={_child_max_rss_bytes() / 2**30:.2f}GiB')
                 clock['last_log'] = now
+                clock['last_rows'] = clock['rows']
             if not outstanding:
                 break
             if now - last_progress > float(stall_seconds):
@@ -349,7 +387,10 @@ def main():
             sample_index_split=args.sample_index_split,
             sample_index_artifact_sha256=probe.split_sha256,
             cohort_manifest_hash=probe.source.cohort['manifest_hash'],
-            dual_static_manifest_hash=probe.source.static_cache.manifest_hash)
+            dual_static_manifest_hash=probe.source.static_cache.manifest_hash,
+            direct_source=(direct_source_identity(probe.source) if probe.direct_contract else None))
+        if probe.direct_contract:
+            require_direct_source_rows(args.output, probe.source, publish=True)
         print(f'=== IDENTITY {json.dumps(payload["identity"], sort_keys=True)}')
     finally:
         probe.close()

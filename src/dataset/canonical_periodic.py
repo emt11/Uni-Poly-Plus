@@ -161,16 +161,13 @@ def find_atom_graph_mapping(source, target):
     candidates = target.GetSubstructMatches(
         source, uniquify=False, useChirality=True, maxMatches=max_matches
     )
-    valid = [
-        tuple(int(value) for value in match)
-        for match in candidates
-        if _validate_full_atom_mapping(source, target, match)
-    ]
-    if not valid:
-        raise RuBuildUnsupported(
-            "atom mapping failed: no validated graph isomorphism"
-        )
-    return torch.tensor(min(valid), dtype=torch.long)
+    # The first valid candidate in sorted order is exactly min(valid).
+    # Preserve RDKit's candidate bounds, chirality and full validation while
+    # avoiding a complete atom/bond scan for every symmetric automorphism.
+    for match in sorted(candidates):
+        if _validate_full_atom_mapping(source, target, match):
+            return torch.tensor(tuple(int(value) for value in match), dtype=torch.long)
+    raise RuBuildUnsupported("atom mapping failed: no validated graph isomorphism")
 
 
 def _base_atom_order(molecule):

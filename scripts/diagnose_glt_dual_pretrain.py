@@ -38,7 +38,7 @@ from src.training.glt_dual_runtime import write_json, open_source, OrderedSample
 MODES = ("concat", "kfuse")
 STEPS = (2000, 3000, 5000)
 RECORDS, BATCH = 16, 8
-COMPONENTS = ("chem", "length", "angle", "fingerprint")
+COMPONENTS = ("chem", "length", "angle", "third")
 
 
 def _device(spec: str) -> torch.device:
@@ -156,9 +156,9 @@ def component_gradients(model, out, weights, world, counts, params):
     """Component gradients over the FULL 3D encoder parameter list."""
 
     tensors = out["diagnostics"]["component_tensors"]
-    # chem -> weight[0]; length AND angle -> the geometry weight[1]; fp -> weight[2].
+    # chem -> weight[0]; length AND angle -> the geometry weight[1]; optional third task -> weight[2].
     component_weight = {"chem": weights[0], "length": weights[1],
-                        "angle": weights[1], "fingerprint": weights[2]}
+                        "angle": weights[1], "third": weights[2]}
     gradients, norms = {}, {}
     for index, name in enumerate(COMPONENTS):
         grad = torch.autograd.grad(tensors[name], params,

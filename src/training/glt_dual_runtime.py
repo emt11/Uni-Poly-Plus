@@ -44,6 +44,32 @@ def ordered_text_hash(values):
     return digest.hexdigest()
 
 
+def apply_geometry_quality(source, root):
+    """Attach read-only quality metadata; no coordinate or label mutation."""
+    if not root:return source
+    root=Path(root)
+    summary=json.loads((root/'summary.json').read_text())
+    if summary.get('status')!='PASS' or summary.get('schema')!='glt-quality-v1':raise ValueError('quality sidecar incomplete')
+    if source.kind=='pi1m':
+        flags=np.load(root/'pi1m_eligible.npy',mmap_mode='r',allow_pickle=False)
+        keys=np.load(root/'pi1m_keys.npy',mmap_mode='r',allow_pickle=False)
+        source.geometry_quality=[bool(flags[r['source_index']]==1) for r in source.entries]
+        for r in source.entries:
+            i=r['source_index']
+            if r.get('pretrain_role')=='excluded':
+                if flags[i]!=-1:raise ValueError('excluded row unexpectedly in quality view')
+                continue
+            if flags[i] not in (0,1) or bytes(keys[i])!=bytes.fromhex(r['sample_key']):raise ValueError('quality/source row mismatch')
+    else:
+        table=json.loads((root/'downstream_quality.json').read_text())
+        source.geometry_quality=[]
+        for r in source.entries:
+            q=table[r['sample_key']]
+            if q['normalized_smiles']!=r['normalized_smiles']:raise ValueError('quality/downstream identity mismatch')
+            source.geometry_quality.append(q['quality_eligible'])
+    return source
+
+
 def load_sample_index_artifact(path, split):
     """Load and verify a read-only source-index subset contract."""
 
@@ -55,6 +81,63 @@ def load_sample_index_artifact(path, split):
     if not artifact_path.is_file():
         raise FileNotFoundError(f'sample index artifact is missing: {artifact_path}')
     payload = json.loads(artifact_path.read_text(encoding='utf-8'))
+    if payload.get('schema')=='glt-quality-index-v1':
+        original=load_sample_index_artifact(payload['original_index'],split)
+        if split=='train':
+            indices=np.load(artifact_path.with_name('train_indices.npy'),allow_pickle=False)
+            if indices.dtype!=np.int64 or indices.ndim!=1 or not len(indices) or np.any(np.diff(indices)<=0) or not np.isin(indices,original['indices']).all():raise ValueError('quality training indices invalid')
+            original['indices']=indices
+            original['payload']=dict(original['payload'],pretrain_train_count=len(indices))
+        return original
+    # The r4 direct source is checked by row identity and semantics.  Its
+    # companion summary intentionally has no source-file digest: the immutable
+    # JSONL rows are verified directly by the publisher/audit and the reader.
+    if payload.get('schema') == 'mcl-ph-next-direct-index-v1':
+        if split not in ('train', 'validation', 'fixed_validation'):
+            raise ValueError(f'unsupported direct sample index split: {split}')
+        names = {'train': 'train_source_indices',
+                 'validation': 'validation_source_indices',
+                 'fixed_validation': 'fixed_validation_source_indices'}
+        npz_path = artifact_path.with_name('pretrain_indices.npz')
+        if not npz_path.is_file():
+            raise FileNotFoundError(f'direct sample index npz is missing: {npz_path}')
+        with np.load(npz_path, allow_pickle=False) as archive:
+            subsets = {}
+            for role, name in names.items():
+                if name not in archive.files:
+                    raise ValueError(f'direct sample index npz is missing {name}')
+                values = np.asarray(archive[name])
+                if (values.dtype != np.int64 or values.ndim != 1 or not len(values)
+                        or values[0] < 0 or values[-1] >= int(payload['pi1m_rows'])
+                        or np.any(values[:-1] >= values[1:])):
+                    raise ValueError(f'direct {role} indices must be sorted int64 rows in range')
+                count = payload.get(f'pretrain_{role}_count')
+                if count is not None and int(count) != len(values):
+                    raise ValueError(f'direct {role} source index count mismatch')
+                subsets[role] = values.copy()
+            if np.intersect1d(subsets['train'], subsets['validation']).size:
+                raise ValueError('direct train/validation indices overlap')
+            if not np.isin(subsets['fixed_validation'], subsets['validation']).all():
+                raise ValueError('direct fixed validation is not a validation subset')
+            if ('excluded_overlap' in payload and
+                    len(subsets['train']) + len(subsets['validation']) !=
+                    int(payload['pi1m_rows']) - int(payload['excluded_overlap'])):
+                raise ValueError('direct source index eligible coverage differs')
+            indices = subsets[split]
+        expected_count = payload.get(f'pretrain_{split}_count')
+        if expected_count is None:
+            expected_count = payload.get(f'{split}_count')
+        if expected_count is not None and int(expected_count) != int(indices.size):
+            raise ValueError(f'direct {split} source index count mismatch')
+        return {
+            'path': str(artifact_path),
+            # No artifact digest is used for this contract.  Consumers verify
+            # the selected integer rows against the immutable source rows.
+            'sha256': None,
+            'schema_version': payload['schema'],
+            'split': str(split), 'indices': indices, 'payload': payload,
+            'npz_path': str(npz_path), 'direct_contract': True,
+        }
     if payload.get('schema_version') != 'glt_dual_mcl_pretrain_split-v1':
         raise ValueError('unsupported sample index artifact schema')
     split = str(split or 'train')
@@ -92,7 +175,7 @@ def load_sample_index_artifact(path, split):
     }
 
 
-def apply_common_initialization(model, path, *, exclude=()):
+def apply_common_initialization(model, path, *, exclude=(), direct=False):
     """Copy a frozen common-state initialization into one task variant.
 
     ``exclude`` names parameters this task variant replaces with a different
@@ -109,6 +192,18 @@ def apply_common_initialization(model, path, *, exclude=()):
         raise ValueError('common initialization artifact has no common_state_dict')
     skipped = set(exclude)
     current = model.state_dict()
+    # Old common artifacts may contain the removed task head. Reuse only
+    # common encoder/atom/geometry parameters for a fresh initialization.
+    skipped.update(name for name in state if name.startswith('fp_head.'))
+    if direct:
+        selected = set(state) - skipped
+        if selected != set(current) - skipped:
+            raise ValueError('direct common initialization tensor coverage differs')
+        for name in selected:
+            value = state[name]
+            if (value.dtype != current[name].dtype or not torch.isfinite(value).all()
+                    or value.shape != current[name].shape):
+                raise ValueError(f'direct common initialization tensor is incompatible: {name}')
     missing = [name for name, value in state.items()
                if name not in skipped
                and (name not in current
@@ -120,6 +215,12 @@ def apply_common_initialization(model, path, *, exclude=()):
             if name in skipped:
                 continue
             current[name].copy_(value)
+            if direct and not torch.equal(current[name].detach().cpu(), value.detach().cpu()):
+                raise ValueError(f'direct common initialization tensor copy differs: {name}')
+    if direct:
+        return dict(path=str(artifact_path), identity_contract='actual_tensor_values',
+                    tensor_names=sorted(set(state) - skipped),
+                    fixed_seed_unshared_tensor_names=[], sha256=None)
     return {
         'path': str(artifact_path),
         'sha256': sha256_file(artifact_path),
@@ -166,11 +267,25 @@ class IndexedFrozenDualSource(Dataset):
     def __getitem__(self, index):
         return self.base[int(self.source_indices[int(index)])]
 
+    def source_index_at(self, index):
+        base_index = int(self.source_indices[int(index)])
+        if hasattr(self.base, 'source_index_at'):
+            return int(self.base.source_index_at(base_index))
+        return base_index
+
     def static_for(self, index):
         return self.base.static_for(int(self.source_indices[int(index)]))
 
     def target_for(self, index):
         return self.base.target_for(int(self.source_indices[int(index)]))
+
+    def pretrain_fields_for(self, index, *, include_target):
+        return pretrain_source_fields(
+            self.base, int(self.source_indices[int(index)]), include_target=include_target)
+
+    def validated_pretrain_fields_for(self, index, *, include_target):
+        return pretrain_source_fields(self.base, int(self.source_indices[int(index)]),
+                                      include_target=include_target, include_identity=True)
 
     @property
     def cohort(self):
@@ -200,6 +315,52 @@ class IndexedFrozenDualSource(Dataset):
         self.base.close()
 
 
+def pretrain_source_fields(source, index, *, include_target=False, include_identity=False):
+    """Read one validated direct record; preserve the legacy source path."""
+    if include_identity and hasattr(source, 'validated_pretrain_fields_for'):
+        return source.validated_pretrain_fields_for(index, include_target=include_target)
+    if hasattr(source, 'pretrain_fields_for'):
+        result = source.pretrain_fields_for(index, include_target=include_target)
+    else:
+        topology, trimer, smiles = source[index]
+        result = (topology, trimer, smiles, source.static_for(index),
+                  source.target_for(index) if include_target else None)
+    return (*result, None) if include_identity else result
+
+
+def prepare_source_sample(source, index, **kwargs):
+    """Carry target and validated identity from the same single record read."""
+    from src.dataset.glt_dual_pretrain import prepare_pretrain_sample
+    topology, trimer, smiles, static, target, identity = pretrain_source_fields(
+        source, index, include_target=True, include_identity=True)
+    base = source
+    while hasattr(base, 'base'):
+        base = base.base
+    kind = getattr(base, 'kind', None)
+    source_type = 'direct_' + kind if kind else type(base).__name__
+    result=prepare_pretrain_sample(topology, trimer, smiles, static=static,
+        target=target, identity=identity, source_type=source_type, **kwargs)
+    view=source;local=index
+    while hasattr(view,'base'):
+        if hasattr(view,'source_indices'):local=int(view.source_indices[local])
+        view=view.base
+    if hasattr(view,'r10_qc_weights'):
+        weight=view.r10_qc_weights[local]
+        if (weight>0)!=bool(static['geometry_valid']):raise ValueError('QC weight cannot change original record geometry coverage')
+        result[1]['geometry_quality_weight']=weight
+    return result
+
+
+def pretrain_loader(dataset, *, workers, seed, rank):
+    """Prefetch on CPU without consuming the model's dropout RNG stream."""
+    if int(workers) <= 0:
+        raise ValueError('prefetch requires positive worker count')
+    return torch.utils.data.DataLoader(
+        dataset, batch_size=None, num_workers=int(workers), prefetch_factor=2,
+        persistent_workers=False, pin_memory=False,
+        generator=torch.Generator().manual_seed(int(seed) + int(rank)))
+
+
 class OrderedSampleStream:
     """Recover sampling solely from absolute position; no hidden iterator RNG."""
     def __init__(self, size, seed):
@@ -226,14 +387,14 @@ class RankMicrobatchStream(Dataset):
     """
 
     def __init__(self, source, *, seed, world, rank, microbatch, accumulation,
-                 start_step, max_steps, sigma, ratio, third_task='fp',
+                 start_step, max_steps, sigma, ratio, third_task='none',
                  fgr_mu=0.0, fgr_sigma=1.0, fgr_max_pairs=32,
-                 atom_target='element', env_vocab=None, torsion_mode=None):
+                 atom_target='element', env_vocab=None, torsion_mode=None, torsion_revision=None, opt_mode=None, geometry_mode="finite_internal", nonbonded_revision=None):
         from src.dataset.glt_dual_pretrain import (  # local: avoid import cycles
-            prepare_pretrain_sample, pretrain_collate,
+            pretrain_collate,
         )
 
-        self._prepare = prepare_pretrain_sample
+        self._prepare = prepare_source_sample
         self._collate = pretrain_collate
         self.source = source
         self.stream = OrderedSampleStream(len(source), int(seed))
@@ -253,7 +414,11 @@ class RankMicrobatchStream(Dataset):
         self.fgr_max_pairs = int(fgr_max_pairs)
         self.atom_target = str(atom_target)
         self.env_vocab = env_vocab
+        self.torsion_revision = torsion_revision
         self.torsion_mode = torsion_mode
+        self.opt_mode = opt_mode
+        self.geometry_mode = geometry_mode
+        self.nonbonded_revision=nonbonded_revision
 
     def __len__(self):
         return self.steps * self.accumulation
@@ -269,14 +434,12 @@ class RankMicrobatchStream(Dataset):
             index = self.stream.index_at(position)
             key, _ = self.source.samples[index]
             rows.append(self._prepare(
-                *self.source[index], seed=self.seed, key=key.hex(),
+                self.source, index, seed=self.seed, key=key.hex(),
                 position=position, sigma=self.sigma, ratio=self.ratio,
-                static=self.source.static_for(index),
-                target=(self.source.target_for(index) if self.third_task == 'fp' else None),
-                third_task=self.third_task, fgr_mu=self.fgr_mu,
+                nonbonded_revision=self.nonbonded_revision,third_task=self.third_task, fgr_mu=self.fgr_mu,
                 fgr_sigma=self.fgr_sigma, fgr_max_pairs=self.fgr_max_pairs,
                 atom_target=self.atom_target, env_vocab=self.env_vocab,
-                torsion_mode=self.torsion_mode,
+                torsion_mode=self.torsion_mode, torsion_revision=self.torsion_revision, opt_mode=self.opt_mode, geometry_mode=self.geometry_mode,
             ))
         return self._collate(rows)
 
@@ -293,7 +456,14 @@ def open_source(cohort_root, cache_root, *, task=None, dual_static_root=None,
                 pretrain_target_root=None, selected_indices=None,
                 expected_task_rows=None, expected_split_sha256=None,
                 record_index_path=None, union_manifest_path=None,
-                chunk_cache_capacity=CHUNK_CACHE_CAPACITY):
+                chunk_cache_capacity=CHUNK_CACHE_CAPACITY, split_manifest=None,
+                readonly_readahead=False, verify_key_digest=True, md200_root=None):
+    if (Path(cohort_root) / 'direct_source.json').is_file():
+        from src.dataset.mcl_ph_direct import DirectMCLSource
+        source = DirectMCLSource(cohort_root, task=task,
+                                 selected_indices=selected_indices,
+                                 split_manifest=split_manifest, readahead=readonly_readahead, verify_key_digest=verify_key_digest, md200_root=md200_root)
+        return source, pd.DataFrame(source.entries)
     if selected_indices is None:
         full_cohort = load_dual_cohort(cohort_root, cache_root)
     else:

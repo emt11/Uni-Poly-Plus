@@ -24,7 +24,7 @@ import torch
 from src.dataset.cache_lifecycle import CacheLifecycleError, atomic_json, json_hash, zero_write_snapshot
 from src.dataset.glt_dual import build_dual_sample
 from src.dataset.glt_dual_cache import DualFrozenBundle, load_active_dual_store, load_dual_cohort, ordered_key_hash
-from src.dataset.glt_dual_pretrain import prepare_pretrain_sample, _unpack_fingerprint
+from src.dataset.glt_dual_pretrain import prepare_pretrain_sample
 from src.dataset.glt_dual_static import (
     DualStaticCache, PretrainTargetsCache, build_pretrain_target, load_chunk_payload,
     write_chunk,
@@ -306,19 +306,14 @@ def _check_static_and_runtime(reference, candidate, topology, trimer, row, key_h
     details["float_differences"].extend(floats)
     if target_reference is not None:
         expected = build_pretrain_target(row["normalized_smiles"])
+        target_reference = {"brics_groups": target_reference["brics_groups"]}
+        target_candidate = {"brics_groups": target_candidate["brics_groups"]}
         target_diffs, target_floats = _compare(target_reference, target_candidate, "target")
         details["target_differences"].extend(target_diffs)
         details["target_differences"].extend(target_floats)
         expected_diffs, expected_floats = _compare(target_candidate, expected, "target_expected")
         details["target_differences"].extend(expected_diffs)
         details["target_differences"].extend(expected_floats)
-        unpacked = _unpack_fingerprint(target_candidate["fingerprint_packed"])
-        expected_bits = torch.from_numpy(
-            np.unpackbits(expected["fingerprint_packed"], bitorder="little")[:2048].copy()
-        ).float()
-        bit_diffs, bit_floats = _compare(unpacked, expected_bits, "fingerprint_unpacked")
-        details["target_differences"].extend(bit_diffs)
-        details["target_differences"].extend(bit_floats)
 
     online = build_dual_sample(topology, trimer, row["source_smiles"])
     cached = build_dual_sample(topology, trimer, row["source_smiles"], static=candidate)

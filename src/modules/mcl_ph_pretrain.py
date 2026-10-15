@@ -135,8 +135,12 @@ class MCLPHPretrainer(nn.Module):
     """The new pretraining objective; no fingerprint, no MD200, no third task."""
 
     def __init__(self, fusion_mode='gate', dropout=0.1, cutoffs=(2.0, 3.0, 4.0),
-                 router_dense_updates=500, collect_diagnostics=False):
+                 router_dense_updates=500, collect_diagnostics=False,
+                 local_objective='expert'):
         super().__init__()
+        if local_objective not in ('expert', 'expert_mixed_50'):
+            raise ValueError('local_objective must be expert or expert_mixed_50')
+        self.local_objective = local_objective
         self.encoder = MCLPHEncoder(fusion_mode, dropout, cutoffs, router_dense_updates)
         self.atom_head = nn.Linear(512, ATOM_CLASSES)
         self.local_decoder = LocalGeometryDecoder()
@@ -200,6 +204,8 @@ class MCLPHPretrainer(nn.Module):
             'fused': fused,
             'alpha': encoded['alpha'],
             'router_top_k': encoded['router_top_k'],
+            'router_dense': encoded['router_dense'],
+            'readout_valid': encoded['readout_valid'],
             'router_diagnostics': encoded.get('diagnostics'),
             'gate_diagnostics': encoded.get('gate_diagnostics'),
             'targets': torch.stack([
@@ -234,7 +240,10 @@ class MCLPHPretrainer(nn.Module):
         angle_graph = labels['mcl_angle_graph'].long()
         bonds = data.mcl_bond_index.long()
         per_expert = []
-        for states in encoded['expert_states']:
+        states_to_decode = list(encoded['expert_states'])
+        if self.local_objective == 'expert_mixed_50':
+            states_to_decode.append(encoded['mixed'])
+        for states in states_to_decode:
             terms, weights = [], []
             if int(length_pairs.size(0)):
                 prediction = self.local_decoder.lengths(states, length_pairs)
@@ -257,7 +266,9 @@ class MCLPHPretrainer(nn.Module):
             # three experts are then weighted equally with each other.
             present = torch.stack(weights).sum(0).clamp_min(1.0)
             per_expert.append(torch.stack(terms).sum(0) / present)
-        local_value = torch.stack(per_expert).mean(0)
+        local_value = torch.stack(per_expert[:3]).mean(0)
+        if self.local_objective == 'expert_mixed_50':
+            local_value = 0.5 * local_value + 0.5 * per_expert[3]
         covered = torch.zeros(graphs, dtype=torch.bool, device=device)
         if int(length_pairs.size(0)):
             covered[length_graph] = True

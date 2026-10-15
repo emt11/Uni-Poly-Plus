@@ -89,6 +89,7 @@ class OriginalMIPSAttentiveFusion(nn.Module):
         node_feature: torch.Tensor,
         knowledge: Mapping[str, torch.Tensor],
         batch: torch.Tensor,
+        availability: Mapping[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if node_feature.ndim != 2 or node_feature.size(1) != self.d_model:
             raise ValueError(f"node_feature must be [N,{self.d_model}]")
@@ -110,7 +111,21 @@ class OriginalMIPSAttentiveFusion(nn.Module):
         v_vectors = self._vectors(normalized, batch, self.v_proj)
         q = self.Wq(node_feature) / (self.d_model ** 0.5)
         logits = torch.bmm(q.unsqueeze(1), k_vectors.transpose(1, 2))
+        if availability is not None:
+            if tuple(availability) != self.knodes:
+                raise ValueError('availability modality order differs')
+            active = torch.stack([
+                availability[name].to(device=node_feature.device, dtype=torch.bool)[batch]
+                for name in self.knodes], dim=-1).unsqueeze(1)
+            any_active = active.any(-1, keepdim=True)
+            logits = logits.masked_fill(~active, -torch.inf)
+            # All-unavailable graphs retain exactly the atom residual.
+            logits = torch.where(any_active, logits, torch.zeros_like(logits))
         weights = torch.softmax(logits, dim=-1)
+        if availability is not None:
+            weights = weights * active.to(weights.dtype)
+            v_vectors = torch.where(active.transpose(1, 2), v_vectors,
+                                    torch.zeros_like(v_vectors))
         out = torch.bmm(weights, v_vectors).squeeze(1)
         self.fusion_call_count += 1
         self.last_attention_logits = logits.detach()

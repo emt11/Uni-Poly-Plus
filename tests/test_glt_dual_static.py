@@ -3,13 +3,13 @@ import copy
 import numpy as np
 import torch
 
-from test_complete_trimer_glt import _toy_pair
+from tests.test_dual_glt import _toy_pair
 from src.dataset.canonical_periodic import build_canonical_periodic_topology
 from src.dataset.glt_dual import build_dual_sample
 from src.dataset.glt_dual_pretrain import prepare_pretrain_sample
 from src.dataset.glt_dual_static import (
-    _projected_position_index, build_dual_static, build_pretrain_target,
-    materialize_dual_geometry,
+    _projected_position_index, _pack_rows, load_chunk_payload,
+    build_dual_static, build_pretrain_target, materialize_dual_geometry,
 )
 
 
@@ -52,6 +52,9 @@ def test_cached_pretrain_target_replays_fixed_noise():
     _, trimer = _toy_pair(smiles)
     static = build_dual_static(topology, trimer, smiles)
     target = build_pretrain_target(smiles)
+    assert set(target) == {'brics_groups'}
+    # An obsolete field in a saved record cannot become a current label.
+    target['fingerprint_packed'] = object()
     dynamic, labels = prepare_pretrain_sample(
         topology, trimer, smiles, seed=41, key='key', position=9,
         static=static, target=target,
@@ -71,3 +74,17 @@ def test_cached_pretrain_target_replays_fixed_noise():
             torch.testing.assert_close(left, right)
         else:
             assert left == right
+
+
+def test_brics_chunk_does_not_read_legacy_fp_array(tmp_path):
+    arrays=_pack_rows([build_pretrain_target('*COC*')],target=True)
+    assert 'fingerprint_packed' not in arrays
+    item={'count':1,'arrays':{}}
+    for name,value in arrays.items():
+        np.save(tmp_path/(name+'.npy'),value)
+        item['arrays'][name]={'shape':list(value.shape),'dtype':str(value.dtype)}
+    # Old manifests may mention an FP file. It is no longer a dependency.
+    item['arrays']['fingerprint_packed']={'shape':[1,256],'dtype':'uint8'}
+    loaded=load_chunk_payload(tmp_path,item,targets=True)
+    assert 'fingerprint_packed' not in loaded
+    assert np.array_equal(loaded['brics_atom_index'],arrays['brics_atom_index'])

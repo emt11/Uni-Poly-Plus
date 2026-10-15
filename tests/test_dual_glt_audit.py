@@ -10,7 +10,7 @@ import pytest
 import torch
 from rdkit import Chem
 
-from test_complete_trimer_glt import _toy_pair
+from tests.test_dual_glt import _toy_pair
 from src.dataset.graph_data import build_periodic_multimer_mol, build_star_linking_mol
 from src.dataset.periodic_line_glt_complete import build_complete_trimer_glt_sample
 from src.dataset.glt_dual import FrozenDualLayerSource, build_dual_sample, dual_glt_collate
@@ -18,7 +18,7 @@ from src.dataset.canonical_periodic import (
     build_canonical_periodic_topology, resolve_normalized_identity,
 )
 from src.dataset.glt_dual_pretrain import (
-    chemical_targets, motif_mask, prepare_pretrain_sample, sample_generator,
+    chemical_groups, motif_mask, prepare_pretrain_sample, sample_generator,
 )
 from src.modules.glt_dual import build_dual_glt_model
 from scripts import validate_dual_glt as audit
@@ -239,10 +239,9 @@ def test_normalized_identity_keeps_paths_brics_noise_and_prediction_inputs_equal
         torch.testing.assert_close(getattr(raw_item, name), getattr(alternate_item, name))
     assert raw_item.geometry_valid == normalized_item.geometry_valid == alternate_item.geometry_valid
 
-    groups_raw, fingerprint_raw = chemical_targets(raw)
-    groups_norm, fingerprint_norm = chemical_targets(normalized)
+    groups_raw = chemical_groups(raw)
+    groups_norm = chemical_groups(normalized)
     assert groups_raw == groups_norm
-    torch.testing.assert_close(fingerprint_raw, fingerprint_norm)
     mask_raw, fallback_raw = motif_mask(
         top, groups_raw, sample_generator(42, 'identity', 7)
     )

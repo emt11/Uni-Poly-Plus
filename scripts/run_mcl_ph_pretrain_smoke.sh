@@ -39,7 +39,7 @@ for arm in $ARMS; do
       --config "$CONFIG" \
       --cohort-root "$COHORT" --cache-root "$CACHE" \
       --dual-static-root "$STATIC" --pretrain-target-root "$TARGETS" \
-      --third-task fp --diagnostics --diagnostic-save-steps "$UPDATES" \
+      --third-task none --diagnostics --diagnostic-save-steps "$UPDATES" \
       --stop-after-step "$UPDATES" --prep-workers "$PREP_WORKERS" \
       --output "$OUTPUT/$arm" >> "$LOG" 2>&1
   else

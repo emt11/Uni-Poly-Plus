@@ -11,7 +11,7 @@ import copy
 import pytest
 import torch
 
-from test_complete_trimer_glt import _toy_pair
+from tests.test_dual_glt import _toy_pair
 from src.dataset.canonical_periodic import build_canonical_periodic_topology
 from src.dataset.glt_dual_pretrain import prepare_pretrain_sample, pretrain_collate
 from src.modules.glt_dual_pretrain import DualPretrainer, global_objective
@@ -94,11 +94,10 @@ def test_component_tensors_carry_gradients():
     model = _model('concat', True)
     result = model(data, labels)
     tensors = result['diagnostics']['component_tensors']
-    for name in ('length', 'angle', 'fingerprint'):
+    for name in ('length', 'angle'):
         assert tensors[name].requires_grad, name
     for name, parameter in (('length', 'length_head.2.weight'),
-                            ('angle', 'angle_head.2.weight'),
-                            ('fingerprint', 'fp_head.3.weight')):
+                            ('angle', 'angle_head.2.weight')):
         grad = torch.autograd.grad(tensors[name], model.get_parameter(parameter),
                                    retain_graph=True)[0]
         assert grad is not None and torch.isfinite(grad).all(), name
@@ -115,7 +114,8 @@ def test_module_grad_norms_aligns_missing_gradients_to_zero():
         parameter.grad = None
     norms = _module_grad_norms(model)
     assert set(norms) >= {'o8_2d_encoder', 'glt_3d_encoder', 'length_head',
-                          'angle_head', 'fp_head', 'atom_head', 'fusion'}
+                          'angle_head', 'atom_head', 'fusion'}
+    assert 'fp_head' not in norms
     assert norms['angle_head'] == 0.0
     assert norms['glt_3d_encoder'] > 0.0
     assert all(torch.isfinite(torch.tensor(value)) for value in norms.values())
