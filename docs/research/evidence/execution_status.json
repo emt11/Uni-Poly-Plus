@@ -1,0 +1,401 @@
+{
+  "legacy_extras": [
+    {
+      "source_local": "results/glt_optimization_20261011/r10/A1/consumption.json",
+      "record": {
+        "pt_starts": 2,
+        "pt_attempted_updates": 5093,
+        "pt_completed_updates": 5092,
+        "pt_validation_completed": 3,
+        "pt_validation_presentations": 3072,
+        "ft_starts": 0,
+        "ft_completed": 0,
+        "ft_epochs": 0,
+        "ft_attempted_updates": 0,
+        "ft_completed_updates": 0,
+        "formal_starts": 0,
+        "formal_completed": 0,
+        "cpu_test_starts": 0,
+        "geometry_derivations": 0,
+        "pt_train_presentations": 5132736
+      }
+    },
+    {
+      "source_local": "results/glt_optimization_20261011/r10/A1/failure.json",
+      "record": {
+        "status": "需返修",
+        "error": "RuntimeError('controller interrupted by signal 15')",
+        "consumption": {
+          "pt_starts": 2,
+          "pt_attempted_updates": 5093,
+          "pt_completed_updates": 5092,
+          "pt_validation_completed": 3,
+          "pt_validation_presentations": 3072,
+          "ft_starts": 0,
+          "ft_completed": 0,
+          "ft_epochs": 0,
+          "ft_attempted_updates": 0,
+          "ft_completed_updates": 0,
+          "formal_starts": 0,
+          "formal_completed": 0,
+          "cpu_test_starts": 0,
+          "geometry_derivations": 0,
+          "pt_train_presentations": 5132736
+        }
+      }
+    },
+    {
+      "source_local": "results/glt_optimization_20261011/r10/E1/consumption.json",
+      "record": {
+        "cpu_test_starts": 1,
+        "gpu_comparison_starts": 0,
+        "pt_starts": 0,
+        "ft_starts": 0,
+        "optimizer_updates": 0,
+        "formal_predictions": 0,
+        "worker_starts": 0
+      }
+    },
+    {
+      "source_local": "results/glt_optimization_20261011/r10/E1/gpu_comparison.json",
+      "record": {
+        "status": "PASS",
+        "consumption": {
+          "pairs_attempted": 36,
+          "pairs_completed": 36,
+          "fusion_forward_backward_attempted": 72,
+          "fusion_forward_backward_completed": 72,
+          "optimizer_updates": 0,
+          "worker_starts": 0
+        },
+        "peak_allocated_bytes": 42704384,
+        "dtype": "fp32",
+        "atol": 1e-05,
+        "rtol": 0.0001,
+        "gpu": "physical3/logical0"
+      }
+    },
+    {
+      "source_local": "results/sota_ft_20261005/budget.json",
+      "record": {
+        "recorded_units": 10,
+        "completed_epochs": 566,
+        "attempted_updates": 6226,
+        "completed_updates": 6226
+      }
+    }
+  ],
+  "captured_at": "2026-10-17T23:14:43.002730+08:00",
+  "kind": "one-time local status snapshot, not live remote monitoring",
+  "records": [
+    {
+      "source_local": "results/ua2d_fusion_20261017/g1_fp_gate/completion.json",
+      "exists": true,
+      "record": {
+        "status": "需返修",
+        "science": "STOPPED",
+        "phase": "finetune",
+        "error": "RuntimeError('GPU concurrency exceeded')",
+        "consumption": {
+          "ft_starts": 8,
+          "ft_completed": 0,
+          "epochs": 0,
+          "attempted": 24,
+          "completed": 21,
+          "formal_starts": 0,
+          "formal_completed": 0,
+          "gate_arrays": 0,
+          "reference_units": 0,
+          "reference_arrays": 0,
+          "fp_generated": 586,
+          "ft_graphs": 0,
+          "test_graphs": 0,
+          "final_cpu_starts": 0,
+          "pt": 0,
+          "teacher": 0,
+          "krr_fit": 0,
+          "krr_forward": 0,
+          "conformers": 0,
+          "extra_seed": 0,
+          "workers": 0
+        },
+        "test": "NOT_RUN",
+        "independent_review": "NOT_PERFORMED"
+      }
+    },
+    {
+      "source_local": "results/ua2d_fusion_20261017/g1_fp_gate_recovery1/completion.json",
+      "exists": true,
+      "record": {
+        "status": "需返修",
+        "science": "STOPPED",
+        "phase": "finetune",
+        "error": "RuntimeError('GPU concurrency exceeded')",
+        "consumption": {
+          "old_known": {
+            "ft_starts": 8,
+            "attempted": 24,
+            "completed": 21,
+            "fp_generated": 586,
+            "ft_graphs": null,
+            "actual_updates": null
+          },
+          "old_budget_occupancy": {
+            "ft_starts": 8,
+            "attempted": 32,
+            "completed": 32,
+            "fp_generated": 586,
+            "ft_graphs": 2818
+          },
+          "old_actual_unknown": [
+            "ft_graphs",
+            "exact_optimizer_updates",
+            "partial_epochs"
+          ],
+          "new": {
+            "ft_starts": 8,
+            "ft_completed": 0,
+            "epochs": 0,
+            "attempted": 26,
+            "completed": 26,
+            "formal_starts": 0,
+            "formal_completed": 0,
+            "gate_arrays": 0,
+            "reference_units": 0,
+            "reference_arrays": 0,
+            "fp_generated": 0,
+            "ft_graphs": 768,
+            "test_graphs": 0,
+            "final_cpu_starts": 0,
+            "pt": 0,
+            "teacher": 0,
+            "krr_fit": 0,
+            "krr_forward": 0,
+            "conformers": 0,
+            "extra_seed": 0,
+            "workers": 0
+          },
+          "new_incomplete_records": [],
+          "cumulative_budget_occupancy": {
+            "ft_starts": 16,
+            "ft_completed": 0,
+            "epochs": 0,
+            "attempted": 58,
+            "completed": 58,
+            "formal_starts": 0,
+            "formal_completed": 0,
+            "gate_arrays": 0,
+            "reference_units": 0,
+            "reference_arrays": 0,
+            "fp_generated": 586,
+            "ft_graphs": 3586,
+            "test_graphs": 0,
+            "final_cpu_starts": 0,
+            "pt": 0,
+            "teacher": 0,
+            "krr_fit": 0,
+            "krr_forward": 0,
+            "conformers": 0,
+            "extra_seed": 0,
+            "workers": 0
+          }
+        },
+        "test": "NOT_RUN",
+        "independent_review": "NOT_PERFORMED"
+      }
+    },
+    {
+      "source_local": "results/ua2d_fusion_20261017/g1_fp_gate_recovery2/completion.json",
+      "exists": true,
+      "record": {
+        "status": "需返修",
+        "science": "STOPPED",
+        "phase": "finetune",
+        "error": "ValueError('not enough values to unpack (expected 2, got 1)')",
+        "consumption": {
+          "old_known": {
+            "ft_starts": 16,
+            "attempted": 50,
+            "completed": 47,
+            "fp_generated": 586,
+            "ft_graphs": null,
+            "actual_updates": null
+          },
+          "old_budget_occupancy": {
+            "ft_starts": 16,
+            "attempted": 58,
+            "completed": 58,
+            "fp_generated": 586,
+            "ft_graphs": 3586
+          },
+          "old_actual_unknown": [
+            "ft_graphs",
+            "exact_optimizer_updates",
+            "partial_epochs"
+          ],
+          "new": {
+            "ft_starts": 27,
+            "ft_completed": 19,
+            "epochs": 1573,
+            "attempted": 30790,
+            "completed": 30790,
+            "formal_starts": 0,
+            "formal_completed": 0,
+            "gate_arrays": 0,
+            "reference_units": 0,
+            "reference_arrays": 0,
+            "fp_generated": 2828,
+            "ft_graphs": 20549,
+            "test_graphs": 0,
+            "final_cpu_starts": 0,
+            "pt": 0,
+            "teacher": 0,
+            "krr_fit": 0,
+            "krr_forward": 0,
+            "conformers": 0,
+            "extra_seed": 0,
+            "workers": 0
+          },
+          "new_incomplete_records": [],
+          "cumulative_budget_occupancy": {
+            "ft_starts": 43,
+            "ft_completed": 19,
+            "epochs": 1573,
+            "attempted": 30848,
+            "completed": 30848,
+            "formal_starts": 0,
+            "formal_completed": 0,
+            "gate_arrays": 0,
+            "reference_units": 0,
+            "reference_arrays": 0,
+            "fp_generated": 3414,
+            "ft_graphs": 24135,
+            "test_graphs": 0,
+            "final_cpu_starts": 0,
+            "pt": 0,
+            "teacher": 0,
+            "krr_fit": 0,
+            "krr_forward": 0,
+            "conformers": 0,
+            "extra_seed": 0,
+            "workers": 0
+          }
+        },
+        "test": "NOT_RUN",
+        "independent_review": "NOT_PERFORMED"
+      }
+    },
+    {
+      "source_local": "results/ua2d_fusion_20261017/p2_align20k/failure.json",
+      "exists": true,
+      "record": {
+        "error": "RuntimeError(\"Malformed nvidia-smi CSV; raw='Unable to determine the device handle for GPU2: 0000:98:00.0: Unknown Error\\\\n0, GPU-d57d4b9e-0c37-7854-f08b-7bf43759717c\\\\n1, GPU-c5a42592-e8f2-78f6-c1f9-e3da2a0ea4ec\\\\n3, GPU-665c4372-2ad2-31f1-7b34-8ec763ef6b38\\\\n'\")",
+        "consumption": {
+          "starts": 0,
+          "attempted_updates": 0,
+          "completed_updates": 0
+        },
+        "ft_launched": false
+      }
+    },
+    {
+      "source_local": "logs/ua2d_fusion_20261017/p2_align20k_r7/execution.json",
+      "exists": true,
+      "record": {
+        "status": "RUNNING",
+        "start": "2026-10-17T11:48:44.333206+00:00",
+        "end": null,
+        "exit": null,
+        "pt_starts": 1,
+        "ft_launched": false
+      }
+    },
+    {
+      "source_local": "results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/consumption.json",
+      "exists": true,
+      "record": {
+        "status": "RUNNING",
+        "attempted_updates": 5070,
+        "completed_updates": 5069,
+        "starts": 1
+      }
+    },
+    {
+      "source_local": "results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/runtime.json",
+      "exists": true,
+      "record": {
+        "status": "RUNNING",
+        "world_size": 2,
+        "config": {
+          "fusion_mode": "token",
+          "use_md200": false,
+          "atom_ce_input": "fused",
+          "align_enabled": true,
+          "local_enabled": false,
+          "third_task": "none",
+          "fusion_revision": "glt_fusion_r1",
+          "opt_mode": "GLT_FUSION_R1",
+          "geometry_head_norm": true,
+          "arm": "P_ALIGN",
+          "seed": 42,
+          "microbatch": 84,
+          "global_batch": 1008,
+          "expected_world_size": 2,
+          "max_optimizer_steps": 20000,
+          "save_every": 5000,
+          "lr": 0.0002,
+          "warmup_steps": 2000,
+          "schedule_total_steps": 20000,
+          "end_lr": 1e-09,
+          "weight_decay": 0,
+          "amp_dtype": "bf16",
+          "atom_mask_ratio": 0.3,
+          "noise_sigma": 0.03,
+          "loss_weights": [
+            1.0,
+            1.0,
+            0.0
+          ],
+          "sample_index_artifact": "/root/workspace/Uni-Poly-Plus-master/results/mcl_ph_next_20260929/p0/direct_indices_v1/summary.json",
+          "sample_index_split": "train",
+          "initial_state": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/initialization/P_ALIGN_step0.pt",
+          "md200_root": null,
+          "plan": "UA2D-FUSION-20261017-01",
+          "revision": "r7",
+          "geometry_revision": "glt_periodic_seam_r1",
+          "geometry_mode": "finite_incident",
+          "angle_value_enabled": true,
+          "readout": "incident",
+          "cycle_root": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7",
+          "torsion_mode": "off",
+          "torsion_modules": false,
+          "geometry_target": "seam",
+          "element_mask": "all_copies_unknown",
+          "input_schema": "periodic_local_observations_v1",
+          "cycle": "P2",
+          "align_revision": "glt_align_2d_u1",
+          "align_init_seed": 314161,
+          "align_temperature": 0.1,
+          "align_weight": 0.1,
+          "align_warmup_steps": 1000,
+          "fusion_gate": "none",
+          "quality_root": null,
+          "ua2d_pt_revision": "ua2d_align20k_r7"
+        }
+      }
+    },
+    {
+      "source_local": "results/ua2d_fusion_20261017/g2_fp_gate_pt20k_r7/completion.json",
+      "exists": false
+    },
+    {
+      "source_local": "results/ua2d_fusion_20261017/g2_fp_gate_pt20k_r7/consumption.json",
+      "exists": false
+    }
+  ],
+  "minimal_fix": {
+    "file": "src/training/ua2d_fp_gate.py",
+    "change": "Pass expected_step=20000 to restore_pure_2d for the new parent.",
+    "verification": "Static call-path finding; no new test/model call and no PT restart. Final CPU suite remains deferred until G2 completion."
+  }
+}

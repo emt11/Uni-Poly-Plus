@@ -276,7 +276,7 @@ class DualPretrainer(nn.Module):
         self.geometry_norm = (nn.LayerNorm(512, elementwise_affine=False)
                               if self.geometry_head_norm else None)
 
-    def forward(self, data, labels, *, collect_diagnostics=None):
+    def forward(self, data, labels, *, collect_diagnostics=None, return_graph_feature=False):
         diagnostics_enabled = (self.collect_diagnostics
                                if collect_diagnostics is None else bool(collect_diagnostics))
         # Do not let a sampled update's detached observations leak into an
@@ -491,6 +491,8 @@ class DualPretrainer(nn.Module):
                 }
                 result['diagnostics'] = diagnostics
                 self.last_diagnostics = diagnostics
+            if return_graph_feature:
+                result['graph_feature'] = fused
             return result
         finally:
             for handle in handles:

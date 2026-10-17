@@ -10,6 +10,27 @@ from scripts.finetune_mcl_ph import (periodic_tdl_head, PERIODIC_TDL_WEIGHT_DECA
 ARMS=('R0','H_LR','B_LR','S_COS')
 TASKS=('eea','egb','egc','ei','eps','nc','xc')
 RUNTIME='fce_param_r2_cache_global_loop_v1'
+T1_ARMS=('T1_R0','T1_D','T1_W','T1_DW')
+T1_RUNTIME='fce_tune_t1_r2_v1'
+T2_ARMS=('T2_R0','T2_G_LR')
+T2_RUNTIME='fce_tune_t2_r3_glt_groups_v1'
+
+def t2_recipe_for(arm,task):
+    if arm not in T2_ARMS or task not in TASKS:raise ValueError('undefined T2 arm/task')
+    recipe=recipe_for('R0',task)
+    recipe.update(revision=T2_RUNTIME,arm=arm,
+        joint_glt_lr=recipe['joint_backbone_lr']*(0.3 if arm=='T2_G_LR' else 1),
+        joint_parameter_groups=['glt','backbone_other','head'])
+    return recipe
+
+def t1_recipe_for(arm,task):
+    if arm not in T1_ARMS or task not in TASKS:raise ValueError('undefined T1 arm/task')
+    recipe=recipe_for('R0',task)
+    recipe.update(revision=T1_RUNTIME,arm=arm,
+        head_dropout=recipe['head_dropout']+(0.10 if arm in ('T1_D','T1_DW') else 0),
+        head_weight_decay=recipe['weight_decay'],
+        joint_backbone_weight_decay=recipe['weight_decay']+(0.02 if arm in ('T1_W','T1_DW') else 0))
+    return recipe
 
 def recipe_for(arm,task):
     if arm not in ARMS or task not in TASKS:raise ValueError('undefined arm/task')
@@ -24,10 +45,50 @@ def recipe_for(arm,task):
         encoder_dropout=0.0,grad_clip=5.0,batch=24,precision='fp32',workers=0)
 
 def validate_recipe(recipe,task):
-    if recipe!=recipe_for(recipe.get('arm'),task):raise ValueError('recipe mismatch')
+    factory=t2_recipe_for if recipe.get('arm') in T2_ARMS else (t1_recipe_for if recipe.get('arm') in T1_ARMS else recipe_for)
+    expected=factory(recipe.get('arm'),task)
+    if recipe!=expected:raise ValueError('recipe mismatch')
     return recipe
 
-def periodic_tdl_trainability(model, *, head_only, ft_candidate=None):
+NORM_ADAPTATION_POLICY = dict(name='encoder_layernorm_affine_and_head', revision='r14',
+    selection='actual nn.LayerNorm direct weight/bias by parameter identity; exclude head',
+    head_stage='original head only', joint_stage='encoder LayerNorm affine plus original head')
+
+
+def validate_adaptation(policy, *, ft_candidate=None, profile=None, backbone_lr=None, recipe=None, smoke=False):
+    if policy is None:return
+    if policy != NORM_ADAPTATION_POLICY:raise ValueError('unknown adaptation policy')
+    if ft_candidate is not None or profile is not None or backbone_lr is not None or smoke:
+        raise ValueError('adaptation policy cannot mix overrides')
+    if recipe is not None and recipe.get('arm')!='R0':raise ValueError('adaptation requires original R0')
+
+
+def norm_parameter_partition(model):
+    head_ids={id(p) for p in periodic_tdl_head(model).parameters()}
+    encoder_ids={id(p) for p in model.model.parameters()}-head_ids
+    ln_ids={id(p) for module in model.model.modules() if isinstance(module,nn.LayerNorm)
+        for name,p in module.named_parameters(recurse=False) if name in ('weight','bias')}-head_ids
+    if not ln_ids or not ln_ids<=encoder_ids:raise ValueError('invalid encoder LayerNorm identity partition')
+    named=dict(model.named_parameters())
+    def group(ids):
+        return dict(parameter_names=[n for n,p in named.items() if id(p) in ids],
+            num_tensors=sum(id(p) in ids for p in named.values()),
+            num_parameters=sum(p.numel() for p in named.values() if id(p) in ids))
+    return dict(total=sum(p.numel() for p in named.values()),head=group(head_ids),
+        encoder_layernorm=group(ln_ids),frozen_encoder=group(encoder_ids-ln_ids),
+        joint=group(head_ids|ln_ids))
+
+
+def periodic_tdl_trainability(model, *, head_only, ft_candidate=None, adaptation_policy=None):
+    validate_adaptation(adaptation_policy,ft_candidate=ft_candidate)
+    if adaptation_policy is not None:
+        partition=norm_parameter_partition(model)
+        allowed=set(partition["head" if head_only else "joint"]["parameter_names"])
+        allowed_ids={id(p) for name,p in model.named_parameters() if name in allowed}
+        for p in model.parameters():p.requires_grad_(False)
+        for p in model.parameters():
+            if id(p) in allowed_ids:p.requires_grad_(True)
+        return
     if ft_candidate not in (None, 'FT_PARTIAL', 'FT_LOW_LR', 'FT_REG'):
         raise ValueError('unknown FT generalization candidate')
     head_ids = {id(parameter) for parameter in periodic_tdl_head(model).parameters()}
@@ -42,7 +103,7 @@ def periodic_tdl_trainability(model, *, head_only, ft_candidate=None):
                                  or id(parameter) in allowed)
 
 
-def periodic_tdl_optimizer(model, task, *, head_only, backbone_lr=None, ft_candidate=None, profile=None, recipe=None):
+def periodic_tdl_optimizer(model, task, *, head_only, backbone_lr=None, ft_candidate=None, profile=None, recipe=None, adaptation_policy=None):
     """Paper learning rates and per-task weight decay on all trainable tensors."""
     if profile not in (None,'uniform_u1'):raise ValueError('unknown FT profile')
     if profile and (ft_candidate is not None or backbone_lr not in (None,1e-4)):raise ValueError('U1 profile override forbidden')
@@ -50,6 +111,10 @@ def periodic_tdl_optimizer(model, task, *, head_only, backbone_lr=None, ft_candi
         validate_recipe(recipe, task)
         if profile is not None or ft_candidate is not None or backbone_lr is not None:
             raise ValueError('explicit recipe cannot mix overrides')
+    validate_adaptation(adaptation_policy,ft_candidate=ft_candidate,profile=profile,backbone_lr=backbone_lr,recipe=recipe)
+    if adaptation_policy is not None:
+        expected=set(norm_parameter_partition(model)["head" if head_only else "joint"]["parameter_names"])
+        if {n for n,p in model.named_parameters() if p.requires_grad}!=expected:raise ValueError("adaptation flags must precede optimizer")
     decay = 0.02 if profile else PERIODIC_TDL_WEIGHT_DECAY[task]
     head_ids = {id(parameter) for parameter in periodic_tdl_head(model).parameters()}
     groups = []
@@ -60,13 +125,27 @@ def periodic_tdl_optimizer(model, task, *, head_only, backbone_lr=None, ft_candi
         if recipe is not None:lr = recipe['joint_backbone_lr']
         if ft_candidate == 'FT_LOW_LR':
             lr *= 0.3
-        groups.append({'params': backbone, 'lr': lr,
-                       'weight_decay': decay + (0.01 if ft_candidate == 'FT_REG' else 0),
-                       'name': 'backbone'})
+        if recipe is not None and recipe['arm'] in T2_ARMS:
+            glt_ids={id(p) for p in model.model.glt.parameters()}
+            if glt_ids & head_ids:raise ValueError('glt/head overlap')
+            glt=[p for p in backbone if id(p) in glt_ids]
+            other=[p for p in backbone if id(p) not in glt_ids]
+            if not glt or not other or {id(p) for p in glt}!=glt_ids:
+                raise ValueError('incomplete glt/backbone_other parameter groups')
+            groups.extend([dict(params=glt,lr=recipe['joint_glt_lr'],weight_decay=decay,name='glt'),
+                           dict(params=other,lr=lr,weight_decay=decay,name='backbone_other')])
+        else:
+            groups.append({'params': backbone, 'lr': lr,
+                           'weight_decay': recipe.get('joint_backbone_weight_decay',decay) if recipe is not None else decay + (0.01 if ft_candidate == 'FT_REG' else 0),
+                           'name': 'backbone'})
     head = [parameter for parameter in model.parameters()
             if parameter.requires_grad and id(parameter) in head_ids]
     groups.append({'params': head, 'lr': 3e-4 if head_only else (recipe['joint_head_lr'] if recipe is not None else 1e-3),
-                   'weight_decay': decay, 'name': 'head'})
+                   'weight_decay': recipe.get('head_weight_decay',decay) if recipe is not None else decay, 'name': 'head'})
+    if adaptation_policy is not None or (recipe is not None and recipe['arm'] in T2_ARMS):
+        ids=[id(p) for g in groups for p in g['params']]
+        if len(ids)!=len(set(ids)) or set(ids)!={id(p) for p in model.parameters() if p.requires_grad}:
+            raise ValueError('optimizer parameter omission/duplication')
     evidence = [{'name': group['name'], 'lr': group['lr'],
                  'weight_decay': group['weight_decay'], 'num_tensors': len(group['params']),
                  'num_parameters': sum(p.numel() for p in group['params'])}
@@ -74,21 +153,24 @@ def periodic_tdl_optimizer(model, task, *, head_only, backbone_lr=None, ft_candi
     return torch.optim.AdamW(groups), evidence
 
 
-def configure_periodic_tdl_dropout(model, task, *, profile=None):
+def configure_periodic_tdl_dropout(model, task, *, profile=None, recipe=None):
     """Use paper task-specific head dropout; disable encoder module dropout."""
     if profile not in (None,'uniform_u1'):raise ValueError('unknown dropout profile')
+    if recipe is not None:
+        validate_recipe(recipe,task)
+        if profile is not None:raise ValueError('explicit recipe cannot mix profile')
     head = periodic_tdl_head(model)
     for module in model.modules():
         if isinstance(module, nn.Dropout):
             module.p = 0.0
     for module in head.modules():
         if isinstance(module, nn.Dropout):
-            module.p = 0.10 if profile else PERIODIC_TDL_HEAD_DROPOUT[task]
+            module.p = recipe['head_dropout'] if recipe is not None else (0.10 if profile else PERIODIC_TDL_HEAD_DROPOUT[task])
 
 
 def run_periodic_tdl_epochs(model, train_loader, validation_loader, criterion,
                             device, *, task, scaler, progress=None, smoke=False, backbone_lr=None,
-                            ft_candidate=None, profile=None, step_observer=None, recipe=None):
+                            ft_candidate=None, profile=None, step_observer=None, recipe=None, adaptation_policy=None):
     """Ten frozen-head epochs, then 50/60 joint epochs; select minimum raw RMSE."""
     if profile not in (None,'uniform_u1'):raise ValueError('unknown FT profile')
     if profile and (smoke or ft_candidate is not None or backbone_lr not in (None,1e-4)):raise ValueError('U1 profile override forbidden')
@@ -96,6 +178,7 @@ def run_periodic_tdl_epochs(model, train_loader, validation_loader, criterion,
         validate_recipe(recipe, task)
         if smoke or profile is not None or ft_candidate is not None or backbone_lr is not None:
             raise ValueError('explicit recipe cannot mix overrides')
+    validate_adaptation(adaptation_policy,ft_candidate=ft_candidate,profile=profile,backbone_lr=backbone_lr,recipe=recipe,smoke=smoke)
     class HeadOnlyAdapter(AdaptationAdapter):
         def forward(self,data):
             if hasattr(data,'cached_features'):
@@ -124,7 +207,7 @@ def run_periodic_tdl_epochs(model, train_loader, validation_loader, criterion,
             feature_cache.invalidate()
             train_loader,validation_loader=online_train,online_validation
         wrapped = HeadOnlyAdapter(model) if stage == 'head' else AdaptationAdapter(model)
-        periodic_tdl_trainability(model, head_only=(stage == 'head'), ft_candidate=ft_candidate)
+        periodic_tdl_trainability(model, head_only=(stage == 'head'), ft_candidate=ft_candidate, adaptation_policy=adaptation_policy)
         context=getattr(model,'feature_cache_context',None)
         if stage=='head' and context is not None:
             from src.modules.glt_adaptation import HeadFeatureCache
@@ -137,11 +220,11 @@ def run_periodic_tdl_epochs(model, train_loader, validation_loader, criterion,
             validation_loader=feature_cache.loader(online_validation)
         optimizer, group_evidence[stage] = periodic_tdl_optimizer(
             model, task, head_only=(stage == 'head'), backbone_lr=backbone_lr,
-            ft_candidate=ft_candidate, profile=profile, recipe=recipe)
+            ft_candidate=ft_candidate, profile=profile, recipe=recipe, adaptation_policy=adaptation_policy)
         if step_observer is not None:
             optimizer.register_step_pre_hook(lambda opt,args,kwargs:step_observer('attempted'))
             optimizer.register_step_post_hook(lambda opt,args,kwargs:step_observer('completed'))
-        if ft_candidate:
+        if adaptation_policy is not None or ft_candidate or (recipe is not None and recipe['arm'] in T1_ARMS+T2_ARMS):
             named = dict(model.named_parameters())
             for group in group_evidence[stage]:
                 members = {id(p) for item in optimizer.param_groups
@@ -197,3 +280,51 @@ def scheduler_for(optimizer,stage,stage_epochs,recipe=None):
     if recipe is not None and recipe['joint_scheduler']=='CosineAnnealingLR':
         return CosineAnnealingLR(optimizer,T_max=stage_epochs,eta_min=1e-6)
     return CosineAnnealingWarmRestarts(optimizer,T_0=10,T_mult=1,eta_min=1e-6)
+
+
+# Shared completion stage for all tasks after the neural validation-best is fixed.
+# Existing epoch/optimizer semantics above remain the matched neural reference.
+from src.training.fce_kernel import (POLICY as FINETUNE_PREDICTION_POLICY,
+    fit_branch as fit_finetune_predictions,
+    predict_branch as predict_finetune_predictions)
+
+# r10 array-only continuation after all r9 model/alpha choices are fixed.
+from src.training.fce_kernel import (GLOBAL_BLEND_POLICY as GLOBAL_FINETUNE_BLEND_POLICY,
+    select_global_weight as select_global_finetune_weight,
+    blend_frozen_predictions as blend_finetune_arrays)
+
+# r11 retains the historical feature metadata while aligning the actual policy.
+from src.training.fce_kernel import (ALIGNED_ALPHA_POLICY as ALIGNED_FINETUNE_POLICY,
+    select_aligned_alpha as select_aligned_finetune_alpha,
+    restore_aligned_model as restore_aligned_finetune_model,
+    predict_aligned_branch as predict_aligned_finetune_predictions)
+
+# r12: explicit radius3 representation, inherited alpha, fixed global .75.
+from src.training.fce_kernel import (RADIUS3_POLICY as RADIUS3_FINETUNE_POLICY,
+    fit_radius3_branch as fit_radius3_finetune_predictions,
+    predict_radius3_branch as predict_radius3_finetune_predictions)
+
+
+# r13: an explicit opt-in loss. Existing callers keep their MSE criterion.
+HUBER_FT_LOSS_POLICY=dict(name='2xHuber',delta=1.0,multiplier=2.0,reduction='mean',
+    target_space='existing train-only standardized targets',stages=['head','joint'],
+    best_selection='original-unit neural validation RMSE; strict improvement')
+
+
+class FixedTwiceHuberLoss(nn.Module):
+    def __init__(self):
+        super().__init__();self.huber=nn.HuberLoss(delta=1.0,reduction='mean')
+    def forward(self,prediction,target):
+        if prediction.shape!=target.shape or prediction.numel()==0:
+            raise ValueError('Huber prediction/target shapes must match without broadcasting')
+        if prediction.ndim not in (1,2) or (prediction.ndim==2 and prediction.shape[1]!=1):
+            raise ValueError('Huber expects one standardized scalar per sample')
+        if not torch.isfinite(prediction).all() or not torch.isfinite(target).all():
+            raise FloatingPointError('nonfinite Huber input')
+        return 2.0*self.huber(prediction,target)
+
+
+def finetune_criterion(loss_policy=None):
+    if loss_policy is None:return nn.MSELoss()
+    if loss_policy!=HUBER_FT_LOSS_POLICY:raise ValueError('undefined FT loss policy')
+    return FixedTwiceHuberLoss()

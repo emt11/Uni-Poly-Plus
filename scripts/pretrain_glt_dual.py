@@ -200,6 +200,47 @@ def main():
     args = parser.parse_args()
     require_tmux()
     config = json.loads(Path(args.config).read_text(encoding='utf-8'))
+    if config.get('ua2d_pt_revision'):
+        from src.training.ua2d_pt20k import validate_config as validate_ua2d_pt
+        validate_ua2d_pt(config)
+        if os.environ.get('CUDA_VISIBLE_DEVICES') != '2,3':
+            raise ValueError('P2 requires physical GPU2,3')
+        if (args.resume or args.diagnostics or args.benchmark_steps or args.stop_after_step
+                or args.no_deploy or args.diagnostic_save_steps or args.timing
+                or args.common_init_artifact or args.reference_log or args.third_task
+                or args.pretrain_target_root or args.sample_index_artifact or args.sample_index_split
+                or args.geometry_head_norm or args.benchmark_warmup or args.diagnostics_every != 1
+                or args.fgr_mu is not None or args.fgr_sigma is not None
+                or args.fgr_max_pairs is not None or args.align_temperature is not None
+                or args.dual_static_root or args.prep_workers != 8 or not args.lmdb_readahead):
+            raise ValueError('P2 runtime/scientific override forbidden')
+        from src.training.ua2d_pt20k import PI as ua2d_pi
+        if Path(args.cohort_root).resolve() != ua2d_pi or Path(args.cache_root).resolve() != ua2d_pi:
+            raise ValueError('P2 must reuse the original direct training cohort')
+    if config.get('t3_revision'):
+        from scripts.run_fce_tune_t3_unit import validate_pt_config,PI
+        validate_pt_config(config)
+        if os.environ.get('CUDA_VISIBLE_DEVICES')!='2,3':raise ValueError('T3 PT requires physical GPU2,3')
+        if (args.prep_workers!=8 or not args.lmdb_readahead or args.diagnostics or args.no_deploy
+                or args.stop_after_step or args.diagnostic_save_steps or args.benchmark_steps or args.timing
+                or args.common_init_artifact or args.reference_log or args.third_task or args.fgr_mu is not None
+                or args.fgr_sigma is not None or args.fgr_max_pairs is not None or args.align_temperature is not None
+                or args.pretrain_target_root or args.sample_index_artifact or args.sample_index_split
+                or Path(args.cohort_root).resolve()!=PI or Path(args.cache_root).resolve()!=PI
+                or (args.dual_static_root and Path(args.dual_static_root).resolve()!=PI)):
+            raise ValueError('T3 PT runtime/scientific override forbidden')
+    if config.get('t3b_revision'):
+        from scripts.run_fce_tune_t3b_unit import validate_pt_config,PI
+        validate_pt_config(config)
+        if os.environ.get('CUDA_VISIBLE_DEVICES')!='2,3':raise ValueError('T3b PT requires physical GPU2,3')
+        if (args.prep_workers!=8 or not args.lmdb_readahead or args.diagnostics or args.no_deploy
+                or args.resume or args.benchmark_warmup or args.stop_after_step or args.diagnostic_save_steps or args.benchmark_steps or args.timing
+                or args.common_init_artifact or args.reference_log or args.third_task or args.fgr_mu is not None
+                or args.fgr_sigma is not None or args.fgr_max_pairs is not None or args.align_temperature is not None
+                or args.pretrain_target_root or args.sample_index_artifact or args.sample_index_split
+                or Path(args.cohort_root).resolve()!=PI or Path(args.cache_root).resolve()!=PI
+                or (args.dual_static_root and Path(args.dual_static_root).resolve()!=PI)):
+            raise ValueError('T3b PT runtime/scientific override forbidden')
     r10=bool(config.get('r10_revision'))
     if r10:
         from src.modules.glt_r10 import validate_pt_config
@@ -320,6 +361,12 @@ def main():
         accumulation = batch_size // (micro * world)
         if config.get('torsion_revision') and config['accumulation']!=accumulation:raise ValueError('S4 accumulation/runtime mismatch')
         if config.get('reference_revision') and config['accumulation']!=accumulation:raise ValueError('S5 accumulation/runtime mismatch')
+        if config.get('t3_revision'):
+            from scripts.run_fce_tune_t3_unit import validate_pt_runtime
+            validate_pt_runtime(config,world,accumulation)
+        if config.get('t3b_revision'):
+            from scripts.run_fce_tune_t3b_unit import validate_pt_runtime
+            validate_pt_runtime(config,world,accumulation)
         set_global_seed(config['seed'])
         from src.modules.glt_dual import locality_options
         base = DualPretrainer(config['fusion_mode'], **locality_options(config),
@@ -739,12 +786,21 @@ def main():
                         model=base.state_dict(), optimizer=optimizer.state_dict(), rng=states,
                         scheduler=dict(step=step + 1, lr=float(lr))))
                     package = deployment_package(base, step + 1)
+                    if config.get('ua2d_pt_revision'):
+                        from src.training.ua2d_pt20k import bind_package as bind_ua2d_package
+                        package = bind_ua2d_package(package, config)
                     if r10:
                         from src.modules.glt_r10 import bind_package
                         package=bind_package(package,config)
                     if config.get('reference_revision'):
                         from scripts.run_glt_pt_matched_reference_unit import bind_deployment
                         package = bind_deployment(package, config)
+                    if config.get('t3_revision'):
+                        from scripts.run_fce_tune_t3_unit import bind_deployment
+                        package=bind_deployment(package,config)
+                    if config.get('t3b_revision'):
+                        from scripts.run_fce_tune_t3b_unit import bind_deployment
+                        package=bind_deployment(package,config)
                     save_checkpoint(output / f'deploy_{step + 1:05d}.pt', package)
                 if world > 1:
                     dist.barrier()

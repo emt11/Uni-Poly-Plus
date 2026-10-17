@@ -1,5 +1,7 @@
 # Uni-Poly 当前可用路线完整流程
 
+> 历史综合实现说明，包含退役/旧分支及其当时状态。2026-10-17当前主线的完整流程以[MODEL_ARCHITECTURE.md](docs/research/MODEL_ARCHITECTURE.md)、[CHATGPT_HANDOFF.md](CHATGPT_HANDOFF.md)及实际源码为准：FP仅在G2下游作为轻量GATE输入，P2预训练仍无FP目标。历史“无FP”或“尚未执行”描述不能覆盖后续实验事实；实际执行索引见[EXPERIMENT_CATALOG.md](docs/research/EXPERIMENT_CATALOG.md)。
+
 实验结果展示统一保留三位小数；选模、差值和门槛判断使用原始完整精度指标，舍入显示为0.000不代表原始差值严格为零。
 
 核对日期：2026-10-07（Asia/Shanghai）。本文依据当前工作树中的模型、数据接口、训练入口、实际配置和现有结果记录编写，覆盖 GLT Dual、MCL-PH、GP 混合模型及其消融／适配能力。原文中的身份映射、构象、PH、几何标签和缓存语义保留并同步到当前实现；2026-09-30“r4尚未训练”的状态由已完成周期的证据替代。

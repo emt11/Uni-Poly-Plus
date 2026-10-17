@@ -166,6 +166,18 @@ def process_validation_positions(start,rank,world):
     return range(start+rank*count,start+(rank+1)*count)
 
 
+def t3_validation_world(config):
+    from scripts.run_fce_tune_t3_unit import validate_pt_config
+    validate_pt_config(config)
+    return 2
+
+
+def t3b_validation_world(config):
+    from scripts.run_fce_tune_t3b_unit import validate_pt_config
+    validate_pt_config(config)
+    return 2
+
+
 def evaluate_process_validation(model, config, step, device, rank, world):
     """Exactly 1024 fixed presentations; leave model/RNG/training stream alone."""
     import torch
@@ -173,6 +185,12 @@ def evaluate_process_validation(model, config, step, device, rank, world):
     from src.training.glt_dual_runtime import rng_state, restore_rng, open_source, pretrain_source_fields, prepare_source_sample, move_labels
     from src.dataset.glt_dual_pretrain import prepare_pretrain_sample, pretrain_collate
     expected_world=2 if config.get('torsion_revision') else 4
+    if config.get('ua2d_pt_revision'):
+        from src.training.ua2d_pt20k import validate_config as validate_ua2d_pt
+        validate_ua2d_pt(config)
+        expected_world = 2
+    if config.get('t3_revision'):expected_world=t3_validation_world(config)
+    if config.get('t3b_revision'):expected_world=t3b_validation_world(config)
     if config.get('r10_revision'):
         from src.modules.glt_r10 import validate_pt_config
         validate_pt_config(config);expected_world=2

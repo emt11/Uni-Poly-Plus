@@ -1,0 +1,64 @@
+{
+  "scope": "One final static delivery check: AST syntax, JSON parse, new-doc links, upload boundary and actual diff format; no imports, model calls, GPU jobs or pytest.",
+  "files": 88,
+  "python_files": 70,
+  "issues": [],
+  "diff_check": {
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "ignore_rules": [
+    {
+      "path": "data/private.json",
+      "ignored": true,
+      "expected": true
+    },
+    {
+      "path": "results/run/metrics.json",
+      "ignored": true,
+      "expected": true
+    },
+    {
+      "path": "logs/run/stdout.log",
+      "ignored": true,
+      "expected": true
+    },
+    {
+      "path": "checkpoints/a.pt",
+      "ignored": true,
+      "expected": true
+    },
+    {
+      "path": "weights.safetensors",
+      "ignored": true,
+      "expected": true
+    },
+    {
+      "path": "cache/fp.sqlite",
+      "ignored": true,
+      "expected": true
+    },
+    {
+      "path": ".env",
+      "ignored": true,
+      "expected": true
+    },
+    {
+      "path": "docs/research/evidence/formal_results.json",
+      "ignored": false,
+      "expected": false
+    },
+    {
+      "path": "docs/research/evidence/formal_results.csv",
+      "ignored": false,
+      "expected": false
+    },
+    {
+      "path": "docs/research/MODEL_ARCHITECTURE.md",
+      "ignored": false,
+      "expected": false
+    }
+  ],
+  "scientific_final_cpu": "NOT_RUN; reserved for completion of running P2/G2"
+}

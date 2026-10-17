@@ -39,7 +39,34 @@ data/
 *.pth
 *.onnx
 *.h5
+*.safetensors
+*.npz
+*.npy
+*.pkl
+*.pickle
+*.parquet
+*.arrow
+*.lmdb
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
 .claude
+
+# Local credentials and private machine configuration
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+*.pem
+*.key
+
+# Personal notes are not part of the research handoff.
+/TODO.md
+
+# Publish curated Markdown/JSON/CSV research evidence under docs/research/.
+# Keep raw logs/, results/, data/ and checkpoints local; no blanket ignore for docs/.
 
 # Generated dataset caches
 data/processed/
