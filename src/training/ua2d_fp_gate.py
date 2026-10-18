@@ -20,8 +20,8 @@ PREVIOUS_OUT = ROOT / 'results/ua2d_fusion_20261017/g1_fp_gate_recovery1'
 PREVIOUS_LOG = ROOT / 'logs/ua2d_fusion_20261017/g1_fp_gate_recovery1'
 FAILED_OUT = ROOT / 'results/ua2d_fusion_20261017/g1_fp_gate_recovery2'
 FAILED_LOG = ROOT / 'logs/ua2d_fusion_20261017/g1_fp_gate_recovery2'
-OUT = ROOT / 'results/ua2d_fusion_20261017/g2_fp_gate_pt20k_r7'
-LOG = ROOT / 'logs/ua2d_fusion_20261017/g2_fp_gate_pt20k_r7'
+OUT = ROOT / 'results/ua2d_fusion_20261017/g2_fp_gate_pt20k_r8'
+LOG = ROOT / 'logs/ua2d_fusion_20261017/g2_fp_gate_pt20k_r8'
 U1 = ROOT / 'results/glt_optimization_20261011/r4/U1'
 R10 = ROOT / 'results/fce_tune_20261016/global_blend'
 OLD_PARENT = U1 / 'pretrain/P_ALIGN/deploy_05000.pt'
@@ -31,7 +31,7 @@ SPLIT = ROOT / 'data/splits/mips_paper5_outer'
 ARMS = ('GATE_REAL', 'GATE_NULL')
 FP_SPEC = {k: v for k, v in FEATURE_SPEC.items() if k not in
            ('kernel', 'returnDistance', 'kernel_dtype', 'g05_weight', 'krr_weight')}
-POLICY = dict(plan='UA2D-FUSION-20261017-01', revision='r7', cycle='G2', parent=str(PARENT), parent_step=20000,
+POLICY = dict(plan='UA2D-FUSION-20261017-01', revision='r8', cycle='G2', parent=str(PARENT), parent_step=20000,
     arms=list(ARMS), main='GATE_REAL', fp_spec=FP_SPEC,
     normalization='sqrt(512)*x/L2(x)', bottleneck=32, gate='sigmoid concat(a,q) 544->1',
     initial_seed=20261017, initial_g=.1, zero_v=True, weight=.75,
@@ -61,7 +61,9 @@ def read(path):
 
 def guard_write(path):
     p = Path(path).resolve()
-    if any(p == root.resolve() or root.resolve() in p.parents for root in (OLD_OUT, OLD_LOG, PREVIOUS_OUT, PREVIOUS_LOG, FAILED_OUT, FAILED_LOG)):
+    if any(p == root.resolve() or root.resolve() in p.parents for root in (OLD_OUT, OLD_LOG, PREVIOUS_OUT, PREVIOUS_LOG, FAILED_OUT, FAILED_LOG,
+        ROOT / 'results/ua2d_fusion_20261017/p2_align20k_r7', ROOT / 'logs/ua2d_fusion_20261017/p2_align20k_r7',
+        ROOT / 'results/ua2d_fusion_20261017/g2_fp_gate_pt20k_r7', ROOT / 'logs/ua2d_fusion_20261017/g2_fp_gate_pt20k_r7')):
         raise ValueError('old G1 root is read-only')
     return p
 
@@ -444,20 +446,26 @@ class Slots:
             counts[gpu] = len(own) + len(set(observed.get(gpu, ())) - pids)
         return counts
 
+    def total_occupancy(self, observed):
+        aliases = {p for unit in self.active.values() for p in
+                   (unit.get('pid'), unit.get('wrapper_pid'), *unit.get('aliases', [])) if p}
+        external = set().union(*(set(observed.get(g, ())) for g in self.gpus)) - aliases
+        return len(self.active) + len(external)
+
     def reserve(self, key, gpu, observed):
         counts = self.occupancy(observed)
-        if key in self.active or gpu not in self.gpus or counts[gpu] >= 4 or sum(counts.values()) >= self.total_limit:
+        if key in self.active or gpu not in self.gpus or counts[gpu] >= 4 or self.total_occupancy(observed) >= self.total_limit:
             raise RuntimeError('GPU slot unavailable')
         self.active[key] = dict(gpu=gpu, pid=None, start=now())
         self.record(observed)
 
     def record(self, observed):
         counts = self.occupancy(observed)
-        if any(v > 4 for v in counts.values()) or sum(counts.values()) > self.total_limit:
+        if any(v > 4 for v in counts.values()) or self.total_occupancy(observed) > self.total_limit:
             raise RuntimeError('GPU concurrency exceeded')
         for gpu, count in counts.items():
             self.peak[gpu] = max(self.peak[gpu], count)
-        self.total_peak = max(self.total_peak, sum(counts.values()))
+        self.total_peak = max(self.total_peak, self.total_occupancy(observed))
         return counts
 
     def release(self, key, exit_record):

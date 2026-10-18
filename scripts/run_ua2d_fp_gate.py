@@ -26,7 +26,7 @@ from src.training.glt_dual_runtime import require_tmux, save_checkpoint
 def launch_job(name, argv, gpu=''):
     folder = LOG / name
     folder.mkdir(parents=True, exist_ok=False)
-    window = 'ua2d_g2_r7_' + name
+    window = 'ua2d_g2_r8_' + name
     command = dict(argv=argv, cwd=str(ROOT), environment=dict(ENV, CUDA_VISIBLE_DEVICES=str(gpu)),
                    window=window, artifacts=str(OUT))
     write(folder / 'command.json', command)
@@ -133,8 +133,10 @@ def observe_gpus():
         programs = row['argv'][1:3]
         experiment = any(any(word in Path(arg).name for word in ('train', 'finetune', '_unit.py')) for arg in programs)
         is_wrapper = any(Path(arg).name == 'run_ua2d_fp_gate.py' for arg in programs)
-        if row['visible'] in ('2', '3') and experiment and not is_wrapper:
-            proc_pids[row['visible']].append(row['pid'])
+        if experiment and not is_wrapper:
+            for visible in row['visible'].split(','):
+                if visible in ('2', '3'):
+                    proc_pids[visible].append(row['pid'])
     return dict(start=started, end=now(), nvidia_raw=raw, gpu_mapping_raw=uuid_rows,
                 nvidia_pids=nvidia, proc_pids=proc_pids, processes=processes,
                 independent_nvml_pid_view=True)
@@ -324,6 +326,7 @@ class Controller:
         self.refresh_bindings(raw)  # reconcile births during NVML/proc sampling
         observed, detail = classify_observation(raw, self.slots.active)
         detail['counts'] = self.slots.occupancy(observed)
+        detail['total_unique_slots'] = self.slots.total_occupancy(observed)
         detail['sequence'] = self.snapshot_sequence
         self.snapshot_sequence += 1
         self.last_observation = detail
@@ -388,7 +391,7 @@ class Controller:
             if pending:
                 counts = self.slots.occupancy(observed)
                 candidates = [g for g in GPUS if counts[g] < 4]
-                if candidates and sum(counts.values()) < 4:
+                if candidates and self.slots.total_occupancy(observed) < 4:
                     gpu = min(candidates, key=lambda g: (counts[g], g))
                     arm, task, fold = pending.pop(0)
                     key = ('test_' if formal else 'ft_') + arm + '_' + task + '_' + str(fold)
@@ -701,8 +704,8 @@ def update_plan(status, detail):
     s = p.read_text()
     a = s.index('状态：')
     b = s.index('\n\n', a)
-    s = s[:a] + f'状态：**{status}（P2＋G2）**。授权来源：用户要求仅GPU2/3、PT最多2路、FT最多4路总并发，启动正常后停止监控；新PT20,000步、每5,000步保存。新parent固定20k，70个完整FT；旧43次启动及19个旧parent已完成单元仅保留消费与现场。自检不代替独立审查。' + s[b:]
-    s += '\n\n## 27. r7 G2 实际交付记录\n\n' + detail + '\n'
+    s = s[:a] + f'状态：**{status}（P2＋G2）**。授权来源：用户要求仅GPU2/3、PT最多2路、FT最多4路总并发，启动正常后停止监控；r8受限15k恢复仅新增5000步、逻辑结束20k。新parent固定本次恢复20k，70个完整FT；旧43次启动及19个旧parent已完成单元仅保留消费与现场。自检不代替独立审查。' + s[b:]
+    s += '\n\n## 27. r8 G2 实际交付记录\n\n' + detail + '\n'
     p.write_text(s)
 
 
@@ -739,7 +742,7 @@ def execute():
     folder = LOG / 'controller'
     folder.mkdir()
     command = dict(argv=[PYTHON, 'scripts/run_ua2d_fp_gate.py', '--execute'], cwd=str(ROOT),
-        environment=dict(ENV, CUDA_VISIBLE_DEVICES=''), pid=os.getpid(), window='ua2d_g2_r7_controller', artifacts=str(OUT))
+        environment=dict(ENV, CUDA_VISIBLE_DEVICES=''), pid=os.getpid(), window='ua2d_g2_r8_controller', artifacts=str(OUT))
     write(folder / 'command.json', command)
     execution = dict(command=command, start=now(), end=None, exit=None, pid=os.getpid())
     write(folder / 'execution.json', execution)
@@ -753,7 +756,7 @@ def execute():
             for name, snapshot in prior_files.items():
                 before = OUT / 'source_before' / name
                 before.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(Path('/tmp/ua2d_r7_before') / snapshot, before)
+                shutil.copyfile(Path('/tmp/ua2d_r8_before') / snapshot, before)
             before = OUT / 'source_before/src/modules/ua2d_fp_gate.py'
             before.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / 'src/modules/ua2d_fp_gate.py', before)
@@ -764,7 +767,7 @@ def execute():
             for name in ('scripts/pretrain_glt_dual.py', 'scripts/evaluate_glt_pt_endpoint.py', 'src/training/ua2d_pt20k.py', 'scripts/run_ua2d_pt20k.py'):
                 before = OUT / 'source_before' / name
                 before.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(Path('/tmp/ua2d_r7_before') / Path(name).name, before)
+                shutil.copyfile(Path('/tmp/ua2d_r8_before') / Path(name).name, before)
             source_units = initialize()
             controller.fp = FPWriter(OUT / 'fingerprints.sqlite', source=FAILED_OUT / 'fingerprints.sqlite')
             controller.phase = 'finetune'
@@ -791,7 +794,7 @@ def execute():
                 test_exit=test_exit, consumption=consumption_record(b), independent_review='NOT_PERFORMED'))
             detail = (OUT / 'final_review/delivery.md').read_text()
             detail += '\n实际消费：' + json.dumps(consumption_record(b), ensure_ascii=False) + '。\n'
-            detail += f'唯一最终CPU测试 exit={test_exit}；日志{LOG}/final_cpu/。tmux Uni-Poly:ua2d_g2_r7_*；每卡峰值{controller.slots.peak}，总峰值{controller.slots.total_peak}。\n'
+            detail += f'唯一最终CPU测试 exit={test_exit}；日志{LOG}/final_cpu/。tmux Uni-Poly:ua2d_g2_r8_*；每卡峰值{controller.slots.peak}，总峰值{controller.slots.total_peak}。\n'
             detail += f'冻结{OUT}/selection_before_test.json；汇总、逐fold、来源索引、实际diff与退出索引在final_review/；controller最终真实exit见{LOG}/controller/exit.txt。所有旧产物保留，原A未接续；无删除、哈希校验、commit/push或追加候选。\n'
             update_plan(status, detail)
             rc = 0 if test_exit == 0 else 1
@@ -829,9 +832,9 @@ if __name__ == '__main__':
             raise FileExistsError('G1 roots already exist')
         subprocess.run(['tmux', 'has-session', '-t', 'Uni-Poly'], check=True)
         line = shlex.join(['env', *[k + '=' + v for k, v in dict(ENV, CUDA_VISIBLE_DEVICES='').items()], PYTHON, str(Path(__file__).resolve()), '--execute'])
-        subprocess.run(['tmux', 'new-window', '-d', '-t', 'Uni-Poly', '-n', 'ua2d_g2_r7_controller',
+        subprocess.run(['tmux', 'new-window', '-d', '-t', 'Uni-Poly', '-n', 'ua2d_g2_r8_controller',
             'tmux set-option -w -t "$TMUX_PANE" remain-on-exit on\ncd ' + shlex.quote(str(ROOT)) + '\nexec ' + line], check=True)
-        print('G1 launched in Uni-Poly:ua2d_g2_r7_controller; real status/logs:', LOG)
+        print('G1 launched in Uni-Poly:ua2d_g2_r8_controller; real status/logs:', LOG)
     elif args.execute:
         sys.exit(execute())
     elif args.job:

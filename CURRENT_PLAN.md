@@ -1,8 +1,8 @@
 # UA_2D＋FP GATE 融合优化计划：保留 r10 统一预测政策
 
-计划 ID：**UA2D-FUSION-20261017-01 / r7（GPU2/3、PT最多2路、FT最多4路总并发）**。日期：2026-10-17（北京时间）。
+计划 ID：**UA2D-FUSION-20261017-01 / r8（P2受限15k恢复与G2完整接续）**。日期：2026-10-17（北京时间）。
 
-状态：**执行中（P2＋G2）**。用户已授权新预训练20,000 step、每5,000 step保存，使用GPU2/3，PT最多2路、FT最多4路总并发；实际依据见第26节与P2日志。
+状态：**执行中（r8 P2恢复＋G2）**。用户明确授权一次15k→20k恢复（累计PT最多2次）、新G2完整70FT及唯一最终CPU；旧r7科学配置身份保留。
 
 本文件替代原F_CE长计划；第1—24节为历次规划与现场快照，发生冲突时以第26节r7为准。旧G1累计43次启动、19个旧parent完整FT只读保留；P2 r5因GPU2句柄异常在PT启动前停止。随后GPU3单卡草案仅改代码、没有启动；用户最新已改为GPU2/3范围，两卡现在均可正常查询。本轮新根重新执行PT20k及G2完整70FT，不重跑已完成旧周期，不读TODO。
 
@@ -713,3 +713,41 @@ AGENTS已将默认分工改为ChatGPT规划/独立审查、Codex执行，并加�
 当前P2进度及r7消费快照见docs/research/evidence/execution_status.json；G2正式结果仍未完成，七任务仍按第26.4节不可比较。没有新模型/闭合实验结果归档到PROJECT_HISTORY，已有231行历史迁移改动随本轮一并同步。SOTA_RESULT内容保持原参考。
 
 交付最终检查只覆盖本次文档/发布差异、链接/JSON/精简表格与待上传源码的静态语法，不启动模型或pytest；它不是r7唯一最终CPU suite。训练继续，Codex不恢复持续监控。源码、已有实验测试与记录按本次批准同步为“运行中/待审查”；整个科学周期的最终测试和独立审查仍待实际执行。
+
+
+### P2 实际运行记录
+
+P2未能完成：RuntimeError('P2 GPU process concurrency exceeded (maximum 2 ranks)')。PT启动1次；未启动G2、未运行最终CPU测试。证据：/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/failure.json，日志/root/workspace/Uni-Poly-Plus-master/logs/ua2d_fusion_20261017/p2_align20k_r7/。
+
+
+## 29. r8执行授权与固定边界（2026-10-18）
+
+远程检查时间：2026-10-18T10:01:15.143765+08:00。fetch后dev本地／远程均为d053b726cec65e5bf3ea92356b904f92cde7e083，最近一次提交同步实验实现和科研交接；已读远程AGENTS、CURRENT_PLAN、SOTA与相关实际源码。本地7行失败记录改动保留，旧网页2026-10-17快照已过期。本轮为执行，不代替ChatGPT独立审查。
+
+授权来源：用户本条r8提示词；不自动追加重试。scientific question仍为同20k parent／相同容量训练下REAL相对NULL的FP信息作用；参考旧UA macro R² 0.788、r10 0.796。REAL／NULL唯一受控变化为Morgan binary FP与常量0.5。split、seed42+fold、原二维head、train-only scaler、GATE架构和uniform_u1不变。
+
+- 仅一次PT恢复启动，唯一来源`results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/resume_15000.pt`；完整model／optimizer／scheduler位置／逐rank RNG／数据位置恢复，逻辑15001—20000，本次5000更新，不延长轨迹。旧attempted18348／completed18347保留，旧18348边界实际更新unknown；顺利完成已知累计completed23347，attempted及保守更新占用上限23348，累计启动最多2次。
+- 保留旧r7科学config身份，执行修订／恢复路径另记；不改旧checkpoint metadata。旧5k／10k／15k resume/deploy及1000／2500／5000过程validation只读路径复用，仅新增20k一组。
+- PT新根`results/ua2d_fusion_20261017/p2_align20k_r7_recovery1/`及对应logs；GPU2、3，CUDA_VISIBLE_DEVICES=2,3，两个DDP rank，全卡最多两个GPU训练进程；world2、micro84、accum6、global1008和原精度／loss／优化保持。其他作业占资源则等待，不停止无关进程；当前身份歧义／真实超限停止并保留现场。历史362769身份未核实，不硬编码忽略，不用PID偏移。
+- PT20k完整且rank／context退出后自动G2，新根`results/ua2d_fusion_20261017/g2_fp_gate_pt20k_r8/`及对应logs。70FT、4900epoch、112000更新、FT图47000、TEST图11750；两卡总最多4路（含预留与外部），正常均衡派发。旧G1 43启动／19完整FT只进旧消费，不能混入新矩阵；复用3414 FP，新生成最多2461。
+- 全70个validation best及parent／政策／KRR来源全局冻结后才开放TEST；正式神经70、神经／融合数组140、UA_FIXED75至多35旧数组算术；固定0.75／0.25，无新KRR fit／forward或权重搜索。
+- 允许最小修改PT控制器／辅助、pretrain入口，以及恢复parent绑定／队列／消费／同一并发问题必要的GATE控制器／辅助、人工CPU夹具与交接证据。模型、数据、split、旧配置checkpoint、预测／日志只读。禁止额外候选、smoke、probe、benchmark、阶段性pytest或哈希校验。无删除／pull／force-push。
+- 所有长命令／GPU和产物写入在tmux Uni-Poly独立window；可创建session。异常停止自身与依赖派发、保存真实exit和在途unknown，本次不能自动第三次PT启动。
+- 全部科学完成后仅一次空CUDA timeout300秒 `python -m pytest -q tests/test_ua2d_fp_gate.py`，同一suite补恢复／并发人工夹具；不为本轮commit/push提前运行。最终报告七任务R²／原单位RMSE、ddof0、任务等权macro及论文差，原精度计算后3位；当前七项仍未完成／不可比较。共享validation／TEST开发暴露，协议等价未核实，不能称公平超越。独立审查前不归档PROJECT_HISTORY。
+- 新根final_review保存恢复链、消费／checkpoint路径索引、真实exit、实际diff、CPU路径与delivery。确认正式优化更新推进后停止Codex主动轮询，控制器继续自动PT→G2→正式评估→唯一CPU；本轮结束前仅提交源码、计划与带时间的精简证据到dev，不上传大产物。提交／推送不等于测试通过。
+
+
+### r8 P2 实际执行记录
+
+唯一恢复已启动；/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/resume_15000.pt→逻辑20000，仅5000更新。窗口Uni-Poly:ua2d_p2_r8_recovery1；日志/root/workspace/Uni-Poly-Plus-master/logs/ua2d_fusion_20261017/p2_align20k_r7_recovery1/。
+
+
+### r8正常恢复与停止主动监控
+
+r8恢复启动交接（2026-10-18T10:07:29.454289+08:00）。窗口Uni-Poly:ua2d_p2_r8_recovery1，controller PID5409、torchrun PID5566。一次新增PT恢复、累计2次启动；本次已完成45次、attempted46次（可有一次在途），逻辑completed step15045。两rank完整model／optimizer／scheduler／RNG／数据继承记录已落盘，rank CUDA group依据正常启动快照绑定；旧18348边界仍unknown。当前实际状态RUNNING、exit=null，不能写成实验完成。
+
+最近日志中位步耗时2.455秒；PT粗估2026-10-18 13:09—2026-10-18 14:25（北京时间），含G2／正式评估／最终CPU的全周期粗估2026-10-18 13:39—2026-10-18 16:05。估算使用正常日志，未跑benchmark；G2仅参考旧小任务55—78秒，Egc没有匹配完整耗时，区间不含外部资源等待与异常。
+
+G2／正式预测／CPU均未启动；全部七任务仍未完成／不可比较，沿用第26.4论文参考。科学条件不变，共享validation／TEST参与开发，仅探索性比较。Codex已停止主动监控，不等待整周期；控制器仍持续正常限流、故障处理和成功后自动接续，不能自动第三次PT启动。
+
+日志logs/ua2d_fusion_20261017/p2_align20k_r7_recovery1/，本地一次快照results/ua2d_fusion_20261017/p2_align20k_r7_recovery1/startup_status_r8.json；远程精简快照docs/research/evidence/r8_recovery_status.json，旧网页快照过期。未来20k产物／checkpoint索引／消费／真实exit位于新P2 final_review，G2输出到g2_fp_gate_pt20k_r8新根。最终CPU suite只在全科学完成后运行一次；当前未运行pytest，不把静态交付检查或commit/push称测试通过；独立审查未进行、不提前归档。

@@ -1,0 +1,329 @@
+{
+  "captured_at": "2026-10-18T10:07:29.454289+08:00",
+  "kind": "one-time launch handoff snapshot; NOT LIVE",
+  "remote_baseline": "d053b726cec65e5bf3ea92356b904f92cde7e083",
+  "branch": "dev",
+  "execution_revision": "r8",
+  "execution": {
+    "start": "2026-10-18T10:05:19.538890+08:00",
+    "end": null,
+    "exit": null,
+    "status": "RUNNING",
+    "pid": 5409,
+    "torchrun_pid": 5566,
+    "new_pt_starts": 1,
+    "cumulative_pt_starts": 2,
+    "ft_launched": false,
+    "execution_revision": "r8",
+    "worker_identity": {
+      "pid": 5566,
+      "ppid": 5409,
+      "start_ticks": 219874,
+      "argv": [],
+      "exe": "/opt/conda/bin/python3.11",
+      "visible": "2,3",
+      "nspid": [
+        5566
+      ]
+    }
+  },
+  "consumption": {
+    "starts": 1,
+    "attempted_updates": 46,
+    "completed_updates": 45,
+    "logical_attempted": 15046,
+    "logical_completed": 15045,
+    "segment_start": 15000,
+    "status": "RUNNING",
+    "old_known": {
+      "starts": 1,
+      "attempted_updates": 18348,
+      "completed_updates": 18347
+    },
+    "old_interrupted_update": "unknown: logical step18348 may have updated before bookkeeping",
+    "cumulative_starts": 2,
+    "cumulative_known_completed": 18392,
+    "cumulative_attempted_budget_occupancy": 18394
+  },
+  "restored_ranks": {
+    "0": {
+      "start": 15000,
+      "next_position": 15120000,
+      "resume": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/resume_15000.pt",
+      "scheduler": {
+        "step": 15000,
+        "lr": 3.573543133499873e-05
+      },
+      "rank": 0,
+      "world": 2,
+      "full_state_restored": true,
+      "execution_revision": "r8"
+    },
+    "1": {
+      "start": 15000,
+      "next_position": 15120000,
+      "resume": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/resume_15000.pt",
+      "scheduler": {
+        "step": 15000,
+        "lr": 3.573543133499873e-05
+      },
+      "rank": 1,
+      "world": 2,
+      "full_state_restored": true,
+      "execution_revision": "r8"
+    }
+  },
+  "cuda_binding": {
+    "ranks": {
+      "0": {
+        "pid": 5573,
+        "ppid": 5566,
+        "start_ticks": 220026,
+        "rank": 0,
+        "local_rank": 0,
+        "world": 2,
+        "visible": "2,3",
+        "argv": [
+          "scripts/pretrain_glt_dual.py",
+          "--config",
+          "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/initialization/P_ALIGN.json",
+          "--cohort-root",
+          "/root/workspace/Uni-Poly-Plus-master/data/processed/mcl_ph_r4_20260930/pi1m_direct_01.staging",
+          "--cache-root",
+          "/root/workspace/Uni-Poly-Plus-master/data/processed/mcl_ph_r4_20260930/pi1m_direct_01.staging",
+          "--output",
+          "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7_recovery1/pretrain/P_ALIGN",
+          "--prep-workers",
+          "8",
+          "--lmdb-readahead",
+          "--resume",
+          "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/resume_15000.pt",
+          "--ua2d-recovery"
+        ],
+        "phase": "restored",
+        "execution_revision": "r8",
+        "logical_start": 15000,
+        "next_position": 15120000
+      },
+      "1": {
+        "pid": 5574,
+        "ppid": 5566,
+        "start_ticks": 220026,
+        "rank": 1,
+        "local_rank": 1,
+        "world": 2,
+        "visible": "2,3",
+        "argv": [
+          "scripts/pretrain_glt_dual.py",
+          "--config",
+          "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/initialization/P_ALIGN.json",
+          "--cohort-root",
+          "/root/workspace/Uni-Poly-Plus-master/data/processed/mcl_ph_r4_20260930/pi1m_direct_01.staging",
+          "--cache-root",
+          "/root/workspace/Uni-Poly-Plus-master/data/processed/mcl_ph_r4_20260930/pi1m_direct_01.staging",
+          "--output",
+          "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7_recovery1/pretrain/P_ALIGN",
+          "--prep-workers",
+          "8",
+          "--lmdb-readahead",
+          "--resume",
+          "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/resume_15000.pt",
+          "--ua2d-recovery"
+        ],
+        "phase": "restored",
+        "execution_revision": "r8",
+        "logical_start": 15000,
+        "next_position": 15120000
+      }
+    },
+    "launcher_pid": 5566,
+    "registered_nvml": [
+      21993,
+      21994
+    ],
+    "unassigned_nvml": [],
+    "external_proc": [],
+    "unique_gpu_processes": 2,
+    "per_card_contexts": {
+      "2": 1,
+      "3": 1
+    },
+    "method": "idle-baseline required DDP CUDA birth group; union NVML across cards; proc external reservations conservative",
+    "errors": [],
+    "ready_ranks": [
+      0,
+      1
+    ],
+    "time": "2026-10-18T10:05:34.716433+08:00",
+    "baseline": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7_recovery1/device_before.json"
+  },
+  "latest_rank_records": {
+    "0": {
+      "cpu_observed_timing": {
+        "preparation_seconds": 0.04773444100010238,
+        "scope": "host wall time without additional CUDA synchronization",
+        "step_seconds": 2.405365171000085
+      },
+      "extra_losses": [
+        0.02621893770992756,
+        0.0
+      ],
+      "extra_valid_graphs": [
+        1008.0,
+        0.0
+      ],
+      "extra_weighted_contributions": [
+        0.002621893770992756,
+        0.0
+      ],
+      "extra_weights": [
+        0.1,
+        0.0
+      ],
+      "grad_norms": {
+        "align_proj2": 0.0027219990734010935,
+        "align_proj3": 0.003531383816152811,
+        "angle_head": 0.020946837961673737,
+        "atom_head": 0.03659098222851753,
+        "fgr_head": 0.0,
+        "fusion": 0.04254032298922539,
+        "glt_3d_encoder": 0.14708347618579865,
+        "length_head": 0.005894161760807037,
+        "o8_2d_encoder": 0.0249051321297884
+      },
+      "grad_total_preclip": 0.16092167794704437,
+      "local_fallbacks": 18,
+      "local_skip_reasons": {},
+      "losses": [
+        0.014086172915995121,
+        0.0007901482749730349,
+        0.0
+      ],
+      "lr": 3.513568461460616e-05,
+      "rank": 0,
+      "raw_geometry_losses": [
+        0.00015582138439640403,
+        0.0006343268323689699
+      ],
+      "step": 15045,
+      "target_counts": [
+        11852.0,
+        29856.0,
+        38568.0,
+        0.0
+      ],
+      "third_stream_signature": null,
+      "third_task": "none",
+      "valid_graphs": [
+        1008.0,
+        1008.0,
+        0.0
+      ]
+    },
+    "1": {
+      "cpu_observed_timing": {
+        "preparation_seconds": 0.06573002000004635,
+        "scope": "host wall time without additional CUDA synchronization",
+        "step_seconds": 2.407484709000073
+      },
+      "extra_losses": [
+        0.02621893770992756,
+        0.0
+      ],
+      "extra_valid_graphs": [
+        1008.0,
+        0.0
+      ],
+      "extra_weighted_contributions": [
+        0.002621893770992756,
+        0.0
+      ],
+      "extra_weights": [
+        0.1,
+        0.0
+      ],
+      "local_fallbacks": 16,
+      "local_skip_reasons": {},
+      "losses": [
+        0.014086172915995121,
+        0.0007901482749730349,
+        0.0
+      ],
+      "lr": 3.513568461460616e-05,
+      "rank": 1,
+      "raw_geometry_losses": [
+        0.00015582138439640403,
+        0.0006343268323689699
+      ],
+      "step": 15045,
+      "target_counts": [
+        11852.0,
+        29856.0,
+        38568.0,
+        0.0
+      ],
+      "third_stream_signature": null,
+      "third_task": "none",
+      "valid_graphs": [
+        1008.0,
+        1008.0,
+        0.0
+      ]
+    }
+  },
+  "known_progress": "normal official optimizer updates from the full15000 training checkpoint; no test or probe",
+  "old_failure": {
+    "time": "2026-10-18T00:09:57.705243+00:00",
+    "error": "RuntimeError('P2 GPU process concurrency exceeded (maximum 2 ranks)')",
+    "traceback": "Traceback (most recent call last):\n  File \"/root/workspace/Uni-Poly-Plus-master/scripts/run_ua2d_pt20k.py\", line 140, in execute\n    raise RuntimeError('P2 GPU process concurrency exceeded (maximum 2 ranks)')\nRuntimeError: P2 GPU process concurrency exceeded (maximum 2 ranks)\n",
+    "execution": {
+      "start": "2026-10-17T11:48:44.333206+00:00",
+      "end": null,
+      "exit": null,
+      "status": "需返修",
+      "pid": 22908,
+      "torchrun_pid": 22949,
+      "pt_starts": 1,
+      "ft_launched": false,
+      "worker_identity": {
+        "pid": 22949,
+        "ppid": 22908,
+        "start_ticks": 710990,
+        "argv": [],
+        "exe": "/opt/conda/bin/python3.11",
+        "visible": "2,3",
+        "nspid": [
+          22949
+        ]
+      },
+      "error": "RuntimeError('P2 GPU process concurrency exceeded (maximum 2 ranks)')"
+    },
+    "consumption": {
+      "starts": 1,
+      "attempted_updates": 18348,
+      "completed_updates": 18347,
+      "status": "RUNNING"
+    },
+    "ft_launched": false,
+    "tests": "NOT_RUN"
+  },
+  "paths": {
+    "pt_results": "results/ua2d_fusion_20261017/p2_align20k_r7_recovery1",
+    "pt_logs": "logs/ua2d_fusion_20261017/p2_align20k_r7_recovery1",
+    "g2_results": "results/ua2d_fusion_20261017/g2_fp_gate_pt20k_r8",
+    "g2_logs": "logs/ua2d_fusion_20261017/g2_fp_gate_pt20k_r8"
+  },
+  "g2": "NOT_STARTED: automatic only after successful20k and PT/context exit",
+  "final_cpu": "NOT_RUN: deferred until complete G2 science",
+  "independent_review": "NOT_PERFORMED",
+  "monitoring": "Codex active monitoring stopped after normal startup; autonomous controller continues",
+  "eta": {
+    "pt_earliest": "2026-10-18T13:09:56.040670+08:00",
+    "pt_latest": "2026-10-18T14:25:53.046484+08:00",
+    "complete_earliest": "2026-10-18T13:39:56.040670+08:00",
+    "complete_latest": "2026-10-18T16:05:53.046484+08:00",
+    "median_recent_step_seconds": 2.4546667519998664,
+    "method": "remaining PT steps * recent host timing(0.9..1.25), plus300s output margin; G2/formal/CPU add30..100min",
+    "limitation": "rough log-based estimate; old small-task FT55..78s; no matching complete Egc timing; excludes external GPU waiting, device errors and stop conditions"
+  }
+}

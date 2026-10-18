@@ -1,5 +1,6 @@
 """Final-only G1 CPU checks with synthetic tensors and identities."""
 from types import SimpleNamespace
+from pathlib import Path
 import numpy as np
 import pytest
 import torch
@@ -252,8 +253,8 @@ def test_cache_inherits_without_regeneration(tmp_path, monkeypatch):
 
 
 def test_recovery_paths_reject_old_writes(tmp_path, monkeypatch):
-    assert runtime.OUT.name == 'g2_fp_gate_pt20k_r7'
-    assert runtime.LOG.name == 'g2_fp_gate_pt20k_r7'
+    assert runtime.OUT.name == 'g2_fp_gate_pt20k_r8'
+    assert runtime.LOG.name == 'g2_fp_gate_pt20k_r8'
     old_out, old_log = tmp_path / 'old_results', tmp_path / 'old_logs'
     monkeypatch.setattr(runtime, 'OLD_OUT', old_out)
     monkeypatch.setattr(runtime, 'OLD_LOG', old_log)
@@ -355,3 +356,128 @@ def test_total_four_slots_and_targeted_queries(monkeypatch):
     monkeypatch.setattr(controller.subprocess, 'run', query)
     assert controller.gpu_query('gpu=index,uuid') == '3, GPU-fixture\n'
     assert calls[0][1:3] == ['-i', '2,3']
+
+
+def pt_fixture_snapshot(contexts=None, external=None):
+    return dict(nvidia_pids=contexts or {'2': [101], '3': [102]},
+        proc_pids=external or {'2': [11], '3': [12]}, processes=[
+            dict(pid=10, ppid=1, start_ticks=100), dict(pid=11, ppid=10, start_ticks=110),
+            dict(pid=12, ppid=10, start_ticks=120)])
+
+
+def pt_fixture_ranks():
+    return {rank: dict(pid=11+rank, ppid=10, start_ticks=110+10*rank, rank=rank,
+        local_rank=rank, world=2, visible='2,3', phase='restored') for rank in range(2)}
+
+
+def test_pt_ddp_birth_and_cross_card_union():
+    from src.training.ua2d_pt20k import classify_pt
+    ranks = pt_fixture_ranks()
+    snapshot = pt_fixture_snapshot({'2': [101, 102], '3': [101, 102]})
+    result = classify_pt(snapshot, ranks, 10)
+    assert result['registered_nvml'] == [101, 102]
+    assert result['unique_gpu_processes'] == 2 and not result['errors']
+    snapshot['nvidia_pids'] = {'2': [101, 900], '3': [102, 900]}
+    result = classify_pt(snapshot, ranks, 10, [101, 102])
+    assert result['unassigned_nvml'] == [900] and result['unique_gpu_processes'] == 3
+    # Unknown external PID is neither silently attributed nor double-counted.
+    assert result['registered_nvml'] == [101, 102]
+
+
+def test_pt_rank_birth_identity_and_normal_exit():
+    from src.training.ua2d_pt20k import classify_pt
+    ranks = pt_fixture_ranks()
+    wrong = pt_fixture_snapshot()
+    wrong['processes'][1]['start_ticks'] += 1
+    assert classify_pt(wrong, ranks, 10)['errors']
+    exited = pt_fixture_snapshot()
+    exited['processes'] = [dict(pid=10, ppid=1, start_ticks=100)]
+    assert classify_pt(exited, ranks, 10, [101, 102])['errors']
+    assert not classify_pt(exited, ranks, 10, [101, 102], allow_exited=True)['errors']
+
+
+def test_p2_segment_physical_consumption_and_unknown():
+    from src.training.ua2d_pt20k import segment_consumption
+    first = segment_consumption(15001, 15000, 'RUNNING')
+    assert first['attempted_updates'] == 1 and first['completed_updates'] == 0
+    end = segment_consumption(20000, 20000, 'COMPLETED')
+    assert end['completed_updates'] == 5000 and end['logical_completed'] == 20000
+    assert end['cumulative_known_completed'] == 23347
+    assert end['cumulative_attempted_budget_occupancy'] == 23348
+    assert 'unknown' in end['old_interrupted_update']
+    with pytest.raises(ValueError):
+        segment_consumption(20001, 20000, 'RUNNING')
+
+
+def test_restricted_p2_resume_location_and_full_state():
+    from src.training import ua2d_pt20k as pt
+    from src.training.glt_dual_runtime import scheduled_lr
+    pt.validate_recovery_request(pt.RESUME, pt.TRAIN_OUTPUT, pt.CONFIG)
+    with pytest.raises(ValueError):
+        pt.validate_recovery_request(pt.RESUME.parent / 'deploy_15000.pt', pt.TRAIN_OUTPUT, pt.CONFIG)
+    with pytest.raises(ValueError):
+        pt.validate_recovery_request(pt.RESUME, pt.ORIGINAL / 'pretrain/P_ALIGN', pt.CONFIG)
+    cfg = pt.make_config()
+    state = dict(step=15000, next_position=15000*1008, rng=[{}, {}],
+        identity=dict(config=cfg, world_size=2), optimizer=dict(state={0: 'fixture'}),
+        scheduler=dict(step=15000, lr=scheduled_lr(14999, **{k:cfg[k] for k in ('lr','warmup_steps','schedule_total_steps','end_lr')})))
+    pt.validate_resume_position(state, cfg)
+    state['next_position'] = 0
+    with pytest.raises(ValueError):
+        pt.validate_resume_position(state, cfg)
+
+
+def test_g2_uses_recovered_20k_parent_and_unique_external_slots():
+    from src.training import ua2d_pt20k as pt
+    assert runtime.PARENT == pt.TRAIN_OUTPUT / 'deploy_20000.pt'
+    assert runtime.OUT.name == 'g2_fp_gate_pt20k_r8'
+    assert pt.make_config()['cycle_root'] == str(pt.ORIGINAL)
+    slots = Slots()
+    # One external context visible on two GPUs still spends one global slot.
+    observed = {2: {-123}, 3: {-123}}
+    slots.reserve('one', 2, observed)
+    slots.reserve('two', 3, observed)
+    slots.reserve('three', 2, observed)
+    assert slots.total_occupancy(observed) == 4
+    with pytest.raises(RuntimeError):
+        slots.reserve('four', 3, observed)
+
+
+def test_p2_segment_completion_rejects_fake_20k_consumption(tmp_path, monkeypatch):
+    import json
+    from src.training import ua2d_pt20k as pt
+    train, old, logs = tmp_path / 'train', tmp_path / 'old', tmp_path / 'logs'
+    for path in (train, old, logs):
+        path.mkdir()
+    config = dict(global_batch=1008)
+    cfg_path = tmp_path / 'config.json'
+    cfg_path.write_text(json.dumps(config))
+    monkeypatch.setattr(pt, 'CONFIG', cfg_path)
+    monkeypatch.setattr(pt, 'TRAIN_OUTPUT', train)
+    monkeypatch.setattr(pt, 'ORIGINAL', old)
+    monkeypatch.setattr(pt, 'LOG', logs)
+    monkeypatch.setattr(pt, 'validate_config', lambda cfg: cfg)
+    (logs / 'pretrain_exit.txt').write_text('0\n')
+    def save(path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value))
+    runtime_record = dict(status='PASS', completed_steps=5000, segment_start=15000,
+                          logical_end=20000, config=config, world_size=2)
+    save(train / 'runtime.json', runtime_record)
+    save(train / 'consumption.json', pt.segment_consumption(20000, 20000, 'COMPLETED'))
+    for rank in range(2):
+        save(train / f'recovery_rank{rank}.json', dict(start=15000, next_position=15000*1008,
+            resume=str(pt.RESUME), full_state_restored=True))
+    for group in pt.checkpoint_index():
+        for key in ('resume', 'deploy'):
+            path = Path(group[key])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+    for step in (1000, 2500, 5000):
+        save(old / f'pt_validation/P_ALIGN/step{step:05d}/metrics.json', dict(status='PASS',
+            presented=1024, step=step, config=config, checkpoint_selection=False))
+    assert pt.require_complete()['runtime']['completed_steps'] == 5000
+    runtime_record['completed_steps'] = 20000
+    save(train / 'runtime.json', runtime_record)
+    with pytest.raises(ValueError, match='5000 physical'):
+        pt.require_complete()

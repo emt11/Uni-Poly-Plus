@@ -1,0 +1,16 @@
+{
+  "captured_at": "2026-10-18T10:07:29.495180+08:00",
+  "kind": "static delivery only; not final CPU suite",
+  "ast_parsed": [
+    "scripts/run_ua2d_pt20k.py",
+    "src/training/ua2d_pt20k.py",
+    "scripts/pretrain_glt_dual.py",
+    "scripts/run_ua2d_fp_gate.py",
+    "src/training/ua2d_fp_gate.py",
+    "tests/test_ua2d_fp_gate.py"
+  ],
+  "final_cpu": "NOT_RUN",
+  "gpu_probe": 0,
+  "benchmark": 0,
+  "scientific_replay": 0
+}

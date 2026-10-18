@@ -85,7 +85,7 @@
       }
     }
   ],
-  "captured_at": "2026-10-17T23:14:43.002730+08:00",
+  "captured_at": "2026-10-18T10:07:29.454289+08:00",
   "kind": "one-time local status snapshot, not live remote monitoring",
   "records": [
     {
@@ -302,22 +302,36 @@
       "source_local": "logs/ua2d_fusion_20261017/p2_align20k_r7/execution.json",
       "exists": true,
       "record": {
-        "status": "RUNNING",
         "start": "2026-10-17T11:48:44.333206+00:00",
-        "end": null,
-        "exit": null,
+        "end": "2026-10-18T00:09:57.708433+00:00",
+        "exit": 1,
+        "status": "需返修",
+        "pid": 22908,
+        "torchrun_pid": 22949,
         "pt_starts": 1,
-        "ft_launched": false
+        "ft_launched": false,
+        "worker_identity": {
+          "pid": 22949,
+          "ppid": 22908,
+          "start_ticks": 710990,
+          "argv": [],
+          "exe": "/opt/conda/bin/python3.11",
+          "visible": "2,3",
+          "nspid": [
+            22949
+          ]
+        },
+        "error": "RuntimeError('P2 GPU process concurrency exceeded (maximum 2 ranks)')"
       }
     },
     {
       "source_local": "results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/consumption.json",
       "exists": true,
       "record": {
-        "status": "RUNNING",
-        "attempted_updates": 5070,
-        "completed_updates": 5069,
-        "starts": 1
+        "starts": 1,
+        "attempted_updates": 18348,
+        "completed_updates": 18347,
+        "status": "RUNNING"
       }
     },
     {
@@ -391,11 +405,84 @@
     {
       "source_local": "results/ua2d_fusion_20261017/g2_fp_gate_pt20k_r7/consumption.json",
       "exists": false
+    },
+    {
+      "source_local": "results/ua2d_fusion_20261017/p2_align20k_r7_recovery1/startup_status_r8.json",
+      "record": {
+        "captured_at": "2026-10-18T10:07:29.454289+08:00",
+        "kind": "one-time launch handoff snapshot; NOT LIVE",
+        "remote_baseline": "d053b726cec65e5bf3ea92356b904f92cde7e083",
+        "branch": "dev",
+        "execution_revision": "r8",
+        "execution": {
+          "start": "2026-10-18T10:05:19.538890+08:00",
+          "end": null,
+          "exit": null,
+          "status": "RUNNING",
+          "pid": 5409,
+          "torchrun_pid": 5566,
+          "new_pt_starts": 1,
+          "cumulative_pt_starts": 2,
+          "ft_launched": false,
+          "execution_revision": "r8",
+          "worker_identity": {
+            "pid": 5566,
+            "ppid": 5409,
+            "start_ticks": 219874,
+            "argv": [],
+            "exe": "/opt/conda/bin/python3.11",
+            "visible": "2,3",
+            "nspid": [
+              5566
+            ]
+          }
+        },
+        "consumption": {
+          "starts": 1,
+          "attempted_updates": 46,
+          "completed_updates": 45,
+          "logical_attempted": 15046,
+          "logical_completed": 15045,
+          "segment_start": 15000,
+          "status": "RUNNING",
+          "old_known": {
+            "starts": 1,
+            "attempted_updates": 18348,
+            "completed_updates": 18347
+          },
+          "old_interrupted_update": "unknown: logical step18348 may have updated before bookkeeping",
+          "cumulative_starts": 2,
+          "cumulative_known_completed": 18392,
+          "cumulative_attempted_budget_occupancy": 18394
+        },
+        "known_progress": "normal official optimizer updates from the full15000 training checkpoint; no test or probe",
+        "paths": {
+          "pt_results": "results/ua2d_fusion_20261017/p2_align20k_r7_recovery1",
+          "pt_logs": "logs/ua2d_fusion_20261017/p2_align20k_r7_recovery1",
+          "g2_results": "results/ua2d_fusion_20261017/g2_fp_gate_pt20k_r8",
+          "g2_logs": "logs/ua2d_fusion_20261017/g2_fp_gate_pt20k_r8"
+        },
+        "g2": "NOT_STARTED: automatic only after successful20k and PT/context exit",
+        "final_cpu": "NOT_RUN: deferred until complete G2 science",
+        "independent_review": "NOT_PERFORMED",
+        "monitoring": "Codex active monitoring stopped after normal startup; autonomous controller continues",
+        "eta": {
+          "pt_earliest": "2026-10-18T13:09:56.040670+08:00",
+          "pt_latest": "2026-10-18T14:25:53.046484+08:00",
+          "complete_earliest": "2026-10-18T13:39:56.040670+08:00",
+          "complete_latest": "2026-10-18T16:05:53.046484+08:00",
+          "median_recent_step_seconds": 2.4546667519998664,
+          "method": "remaining PT steps * recent host timing(0.9..1.25), plus300s output margin; G2/formal/CPU add30..100min",
+          "limitation": "rough log-based estimate; old small-task FT55..78s; no matching complete Egc timing; excludes external GPU waiting, device errors and stop conditions"
+        }
+      }
     }
   ],
   "minimal_fix": {
     "file": "src/training/ua2d_fp_gate.py",
     "change": "Pass expected_step=20000 to restore_pure_2d for the new parent.",
     "verification": "Static call-path finding; no new test/model call and no PT restart. Final CPU suite remains deferred until G2 completion."
-  }
+  },
+  "latest_r8_snapshot": "r8_recovery_status.json",
+  "prior_snapshot_warning": "2026-10-17 webpage snapshot is obsolete; below historical files with status RUNNING may be unfinalized remnants; r7 controller exit1/failure supersede them."
 }

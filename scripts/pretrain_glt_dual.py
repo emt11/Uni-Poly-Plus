@@ -29,12 +29,15 @@ from src.training.glt_dual_runtime import (require_tmux, open_source, save_check
 from src.utils import set_global_seed
 
 
-def write_consumption(path, *, attempted, completed, status):
+def write_consumption(path, *, attempted, completed, status, p2_recovery=False):
     """Publish one rank-0 ledger atomically for the concurrently reading controller."""
     path = Path(path)
     temporary = path.with_suffix(path.suffix + '.tmp')
-    write_json(temporary, dict(starts=1, attempted_updates=attempted,
-                               completed_updates=completed, status=status))
+    value = dict(starts=1, attempted_updates=attempted, completed_updates=completed, status=status)
+    if p2_recovery:
+        from src.training.ua2d_pt20k import segment_consumption
+        value = segment_consumption(attempted, completed, status)
+    write_json(temporary, value)
     os.replace(temporary, path)
 
 
@@ -160,6 +163,7 @@ def main():
     parser.add_argument('--common-init-artifact',
                         help='frozen common encoder/head initialization artifact')
     parser.add_argument('--resume')
+    parser.add_argument('--ua2d-recovery', action='store_true', help='r8 sole P2 15k recovery segment')
     parser.add_argument('--prep-workers', type=int, default=0,
                         help='DataLoader workers per rank for input prefetch '
                              '(0 = inline preparation, the exact original path)')
@@ -205,7 +209,14 @@ def main():
         validate_ua2d_pt(config)
         if os.environ.get('CUDA_VISIBLE_DEVICES') != '2,3':
             raise ValueError('P2 requires physical GPU2,3')
-        if (args.resume or args.diagnostics or args.benchmark_steps or args.stop_after_step
+        from src.training.ua2d_pt20k import validate_recovery_request
+        if args.ua2d_recovery:
+            if not args.resume:
+                raise ValueError('P2 recovery requires its full 15k training checkpoint')
+            validate_recovery_request(args.resume, args.output, args.config)
+        elif args.resume:
+            raise ValueError('P2 generic --resume forbidden; use the restricted r8 segment')
+        if (args.diagnostics or args.benchmark_steps or args.stop_after_step
                 or args.no_deploy or args.diagnostic_save_steps or args.timing
                 or args.common_init_artifact or args.reference_log or args.third_task
                 or args.pretrain_target_root or args.sample_index_artifact or args.sample_index_split
@@ -217,6 +228,8 @@ def main():
         from src.training.ua2d_pt20k import PI as ua2d_pi
         if Path(args.cohort_root).resolve() != ua2d_pi or Path(args.cache_root).resolve() != ua2d_pi:
             raise ValueError('P2 must reuse the original direct training cohort')
+    if args.ua2d_recovery and not config.get('ua2d_pt_revision'):
+        raise ValueError('r8 recovery flag is P2-only')
     if config.get('t3_revision'):
         from scripts.run_fce_tune_t3_unit import validate_pt_config,PI
         validate_pt_config(config)
@@ -315,9 +328,14 @@ def main():
     if world > 1:
         dist.init_process_group('nccl' if device.type == 'cuda' else 'gloo')
     output = Path(args.output)
+    if args.ua2d_recovery:
+        from src.training.ua2d_pt20k import publish_rank
+        publish_rank(output, rank, world, 'ddp_initialized')
     preparation_error = [None]
     if rank == 0:
         try:
+            if args.ua2d_recovery and any((output / name).exists() for name in ('runtime.json', 'run.json', 'resume_20000.pt', 'deploy_20000.pt')):
+                raise FileExistsError('P2 recovery training evidence already exists')
             if output.exists() and not args.resume:
                 raise FileExistsError('new training requires a new output directory')
             output.mkdir(parents=True, exist_ok=bool(args.resume))
@@ -441,6 +459,9 @@ def main():
         resume_rng = None
         if args.resume:
             state = torch.load(args.resume, map_location='cpu', weights_only=False)
+            if args.ua2d_recovery:
+                from src.training.ua2d_pt20k import validate_resume_position
+                validate_resume_position(state, config)
             if state['identity'] != identity or state['ordered_keys'] != ordered_keys:
                 raise ValueError('resume data/config/world size differs')
             if is_direct:
@@ -530,6 +551,17 @@ def main():
             restore_rng(resume_rng)
             if is_direct:
                 assert_actual_equal(rng_state(), resume_rng, 'restored.rng')
+            if args.ua2d_recovery:
+                write_json(output / f'recovery_rank{rank}.json', dict(start=start,
+                    next_position=start * batch_size, resume=str(Path(args.resume).resolve()),
+                    scheduler=state['scheduler'], rank=rank, world=world,
+                    full_state_restored=True, execution_revision='r8', identity=identity))
+                publish_rank(output, rank, world, 'restored', logical_start=start,
+                             next_position=start * batch_size)
+                if rank == 0:
+                    runtime = json.loads((output / 'runtime.json').read_text())
+                    runtime.update(segment_start=start, logical_end=stop, execution_revision='r8')
+                    write_json(output / 'runtime.json', runtime)
         reference = _reference_steps(args.reference_log) if args.reference_log else {}
         diagnostics_path = output / 'diagnostics_steps.jsonl'
         timing_path = output / 'timing_steps.jsonl'
@@ -548,7 +580,7 @@ def main():
             step_number = step + 1
             if new_cycle and rank == 0:
                 write_consumption(output / 'consumption.json', attempted=step_number,
-                                  completed=step, status='RUNNING')
+                                  completed=step, status='RUNNING', p2_recovery=args.ua2d_recovery)
             step_started = time.perf_counter()
             # All ranks finish warmup before the first timed update.  The
             # barrier is deliberately at the transition, rather than relying
@@ -676,7 +708,7 @@ def main():
             optimizer.step()
             if new_cycle and rank == 0:
                 write_consumption(output / 'consumption.json', attempted=step_number,
-                                  completed=step_number, status='RUNNING')
+                                  completed=step_number, status='RUNNING', p2_recovery=args.ua2d_recovery)
             if args.timing and device.type == 'cuda':
                 torch.cuda.synchronize(device)
             optimizer_seconds = time.perf_counter() - optimizer_started
@@ -849,7 +881,7 @@ def main():
             write_json(output / 'runtime.json', runtime)
             if new_cycle:
                 write_consumption(output / 'consumption.json', attempted=stop,
-                                  completed=stop, status='COMPLETED')
+                                  completed=stop, status='COMPLETED', p2_recovery=args.ua2d_recovery)
     finally:
         source.close()
         if dist.is_initialized():
