@@ -2,7 +2,7 @@
 
 计划 ID：**UA2D-FUSION-20261017-01 / r8（P2受限15k恢复与G2完整接续）**。日期：2026-10-17（北京时间）。
 
-状态：**执行中（r8 P2恢复＋G2）**。用户明确授权一次15k→20k恢复（累计PT最多2次）、新G2完整70FT及唯一最终CPU；旧r7科学配置身份保留。
+状态：**已取消（用户于2026-10-18明确要求立即停止）**。P2恢复训练与控制器已退出，G2及后续预测／融合／最终CPU测试不再派发；先前接续授权以本次停止指令为准。依据见第30节。
 
 本文件替代原F_CE长计划；第1—24节为历次规划与现场快照，发生冲突时以第26节r7为准。旧G1累计43次启动、19个旧parent完整FT只读保留；P2 r5因GPU2句柄异常在PT启动前停止。随后GPU3单卡草案仅改代码、没有启动；用户最新已改为GPU2/3范围，两卡现在均可正常查询。本轮新根重新执行PT20k及G2完整70FT，不重跑已完成旧周期，不读TODO。
 
@@ -751,3 +751,18 @@ r8恢复启动交接（2026-10-18T10:07:29.454289+08:00）。窗口Uni-Poly:ua2d
 G2／正式预测／CPU均未启动；全部七任务仍未完成／不可比较，沿用第26.4论文参考。科学条件不变，共享validation／TEST参与开发，仅探索性比较。Codex已停止主动监控，不等待整周期；控制器仍持续正常限流、故障处理和成功后自动接续，不能自动第三次PT启动。
 
 日志logs/ua2d_fusion_20261017/p2_align20k_r7_recovery1/，本地一次快照results/ua2d_fusion_20261017/p2_align20k_r7_recovery1/startup_status_r8.json；远程精简快照docs/research/evidence/r8_recovery_status.json，旧网页快照过期。未来20k产物／checkpoint索引／消费／真实exit位于新P2 final_review，G2输出到g2_fp_gate_pt20k_r8新根。最终CPU suite只在全科学完成后运行一次；当前未运行pytest，不把静态交付检查或commit/push称测试通过；独立审查未进行、不提前归档。
+
+
+### r8 P2 实际执行记录
+
+r8在本次恢复启动1次后停止：RuntimeError('P2 recovery torchrun failed, exit=1')；/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7_recovery1/failure.json；不自动第三次PT启动。
+
+
+## 30. 用户立即停止当前计划（2026-10-18）
+
+- 授权来源：用户明确指令“请你立刻停止当前CURRENT_PLAN.md计划”；状态：**已取消**，不是实验完成。本次取消覆盖P2恢复、G2微调与全部后续派发，不自动恢复或重试。
+- 已核实归属后向controller PID5409及本任务torchrun/rank进程组5566、5573、5574发送SIGTERM。控制器真实退出时间为2026-10-18 12:22:42（北京时间），controller／torchrun原始exit均为1。控制器通用退出路径记录“需返修”及错误原文，原始文件保留；本次停止原因以用户指令及信号记录说明，不解释为新的模型或并发故障。
+- 停止账本：本段attempted3437、completed3436，逻辑attempted18437／completed18436；累计PT启动2次，已知completed21783、attempted预算占用21785。旧18348及当前18437中断边界实际更新保留unknown；原账本RUNNING字段不代表仍在运行。
+- 停止后没有本计划活跃controller、训练rank或预取worker；GPU2、3计算进程查询为空。退出tmux window保留，无关窗口和作业未停止；既有数据、5k／10k／15k checkpoint、日志与失败证据保留，没有删除或追加保存20k。
+- G2启动0，正式预测0，固定融合／UA_FIXED75算术和最终CPU suite均未运行；不因取消执行任何补测。Eea、Egb、Egc、Ei、EPS、Nc、Xc全部为**未完成／不可比较**，原因是新20k parent与G2正式预测未完成；论文参考沿用第26.4节，不用旧FT或训练loss补齐。
+- 本地停止证据：`results/ua2d_fusion_20261017/p2_align20k_r7_recovery1/final_review/cancellation_20261018_1222.json`；可公开快照：`docs/research/evidence/r8_cancellation_status.json`，采集时间见JSON。源码和科学产物未修改，未做独立审查，不新增PROJECT_HISTORY归档。

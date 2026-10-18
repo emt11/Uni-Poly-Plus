@@ -1,0 +1,145 @@
+{
+  "captured_at": "2026-10-18T12:25:33.787631+08:00",
+  "plan": "UA2D-FUSION-20261017-01",
+  "execution_revision": "r8",
+  "status": "已取消",
+  "reason": "用户明确要求立即停止当前计划，禁止后续自动接续或重试",
+  "stopped_at": "2026-10-18T12:22:42.505078+08:00",
+  "signal_actions": [
+    {
+      "pid": 5409,
+      "signal": "SIGTERM",
+      "target": "controller",
+      "start_ticks": 219457
+    },
+    {
+      "pid": 5566,
+      "signal": "SIGTERM",
+      "target": "own torchrun process group",
+      "start_ticks": 219874
+    },
+    {
+      "pid": 5573,
+      "signal": "SIGTERM",
+      "target": "own rank0 process group",
+      "start_ticks": 220026
+    },
+    {
+      "pid": 5574,
+      "signal": "SIGTERM",
+      "target": "own rank1 process group",
+      "start_ticks": 220026
+    }
+  ],
+  "active_plan_processes": [],
+  "zombie_processes": [],
+  "gpu_compute_query": {
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "execution": {
+    "start": "2026-10-18T10:05:19.538890+08:00",
+    "end": "2026-10-18T12:22:42.505078+08:00",
+    "exit": 1,
+    "status": "需返修",
+    "pid": 5409,
+    "torchrun_pid": 5566,
+    "new_pt_starts": 1,
+    "cumulative_pt_starts": 2,
+    "ft_launched": false,
+    "execution_revision": "r8",
+    "worker_identity": {
+      "pid": 5566,
+      "ppid": 5409,
+      "start_ticks": 219874,
+      "argv": [],
+      "exe": "/opt/conda/bin/python3.11",
+      "visible": "2,3",
+      "nspid": [
+        5566
+      ]
+    },
+    "error": "RuntimeError('P2 recovery torchrun failed, exit=1')"
+  },
+  "consumption": {
+    "starts": 1,
+    "attempted_updates": 3437,
+    "completed_updates": 3436,
+    "logical_attempted": 18437,
+    "logical_completed": 18436,
+    "segment_start": 15000,
+    "status": "RUNNING",
+    "old_known": {
+      "starts": 1,
+      "attempted_updates": 18348,
+      "completed_updates": 18347
+    },
+    "old_interrupted_update": "unknown: logical step18348 may have updated before bookkeeping",
+    "cumulative_starts": 2,
+    "cumulative_known_completed": 21783,
+    "cumulative_attempted_budget_occupancy": 21785
+  },
+  "ft_launched": false,
+  "g2_root_exists": false,
+  "formal_predictions": "NOT_RUN",
+  "reference_arithmetic": "NOT_RUN",
+  "final_cpu": "NOT_RUN",
+  "checkpoint_index": [
+    {
+      "step": 5000,
+      "resume": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/resume_05000.pt",
+      "deploy": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/deploy_05000.pt",
+      "both_exist": true
+    },
+    {
+      "step": 10000,
+      "resume": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/resume_10000.pt",
+      "deploy": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/deploy_10000.pt",
+      "both_exist": true
+    },
+    {
+      "step": 15000,
+      "resume": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/resume_15000.pt",
+      "deploy": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_fusion_20261017/p2_align20k_r7/pretrain/P_ALIGN/deploy_15000.pt",
+      "both_exist": true
+    }
+  ],
+  "step20000_exists": false,
+  "notes": [
+    "原始exit=1/需返修是控制器通用终止记录；用户停止及SIGTERM是本次原因，原文保持。",
+    "原账本RUNNING是终止前字段，以真实退出和本取消快照为准。",
+    "旧18348及本次18437实际更新/记账边界保留unknown。",
+    "退出tmux pane及其僵尸PID无执行能力，现场保留。"
+  ],
+  "seven_tasks": {
+    "Eea": {
+      "status": "未完成／不可比较",
+      "reason": "新20k parent及G2正式预测未完成，本周期由用户取消"
+    },
+    "Egb": {
+      "status": "未完成／不可比较",
+      "reason": "新20k parent及G2正式预测未完成，本周期由用户取消"
+    },
+    "Egc": {
+      "status": "未完成／不可比较",
+      "reason": "新20k parent及G2正式预测未完成，本周期由用户取消"
+    },
+    "Ei": {
+      "status": "未完成／不可比较",
+      "reason": "新20k parent及G2正式预测未完成，本周期由用户取消"
+    },
+    "EPS": {
+      "status": "未完成／不可比较",
+      "reason": "新20k parent及G2正式预测未完成，本周期由用户取消"
+    },
+    "Nc": {
+      "status": "未完成／不可比较",
+      "reason": "新20k parent及G2正式预测未完成，本周期由用户取消"
+    },
+    "Xc": {
+      "status": "未完成／不可比较",
+      "reason": "新20k parent及G2正式预测未完成，本周期由用户取消"
+    }
+  }
+}
