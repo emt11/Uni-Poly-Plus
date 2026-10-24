@@ -1,0 +1,48 @@
+{
+  "plan": "UA2D-FG10K-MORGAN-20261023-01",
+  "revision": "r1.1",
+  "arms": [
+    "CONCAT_FP",
+    "GATE_FP"
+  ],
+  "FINAL": "GATE_FP",
+  "physical_gpu": 3,
+  "world_size": 1,
+  "per_arm_limit": 4,
+  "total_limit": 4,
+  "latest_override": "本会话用户：GPU3正式FT和TEST最多四路，立刻执行，不做多余测试",
+  "limits": {
+    "prepare_starts": 1,
+    "initialization_starts": 1,
+    "pt_starts": 0,
+    "pt_updates": 0,
+    "pt_presentations": 0,
+    "fp_generation": 0,
+    "ft_starts": 70,
+    "epochs_started": 4900,
+    "validation_started": 4900,
+    "attempted_updates": 112000,
+    "test_starts": 70,
+    "test_graphs": 11750,
+    "cpu_suites": 1
+  },
+  "parent": "/root/workspace/Uni-Poly-Plus-master/results/ua2d_3dshift_20261022/r1/all1_pcontrol_gpu2/pretrain/F_G10K/deploy.pt",
+  "fp_input": "real MorganBinary2048 radius2 from existing SQLite; no generation",
+  "branch_seed": 20261023,
+  "epochs": {
+    "head": 10,
+    "joint": 60
+  },
+  "batch": 24,
+  "precision": "FP32",
+  "workers": 0,
+  "threads": 1,
+  "validation_selection": "strict original-unit RMSE decrease; ties earlier",
+  "wallclock_seconds": 129600,
+  "prepare_seconds": 3600,
+  "ft_seconds": 7200,
+  "test_seconds": 300,
+  "cpu_seconds": 300,
+  "automatic_retry": false,
+  "automatic_resume": false
+}

@@ -247,7 +247,18 @@ class DualPretrainer(nn.Module):
         self.align_direction=align_direction
         if align_direction not in ('symmetric','2d_anchor') or (align_direction!='symmetric' and align_revision!='glt_align_r10_a2'):
             raise ValueError('ALIGN direction requires the A2 revision')
-        if align_revision is not None:
+        if align_revision == 'ua2d_sota_r1':
+            if (type(align_init_seed) is not int or align_init_seed != 314161
+                    or not align_enabled or third_task != 'none' or align_temperature != .10
+                    or self.align_weight not in (.05,.10) or self.align_warmup_steps != 1000
+                    or self.encoder.endpoint_revision or fusion_mode != 'token' or fusion_gate != 'none'
+                    or use_md200 or geometry_mode != 'finite_incident'
+                    or geometry_revision != 'glt_periodic_seam_r1' or readout != 'incident'
+                    or not angle_value_enabled or atom_ce_input not in ('raw','fused')
+                    or not geometry_head_norm or opt_mode != 'GLT_FUSION_R1'
+                    or local_enabled or torsion or quality_root is not None or align_direction != 'symmetric'):
+                raise ValueError('invalid UA2D SOTA r1 ALIGN configuration')
+        elif align_revision is not None:
             allowed_ce=('raw','fused') if align_revision=='glt_align_r10_a1' else ('fused',)
             if align_revision not in ('glt_align_2d_u1','glt_align_r10_a1','glt_align_r10_a2') or type(align_init_seed) is not int or align_init_seed!=314161 or not align_enabled or third_task!='none' or align_temperature!=0.10 or self.align_weight!=0.10 or self.align_warmup_steps!=1000 or self.encoder.endpoint_revision or fusion_mode!='token' or fusion_gate!='none' or use_md200 or geometry_mode!='finite_incident' or geometry_revision!='glt_periodic_seam_r1' or readout!='incident' or not angle_value_enabled or atom_ce_input not in allowed_ce or not geometry_head_norm or opt_mode!='GLT_FUSION_R1' or local_enabled or torsion or quality_root is not None:raise ValueError('invalid revision-specific ALIGN configuration')
             if align_revision=='glt_align_r10_a2' and align_direction!='2d_anchor':raise ValueError('A2 requires 2D anchors')
@@ -493,6 +504,7 @@ class DualPretrainer(nn.Module):
                 self.last_diagnostics = diagnostics
             if return_graph_feature:
                 result['graph_feature'] = fused
+                result['raw_graph_2d'] = encoded['graph_2d']
             return result
         finally:
             for handle in handles:

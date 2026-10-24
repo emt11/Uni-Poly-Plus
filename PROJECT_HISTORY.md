@@ -889,3 +889,286 @@ r7只运行Xc，r8只运行Ei；每task五折、std ddof=0、固定0.5G05＋0.5K
 r15返修证据：[交付](results/fce_tune_20261016/graph_distill/repair_device_fixture/delivery.md)、[增量](results/fce_tune_20261016/graph_distill/repair_device_fixture/repair_only_changes.diff)、[指定测试日志](logs/fce_tune_20261016/graph_distill/repair_device_fixture/stdout.log)。其原completion仍保留需返修／test_exit1，不能据本节回写为原suite全通过。r16／FP f1各自唯一CPU日志为`logs/fce_tune_20261017/nonbonded_ft/final_cpu/`与`logs/fp_graph_fusion_20261017/f1/final_cpu/`，分别11 passed／10 passed、exit0；自检通过不替代尚未进行的独立审查。
 
 本次只修改CURRENT_PLAN.md和本文件，新增PT／FT／fit／模型推理／正式融合评价／pytest／GPU均0，没有文件删除或旧产物改写。UA新周期和旧待审查事项由CURRENT_PLAN.md继续交接；未消费或已消费的旧额度都不因文档迁移重新生效。
+
+
+## 2026-10-18｜UA2D-SOTA-20261018-01 / r2 F0：Morgan条件化融合开发阶段关闭
+
+- **状态与审查**：已完成，仅关闭已授权F0开发和一次FP专项CPU测试。2026-10-18T16:07:52+08:00 Codex静态独立审查通过；完整SOTA周期未完成，原主线与F1、正式TEST继续暂停。基于本地dev / `3503fbe780a5399410d6db6055305925765c3ff8`及当时未提交工作树，没有远程同步。
+- **scientific question / reference**：固定原UA各任务各折已训练O8及head，当前Morgan信息能否通过特征融合产生≥0.010的validation宏平均增量？原UA validation宏平均为0.812；NULL另控制head继续训练和全局适配收益。
+- **实际架构 / controlled change**：复用35份norm2后raw h缓存；固定radius2/2048-bit Morgan。新增2048→32→1024适配器（99,360参数），输出`γ=0.1tanh(vγ)`、`β=0.1tanh(vβ)`。NULL用常量0.5输入及完整FiLM；SHIFT用真实FP的`h+β`；FILM用`(1+γ)⊙h+β`。输出层零初始化。仅训练adapter与同一核心的已训练head，O8/readout/norm2无更新。SHIFT的γ未参与预测，有效容量较低；FP信息控制以FILM−NULL为准。
+- **comparison budget / 执行**：三臂各七任务五折、seed42+fold、50 epochs、batch24、FP32；AdamW3e-4/WD0.02，cosine50/min3e-6、clip5、head dropout0.1。逐fold按validation原单位RMSE选best，允许epoch0，不early stop。实际105 starts、5250 epochs、attempted/completed updates=120000/120000；未增加PT、KRR、FP、PH、构象、encoder forward或TEST。
+
+### Validation结果及开发结论
+
+| 臂 | 七任务五折validation宏平均R² | 相对原UA |
+|---|---:|---:|
+| NULL | 0.814 | +0.002 |
+| SHIFT | 0.815 | +0.003 |
+| FILM | 0.815 | +0.003 |
+
+完整精度选SHIFT；FILM−NULL为+0.001，FILM−SHIFT为-0.000（小负差值舍入）。未达到+0.010开发晋级门槛，不采用为最终融合系统。NULL有19/35、SHIFT和FILM各18/35单元选epoch0。该结果未证明FP提供稳定收益，也不能否定其他未执行的FP融合机制。
+
+### 七任务正式SOTA对照
+
+下表前三列全部为validation均值±五折总体标准差(ddof=0)，仅记录实际开发观测；不能与论文正式数值混作性能对照。本批没有正式TEST，项目TEST R²与差值七项均不可比较。
+
+| 任务 | NULL validation R² | SHIFT validation R² | FILM validation R² | 论文R² | 论文模型 | 本项目TEST R² | 项目−论文 |
+|---|---:|---:|---:|---:|---|---|---|
+| Eea | 0.924±0.016 | 0.924±0.016 | 0.924±0.015 | 0.934±0.013 | Periodic-TDL | 未完成／不可比较 | — |
+| Egb | 0.942±0.013 | 0.941±0.012 | 0.941±0.012 | 0.923±0.009 | Periodic-TDL (+Chem, +RC) | 未完成／不可比较 | — |
+| Egc | 0.908±0.005 | 0.911±0.007 | 0.911±0.007 | 0.911±0.008 | Periodic-TDL (+Chem, +RC) | 未完成／不可比较 | — |
+| Ei | 0.848±0.023 | 0.848±0.023 | 0.848±0.023 | 0.839±0.018 | Periodic-TDL | 未完成／不可比较 | — |
+| EPS | 0.771±0.082 | 0.772±0.081 | 0.772±0.081 | 0.787±0.033 | Periodic-TDL | 未完成／不可比较 | — |
+| Nc | 0.852±0.050 | 0.853±0.051 | 0.853±0.051 | 0.856±0.032 | Periodic-TDL | 未完成／不可比较 | — |
+| Xc | 0.455±0.098 | 0.455±0.098 | 0.454±0.098 | 0.423±0.102 | Periodic-TDL | 未完成／不可比较 | — |
+
+统计为5fold等权、七任务等权，无额外seed；论文参考来自`SOTA_RESULT.md`，数据/split/预训练/seed统计未证明一致，历史TEST曾参与路线开发。EAT/Eib/Tg不纳入，不宣称公平超过论文。
+
+### 独立审查证据、测试与限制
+
+- 三份当前实现与交付`implementation.diff`一致；105单元配置、split/行身份、epoch记录、预算和exit已核对。读取保存的validation预测重算R²/RMSE，和记录最大绝对差0；没有重放模型forward或实验。
+- 最终唯一CPU日志为10 passed、1 warning、4.58s、exit0；warning为依赖弃用提示。本轮不重跑测试，不重新strict-load105个best包；审查通过不等于部署恢复或正式TEST通过。
+- [validation报告](results/ua2d_sota_20261018/r2/fp_fusion/final_review/validation_report.md)、[完整精度开发汇总](results/ua2d_sota_20261018/r2/fp_fusion/development/validation_summary.json)、[SOTA缺项表](results/ua2d_sota_20261018/r2/fp_fusion/final_review/seven_task_comparison.md)、[交付diff](results/ua2d_sota_20261018/r2/fp_fusion/final_review/implementation.diff)、[CPU日志](results/ua2d_sota_20261018/r2/fp_fusion/final_review/final_cpu.log)。结果根`results/ua2d_sota_20261018/r2/fp_fusion/`，日志根`logs/ua2d_sota_20261018/r2/fp_fusion/`；历史tmux窗口为`Uni-Poly:ua2d_sota_fp_r2`、`film_r2_<mode>_<task>_<fold>`、`film_r2_final_cpu`，本轮未查询/操作进程。
+- 原execution_manifest的待审查状态保留为交付快照，独立审查状态以本归档及CURRENT_PLAN为准。不重跑F0，不自动启动F1/TEST或原P/A/T/M/I；下一步恢复须明确授权并保留实际累计预算。
+
+## 2026-10-20｜UA-HOP-PH-20261020-01 / r1：四hop与空间PH路由负结果收口
+
+**状态：已完成；Codex独立审查通过；性能门槛未通过，不晋级。** 用户2026-10-20明确要求Codex亲自记录审查并制定下一步计划，本节据此归档。审查结论已同时写入CURRENT_PLAN.md H16；不改变其他待审查周期状态。
+
+- 审查主体：Codex；上轮独立审查为2026-10-20 17:07—17:11（Asia/Shanghai）；本轮17:30起按用户要求亲自落盘，并复核交付汇总未变化。依据本地 dev / `3503fbe780a5399410d6db6055305925765c3ff8` 加已有 dirty 工作区；不是对干净提交的验收。用户本轮授权审查记录、归档及下一步计划，不授权新训练。
+- 科学问题：相同 UA、四尺度适配器和训练条件下，空间 PH 条件路由是否优于固定等权。reference 为 HOP_EQ，controlled change 为 PH router及其额外20484参数；与纯二维 V1＋FP 的差值另含推理期三维输入和适配器，不能单独归因 PH。
+- 实际实现：保留 B_FP step5000 的 O8、MaskedGalformer3D、旧 attention 1/√512 与原 mean/norm2/head；末端四套独立LN/QKV构成物理键线图 exact 1／2／3／4-hop；全部最短路径先归约后进入共享18→32→4 bias MLP；等权或155→128→4空间PH dense路由后，经中央真实incidence均值、零初始化W_out和投影后完整屏蔽注入二维原子表示。合法无几何采用零增量，不新增构象。
+- 审查范围：已静态检查 `src/dataset/ua_hop_ph.py`、`src/modules/ua_hop_ph.py`、`src/training/ua_hop_ph.py`、`scripts/run_ua_hop_ph.py`、`tests/test_ua_hop_ph.py` 及交付diff；旧 `glt_dual.py`／`glt_dual_pretrain.py` 改动此前已存在，本次未归为r1新修改。核对70个history／best阶段、冻结记录、配置／样本键／split索引、140份既有validation／TEST预测；保存预测重算R²与记录最大差为0，没有新增模型预测。抽查Egc/fold0 joint与Nc/fold4 head的完整checkpoint参数；未重放70个模型forward。
+- 实际消耗：0 PT；70 FT；4900 started/completed epochs及validations；attempted/completed updates均112000；70正式TEST、11750图；prepare／FT／TEST／CPU共142个作业exit均0。GPU2／3每卡最高两路；冻结时间16:55:53早于首个TEST启动；controller最终exit0，结束16:59:15。实际controller窗口为 `Uni-Poly/@1200`，交付文本的 `@0` 为元数据笔误，不代表额外启动。
+- 最终唯一CPU证据：`logs/ua_hop_ph_20261020/r1/cpu/stdout.log`，8 passed、1个依赖弃用warning、8.72秒、exit0；作业窗口@1342，包含启动的墙钟约15秒，未超300秒。本轮不重跑suite或实验。
+- 性能：HOP_EQ validation／TEST宏R²为0.819／0.788；HOP_PH为0.819／0.788。PH−EQ的未舍入validation和TEST差值均为正且小于0.001，展示均为+0.000；validation支持条件满足，TEST增量未达≥0.010，预设总门槛不通过。
+- 历史参照：HOP_EQ相对V1＋FP／r10的TEST差值为−0.003／−0.008；HOP_PH为−0.003／−0.008。历史来源分别为 `results/ua2d_pretrain_fp_20261019/fast_r4/final_review/results.json`、`results/fce_tune_20261016/global_blend/final_review/seven_task_results.json`；本次不改变这些周期的既有审查状态。
+- 两臂各有4／35折选head-only best；这些折W_out仍为零，只能按二维预测解释。输入准备为3654个唯一身份（3646有效、8合法无几何），5875个任务记录；中央incidence根键四跳周期覆盖95.022%，该比例不是分子覆盖率，也不能单独解释性能差。
+- 统计：各任务5fold、seed42—46、std ddof=1，再七任务等权macro；原始预测／指标保持完整精度，展示三位小数。共享validation／TEST已经参与路线开发，非独立盲测；与论文数据、split及统计等价性未证明，仅作数值对照。Eea显示0.934但两臂未舍入值均低于参考；两臂均只有Egb、Egc两项数值达到参考，SOTA目标未完成。EAT／Eib／Tg不纳入。
+
+| 任务 | 论文最佳模型 | 参考 R² | HOP_EQ R²±std | EQ−参考 | HOP_PH R²±std | PH−参考 |
+|---|---|---:|---:|---:|---:|---:|
+| Eea | Periodic-TDL | 0.934 | 0.934±0.015 | -0.000 | 0.934±0.015 | -0.000 |
+| Egb | Periodic-TDL (+Chem, +RC) | 0.923 | 0.932±0.014 | +0.009 | 0.933±0.014 | +0.010 |
+| Egc | Periodic-TDL (+Chem, +RC) | 0.911 | 0.912±0.018 | +0.001 | 0.914±0.015 | +0.003 |
+| Ei | Periodic-TDL | 0.839 | 0.807±0.036 | -0.032 | 0.807±0.036 | -0.032 |
+| EPS | Periodic-TDL | 0.787 | 0.755±0.045 | -0.032 | 0.755±0.045 | -0.032 |
+| Nc | Periodic-TDL | 0.856 | 0.808±0.079 | -0.048 | 0.804±0.069 | -0.052 |
+| Xc | Periodic-TDL | 0.423 | 0.369±0.152 | -0.054 | 0.372±0.151 | -0.051 |
+
+- 原始结果与产物：`results/ua_hop_ph_20261020/r1/final_review/results.json`、`best_stage_summary.json`、`code_diff.patch`、`plan_diff.patch`；每臂每任务五折的 `finetune/`、`formal/`、`selection/final_frozen.json`、`sidecar/coverage_summary.json`、`initialization/`、`execution_manifest.json` 和 `budget.json` 全部保留。
+- 日志：`logs/ua_hop_ph_20261020/r1/`，含controller／142个prepare、FT、TEST及CPU作业记录；实际controller为Uni-Poly/@1200，CPU为@1342。本轮不重启或干预这些历史进程。
+- 收口：保留r1为已执行负结果，不替换V1＋FP或r10，不追加seed、训练或测试，不修改原始产物／旧审查快照。后续仅提出三维编码器冻结的单因素计划，状态待授权，唯一当前交接以CURRENT_PLAN.md F1—F11为准。
+- 本轮只修改CURRENT_PLAN.md和本归档，新增代码、PT、FT、模型预测、CPU suite和GPU消耗均0，没有删除文件、哈希／校验和或远程同步。
+
+## 2026-10-20｜UA-HOP-PH-FROZEN3D-20261020-01 / r1：冻结三维编码器开发负结果收口
+
+**状态：已完成；Codex独立审查通过；开发门槛未通过，不晋级；正式TEST=0。** 当前用户要求Codex审查并制定下一步计划，本节归档实际实现与开发结果；CURRENT_PLAN.md F12为对应审查记录。
+
+- 审查主体：Codex；检查时间2026-10-20 19:01起（Asia/Shanghai）。依据本地dev／`3503fbe780a5399410d6db6055305925765c3ff8`加已有dirty工作区，以及FROZEN3D的实际源码、交付diff和产物；用户授权本轮审查落盘、归档、规划与提示词，未授权新训练。
+- 科学问题／reference：在相同初始化、数据与10＋60 epochs下，只冻结B_FP的encoder3d是否优于r1 HOP_PH全量joint更新。候选F3D_PH，原r1 HOP_PH的35套正式FT validation记录只读复用；原reference未重训或重推理。
+- 实际实现与检查：静态查看 `src/modules/ua_hop_ph_frozen3d.py`、`src/training/ua_hop_ph_frozen3d.py`、`scripts/run_ua_hop_ph_frozen3d.py`、`tests/test_ua_hop_ph_frozen3d.py`。encoder3d全阶段requires_grad=false／eval，不入optimizer，真实3D前向保留；O8／norm2与新适配器／router／head在joint按原LR训练。共享输入／初态只读来自r1，新的OUT隔离，没有输入准备或embedding缓存。
+- 执行证据：35 FT全部完成；started/completed epochs及validations均2450；attempted/completed updates均56000；TEST starts／graphs均0；CPU suite1次。35 FT＋1 CPU共36个作业exit均0，GPU2／3峰值各两路。FT从17:50:34至18:38:54，controller为Uni-Poly/@1343，18:39:05真实exit0；当前controller窗口为bash，无继续派发证据。
+- 选择与数据核对：35个history的完整70 epochs、严格validation best、配置／阶段／scaler及保存预测一致；4714条既有validation预测的fold索引和sample key与manifest一致，保存预测重算R²与记录最大差0。无正式预测文件、无final_frozen.json，符合未通过门槛时不开放TEST的规定。
+- checkpoint抽查：Egc/fold0 best为joint epoch59，encoder3d的103个状态张量与B_FP parent逐项torch.equal且状态有限；这支持冻结实现，不代替对全部35套参数的重新恢复。未执行模型forward或重跑训练／预测。
+- 唯一CPU日志：`logs/ua_hop_ph_20261020/frozen3d_r1/cpu/stdout.log`，5 passed、1个依赖弃用warning、6.86秒、exit0；作业窗口@1379，包含启动墙钟约10秒，未超300秒。本轮没有重跑测试或扩大预算。
+- 结果：F3D_PH validation宏R² 0.821，r1 HOP_PH 0.819，差值+0.002；完整精度差值小于0.010，开发门槛未通过。Ei／EPS／Nc三项validation提高，Eea／Egb／Egc／Xc下降；EPS单任务+0.011不构成改变全局门槛或按任务拼接的依据。head阶段best为3／35，不作三维收益解释。
+- 统计与正式结果限制：每任务5fold、seed42—46、std ddof=1，再七任务等权macro，完整精度计算后三位小数展示；共享validation已经用于开发。新候选没有TEST，七任务正式R²及项目减论文差值全部不可比较，不填入r1、V1＋FP或validation数值代替。
+
+| 任务 | F3D_PH validation R²±std | r1 HOP_PH validation R²±std | 候选−参考 |
+|---|---:|---:|---:|
+| Eea | 0.925±0.017 | 0.926±0.016 | -0.002 |
+| Egb | 0.941±0.011 | 0.942±0.009 | -0.001 |
+| Egc | 0.919±0.008 | 0.921±0.006 | -0.002 |
+| Ei | 0.872±0.024 | 0.866±0.022 | +0.006 |
+| EPS | 0.791±0.059 | 0.780±0.078 | +0.011 |
+| Nc | 0.852±0.063 | 0.847±0.064 | +0.005 |
+| Xc | 0.444±0.119 | 0.450±0.113 | -0.006 |
+
+| 任务 | 论文最佳模型 | 参考R² | F3D_PH正式R²／项目−参考 |
+|---|---|---:|---|
+| Eea | Periodic-TDL | 0.934 | 未执行／不可比较（validation门槛未通过，TEST=0） |
+| Egb | Periodic-TDL (+Chem, +RC) | 0.923 | 未执行／不可比较（validation门槛未通过，TEST=0） |
+| Egc | Periodic-TDL (+Chem, +RC) | 0.911 | 未执行／不可比较（validation门槛未通过，TEST=0） |
+| Ei | Periodic-TDL | 0.839 | 未执行／不可比较（validation门槛未通过，TEST=0） |
+| EPS | Periodic-TDL | 0.787 | 未执行／不可比较（validation门槛未通过，TEST=0） |
+| Nc | Periodic-TDL | 0.856 | 未执行／不可比较（validation门槛未通过，TEST=0） |
+| Xc | Periodic-TDL | 0.423 | 未执行／不可比较（validation门槛未通过，TEST=0） |
+
+- 原始产物：`results/ua_hop_ph_20261020/frozen3d_r1/`，包括35份FT完整best／resume／scaler／history／validation预测、sources、execution_manifest、budget、selection/development_decision.json及final_review结果／CPU／diff。日志根 `logs/ua_hop_ph_20261020/frozen3d_r1/`，controller @1343，CPU @1379，真实退出码保留。
+- 没有正式TEST、没有final_frozen，不伪造候选七任务正式结果。原交付metadata中的PENDING仅代表DSH交付时点，独立审查状态以本归档及CURRENT_PLAN F12为准。保留全部原始产物，不追加训练或测试，不以单任务EPS改善重写宏门槛。
+- 下一步为固定每折已微调B_FP二维预测、比较REAL／NULL几何残差的新方案，见CURRENT_PLAN A1—A11，状态待授权；不恢复旧r1／FROZEN3D或其他历史队列。本轮仅修改两份文档，新实现／PT／FT／模型预测／CPU／GPU消耗均0，无删除、哈希或远程操作。
+
+## 2026-10-24｜近几日实验集中独立审查与归档
+
+### 审查范围、版本与完成层级
+
+- 审查 ID：UA2D-RECENT-REVIEW-20261024-01／r1；主体 Codex。用户本轮明确要求审查近几天所有实验并写入本文件；授权范围为审查与文档归档，没有新增实现、训练或评估授权。
+- 检查时间：2026-10-24 10:36 起（Asia/Shanghai）。基于本地 dev／3503fbe780a5399410d6db6055305925765c3ff8 及已有 dirty 工作区。开始时 AGENTS.md、CURRENT_PLAN.md、PROJECT_HISTORY.md、共享模型已有修改，另有大量未跟踪实验源码与既有删除；全部保留。已查看相关 diff、源码、计划、SOTA_RESULT.md、实际交付和预算，不把 HEAD 当作全部运行源码。
+- 范围：10 月 18—23 日实际执行的 UA2D 工作，重点为 10 月 19—23 日的 16 个交付周期，另补记已取消的旧 SOTA 主线；共 17 个周期／工作包。HOP_PH、FROZEN3D 及 10 月 18 日 F0 已有独立归档，复用其记录并纳入索引，不重复计费或伪造新增周期。10 月 17 日以前的 FCE／r9／r10 等仍见前文既有归档。
+- 16 个交付周期合计：PT 启动 26 次（含历史失败／停止尝试），FT 启动 1,443 次，其中完整 FT 1,435 次、OPT 历史失败 8 次；正式评估 1,295 单元，包含 36 个模型输出臂的 1,260 次评估和 1 个数组融合政策的 35 次评估；已有 CPU suite 共 20 次。旧 SOTA 主线及其已归档 F0 的消费另列，不混入上述合计。
+- 本轮只读核对 1,435 份完整 70-epoch history；OPT 按成功 attempt 映射取 280 个单元，未把失败目录当作成功记录。核对正式预测的配置、fold／seed、样本键、原始行号和目标，重算 1,260 组既有模型预测的 R²，结果与保存值差异为 0；各臂的五折均值、样本标准差和七任务 macro 一致。另按原始行号与 sample key 联合对齐，核对 35 组数组融合预测及 175 个既有 validation 权重分数，融合预测最大差异为 0。
+- 已核对相关实际实现、交付 diff／配置、预算与作业真实退出证据；原有最终 CPU 测试结果见下表，没有重跑。既有 FPDECAY、HOP_PH、FROZEN3D 的详细参数／数据审查记录一并复用。审查没有重新恢复全部 checkpoint 或执行数值 forward，不声称逐张量全面认证。
+- 下文“已完成、审查通过”指限定执行范围及其结果证据通过独立审查；性能结论另行判定。原始 JSON 的 PENDING、旧计划的待执行、事故日志和未知退出码保留为历史快照，当前结论以本节及 CURRENT_PLAN.md 的同 ID 审查记录为准。L、额外 30K／40K PT 等未执行方案不列为实验结果。
+
+### 各周期的科学问题、实际实现与判定
+
+**SOTA 主线／r1、r1_retest1（10 月 18—19 日）：已取消，完整实验未完成。** 该旧路线包含 T_RAWCE、T_AL05、M_ALL4 等旧预训练与下游开发分支，不等同于后来的 V1／B_FP。retest1 的两支 PT runtime 各记录完成 5,000 steps，M_ALL4 被用户停止；账本累计 PT 启动 3、attempted updates 11,845、completed updates 11,844，FT 启动 284、begun epochs 19,786／completed epochs 19,782，KRR 拟合 315、特征单元 35，正式神经／核 TEST 与最终 CPU 均为 0。更早 r1 单独记录 FT 启动 53、epochs 3,577、KRR 拟合 315、特征单元 36，其中一次 FP 旧表列不匹配失败；不将这些消费重置或称为 retest 新增。2026-10-19 11:27 的用户停止记录明确禁止自动继续。该部分仅完成停止／消费证据审查，未逐单元认证其开发产物，不作为完整实验或性能通过归档。原 r2 F0 的 105 次适配与 CPU 结果已经在本文件 2026-10-18 节归档，TEST=0，保持原结论。
+
+**FP／PRETRAIN-FP fast_r4（10 月 19 日）：已完成，执行与结果审查通过；新增 FP 未达性能门槛。** 科学问题是在纯二维下游路径中，比较 masked atom／3D bond CE＋图级 ALIGN 的 V1、几何重建任务包 V2，以及 V1 加真实 Morgan FP 监督的 B_FP。三支成功 PT 均从公共 step0 完整训练 5,000 updates，各 35 FT／35 TEST；数据、split、公共下游 head 与 10＋60 epochs 配方相同。B_FP 使用 masked 2D states 的 mean＋norm2 预测完整 2048-bit Morgan，balanced BCE；历史 ALIGN／FP 权重各 0.1 并 warmup 1,000，双向 ALIGN 使用 sum 口径。下游不输入 FP 或 3D。TEST：V1 0.787，V2 0.785，B_FP 0.791；B_FP−V1 +0.004，V2−V1 −0.002。B_FP 可保留为后续已使用的数值参考，不能写成达到 +0.010 的改进。最早 collate NameError、一次失败 CPU、用户停止的 V1_attempt2 均保留并进入累计账本；后者日志完成约 1,390 steps，计费采用预算记录，不拿每个 rank 的相同步数重复相加。
+
+**CLEAN／CLEANFP-READOUT-DISTILL（10 月 19—20 日）：已完成，审查通过；固定候选未晋级，存在限定的内部正向对照。** 六臂为 G／Q／QL × ALL1／DYN，每臂 5,000 PT＋35 FT＋35 TEST。实际实现同时进行 masked 与 clean 的 2D／3D forward：masked 路径负责恢复 CE，clean 2D 路径预测完整 FP，clean 2D／3D 图表示做 ALIGN；因此它同时改变 FP 输入和 ALIGN 输入，不能单独归因为“clean FP”。G 为 mean readout；Q 为零门控残差的 query readout；QL 进一步用 clean atom 与 stop-gradient incident 3D bond teacher 对齐。ALL1 的各任务系数为 1，但保留旧 ALIGN×2 口径，不能与后来 uniform1_align_mean_v1 混称。DYN 按训练损失历史每 20 窗口调整，权重限制 0.25—4，保持总和并平滑，不读取 TEST。固定候选 G_ALL1 TEST 0.778，低于历史 B_FP；原 validation 晋级条件也未通过。QL_DYN TEST 0.790，较 QL_ALL1 0.774 提高 +0.016，按当前默认 TEST 数值门槛，该匹配内部权重对照达到门槛；但它仍低于 B_FP，且不改变原冻结候选或原周期晋级结论。不能写成“六臂所有对照都没有收益”，也不能按 TEST 将 QL_DYN 追认为最终候选。
+
+**ATTN／V1_ATTN64（10 月 20 日）：已完成，审查通过；性能未通过。** 将 O8／3D attention 的 QK 缩放由 1/√512 改为 1/√64，结构偏置在缩放之后加入、保持不缩放。新增 1 支 5,000-step PT＋35 FT／35 TEST；历史 V1 为 reference。TEST 0.782，相对 V1 −0.005、B_FP −0.009。该结果没有支持调整缩放即可改善迁移；与历史 PT 执行条件的差异限制因果解释，不据此宣称缩放对任何设置均无效。
+
+**DEMOL（10 月 20 日）：已完成限定开发范围，审查通过；正式性能未完成／不可比较。** 从同一 B_FP 恢复 O8／norm2 与公共 head，PT=0；对比 BOND_SELF／BOND_NEIGHBOR，各 35 FT。原子端点和 bond chemistry 构造 128 维键适配器，经过自身或 1-hop 键邻域聚合后，通过零初始化投影回注入原子；两臂适配器结构匹配。head 10 epochs 冻结适配器，joint 60 epochs 使用 O8 1e−4、adapter 3e−4、head 1e−3。validation macro：SELF 0.820、NEIGHBOR 0.819，NEIGHBOR−SELF −0.001，原开发触发条件未满足，正式 TEST=0。不能将 validation 差值当成 TEST 负结果。
+
+**ET／ET_SINGLE repair1（10 月 20—21 日）：修复后的限定开发范围已完成，审查通过；正式性能未完成／不可比较。** 用 TorchMD 风格 6×256 equivariant atom encoder 替代 3D bondline teacher，以半径 4 Å、真实重原子键及 self 的并集构图；保留 2D CE、3D bond-type CE 与图级 ALIGN，下游仍纯 2D。原首次 PT 因 atomic/template physical count mismatch 失败，真实退出 137；repair1 经授权排除 635 条 geometry_invalid 的整条记录，911,391→910,756，不让它们只参与二维目标。修复 PT 完成 5,000 updates、35 FT 完成；validation macro 0.815，相对 V1 −0.002，原触发条件未满足，TEST=0。早先“修复仅到 51 steps”的进度快照已过时。两次 prepare／PT、两次既有 CPU 与失败消费保留；不同 teacher 与筛选后的 cohort 同时变化，不能归因于单独的 ET 算子。
+
+**HOP／UA-HOP-PH r1 与 F3D／FROZEN3D（10 月 20 日）：沿用前文审查，通过证据归档，均未形成晋级结果。** HOP 在同一 B_FP parent 上比较四 hop 等权与基于空间 PH 的路由，共 70 FT／70 TEST，HOP_EQ 0.788、HOP_PH 0.788，差值展示 +0.000；不能称为 0.010 改进。FROZEN3D 另做 35 FT、TEST=0，实际保留 3D forward 而仅冻结 encoder3d；validation 差值 +0.002，正式性能未完成／不可比较。两周期的实现、参数冻结抽查、GPU 峰值与论文对照已见本文件对应 2026-10-20 独立归档，不再重复记为新增实验。
+
+**OPT／r1-FT-REPAIR1（10 月 21—22 日）：修复后已完成，审查通过；性能未通过。** A 比较末两层迁移和 2／4／6 层读出；B 比较固定 2／3-hop 与元素 E／化学上下文 C 目标；C 为六层 hop schedule [1,1,2,2,3,3]；D 将所选 B2_C 与 MIX246 组合。实际 MIX246 为 p6＋0.25 tanh(a2)(p2−p6)＋0.25 tanh(a4)(p4−p6)，a2／a4 零初始化，属于有界残差混合，绝非 softmax 权重混合。用户后续授权 C、D 无论 B 结果均执行，不能再按早期 FT_POLICY=NONE 宣称 D 未跑。实际 8 臂各 35 FT 完成；按最后授权政策，一次冻结 A_MIX246、B3_E、B2_C、C_SCHED_E、D_INTEGRATE 的 175 个正式单元。FINAL=A_MIX246 TEST 0.791，较 B_FP +0.000；C−B3_E −0.011，D−B2_C +0.000，均未达到门槛。A_TOP2、B2_E、B3_C 没有正式 TEST，因此不能报告完整 TEST 2×2 hop×target 主效应或交互效应。审查使用 repair_ft1 的结果和 attempt_mapping，而非旧失败 final_review 的空结果。
+
+OPT 历史 B3_C 的 8 次失败各有真实退出：Egc folds 0／1 为 124，Egc folds 2／3、Ei fold4、EPS fold1 为 137，Egc fold4、EPS fold0 为 1。授权修复为新目录各一次完整 fresh FT，没有覆盖失败现场。最终 288 次 FT 启动包含 280 次成功和 8 次失败；失败单元按整单元保守预留替代已知下界计费，共 20,160 epochs／validations、482,090 attempted updates，不能误写成全部成功完成的训练量。B3_C／C 的 LMDB 预读与计时仅为工程变化，实际加载／耗时见原报告；没有根据静态检查预先断言提速。
+
+**TRANSFER（10 月 22 日）：已完成，审查通过；性能未通过。** 同一 B_FP、同一 2-hop 输入及公共 head，比较 R_MEAN、R_STD、A_SP、R_STD_SP，各 35 FT／TEST，PT=0。R_MEAN／R_STD 使用匹配的零输出残差适配器，后者读 population std；A_SP 在共同 mean 路径施加系数 0.5e−3 的 L2-SP 锚定，组合臂合并两因素。R_MEAN 0.791、R_STD 0.788、A_SP 0.790、R_STD_SP 0.785；固定 FINAL=R_STD_SP，相对 B_FP −0.006。R_STD−R_MEAN 是匹配适配器容量的读出对照；其他跨配置差值不统一解释成“std 的效果”。
+
+**WAVG（10 月 22 日）：已完成，审查通过；权重平均未达性能门槛。** 仅 35 条完整 70-epoch FT 轨迹，各导出 validation BEST、全局 epochs 40／50／60／70 的 SWA4，以及全局 epochs 11—70（joint 60 轮）的 β=0.9、S0=z0=0、最终 S/z 的 EMA60；浮点状态 FP32 累加，非浮点 buffer 必须一致。不是 105 次 FT；额外 70 次 endpoint validation 已计入 2,520 次 validation。一次冻结 105 个估计器后正式 TEST：BEST 0.791，SWA4 0.780（−0.011），EMA60 0.777（−0.014）。固定 FINAL=EMA60，不根据 TEST 改选 BEST 为新优化成果。
+
+**PTSCALE（10 月 22 日）：已完成，审查通过；10K 是本周期冻结参考，扩大步数未达到提升门槛。** 同一条从 step0 连续到 20,000 的 PT 轨迹保存 5K／10K／20K；不是三次独立 PT，也不把 5K／10K checkpoint 当成另外训练消费。保持旧 masked FP、ALIGN／FP 0.1 warmup 配方，5K 学习率周期重复；因此延长训练同时增加数据曝光和学习率周期数。三组各 35 FT／35 TEST：P5K 0.788、P10K 0.793、P20K 0.785；P10K−P5K +0.005，P20K−P10K −0.008，P10K−B_FP +0.002。正式 reference 是 step10000/deploy.pt，不是 0.893，也不是 3DSHIFT 的 P_G。
+
+**FPDECAY／r2-SG（10 月 22 日）：已完成，审查通过；严格未通过性能门槛。** 单物理 GPU3、world1、micro168×acc6、global1008；BASE 与 FP_DECAY 各独立 5K PT＋35 FT／35 TEST，使用同一采样、初始化与目标计数口径。FP_DECAY 在前 4,000 updates 保留原 FP，4,000—5,000 余弦退火到 0，其余保持匹配。BASE TEST 0.781，FP_DECAY 0.790，差值展示 +0.010，但原始未舍入值严格小于 0.010，性能判定为未通过；相对 P10K −0.003、B_FP −0.001。既有 CURRENT_PLAN 第 2 节对 PT 日志、全部微批采样、resume／deploy、预测及源码的详细核对继续有效，不重复跑测试。
+
+**SHIFT／3DSHIFT r1.5-ALL1-PCTRL-GPU2（10 月 22—23 日）：新修订已完成，审查通过；P 未达到性能门槛。** 科学问题是周期 canonical bond shared state＋相对 image shift covering graph＋每层零初始化几何 value 的 P 表征包，相对有限 Trimer teacher 是否改善纯二维迁移。共同取消 ALIGN×2，所有激活目标权重为 1、无 loss warmup，policy=uniform1_align_mean_v1；FP 仍是 masked 2D→完整 Morgan，L 关闭。F_G10K 与 P_G10K 从公共 step0 各独立 10,000 updates；P_G5K 只读出同一 P_G 轨迹已保留的 step5K，增加 35 FT／TEST 而无新增 PT。最终总计 105 FT／105 TEST，逐臂冻结并保留 all_evaluations_frozen 记录，固定 FINAL=P_G。TEST F_G10K 0.782、P_G5K 0.776、P_G10K 0.783；P_G10K−F_G10K +0.001，P_G10K−PTSCALE/P10K −0.010。后者还存在 objective policy／资源等变化，只作数值参考，不是 P 的单因素对照。
+
+SHIFT 早期 original_P_G 异常停止，真实退出与原因缺失，仍为未核实；recovery1 完成 629／尝试 630 后于 10 月 23 日 08:54 按用户要求取消。累计账本包含旧 2 次 PT 与新 2 次 PT，保守计费 30,630 updates，已知实际下界 26,009，不把保守预留称为全部完成。原 prepare 已完成 910,756 条 sidecar，后续只读复用。新两支 PT 及 105 FT／TEST、最终 CPU 的退出证据完整；旧未知退出不伪造为 0。历史 PT 使用当时明确授权的 GPU2，F_G 与 P_G5K 下游用 GPU3、P_G10K 用 GPU2，硬件差异保留。没有执行 L，不宣称完成 P×L 消融或交互效应。
+
+**FPM／F_G10K＋Morgan concat／gate（10 月 23 日）：已完成，审查通过；性能下降。** 只复用上项 F_G10K step10000，PT=0；真实 binary Morgan 2048→128→128＋LN，concat 等价于旧 head 的 UA512 线性输出加零初始化 FP128→512 投影；gate 用 [UA,z]→64→128 的 2sigmoid，零末层使初始 gate=1。只新增 CONCAT_FP／GATE_FP 各 35 FT／TEST，head／joint 保持 10＋60 epochs；FP 提前从既有 SQLite 缓存读取，5,875 行、3,654 结构，无在线 FP 生成。TEST 0.757／0.758，对 F_G10K 分别 −0.025／−0.024。两支均为负结果；不能据此否定独立 KRR 的预测级融合。实际 GPU3 总并发最多 4 路，旧计划中的每组并发表述以其后执行授权为准。
+
+**PH／P10K＋PH descriptor concat／gate（10 月 23 日）：已完成，审查通过；性能下降。** reference 明确为 PTSCALE/P10K TEST 0.793，PT=0。有限 Trimer 的 ALL-heavy／C／C+N／C+O 四组点云，F₂ VR filtration、截断 4.5 Å、H0／H1，输出 412 维 Betti／有限条形统计／右删失信息；它是分子描述符，不是无限周期 PH 或额外预训练通道。一次 prepare 3,654 结构（3,646 有效、8 无效），耗时 44.8 秒；无效样本保留，encoder 后置零其 PH 分支。每折仅有效 train 行拟合 log1p 后的特征 scaler。412→128→128＋LN、零投影 concat 或初始 gate=1 的通道 gate；共 70 FT／70 TEST，无新 PT。TEST CONCAT_PH 0.782、GATE_PH 0.781，分别较 reference −0.011／−0.012。Nc 的局部改善不改变宏门槛，不按任务拼接。实际执行 GPU2 总并发 4，是后续授权的交付配置；目录名 gpu01 与旧 PH_PLAN 的 GPU0／1 不代表实际用了两卡。既有保存 barcodes、feature scaler 与预测构成可追溯证据，不新增 PH 计算或填补几何。
+
+**R10／P10K＋r10-style 全局预测融合（10 月 23 日）：已完成，独立审查通过；本轮固定主候选达到性能门槛。** reference 为 PTSCALE/P10K 的原始单位正式预测，FP 分支只读复用 r9 all_task_kernel 的已拟合 KRR 及既有预测，保持其原 train-only scaler、核、alpha 和 split；不是复用旧 r10 已混合的输出再混合。一次 prepare 对齐 35 validation 单元；在固定 w∈{0,0.25,0.5,0.75,1} 上比较 175 个 validation R²，唯一全局 w=0.75。一次冻结后仅评估政策 y=0.75·P10K＋0.25·KRR 的 35 个 TEST 单元，不比较其他 w 的 TEST，不按 task／fold 选权重、不重选 alpha。
+
+R10 正式 macro R² 0.804，reference 0.793，配对差值展示 +0.010，原始未舍入值达到 0.010 门槛；由完整精度判定为性能通过，不能用两个已舍入 macro 相减代替原差值。EPS、Nc、Xc 的均值分别改善 +0.015、+0.010、+0.042；24／35 folds 为正。新 PT、FT、KRR 拟合、FP 生成、核查询、模型推理、GPU 和 worker 全为 0；35 次正式评估是保存数组的政策评估，不是 35 次重新推理。CPU 24 passed、exit0；全流程 5.516 秒。融合收益支持两类预测在本协议下互补，不能自动称为表征交互效应、独立盲测优势或超过全部论文任务。
+
+### 实际预算、退出与已有 CPU 证据
+
+| ID | PT 启动／计费 updates | FT 启动／完整单元 | 正式 TEST 单元 | CPU 原有证据 |
+|---|---:|---:|---:|---|
+| FP | 5／16,392 | 105／105 | 105 | 3 次：首次 7 passed／1 failed，exit 1；返修 10 passed；fast_r4 6 passed |
+| CLEAN | 6／30,000 | 210／210 | 210 | 7 passed |
+| ATTN | 1／5,000 | 35／35 | 35 | 8 passed |
+| DEMOL | 0／0 | 70／70 | 0 | 5 passed |
+| ET | 2／5,001 | 35／35 | 0 | 6 passed；repair1 5 passed |
+| HOP | 0／0 | 70／70 | 70 | 8 passed（既有归档） |
+| F3D | 0／0 | 35／35 | 0 | 5 passed（既有归档） |
+| OPT | 5／25,000 | 288／280 | 175 | 23 passed；FT 修复后 28 passed |
+| TRANSFER | 0／0 | 140／140 | 140 | 14 passed |
+| WAVG | 0／0 | 35／35 | 105 | 8 passed |
+| PTSCALE | 1／20,000 | 105／105 | 105 | 11 passed |
+| FPDECAY | 2／10,000 | 70／70 | 70 | 9 passed |
+| SHIFT | 4／30,630 | 105／105 | 105 | 26 passed |
+| FPM | 0／0 | 70／70 | 70 | 9 passed |
+| PH | 0／0 | 70／70 | 70 | 11 passed |
+| R10 | 0／0 | 0／0 | 35 | 24 passed |
+
+上述 CPU 的成功项均有原日志 exit0；FP 首次 CPU 的 exit1 保留，不由后续通过覆盖。预算 PT updates 是各累计账本口径，包含已说明的失败／预取／未知退出保守计费，不能直接当作净成功更新量。OPT 成功 FT 为 280 而非 288；WAVG 只有 35 FT；PTSCALE 只有 1 条 PT；SHIFT 的 P_G5K 不新增 PT；R10 不新增任何 FT。各周期日志和命令、cwd、tmux window、PID、真实退出见对应 execution_manifest／budget 的 job 记录和 logs 同名根。审查不根据旧 tmux 窗口是否存在推断仍在运行。
+
+### 七任务正式 TEST、论文参考与逐项差值
+
+统一口径：每任务 5 folds，seed=42+fold，等权 mean±std（ddof=1），再七任务等权 macro；原始预测与指标保留完整精度。下表每格为“项目 R²±std（项目−论文）”，均按未舍入值计算后展示 3 位小数；macro 没有另造标准差。R10 的统计由同一 35 单元重算，与此口径一致；历史 r9／r10 原文曾用 ddof=0，不将旧标准差直接作本轮配对不确定性。
+
+| 任务 | 论文参考 R² | 对应模型 |
+|---|---:|---|
+| Eea | 0.934 | Periodic-TDL |
+| Egb | 0.923 | Periodic-TDL (+Chem, +RC) |
+| Egc | 0.911 | Periodic-TDL (+Chem, +RC) |
+| Ei | 0.839 | Periodic-TDL |
+| EPS | 0.787 | Periodic-TDL |
+| Nc | 0.856 | Periodic-TDL |
+| Xc | 0.423 | Periodic-TDL |
+
+七项论文最佳均值的等权包络 macro 为 0.810，来自不同模型配置，不是一个可运行单模型。项目 Egc 3,380 对论文 4,124、Xc 432 对论文 430，且数据／split／评估协议等价性未获证明；以下只作数值对照。共享开发 TEST 已参与路线开发，不称独立盲测；R10 数值高于 Egb／Egc／Xc 三项参考，其他四项仍低于参考，不能宣布整体 SOTA。EAT、Eib、Tg 不纳入。
+
+| 周期／臂 | Eea | Egb | Egc | Ei | EPS | Nc | Xc | macro R² |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| FP／V1 | 0.926±0.020（-0.008） | 0.930±0.015（+0.007） | 0.912±0.016（+0.001） | 0.808±0.044（-0.031） | 0.746±0.067（-0.041） | 0.808±0.067（-0.048） | 0.380±0.083（-0.043） | 0.787 |
+| FP／V2 | 0.928±0.012（-0.006） | 0.934±0.011（+0.011） | 0.911±0.017（-0.000） | 0.816±0.021（-0.023） | 0.740±0.054（-0.047） | 0.788±0.085（-0.068） | 0.380±0.087（-0.043） | 0.785 |
+| FP／B_FP | 0.933±0.014（-0.001） | 0.934±0.012（+0.011） | 0.913±0.017（+0.002） | 0.816±0.032（-0.023） | 0.764±0.058（-0.023） | 0.787±0.100（-0.069） | 0.393±0.146（-0.030） | 0.791 |
+| CLEAN／G_ALL1 | 0.924±0.025（-0.010） | 0.929±0.017（+0.006） | 0.914±0.014（+0.003） | 0.804±0.027（-0.035） | 0.700±0.075（-0.087） | 0.763±0.105（-0.093） | 0.414±0.138（-0.009） | 0.778 |
+| CLEAN／G_DYN | 0.918±0.022（-0.016） | 0.933±0.013（+0.010） | 0.917±0.016（+0.006） | 0.810±0.021（-0.029） | 0.743±0.059（-0.044） | 0.797±0.060（-0.059） | 0.301±0.119（-0.122） | 0.774 |
+| CLEAN／Q_ALL1 | 0.918±0.032（-0.016） | 0.936±0.018（+0.013） | 0.915±0.016（+0.004） | 0.814±0.021（-0.025） | 0.727±0.086（-0.060） | 0.774±0.107（-0.082） | 0.395±0.185（-0.028） | 0.783 |
+| CLEAN／Q_DYN | 0.918±0.034（-0.016） | 0.934±0.011（+0.011） | 0.918±0.018（+0.007） | 0.816±0.020（-0.023） | 0.713±0.099（-0.074） | 0.783±0.095（-0.073） | 0.398±0.132（-0.025） | 0.783 |
+| CLEAN／QL_ALL1 | 0.923±0.018（-0.011） | 0.932±0.017（+0.009） | 0.913±0.016（+0.002） | 0.805±0.021（-0.034） | 0.697±0.077（-0.090） | 0.779±0.101（-0.077） | 0.368±0.139（-0.055） | 0.774 |
+| CLEAN／QL_DYN | 0.921±0.022（-0.013） | 0.937±0.014（+0.014） | 0.917±0.018（+0.006） | 0.815±0.024（-0.024） | 0.761±0.038（-0.026） | 0.785±0.122（-0.071） | 0.394±0.126（-0.029） | 0.790 |
+| ATTN／V1_ATTN64 | 0.922±0.014（-0.012） | 0.933±0.011（+0.010） | 0.910±0.016（-0.001） | 0.819±0.023（-0.020） | 0.713±0.048（-0.074） | 0.810±0.059（-0.046） | 0.367±0.084（-0.056） | 0.782 |
+| HOP／HOP_EQ | 0.934±0.015（-0.000） | 0.932±0.014（+0.009） | 0.912±0.018（+0.001） | 0.807±0.036（-0.032） | 0.755±0.045（-0.032） | 0.808±0.079（-0.048） | 0.369±0.152（-0.054） | 0.788 |
+| HOP／HOP_PH | 0.934±0.015（-0.000） | 0.933±0.014（+0.010） | 0.914±0.015（+0.003） | 0.807±0.036（-0.032） | 0.755±0.045（-0.032） | 0.804±0.069（-0.052） | 0.372±0.151（-0.051） | 0.788 |
+| OPT／A_MIX246 | 0.933±0.014（-0.001） | 0.934±0.012（+0.011） | 0.913±0.015（+0.002） | 0.816±0.032（-0.023） | 0.764±0.058（-0.023） | 0.787±0.100（-0.069） | 0.393±0.146（-0.030） | 0.791 |
+| OPT／C_SCHED_E | 0.933±0.017（-0.001） | 0.932±0.019（+0.009） | 0.912±0.014（+0.001） | 0.795±0.041（-0.044） | 0.732±0.067（-0.055） | 0.812±0.066（-0.044） | 0.336±0.117（-0.087） | 0.779 |
+| OPT／D_INTEGRATE | 0.931±0.025（-0.003） | 0.936±0.015（+0.013） | 0.915±0.016（+0.004） | 0.794±0.042（-0.045） | 0.737±0.058（-0.050） | 0.795±0.087（-0.061） | 0.374±0.066（-0.049） | 0.783 |
+| OPT／B3_E | 0.930±0.018（-0.004） | 0.918±0.023（-0.005） | 0.911±0.016（+0.000） | 0.812±0.027（-0.027） | 0.751±0.055（-0.036） | 0.820±0.074（-0.036） | 0.390±0.123（-0.033） | 0.790 |
+| OPT／B2_C | 0.931±0.025（-0.003） | 0.936±0.015（+0.013） | 0.914±0.016（+0.003） | 0.794±0.042（-0.045） | 0.737±0.058（-0.050） | 0.795±0.087（-0.061） | 0.374±0.066（-0.049） | 0.783 |
+| TRANSFER／R_MEAN | 0.934±0.012（+0.000） | 0.931±0.017（+0.008） | 0.910±0.017（-0.001） | 0.819±0.024（-0.020） | 0.739±0.058（-0.048） | 0.806±0.072（-0.050） | 0.401±0.135（-0.022） | 0.791 |
+| TRANSFER／R_STD | 0.933±0.014（-0.001） | 0.932±0.011（+0.009） | 0.915±0.017（+0.004） | 0.807±0.036（-0.032） | 0.721±0.085（-0.066） | 0.792±0.067（-0.064） | 0.416±0.104（-0.007） | 0.788 |
+| TRANSFER／A_SP | 0.932±0.011（-0.002） | 0.929±0.015（+0.006） | 0.913±0.018（+0.002） | 0.820±0.040（-0.019） | 0.760±0.054（-0.027） | 0.783±0.093（-0.073） | 0.395±0.149（-0.028） | 0.790 |
+| TRANSFER／R_STD_SP | 0.933±0.013（-0.001） | 0.933±0.009（+0.010） | 0.914±0.013（+0.003） | 0.806±0.035（-0.033） | 0.713±0.076（-0.074） | 0.786±0.075（-0.070） | 0.414±0.108（-0.009） | 0.785 |
+| WAVG／BEST | 0.933±0.014（-0.001） | 0.934±0.012（+0.011） | 0.912±0.016（+0.001） | 0.816±0.032（-0.023） | 0.764±0.058（-0.023） | 0.787±0.100（-0.069） | 0.393±0.146（-0.030） | 0.791 |
+| WAVG／SWA4 | 0.933±0.013（-0.001） | 0.934±0.012（+0.011） | 0.910±0.014（-0.001） | 0.819±0.029（-0.020） | 0.694±0.137（-0.093） | 0.782±0.094（-0.074） | 0.391±0.157（-0.032） | 0.780 |
+| WAVG／EMA60 | 0.931±0.014（-0.003） | 0.933±0.012（+0.010） | 0.910±0.014（-0.001） | 0.816±0.029（-0.023） | 0.684±0.148（-0.103） | 0.780±0.095（-0.076） | 0.385±0.159（-0.038） | 0.777 |
+| PTSCALE／P5K | 0.929±0.012（-0.005） | 0.928±0.011（+0.005） | 0.911±0.016（+0.000） | 0.808±0.036（-0.031） | 0.736±0.064（-0.051） | 0.793±0.068（-0.063） | 0.409±0.076（-0.014） | 0.788 |
+| PTSCALE／P10K | 0.932±0.022（-0.002） | 0.929±0.015（+0.006） | 0.916±0.013（+0.005） | 0.820±0.019（-0.019） | 0.736±0.073（-0.051） | 0.815±0.079（-0.041） | 0.404±0.117（-0.019） | 0.793 |
+| PTSCALE／P20K | 0.930±0.019（-0.004） | 0.927±0.012（+0.004） | 0.913±0.014（+0.002） | 0.811±0.025（-0.028） | 0.708±0.097（-0.079） | 0.810±0.075（-0.046） | 0.396±0.112（-0.027） | 0.785 |
+| FPDECAY／BASE | 0.928±0.021（-0.006） | 0.929±0.015（+0.006） | 0.914±0.015（+0.003） | 0.805±0.025（-0.034） | 0.739±0.068（-0.048） | 0.797±0.090（-0.059） | 0.353±0.101（-0.070） | 0.781 |
+| FPDECAY／FP_DECAY | 0.926±0.015（-0.008） | 0.928±0.015（+0.005） | 0.909±0.015（-0.002） | 0.821±0.016（-0.018） | 0.734±0.077（-0.053） | 0.820±0.075（-0.036） | 0.396±0.103（-0.027） | 0.790 |
+| SHIFT／F_G10K | 0.923±0.016（-0.011） | 0.934±0.014（+0.011） | 0.917±0.017（+0.006） | 0.798±0.018（-0.041） | 0.707±0.076（-0.080） | 0.773±0.090（-0.083） | 0.423±0.114（-0.000） | 0.782 |
+| SHIFT／P_G5K | 0.925±0.017（-0.009） | 0.929±0.013（+0.006） | 0.915±0.015（+0.004） | 0.801±0.018（-0.038） | 0.730±0.075（-0.057） | 0.806±0.066（-0.050） | 0.323±0.102（-0.100） | 0.776 |
+| SHIFT／P_G10K | 0.926±0.017（-0.008） | 0.932±0.012（+0.009） | 0.913±0.017（+0.002） | 0.803±0.037（-0.036） | 0.700±0.084（-0.087） | 0.809±0.069（-0.047） | 0.397±0.134（-0.026） | 0.783 |
+| FPM／CONCAT_FP | 0.921±0.015（-0.013） | 0.916±0.010（-0.007） | 0.892±0.017（-0.019） | 0.758±0.097（-0.081） | 0.659±0.143（-0.128） | 0.796±0.086（-0.060） | 0.360±0.103（-0.063） | 0.757 |
+| FPM／GATE_FP | 0.921±0.015（-0.013） | 0.915±0.010（-0.008） | 0.894±0.017（-0.017） | 0.757±0.098（-0.082） | 0.662±0.145（-0.125） | 0.798±0.079（-0.058） | 0.359±0.088（-0.064） | 0.758 |
+| PH／CONCAT_PH | 0.924±0.016（-0.010） | 0.929±0.010（+0.006） | 0.918±0.013（+0.007） | 0.790±0.024（-0.049） | 0.730±0.073（-0.057） | 0.824±0.059（-0.032） | 0.358±0.095（-0.065） | 0.782 |
+| PH／GATE_PH | 0.925±0.015（-0.009） | 0.926±0.011（+0.003） | 0.914±0.016（+0.003） | 0.785±0.021（-0.054） | 0.734±0.075（-0.053） | 0.830±0.061（-0.026） | 0.355±0.109（-0.068） | 0.781 |
+| R10／P10K_R10FP_GLOBAL | 0.933±0.019（-0.001） | 0.928±0.009（+0.005） | 0.919±0.013（+0.008） | 0.822±0.019（-0.017） | 0.751±0.070（-0.036） | 0.825±0.062（-0.031） | 0.447±0.110（+0.024） | 0.804 |
+
+没有完整正式预测的工作逐项登记如下；全部写“未完成／不可比较”，不以 validation、其他 checkpoint 或其他周期结果补齐：
+
+| 任务 | SOTA 参考 R² | SOTA 主线 r1／retest1 | DEMOL 两臂 | ET_SINGLE repair1 | FROZEN3D | OPT：A_TOP2／B2_E／B3_C |
+|---|---:|---|---|---|---|---|
+| Eea | 0.934 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 |
+| Egb | 0.923 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 |
+| Egc | 0.911 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 |
+| Ei | 0.839 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 |
+| EPS | 0.787 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 |
+| Nc | 0.856 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 |
+| Xc | 0.423 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 | 未完成／不可比较 |
+
+缺项原因：旧 SOTA 主线被用户停止；DEMOL、ET_SINGLE repair1、FROZEN3D 的原开发触发条件未满足，实际 TEST=0；OPT 三臂不在最后冻结的正式 TEST 名单。10 月 18 日已归档 F0 同样七项不可比较，原因及消耗见前文，不重复表列或补测。
+
+### 原始证据索引、归档结论与后续边界
+
+| ID | 计划／修订 | 结果入口 | 实际实现／审查材料 |
+|---|---|---|---|
+| FP | UA2D-PRETRAIN-FP-20261019-01／r4 | [results.json](results/ua2d_pretrain_fp_20261019/fast_r4/final_review/results.json) | [预训练模块](src/modules/ua2d_galformer_pretrain.py)、[fast worker](scripts/pretrain_ua2d_fast.py)、[实现与事故报告](results/ua2d_pretrain_fp_20261019/fast_r4/final_review/implementation_review.md) |
+| CLEAN | UA2D-CLEANFP-READOUT-DISTILL-20261019-01／r1 | [results.json](results/ua2d_cleanfp_readout_distill_20261019/r1/final_review/results.json) | [预训练模块](src/modules/ua2d_cleanfp_pretrain.py)、[动态权重与 FT](src/training/ua2d_readout_distill.py) |
+| ATTN | UA2D-V1-ATTNSCALE-20261020-01／r1 | [results.json](results/ua2d_v1_attnscale_20261020/r1/final_review/results.json) | [共享 attention 修改](src/modules/glt_dual.py)、[独立训练入口](src/training/ua2d_attnscale.py) |
+| DEMOL | UA2D-DEMOL-LITE-20261020-01／r1 | [results.json](results/ua2d_demol_20261020/r1/final_review/results.json) | [模型](src/modules/ua2d_demol.py)、[交付 diff](results/ua2d_demol_20261020/r1/final_review/code_diff.patch) |
+| ET | UA2D-ET-SINGLE-20261020-01／r1 | [results.json](results/ua2d_et_single_20261020/r1/final_review/results.json) | [ET 模块](src/modules/ua2d_et_single.py)、[修复授权与执行](scripts/resume_ua2d_et_single_repair1.py) |
+| HOP | UA-HOP-PH-20261020-01／r1 | [results.json](results/ua_hop_ph_20261020/r1/final_review/results.json) | [模型](src/modules/ua_hop_ph.py)，本文件 2026-10-20 既有独立审查 |
+| F3D | UA-HOP-PH-FROZEN3D-20261020-01／r1 | [results.json](results/ua_hop_ph_20261020/frozen3d_r1/final_review/results.json) | [模型](src/modules/ua_hop_ph_frozen3d.py)，本文件 2026-10-20 既有独立审查 |
+| OPT | UA2D-OPT-20261021-01／r1-FT-REPAIR1 | [results.json](results/ua2d_opt_20261021/r1/repair_ft1/results.json) | [模型](src/modules/ua2d_opt.py)、[成功 attempt 映射](results/ua2d_opt_20261021/r1/repair_ft1/attempt_mapping.json)、[修复 diff](results/ua2d_opt_20261021/r1/repair_ft1/actual_diff.patch) |
+| TRANSFER | UA2D-TRANSFER-20261022-01／r1 | [results.json](results/ua2d_transfer_20261022/r1/final_review/results.json) | [模型](src/modules/ua2d_transfer.py)、[交付 diff](results/ua2d_transfer_20261022/r1/final_review/actual_source_diff.patch) |
+| WAVG | UA2D-WAVG-20261022-01／r1 | [results.json](results/ua2d_wavg_20261022/r1/final_review/results.json) | [训练与平均](src/training/ua2d_wavg.py)、[平均来源记录](results/ua2d_wavg_20261022/r1/final_review/estimator_sources.json) |
+| PTSCALE | UA2D-PTSCALE-20261022-01／r1 | [results.json](results/ua2d_ptscale_20261022/r1/final_review/results.json) | [PT worker](scripts/pretrain_ua2d_ptscale.py)、[完整训练与评估](src/training/ua2d_ptscale.py) |
+| FPDECAY | UA2D-FPDECAY-20261022-01／r2-SG | [results.json](results/ua2d_fpdecay_20261022/sg_r2/final_review/results.json) | [SG 训练与权重](src/training/ua2d_fpdecay_sg.py)，CURRENT_PLAN.md 第 2 节既有深度审查 |
+| SHIFT | UA2D-3DSHIFT-20261022-01／r1.5-ALL1-PCTRL-GPU2 | [results.json](results/ua2d_3dshift_20261022/r1/all1_pcontrol_gpu2/final_review/results.json) | [周期几何](src/modules/ua2d_3dshift.py)、[完整交付 diff](results/ua2d_3dshift_20261022/r1/all1_pcontrol_gpu2/final_review/actual_source_diff.patch) |
+| FPM | UA2D-FG10K-MORGAN-20261023-01／r1.1 | [results.json](results/ua2d_fg10k_morgan_20261023/r1/final_review/results.json) | [FP 模型](src/modules/ua2d_fg10k_morgan.py)、[交付 diff](results/ua2d_fg10k_morgan_20261023/r1/final_review/actual_source_diff.patch) |
+| PH | UA2D-PH-DESC-20261023-01／r1.2-P10K-GPU01 | [results.json](results/ua2d_ph_descriptor_20261023/r1_p10k_gpu01/final_review/results.json) | [PH 描述符](src/dataset/ua2d_ph_descriptor.py)、[融合模型](src/modules/ua2d_ph_descriptor.py) |
+| R10 | UA2D-P10K-R10FP-20261023-01／r1 | [results.json](results/ua2d_p10k_r10fp_20261023/r1/final_review/results.json) | [冻结数组融合](src/training/ua2d_p10k_r10fp.py)、[交付 diff](results/ua2d_p10k_r10fp_20261023/r1/final_review/actual_source_diff.patch) |
+
+每个 results 入口所处周期根同时保留 budget.json、execution_manifest 等实际执行记录；报告、CPU 日志和原始产物路径以相邻 final_review/report.md 或表中专项报告为准。OPT 的正式预测在原 r1/formal，修复尝试在 repair_ft1/attempts，由 attempt_mapping／artifact_index 关联；不能只扫描一个目录推断缺折。SHIFT 的正式冻结文件名是 selection/all_evaluations_frozen.json 及各 frozen_*.json，不要求另造 final_frozen.json。
+
+取消与事故补充入口：[旧 SOTA 初次消费](results/ua2d_sota_20261018/r1/budget.json)、[retest1 停止授权与动作](results/ua2d_sota_20261018/r1_retest1/user_stop_20261019.json)、[retest1 消费](results/ua2d_sota_20261018/r1_retest1/budget.json)、[ET 原失败与修复报告](results/ua2d_et_single_20261020/r1/final_review/report.md)、[SHIFT 累计及未知退出证据](results/ua2d_3dshift_20261022/r1/all1_pcontrol_gpu2/budget.json)。工程实现阶段的静态检查不代替这些运行结果。
+
+归档结论：16 个交付周期的实际实现／结果证据按上述限定范围审查通过并收口；旧 SOTA 主线只归档取消、部分消费和证据限制，完整实验未完成。达到本轮主性能门槛的固定候选是 P10K_R10FP_GLOBAL；CLEAN 的 QL_DYN−QL_ALL1 仅作为匹配内部对照的数值正结果保留。其余完整候选未达到各自门槛，开发阶段未做 TEST 的工作维持不可比较。不自动重新开放任何历史队列、不补跑、不修改原结果或 checkpoint，不按 TEST 改选任务、权重或父模型。
+
+本次只向 PROJECT_HISTORY.md 和 CURRENT_PLAN.md 写入审查归档；新增 prepare／PT／FT／TEST／CPU suite／GPU 使用均为 0，未读 TODO.md、未做哈希／校验和、未进行远程操作，未删除文件。后续执行资源遵守当前 AGENTS.md 的物理 GPU3、PT 最多 2 路／FT 最多 4 路；本次归档本身不产生执行授权。

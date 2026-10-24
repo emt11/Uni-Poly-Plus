@@ -1,0 +1,18 @@
+{
+  "strategy": "mask_align_geometry",
+  "fusion": "none",
+  "mask_ratio": 0.4,
+  "noise_sigma": 0.03,
+  "temperature": 0.1,
+  "dropout": 0.1,
+  "mask_2d_weight": 1.0,
+  "coordinate_weight": 1.0,
+  "length_weight": 1.0,
+  "angle_weight": 1.0,
+  "contrast_weight": 0.1,
+  "weight_warmup": 1000,
+  "coordinate_unit": "angstrom_div_sigma",
+  "fp_enabled": false,
+  "fp_weight": 0.1,
+  "revision": "ua2d_galformer_objectives_v3"
+}

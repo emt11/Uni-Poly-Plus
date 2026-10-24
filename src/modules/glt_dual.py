@@ -98,12 +98,20 @@ class SharedBondPathBias(nn.Module):
 
 
 class SourceAttention512(nn.Module):
-    """Source-Q, target-K; source values and incoming softmax. Isolated from legacy."""
-    def __init__(self, dropout=0.1):
+    """Source-Q, target-K; source values and incoming softmax. Isolated from legacy.
+
+    scale_denominator only changes the scalar applied to the QK dot product;
+    the structural/angle bias is added after that scaling and is never scaled.
+    The default 512 preserves every existing checkpoint and entry point.
+    """
+    def __init__(self, dropout=0.1, *, scale_denominator=512):
         super().__init__()
+        if type(scale_denominator) is not int or scale_denominator <= 0:
+            raise ValueError('invalid attention scale denominator')
         self.qkv = nn.Linear(512, 1536)
         self.dropout = nn.Dropout(dropout)
-        self.scale = 512 ** -0.5
+        self.scale_denominator = scale_denominator
+        self.scale = scale_denominator ** -0.5
 
     def forward(self, states, source, target, bias):
         q, k, v = self.qkv(states).reshape(-1, 3, 8, 64).unbind(1)
@@ -114,10 +122,10 @@ class SourceAttention512(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dropout=0.1, *, o8=False):
+    def __init__(self, dropout=0.1, *, o8=False, attention_scale_denominator=512):
         super().__init__()
         self.norm1, self.norm2 = nn.LayerNorm(512), nn.LayerNorm(512)
-        self.attention = SourceAttention512(dropout)
+        self.attention = SourceAttention512(dropout, scale_denominator=attention_scale_denominator)
         self.output = nn.Linear(512, 512)
         self.dropout = nn.Dropout(dropout)
         # O8 retains its original intermediate dropout; Galformer has only
@@ -132,14 +140,14 @@ class TransformerBlock(nn.Module):
 
 
 class BondPathO8(nn.Module):
-    def __init__(self, dropout=0.1):
+    def __init__(self, dropout=0.1, *, attention_scale_denominator=512):
         super().__init__()
         self.atom_embedding = MIPSLocalAtomEmbedding(512)
         self.spd_embedding = nn.Embedding(3, 8)
         nn.init.zeros_(self.spd_embedding.weight)
         self.path_bias = MIPSSinglePathNodeBias(512, 8, 2)
         self.bond_bias = SharedBondPathBias()
-        self.layers = nn.ModuleList([TransformerBlock(dropout, o8=True) for _ in range(6)])
+        self.layers = nn.ModuleList([TransformerBlock(dropout, o8=True, attention_scale_denominator=attention_scale_denominator) for _ in range(6)])
 
     def forward(self, data, atom_mask=None, *, return_initial=False):
         initial = self.atom_embedding(data, atom_mask=atom_mask)
@@ -212,7 +220,7 @@ class PathAngleBias(nn.Module):
 
 
 class GalformerTrimer3D(nn.Module):
-    def __init__(self, dropout=0.1, *, torsion=False, geometry_mode='finite_internal', angle_value_enabled=False, torsion_revision=None, nonbonded_revision=None):
+    def __init__(self, dropout=0.1, *, torsion=False, geometry_mode='finite_internal', angle_value_enabled=False, torsion_revision=None, nonbonded_revision=None, attention_scale_denominator=512):
         super().__init__()
         self.geometry_mode = geometry_mode
         self.torsion_revision = torsion_revision
@@ -224,7 +232,7 @@ class GalformerTrimer3D(nn.Module):
         self.distance_projection = nn.Linear(256, 512)
         self.triplet = nn.Sequential(nn.Linear(1024, 512), nn.GELU(), nn.Linear(512, 512))
         self.angle_bias = PathAngleBias()
-        self.layers = nn.ModuleList([TransformerBlock(dropout) for _ in range(6)])
+        self.layers = nn.ModuleList([TransformerBlock(dropout, attention_scale_denominator=attention_scale_denominator) for _ in range(6)])
         # S4 torsion head: real Trimer heavy-atom quadruplets feed
         # [cos(phi), cos(2*phi)] through a small MLP, pooled per physical
         # center bond and added to the initial 3D bond token through one
@@ -489,9 +497,11 @@ class Pure2DGLTModel(nn.Module):
     Returns standardized predictions; the caller retains the original train-only
     scaler and inverse transform, just as with the U1 Pure2D wrapper.
     """
-    def __init__(self, dropout=0.1):
+    def __init__(self, dropout=0.1, *, attention_scale_denominator=512):
         super().__init__()
-        self.o8 = BondPathO8(dropout)
+        self.o8 = BondPathO8(dropout, attention_scale_denominator=attention_scale_denominator)
+        self.attention_scale_denominator = attention_scale_denominator
+        self.attention_scale = attention_scale_denominator ** -0.5
         self.norm2 = nn.LayerNorm(512)
         self.head = nn.Sequential(nn.Linear(512,512), nn.GELU(),
                                   nn.Dropout(dropout), nn.Linear(512,1))
