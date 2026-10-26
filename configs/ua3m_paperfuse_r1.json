@@ -1,0 +1,21 @@
+{
+  "plan": "UA3M-PAPERFUSE-20261025-01",
+  "revision": "r1",
+  "arms": ["UNI3M", "TMOL3M"],
+  "modalities": ["UA2D", "UA3D", "Morgan2048"],
+  "native_dimension": 512,
+  "fusion_dimension": 256,
+  "geometry_policy": "keep_all_mask_unavailable_3D_renormalize",
+  "pt": {"updates_per_arm":10000,"microbatch":168,"accumulation":6,"world_size":1,"seed":42,"workers":4,"worker_threads":1,"precision":"BF16"},
+  "ft": {"tasks":["eea","egb","egc","ei","eps","nc","xc"],"folds":[0,1,2,3,4],"seed":"42+fold","epochs":70,"head_epochs":10,"batch":24,"precision":"FP32","workers":0},
+  "uni": {"directions":[[0,1],[1,0],[0,2],[2,0],[1,2],[2,1]],"reduction":"mean6","temperature":0.07,"pt_coefficient":0.20,"fusion_heads":8,"ffn":1024,"ft_loss":"MSE"},
+  "tmol": {"directions":[[0,2],[1,0],[2,1]],"reduction":"sum3","temperature":0.1,"positive_in_denominator":false,"alpha":0.08,"beta":0.08,"task_embedding":"number0 + regression_type1","ft_loss":"MSE+0.08*ALIGN-0.08*entropy"},
+  "fp_prediction":false,
+  "kernel_methods":false,
+  "output_fusion":false,
+  "gpu":3,
+  "pt_concurrency":1,
+  "ft_test_concurrency":4,
+  "wallclock_seconds":172800,
+  "timeouts":{"prepare":3600,"pt":21600,"ft":21600,"test":1800,"cpu":600}
+}
