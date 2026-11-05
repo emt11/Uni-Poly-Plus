@@ -1,0 +1,84 @@
+{
+  "plan": "UA3D-HMR-READOUT-20261103-01",
+  "revision": "r1",
+  "resource_revision": "gpu2-pt0-fttest8-hmr-readout-r1",
+  "uuid": "GPU-31456dd5-a421-142b-644b-7a80f482dfb9",
+  "reference": 0.804675462276949,
+  "near": 0.809,
+  "target": 0.81,
+  "rank": 32,
+  "branch_seed": "2026110301+fold",
+  "z_source": "P2 train-only standardized z; s=P2 standardized stat/spec",
+  "batch": 256,
+  "epochs": 70,
+  "lr": 0.0003,
+  "weight_decay": 0.0001,
+  "betas": [
+    0.9,
+    0.999
+  ],
+  "eps": 1e-08,
+  "clip": 5,
+  "dropout": 0.1,
+  "scheduler": {
+    "T_max": 70,
+    "eta_min": 1e-06
+  },
+  "precision": "FP32/strict DET/TF32 off",
+  "parameter_counts": {
+    "N_BASE": 251265,
+    "N_ADD": 280609,
+    "N_BILIN": 280609
+  },
+  "loss": "MSE(pred,y)+0.01*MSE(pred,yb)",
+  "selection_tie_order": [
+    "C_FIXED",
+    "N_BASE",
+    "N_ADD",
+    "N_BILIN"
+  ],
+  "limits": {
+    "preflight": 1,
+    "qualify": 1,
+    "diagnostic": 12,
+    "diagnostic_updates": 240,
+    "ft": 105,
+    "ft_epochs": 7350,
+    "ft_updates": 17850,
+    "train_rows": 3945060,
+    "validation": 7350,
+    "validation_batches": 9450,
+    "validation_rows": 989940,
+    "epoch0_aliases": 105,
+    "epoch0_alias_rows": 14142,
+    "test": 175,
+    "new_outputs": 105,
+    "alias_outputs": 70,
+    "new_rows": 17625,
+    "alias_rows": 11750,
+    "test_rows": 29375,
+    "test_batches": 225,
+    "candidate_forwards": 135,
+    "alias_batches": 90,
+    "cpu": 1,
+    "total_updates": 18090
+  },
+  "budget": {
+    "prepare_seconds": 10800,
+    "total_seconds": 43200,
+    "cpu_timeout": 1800,
+    "pilot_timeout": 1800,
+    "io_reserve": 1800,
+    "closing_reserve": 2400,
+    "storage_gib": 8,
+    "startup_free_gib": 32
+  },
+  "formula": {
+    "ADD": "(LN_z(U z) + LN_s(V s))/sqrt(2)",
+    "BILIN": "LN_z(U z) * LN_s(V s)",
+    "LN_eps": 1e-05,
+    "projection_bias": false,
+    "output_bias": false,
+    "fixed_filter": true
+  }
+}

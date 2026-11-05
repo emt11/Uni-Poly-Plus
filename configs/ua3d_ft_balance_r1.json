@@ -1,0 +1,70 @@
+{
+  "plan": "UA3D-FT-BALANCE-20261028-01",
+  "revision": "r1",
+  "t0_unix": 1793176659.0,
+  "hard_seconds": 86400,
+  "cpu_reserve_seconds": 600,
+  "delivery_reserve_seconds": 300,
+  "reference": 0.804675462276949,
+  "reference_validation": 0.8078628628513551,
+  "recipes": {
+    "C0_BASE": {
+      "loss_schedule": "constant",
+      "lr_policy": "original"
+    },
+    "A_ALIGN_DECAY": {
+      "loss_schedule": "joint_late_decay",
+      "lr_policy": "original"
+    },
+    "B_MODAL_LR": {
+      "loss_schedule": "constant",
+      "lr_policy": "modal_low"
+    },
+    "AB_DECAY_LR": {
+      "loss_schedule": "joint_late_decay",
+      "lr_policy": "modal_low"
+    }
+  },
+  "physical_gpus": [
+    2
+  ],
+  "ft_concurrency": 4,
+  "test_concurrency": 4,
+  "workers": 0,
+  "world_size": 1,
+  "limits": {
+    "registrations": 1,
+    "pt_starts": 0,
+    "prepare_starts": 0,
+    "fp_generation": 0,
+    "geometry_generation": 0,
+    "ft_starts": 140,
+    "ft_epochs": 9800,
+    "ft_updates": 224000,
+    "train_graphs": 5260080,
+    "validation_started": 9800,
+    "validation_graphs": 1319920,
+    "test_starts": 140,
+    "test_graphs": 23500,
+    "cpu_suites": 1,
+    "additional_seeds": 0,
+    "retries": 0,
+    "freezes": 1
+  },
+  "based_on": "2992e3cd095ba636c0f120251c43ca435ae3ea89",
+  "fixed_final": null,
+  "purpose": "fixed 2x2 ALIGN late decay and pretrained modal joint LR",
+  "monitoring": "no active assistant monitoring requested; controller autonomous",
+  "t0_utc": "2026-10-28T08:37:39+00:00",
+  "deadline_utc": "2026-10-29T08:37:39+00:00",
+  "aliases": [
+    "BASE_ORIGINAL",
+    "BASE_REFT_HISTORY"
+  ],
+  "selection": {
+    "macro_margin": 0.005,
+    "task_tolerance": 0.005,
+    "performance_delta": 0.01
+  },
+  "execution_role": "DSH"
+}

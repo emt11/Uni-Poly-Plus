@@ -1,0 +1,77 @@
+{
+  "plan": "UA3D-COND-SPECTRAL-20261104-01",
+  "revision": "r3",
+  "resource_revision": "gpu2-pt1-fttest4-pss-boundedio-r3",
+  "physical_gpu": 2,
+  "uuid": "GPU-31456dd5-a421-142b-644b-7a80f482dfb9",
+  "output": "results/ua3d_cond_spectral_20261104/r2/repairs/memory_r3",
+  "logs": "logs/ua3d_cond_spectral_20261104/r2/repairs/memory_r3",
+  "arms": [
+    "C_FRESH",
+    "S_STATIC_GATE",
+    "S_COND_GATE",
+    "S_STATIC_TOKEN",
+    "S_COND_TOKEN",
+    "S_COND_NOCROSS"
+  ],
+  "tasks": [
+    "eea",
+    "egb",
+    "egc",
+    "ei",
+    "eps",
+    "nc",
+    "xc"
+  ],
+  "pt": {
+    "updates": 10000,
+    "microbatch": 168,
+    "accumulation": 6,
+    "workers": 4,
+    "prefetch": 1,
+    "lru_entries": 128,
+    "lru_tensor_storage_bytes": 268435456,
+    "reopen_source_microbatches": 64,
+    "readahead": false,
+    "buffers": false
+  },
+  "ft": {
+    "epochs": 70,
+    "head": 10,
+    "joint": 60,
+    "batch": 24,
+    "workers": 4,
+    "max_concurrency": 4
+  },
+  "limits": {
+    "pt_updates": 10000,
+    "ft_starts": 210,
+    "ft_epochs": 14700,
+    "ft_updates": 336000,
+    "total_updates": 346000,
+    "test": 210,
+    "test_rows": 35250,
+    "pre_cpu": 0,
+    "diagnostic": 0,
+    "final_cpu": 1,
+    "geometry": 0,
+    "surface": 0,
+    "spectrum": 0
+  },
+  "reference": 0.804675462276949,
+  "host_memory_bytes": 171798691840,
+  "automatic_retry": false,
+  "automatic_resume": false,
+  "independent_review": "PENDING",
+  "science_recipe": "r2",
+  "memory_metric": "sum Pss+SwapPss",
+  "inherit_all_deadlines": true,
+  "cumulative_limits": {
+    "pt_starts": 2,
+    "pt_unit_quota": 20000,
+    "pt_attempts": 10858,
+    "total_attempts": 346858,
+    "pt_microbatches": 65148,
+    "pt_presentations": 10944864
+  }
+}

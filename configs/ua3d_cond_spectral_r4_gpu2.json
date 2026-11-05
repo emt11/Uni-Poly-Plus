@@ -1,0 +1,88 @@
+{
+  "plan": "UA3D-COND-SPECTRAL-20261104-01",
+  "revision": "r4",
+  "resource_revision": "gpu2-fttest4-pss-lifecycle-r4",
+  "physical_gpu": 2,
+  "uuid": "GPU-31456dd5-a421-142b-644b-7a80f482dfb9",
+  "output": "results/ua3d_cond_spectral_20261104/r2/repairs/lifecycle_r4",
+  "logs": "logs/ua3d_cond_spectral_20261104/r2/repairs/lifecycle_r4",
+  "arms": [
+    "C_FRESH",
+    "S_STATIC_GATE",
+    "S_COND_GATE",
+    "S_STATIC_TOKEN",
+    "S_COND_TOKEN",
+    "S_COND_NOCROSS"
+  ],
+  "tasks": [
+    "eea",
+    "egb",
+    "egc",
+    "ei",
+    "eps",
+    "nc",
+    "xc"
+  ],
+  "pt": {
+    "starts": 0,
+    "updates": 0,
+    "allowed_input": "results/ua3d_cond_spectral_20261104/r2/repairs/memory_r3/pretrain/BASE_FRESH/deploy.pt",
+    "source_completed_updates": 10000
+  },
+  "ft": {
+    "epochs": 70,
+    "head": 10,
+    "joint": 60,
+    "batch": 24,
+    "workers": 4,
+    "max_concurrency": 4
+  },
+  "limits": {
+    "pt_updates": 0,
+    "ft_starts": 210,
+    "ft_epochs": 14700,
+    "ft_updates": 336000,
+    "total_updates": 336000,
+    "test": 210,
+    "test_rows": 35250,
+    "pre_cpu": 0,
+    "diagnostic": 0,
+    "final_cpu": 1,
+    "geometry": 0,
+    "surface": 0,
+    "spectrum": 0,
+    "pt_starts": 0,
+    "train_rows": 7890120,
+    "validation_rows": 1979880,
+    "new_initialization": 0,
+    "stat_fit": 0
+  },
+  "reference": 0.804675462276949,
+  "host_memory_bytes": 171798691840,
+  "automatic_retry": false,
+  "automatic_resume": false,
+  "independent_review": "PENDING",
+  "science_recipe": "r2",
+  "memory_metric": "sum Pss+SwapPss",
+  "inherit_all_deadlines": true,
+  "cumulative_limits": {
+    "pt_starts": 2,
+    "pt_unit_quota": 20000,
+    "pt_attempts": 10858,
+    "total_attempts": 347155,
+    "ft_starts": 211,
+    "ft_updates": 336297
+  },
+  "execution_revision": "r4",
+  "input_pt_revision": "r3",
+  "repair_started_unix": 1793838400.0,
+  "repair_prepare_deadline_unix": 1793845600.0,
+  "lifecycle": {
+    "pss_reads": 3,
+    "exit_grace_seconds": 0.25,
+    "pss_seconds": 15,
+    "rss_seconds": 5,
+    "pidfd_optional": true,
+    "wait_direct_children_only": true
+  }
+}

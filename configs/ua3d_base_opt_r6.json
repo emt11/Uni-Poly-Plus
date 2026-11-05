@@ -1,0 +1,362 @@
+{
+  "plan": "UA3D-BASE-OPT-20261026-01",
+  "revision": "r6",
+  "authorization": "explicit user fixed A-G full cycle prompt, 2026-10-26",
+  "based_on": "dev/2992e3cd095ba636c0f120251c43ca435ae3ea89 plus protected dirty worktree",
+  "implementation_started_unix": 1793020294,
+  "physical_gpus": [
+    2
+  ],
+  "physical_gpu": 2,
+  "cuda_visible_devices": "2",
+  "cuda_device_order": "PCI_BUS_ID",
+  "logical_device": "cuda:0",
+  "world_size": 1,
+  "gpu_concurrency": 1,
+  "controller_cpu_cvd": "",
+  "hard_hours_from_first_controller_start": 96,
+  "automatic_retry": false,
+  "automatic_resume": false,
+  "output": "results/ua3d_base_opt_20261026/r6",
+  "logs": "logs/ua3d_base_opt_20261026/r6",
+  "tasks": [
+    "eea",
+    "egb",
+    "egc",
+    "ei",
+    "eps",
+    "nc",
+    "xc"
+  ],
+  "folds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "seed": "42+fold",
+  "order": "one initialization; A/B/C/D validation; E five PT+FT; F three PT+FT; G two FT; one global freeze; fixed TEST for every unique recipe; one final CPU suite; closeout",
+  "selection": {
+    "guard_each_task": -0.005,
+    "score": "equal seven-task mean validation R2, full precision",
+    "ties": "control first, then registration order",
+    "global_control": "A_L_A8_B8",
+    "stage_controls": [
+      "A_L_A8_B8",
+      "A_SELECTED",
+      "B_SELECTED",
+      "C_SELECTED",
+      "E_P_CURRENT_SHARED",
+      "E_PT_SELECTED"
+    ]
+  },
+  "pt_arms": {
+    "P_CURRENT_SHARED": {
+      "directions": [
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "independent": false,
+      "align_each": 0.08
+    },
+    "P_CURRENT_IND": {
+      "directions": [
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "independent": true,
+      "align_each": 0.08
+    },
+    "P_PAPER_SHARED": {
+      "directions": [
+        [
+          0,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          1,
+          2
+        ]
+      ],
+      "independent": false,
+      "align_each": 0.08
+    },
+    "P_PAPER_IND": {
+      "directions": [
+        [
+          0,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          1,
+          2
+        ]
+      ],
+      "independent": true,
+      "align_each": 0.08
+    },
+    "P_SYM_SHARED": {
+      "directions": [
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          1,
+          2
+        ]
+      ],
+      "independent": false,
+      "align_each": 0.04
+    }
+  },
+  "pt": {
+    "seed": 42,
+    "updates_each": 10000,
+    "microbatch": 168,
+    "accumulation": 6,
+    "global_batch": 1008,
+    "workers": 4,
+    "prefetch_factor": 2,
+    "worker_threads": 1,
+    "main_threads": 2,
+    "fp_as_input": true,
+    "fp_prediction": false,
+    "independent_QFP": "deepcopy loaded common Q2; no shared parameters/no RNG draw",
+    "precision": "BF16 forward, FP32 losses",
+    "optimizer": {
+      "name": "AdamW",
+      "peak_lr": 0.0002,
+      "weight_decay": 0,
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "eps": 1e-08,
+      "clip": 1
+    },
+    "scheduler": "two continuous 5K cycles each warmup500 to eta1e-6; optimizer preserved",
+    "align_warmup_global_updates": 1000,
+    "mask": 0.4,
+    "mask_actions": [
+      0.8,
+      0.1,
+      0.1
+    ],
+    "noise": 0.03
+  },
+  "ft": {
+    "batch": 24,
+    "workers": 0,
+    "head_epochs": 10,
+    "joint_epochs": 60,
+    "precision": "FP32",
+    "weight_decay": 0.02,
+    "clip": 5,
+    "native_joint_lr": 0.0001,
+    "head_lr": 0.0003,
+    "head_scheduler": "CosineAnnealingLR T_max10 eta_min3e-5",
+    "best": "strict original-unit validation RMSE, retain earlier exact tie",
+    "early_stop": false,
+    "joint_modal_lrs": [
+      0.001,
+      0.0003
+    ],
+    "joint_schedulers": [
+      "WarmRestarts(T0=10,Tmult=1,eta_min=1e-6)",
+      "CosineAnnealingLR(Tmax=60,eta_min=1e-6)"
+    ]
+  },
+  "stageA": {
+    "order": [
+      "L_A8_B8",
+      "L_A0_B8",
+      "L_A8_B0",
+      "L_A0_B0"
+    ],
+    "align_entropy": [
+      [
+        0.08,
+        0.08
+      ],
+      [
+        0,
+        0.08
+      ],
+      [
+        0.08,
+        0
+      ],
+      [
+        0,
+        0
+      ]
+    ]
+  },
+  "stageB": {
+    "order": [
+      "U_HI_RESTART",
+      "U_LO_RESTART",
+      "U_HI_MONO",
+      "U_LO_MONO"
+    ],
+    "control_alias": true
+  },
+  "stageC": {
+    "order": [
+      "D2_0_D3_0",
+      "D2_1_D3_0",
+      "D2_0_D3_1",
+      "D2_1_D3_1"
+    ],
+    "p2_p3": [
+      [
+        0,
+        0
+      ],
+      [
+        0.1,
+        0
+      ],
+      [
+        0,
+        0.1
+      ],
+      [
+        0.1,
+        0.1
+      ]
+    ]
+  },
+  "stageD": {
+    "order": [
+      "DF_2_H5",
+      "DF_0_H5",
+      "DF_2_H1",
+      "DF_0_H1"
+    ],
+    "pfp_phead": [
+      [
+        0.2,
+        0.5
+      ],
+      [
+        0,
+        0.5
+      ],
+      [
+        0.2,
+        0.1
+      ],
+      [
+        0,
+        0.1
+      ]
+    ]
+  },
+  "stageF": {
+    "order": [
+      "PD_N1_F2",
+      "PD_N0_F2",
+      "PD_N1_F0",
+      "PD_N0_F0"
+    ],
+    "pnative_pfp": [
+      [
+        0.1,
+        0.2
+      ],
+      [
+        0,
+        0.2
+      ],
+      [
+        0.1,
+        0
+      ],
+      [
+        0,
+        0
+      ]
+    ]
+  },
+  "stageG": {
+    "order": [
+      "G_GATE",
+      "G_RESIDUAL",
+      "G_MODALNORM"
+    ],
+    "added_parameters": [
+      0,
+      196864,
+      1536
+    ]
+  },
+  "limits": {
+    "initialize_starts": 1,
+    "pt_starts": 8,
+    "pt_updates": 80000,
+    "pt_microbatches": 480000,
+    "pt_presentations": 80640000,
+    "ft_starts": 805,
+    "ft_epochs": 56350,
+    "ft_updates": 1288000,
+    "test_starts": 805,
+    "test_graphs": 135125,
+    "cpu_suites": 1
+  },
+  "cpu_timeout_seconds": 600,
+  "closeout_reserve_seconds": 300,
+  "reference": {
+    "id": "UA3D-SPATIAL-20261025-01/r4/FULL/BASE",
+    "macro": 0.795244745287872,
+    "performance_delta": 0.01
+  },
+  "stop": "schema/key/shape/dtype/source/target/split/device mismatch; NaN/Inf; OOM; worker/writer conflict; overwrite; budget/order/deadline; no retry, resume or automatic repair",
+  "independent_review": "PENDING"
+}

@@ -1,0 +1,43 @@
+{
+  "plan": "UA3D-BASE-REFT-20261028-01",
+  "revision": "r1",
+  "t0_unix": 1793172157.0,
+  "hard_seconds": 86400,
+  "cpu_reserve_seconds": 600,
+  "delivery_reserve_seconds": 300,
+  "reference": 0.804675462276949,
+  "reference_validation": 0.8078628628513551,
+  "recipes": {
+    "BASE_ORIGINAL": 0.5,
+    "BASE_REFT": 0.5
+  },
+  "physical_gpus": [
+    2
+  ],
+  "ft_concurrency": 4,
+  "test_concurrency": 4,
+  "workers": 0,
+  "world_size": 1,
+  "limits": {
+    "registrations": 1,
+    "pt_starts": 0,
+    "prepare_starts": 0,
+    "fp_generation": 0,
+    "geometry_generation": 0,
+    "ft_starts": 35,
+    "ft_epochs": 2450,
+    "ft_updates": 56000,
+    "train_graphs": 1315020,
+    "validation_started": 2450,
+    "validation_graphs": 329980,
+    "test_starts": 35,
+    "test_graphs": 5875,
+    "cpu_suites": 1,
+    "additional_seeds": 0,
+    "retries": 0
+  },
+  "based_on": "2992e3cd095ba636c0f120251c43ca435ae3ea89",
+  "fixed_final": "BASE_REFT",
+  "purpose": "exact existing BASE recipe rerun, no candidate selection",
+  "monitoring": "no active assistant monitoring requested; controller autonomous"
+}

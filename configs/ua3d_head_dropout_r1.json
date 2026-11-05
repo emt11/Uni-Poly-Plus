@@ -1,0 +1,44 @@
+{
+  "plan": "UA3D-HEAD-DROPOUT-20261028-01",
+  "revision": "r1",
+  "t0_unix": 1793155813.0,
+  "hard_seconds": 86400,
+  "cpu_reserve_seconds": 600,
+  "delivery_reserve_seconds": 300,
+  "reference": 0.804675462276949,
+  "reference_validation": 0.8078628628513551,
+  "recipes": {
+    "H50_BASE": 0.5,
+    "H00": 0.0,
+    "H10": 0.1,
+    "H20": 0.2,
+    "H30": 0.3,
+    "H40": 0.4
+  },
+  "physical_gpus": [
+    2
+  ],
+  "ft_concurrency": 4,
+  "test_concurrency": 4,
+  "workers": 0,
+  "world_size": 1,
+  "limits": {
+    "registrations": 1,
+    "pt_starts": 0,
+    "prepare_starts": 0,
+    "fp_generation": 0,
+    "geometry_generation": 0,
+    "ft_starts": 175,
+    "ft_epochs": 12250,
+    "ft_updates": 280000,
+    "train_graphs": 6575100,
+    "validation_started": 12250,
+    "validation_graphs": 1649900,
+    "test_starts": 175,
+    "test_graphs": 29375,
+    "cpu_suites": 1,
+    "additional_seeds": 0,
+    "retries": 0
+  },
+  "based_on": "2992e3cd095ba636c0f120251c43ca435ae3ea89"
+}
